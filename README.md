@@ -1,7 +1,7 @@
 # Robot LLM Lab 🤖
 
 ![Status: physical PoC](https://img.shields.io/badge/status-physical%20PoC-2ea44f)
-![Tests: 150 passing](https://img.shields.io/badge/tests-150%20passing-2ea44f)
+![Tests: 193 passing](https://img.shields.io/badge/tests-193%20passing-2ea44f)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![Motion: manual only](https://img.shields.io/badge/motion-manual%20only-f59e0b)
 
@@ -30,7 +30,10 @@ förslag ger `reject` eller `clarify`, aldrig en keyword-baserad gissning.
 svenskt tal fungerar; Gemma kör en rörelsefri shadow-loop. En språkblind
 EV3-supervisor finns nu som hårdvarufritt verifierad kärna och dess
 rörelsefria stop-/inventeringspreflight har passerat på den riktiga EV3:an.
-Autonom motorstyrning är fortfarande inte aktiverad.
+En nodmärkt foreground-transport och en Mac-klient har dessutom verifierats
+mot falsk hårdvara genom riktiga OS-processer, pipes, EOF och signaler.
+Transportens publika entrypoint kan inte aktivera motion. Autonom
+motorstyrning är fortfarande inte aktiverad.
 
 ## Vad fungerar på riktigt?
 
@@ -43,6 +46,7 @@ Autonom motorstyrning är fortfarande inte aktiverad.
 | Lokal LLM | Gemma 4 via LM Studio, utan verktyg och utan motoråtkomst, i en komplett fysisk shadow-cykel |
 | IR-evidens | två motorstilla approach/retreat-cykler vid 20 Hz med full auditdata |
 | Supervisor-preflight | fysisk `brake` + `stop`, stabil touch, komplett terminal audit och frigjort motorlås; inga motorstarter |
+| Foreground-transport | strikt JSONL över stdio, controller-identitet, lokal kö-TTL, replaygrind och fail-closed EOF/signal/backpressure mot falsk sysfs |
 
 Det här är alltså inte en simulering med en robotbild bredvid. Kod har kört
 mot riktig sysfs-hårdvara, riktiga encoders, en riktig IR-sensor och den
@@ -67,7 +71,8 @@ flowchart LR
         S["IR · touch · färg · encoders"]
         T["eSpeak / högtalare"]
         M["Motorer A / B / C"]
-        X["Supervisor-kärna<br/>hårdvarufritt verifierad"]
+        X["Foreground-daemon<br/>motion avstängd"]
+        Y["Supervisor-kärna<br/>enda motorägaren"]
     end
 
     I --> A
@@ -79,7 +84,9 @@ flowchart LR
     H --> T
     C -->|"explicit rörelsekvitto"| H
     H -->|"hårda fart- och tidsgränser"| M
-    X -.->|"nästa grind: fysisk processintegration"| M
+    V -.->|"fast SSH + strikt JSONL"| X
+    X --> Y
+    Y -.->|"nästa grind: fysisk daemon-preflight"| M
 ```
 
 Gemmas kandidat är i dag auditdata. Den kan inte välja robotverktyg, tala
@@ -96,7 +103,7 @@ handling.
 
 | Mätning | Observerat resultat |
 |---|---:|
-| Hårdvarufria tester | `150 / 150` passerar |
+| Hårdvarufria tester | `193 / 193` passerar |
 | Fysisk supervisor-preflight | `completed`, `0` motorstartkommandon |
 | Rak fysisk drivpuls, B/C | `+175° / +175°` encoderrotation |
 | Fysisk svängpuls, B/C | `+172° / −170°` encoderrotation |
@@ -237,6 +244,25 @@ Begäran till LM Studio använder native `POST /api/v1/chat`,
 en tresekunders deadline. Modellfel leder till deterministisk fallback och
 skapar ingen motoråtkomst.
 
+### 7. Kör foreground-daemonens rörelsefria preflight
+
+Kopiera först aktuell `ev3/` och `config/` till roboten. Den publika
+daemon-entrypointen saknar en flagga för att aktivera motorstart. Mac-klienten
+begär endast:
+
+`describe → status → claim → heartbeat → status → arm → status → release → status → shutdown`
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.supervisor_preflight_cli \
+  --ssh-target 'robot@<EV3-host>'
+```
+
+`describe` måste rapportera `motion_enabled=false`, differentialdrift som
+avstängd och rörelsebudget `0` innan sessionen får fortsätta. Detta prov
+armerar supervisorns state machine men skickar aldrig `drive_timed`.
+Framgång kräver dessutom ren remote processexit; fysisk audit och
+motor-write-log kontrolleras separat i experimentprotokollet.
+
 <details>
 <summary><strong>Manuellt fysiskt drivprov – läs säkerhetsnotisen först</strong></summary>
 
@@ -276,6 +302,12 @@ pulsen kontrolleras encoderrotationens storlek och riktning.
   som aktivt tills `brake` + `stop` har verifierats,
 - begränsad auditbuffer i minnet under säkerhetskritisk exekvering; den
   rörelsefria preflight-processen skriver JSONL först efter shutdown.
+- strikt, nodmärkt foreground-protokoll med exakt schema, unika request-ID:n,
+  lokal `queue_ttl_ms`, processinstans-ID och annonserade capabilities,
+- separat reader/writer-I/O, prioriterat korrekt adresserat stopp och
+  safety-poll på den enda supervisortråden,
+- rörelsefri host-preflight och riktiga subprocessprov för EOF, `SIGTERM`,
+  trasig frame och blockerad stdout; samtliga verifierar noll `run-timed`.
 
 ### Krävs före autonom rörelse
 
@@ -283,7 +315,10 @@ pulsen kontrolleras encoderrotationens storlek och riktning.
 - fysisk felinjektion för tappad klient, länk, process och motorskrivning,
 - uppmätt faktisk stopplatens och bromssträcka,
 - kalibrering av pollingjitter och stallgränser vid låg hastighet,
-- episodbudget för tid, sträcka, agentvarv och omplaneringar.
+- episodbudget för tid, sträcka, agentvarv och omplaneringar,
+- lock-retaining fail-stop/retry om ett framtida motion-enabled processläge
+  inte kan verifiera shutdown; den publika daemonen är därför fortsatt
+  strikt rörelsefri.
 
 ## Roadmap
 
@@ -294,7 +329,9 @@ pulsen kontrolleras encoderrotationens storlek och riktning.
 - [x] rörelsefri Gemma-shadow med deterministisk TTS-fallback
 - [x] hårdvarufri supervisor-kärna med heartbeat, touch och stallstopp
 - [x] fysisk rörelsefri supervisor-preflight med verifierad shutdown
-- [ ] fysisk supervisor-daemon, transport och uppmätta stoppgrindar
+- [x] rörelsefri foreground-daemon och hosttransport mot falsk hårdvara
+- [ ] fysisk rörelsefri daemon-preflight över USB-SSH
+- [ ] motion-enabled process med lock-retaining fail-stop och uppmätta stoppgrindar
 - [ ] transportoberoende robot-API och manuella verktygstester
 - [ ] LLM-baserad semantisk klassificering med typat beslutskontrakt och
   strukturerad kontext – utan regexp/keyword-fallback
@@ -303,6 +340,9 @@ pulsen kontrolleras encoderrotationens storlek och riktning.
 - [ ] parallell perception, planering och validering
 - [ ] trådlös kamera/mikrofon, ljudriktning och aktiv visuell perception
 - [ ] adaptrar för Robot Inventor 51515 och BOOST Droid Commander
+
+Den långsiktiga nod-, state- och multi-controller-arkitekturen beskrivs i
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 Drömdemon längre fram:
 

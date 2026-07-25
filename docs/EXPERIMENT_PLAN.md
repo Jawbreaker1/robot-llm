@@ -314,7 +314,9 @@ kommando har ett unikt ID.
 
 Status: språkblind kärna implementerad och verifierad mot fake sysfs/fake
 clock. Den rörelsefria preflighten har även passerat på den fysiska EV3:an.
-Kärnan är fortfarande inte godkänd för autonom fysisk körning.
+En foreground-process, ett strikt nodmärkt protokoll och en Mac-klient har
+dessutom verifierats rörelsefritt mot falsk sysfs med riktiga subprocesser
+och OS-pipes. Kärnan är fortfarande inte godkänd för autonom fysisk körning.
 
 Implementerat:
 
@@ -335,26 +337,59 @@ Implementerat:
   behandlas som aktivt motorläge,
 - begränsad, icke-blockerande auditbuffer under supervisorns exekvering,
 - append-only JSONL-flush efter den rörelsefria preflightens shutdown,
-- rörelsefri preflight-CLI.
+- rörelsefri preflight-CLI,
+- foreground-daemon över stdin/stdout avsedd för en autentiserad SSH-kanal,
+- exakt JSONL-schema; duplicerade JSON-nycklar och icke-finita tal nekas,
+- separat `robot_id`, `controller_id` och processunik
+  `controller_instance_id`,
+- lokalt mottagningsstämplad `queue_ttl_ms`, recheck precis före varje
+  motorstart och avbrottsgrind före varje motor i en parad start,
+- unika request-ID:n, strikt controller-routing och prioriterat nödstopp,
+- bounded input/output-köer och I/O utanför safety-/dispatchtråden,
+- `describe` med effektiva capabilities, processgränser och rörelsebudget,
+- publik daemon-entrypoint som alltid annonserar och verkställer
+  `motion_enabled=false` och saknar motion-enable-flagga,
+- rörelsefri Mac-preflight som aldrig konstruerar eller skickar
+  `drive_timed`.
 
-`68` nya hårdvarufria tester täcker bland annat ägarskap, replay, heartbeat
-exakt vid `500 ms`, touch före och under rörelse, ensidig stall, fel
+Den fulla sviten på `193` tester täcker bland annat ägarskap, replay,
+feladresserat shutdown, heartbeat exakt vid `500 ms`, touch före och under
+rörelse, ensidig stall, fel
 encoderriktning, partiell motorstart, oväntad rörelse i tredje motorn,
 auditfel före och efter motorstart, långsam I/O, avbrott mellan parade
 motorstarter, klockregression, missad poll-deadline före och efter poll,
-stopfel, shutdown med bibehållet motorlås och att preflight aldrig skriver
-`run-timed` eller rapporterar framgång efter en misslyckad shutdown/audit.
+stopfel, shutdown med bibehållet motorlås, deadline/cancel mellan parade
+motorstarter och att preflight aldrig skriver `run-timed` eller rapporterar
+framgång efter en misslyckad shutdown/audit. Riktiga subprocessprov omfattar
+ren handshake, stdin-EOF, `SIGTERM`, trasig JSON-frame och fylld stdout-pipe.
 
-Återstår:
+Återstår före en första motorpuls:
 
-- långlivad daemontransport med begränsad och autentiserad lokal kommandoyta,
-- subprocess-/signaltester och avsiktligt dödad klient,
+- fysisk rörelsefri daemon-preflight över den betrodda USB-SSH-länken,
+- separat SSH-nyckel/forced command före motion-enabled användning,
+- lock-retaining fail-stop/retry om shutdown inte kan verifieras; nuvarande
+  publika process kan inte aktivera motion och är därför endast en
+  preflight-yta,
+- avsiktligt dödad riktig SSH-klient och fysisk signal-/auditkontroll,
 - fysisk polling- och stopplatens,
 - fysisk bromssträcka och låg-hastighetskalibrering av stallgränser,
 - verifiering vid sensorbortfall, motorjam, USB-bortfall och supervisor-krasch.
 
 Grind: avsiktligt dödad klient, bruten länk, felaktiga argument och programfel
 leder till ett uppmätt och säkert stopp.
+
+### Backendprotokollet är inte agentens verktyg
+
+`claim`, `heartbeat`, `arm`, `drive_timed`, `release`, `stop` och `shutdown`
+är en intern exekveringsyta mellan hostadapter och fysisk controller. Gemma
+ska aldrig se eller anropa den. Det framtida semantiska robot-API:t översätter
+typade `drive`/`turn`-förslag till dessa primitiv först efter separat
+host-auktorisation.
+
+`queue_ttl_ms` börjar när en komplett frame mottagits på EV3 och jämförs
+endast med EV3:ans monotona klocka. Det är inte en end-to-end-timestamp från
+Macen. Startgrinden kontrollerar deadlinen igen direkt före varje
+`run-timed`.
 
 ### EXP-F2-SUP-PREFLIGHT-001 – fysisk rörelsefri supervisor
 
@@ -494,6 +529,13 @@ Sensorpollning, perception, planering och validering får arbeta parallellt.
 En host-side decision arbiter serialiserar semantiska beslutsförslag. Den
 lokala EV3-supervisorn serialiserar och övervakar endast redan auktoriserade
 motorprimitiver.
+
+En logisk robot kan bestå av flera exekveringsnoder. Varje EV3-, Robot
+Inventor- eller BOOST-controller får exakt en lokal motorägare. En gemensam
+host-koordinator väljer samordnade handlingar men kan inte kringgå någon
+lokal supervisor. Kameror och mikrofoner är separata perceptionsnoder som
+publicerar tidsstämplade observationer och aldrig motorbeslut. Se
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Fas 7 – Kamera, mikrofon och aktiv perception
 

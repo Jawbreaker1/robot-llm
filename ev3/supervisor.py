@@ -992,6 +992,10 @@ class EV3Supervisor(object):
                 "Stall detection cannot run within maximum drive duration",
             )
         supervisor["heartbeat_timeout_ms"] = heartbeat_timeout_ms
+        supervisor["drive_max_speed_dps"] = drive_max_speed_dps
+        supervisor["drive_max_duration_ms"] = (
+            drive_max_duration_ms
+        )
         return supervisor
 
     @property
@@ -1686,11 +1690,20 @@ class EV3Supervisor(object):
         left_speed_dps,
         right_speed_dps,
         duration_ms,
+        external_start_guard=None,
     ):
         self._require_dispatch_thread()
         self._require_state(STATE_ARMED_IDLE)
         self._require_session(session_id)
         self._validate_sequence(sequence_id)
+        if (
+            external_start_guard is not None
+            and not callable(external_start_guard)
+        ):
+            raise SupervisorError(
+                "invalid_start_guard",
+                "external_start_guard must be callable",
+            )
         _validate_identifier("command_id", command_id, 128)
         if command_id in self._seen_command_ids:
             raise SupervisorError(
@@ -1755,6 +1768,8 @@ class EV3Supervisor(object):
                 "touch_pressed",
                 "Touch stop input is pressed",
             )
+        if external_start_guard is not None:
+            external_start_guard()
 
         self._consume_sequence(sequence_id)
         self._seen_command_ids.add(command_id)
@@ -1786,6 +1801,8 @@ class EV3Supervisor(object):
                     "heartbeat_timeout",
                     "Heartbeat expired before motor start",
                 )
+            if external_start_guard is not None:
+                external_start_guard()
         except BaseException as error:
             code = getattr(error, "code", "prestart_failure")
             self._enter_fault(code, str(error))
@@ -1796,13 +1813,22 @@ class EV3Supervisor(object):
                 "Motion prestart check failed",
             )
         try:
+            def guarded_individual_start(
+                motor,
+                prior_start_times_ms,
+            ):
+                self._guard_individual_motor_start(
+                    motor,
+                    prior_start_times_ms,
+                )
+                if external_start_guard is not None:
+                    external_start_guard()
+
             motion = self._owner.start_drive(
                 left_speed_dps,
                 right_speed_dps,
                 duration_ms,
-                pre_each_start=(
-                    self._guard_individual_motor_start
-                ),
+                pre_each_start=guarded_individual_start,
             )
         except BaseException as error:
             first_cleanup = getattr(
@@ -2154,7 +2180,20 @@ class EV3SupervisorLoop(object):
         """Thread-safe signal; the dispatch thread performs the stop."""
         self._emergency_stop_requested.set()
 
-    def run_once(self):
+    def emergency_stop_requested(self):
+        return self._emergency_stop_requested.is_set()
+
+    def _perform_requested_emergency_stop(self):
+        if self._emergency_stop_requested.is_set():
+            self._emergency_stop_requested.clear()
+            self.supervisor.stop()
+
+    def run_once(self, dispatch_one=None):
+        if dispatch_one is not None and not callable(dispatch_one):
+            raise SupervisorError(
+                "invalid_dispatch_hook",
+                "dispatch_one must be callable",
+            )
         self.supervisor.bind_to_current_thread()
         now_ms = self.supervisor._checked_now_ms()
         pre_poll_lateness_ms = now_ms - self._next_tick_ms
@@ -2171,12 +2210,25 @@ class EV3SupervisorLoop(object):
             )
             return self.supervisor.status()
 
-        if self._emergency_stop_requested.is_set():
-            self._emergency_stop_requested.clear()
-            self.supervisor.stop()
+        self._perform_requested_emergency_stop()
 
         self.supervisor.poll_once()
         self._next_tick_ms += self.interval_ms
+        self._perform_requested_emergency_stop()
+
+        now_ms = self.supervisor._checked_now_ms()
+        if (
+            dispatch_one is not None
+            and now_ms < self._next_tick_ms
+        ):
+            try:
+                dispatch_one()
+            except BaseException as error:
+                code = getattr(error, "code", "dispatch_failure")
+                self.supervisor._enter_fault(code, str(error))
+                raise
+            self._perform_requested_emergency_stop()
+
         now_ms = self.supervisor._checked_now_ms()
         lateness_ms = now_ms - self._next_tick_ms
         if lateness_ms > self.max_lateness_ms:
@@ -2197,11 +2249,16 @@ class EV3SupervisorLoop(object):
             self._next_tick_ms = self.supervisor._now_ms()
         return self.supervisor.status()
 
-    def run_forever(self, shutdown_requested):
+    def run_forever(self, shutdown_requested, dispatch_one=None):
         if not callable(shutdown_requested):
             raise SupervisorError(
                 "invalid_shutdown_signal",
                 "shutdown_requested must be callable",
+            )
+        if dispatch_one is not None and not callable(dispatch_one):
+            raise SupervisorError(
+                "invalid_dispatch_hook",
+                "dispatch_one must be callable",
             )
         self.supervisor.bind_to_current_thread()
         exit_status = None
@@ -2209,7 +2266,9 @@ class EV3SupervisorLoop(object):
         close_error = None
         try:
             while not shutdown_requested():
-                exit_status = self.run_once()
+                exit_status = self.run_once(
+                    dispatch_one=dispatch_one,
+                )
         except BaseException as error:
             loop_error = error
         try:

@@ -25,6 +25,12 @@ from .shadow_commentary import (
     run_shadow_comment,
 )
 from .simulated_robot import SimulatedRobot
+from .supervisor_transport import (
+    SupervisorRemoteError,
+    SupervisorSSHError,
+    SupervisorSSHSession,
+    run_motion_free_supervisor_preflight,
+)
 
 __all__ = [
     "CommandResult",
@@ -46,9 +52,13 @@ __all__ = [
     "ShadowCommentResult",
     "ShadowSpeechError",
     "SimulatedRobot",
+    "SupervisorRemoteError",
+    "SupervisorSSHError",
+    "SupervisorSSHSession",
     "StableZoneTracker",
     "classify_infrared",
     "fallback_comment",
     "run_shadow_comment",
+    "run_motion_free_supervisor_preflight",
     "validate_generated_comment",
 ]

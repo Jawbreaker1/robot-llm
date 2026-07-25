@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "robot_id": "ev3rstorm-01",
+  "controller_id": "ev3rstorm-01.ev3-main",
   "motors": {
     "arm": {
       "port": "outA",

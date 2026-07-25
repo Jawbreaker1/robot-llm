@@ -1,7 +1,10 @@
 import fcntl
 import json
+import os
+import queue
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +21,17 @@ from ev3.supervisor import (
     STATE_FAULT_LATCHED,
     STATE_RUNNING,
     SupervisorError,
+)
+from ev3.supervisor_protocol import (
+    PROTOCOL_VERSION,
+    SupervisorProtocol,
+    decode_request,
+)
+from ev3.supervisor_daemon import (
+    ForegroundSupervisorSession,
+    SessionError,
+    build_parser as build_daemon_parser,
+    run_daemon,
 )
 
 
@@ -79,6 +93,39 @@ class FakeClock:
 
     def advance(self, milliseconds):
         self.now_ms += milliseconds
+
+
+class InteractiveInput:
+    def __init__(self):
+        self.items = queue.Queue()
+
+    def readline(self, _maximum):
+        return self.items.get(timeout=2)
+
+    def send(self, value):
+        self.items.put(value)
+
+    def close(self):
+        self.items.put(b"")
+
+
+class InteractiveOutput:
+    def __init__(self, fail_writes=False):
+        self.items = queue.Queue()
+        self.fail_writes = fail_writes
+
+    def write(self, value):
+        if self.fail_writes:
+            raise IOError("simulated output failure")
+        self.items.put(value)
+
+    def flush(self):
+        return None
+
+    def receive(self):
+        return json.loads(
+            self.items.get(timeout=2).decode("utf-8")
+        )
 
 
 class EV3SupervisorTests(unittest.TestCase):
@@ -157,7 +204,7 @@ class EV3SupervisorTests(unittest.TestCase):
             "write_text",
             side_effect=simulate_kernel_state,
         )
-        self.write_patcher.start()
+        self.mock_supervisor_write = self.write_patcher.start()
         self.session_number = 0
 
         def session_id():
@@ -232,6 +279,91 @@ class EV3SupervisorTests(unittest.TestCase):
             for _, value in self.motor_writes
             if value == "run-timed"
         )
+
+    def protocol_request(
+        self,
+        operation,
+        arguments=None,
+        request_id="request-1",
+        controller_id="ev3rstorm-01.ev3-main",
+        ttl_ms=250,
+        received_at_ms=None,
+    ):
+        if received_at_ms is None:
+            received_at_ms = self.clock.now_ms
+        value = {
+            "protocol_version": PROTOCOL_VERSION,
+            "controller_id": controller_id,
+            "request_id": request_id,
+            "op": operation,
+            "queue_ttl_ms": ttl_ms,
+            "args": {} if arguments is None else arguments,
+        }
+        return decode_request(
+            json.dumps(value).encode("utf-8") + b"\n",
+            received_at_ms,
+        )
+
+    def protocol_wire(
+        self,
+        operation,
+        arguments=None,
+        request_id="request-1",
+        controller_id="ev3rstorm-01.ev3-main",
+        ttl_ms=250,
+    ):
+        value = {
+            "protocol_version": PROTOCOL_VERSION,
+            "controller_id": controller_id,
+            "request_id": request_id,
+            "op": operation,
+            "queue_ttl_ms": ttl_ms,
+            "args": {} if arguments is None else arguments,
+        }
+        return json.dumps(value).encode("utf-8") + b"\n"
+
+    def run_interactive_session(
+        self,
+        client,
+        allow_motion=False,
+        motion_budget=0,
+        output=None,
+    ):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+            allow_motion=allow_motion,
+            motion_budget=motion_budget,
+            experiment_max_abs_speed_dps=100,
+            experiment_max_duration_ms=300,
+        )
+        input_stream = InteractiveInput()
+        if output is None:
+            output = InteractiveOutput()
+        client_errors = []
+
+        def run_client():
+            try:
+                client(input_stream, output)
+            except BaseException as error:
+                client_errors.append(error)
+                input_stream.close()
+
+        client_thread = threading.Thread(target=run_client)
+        client_thread.start()
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            input_stream,
+            output,
+            max_session_ms=120000,
+        )
+        result = session.run()
+        client_thread.join(2)
+        self.assertFalse(client_thread.is_alive())
+        if client_errors:
+            raise client_errors[0]
+        return result
 
     def test_startup_is_disarmed_stopped_and_fail_closed(self):
         status = self.supervisor.status()
@@ -1183,6 +1315,707 @@ class EV3SupervisorTests(unittest.TestCase):
             "heartbeat_timeout",
         )
         self.assert_all_stopped()
+
+    def test_protocol_status_is_controller_scoped_and_ttl_bounded(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        response = protocol.execute(
+            self.protocol_request("status"),
+            dispatch_at_ms=self.clock.now_ms,
+        )
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["result"]["state"], STATE_DISARMED)
+
+        wrong = protocol.execute(
+            self.protocol_request(
+                "status",
+                controller_id="another-controller",
+            ),
+            dispatch_at_ms=self.clock.now_ms,
+        )
+        self.assertFalse(wrong["ok"])
+        self.assertEqual(wrong["error"]["code"], "wrong_controller")
+
+        stale = protocol.execute(
+            self.protocol_request(
+                "status",
+                ttl_ms=20,
+                received_at_ms=self.clock.now_ms,
+            ),
+            dispatch_at_ms=self.clock.now_ms + 20,
+        )
+        self.assertFalse(stale["ok"])
+        self.assertEqual(stale["error"]["code"], "stale_request")
+
+    def test_protocol_describes_exact_controller_capabilities(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        response = protocol.execute(
+            self.protocol_request("describe"),
+            dispatch_at_ms=self.clock.now_ms,
+        )
+
+        self.assertTrue(response["ok"])
+        description = response["result"]
+        self.assertEqual(description["robot_id"], "ev3rstorm-01")
+        self.assertEqual(
+            description["controller_id"],
+            "ev3rstorm-01.ev3-main",
+        )
+        self.assertEqual(len(description["controller_instance_id"]), 32)
+        self.assertFalse(description["motion_enabled"])
+        self.assertEqual(description["remaining_motion_budget"], 0)
+        drive = description["capabilities"][
+            "differential_drive_timed"
+        ]
+        self.assertFalse(drive["enabled"])
+        self.assertEqual(drive["max_abs_speed_dps"], 100)
+        self.assertEqual(drive["max_duration_ms"], 300)
+        self.assertNotIn("arm", description["capabilities"])
+        self.assertNotIn("speech", description["capabilities"])
+
+    def test_protocol_motion_is_disabled_by_default_before_motor_write(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        before = self.run_timed_write_count()
+        response = protocol.execute(
+            self.protocol_request(
+                "drive_timed",
+                arguments={
+                    "session_id": "not-a-session",
+                    "sequence_id": 3,
+                    "command_id": "drive-1",
+                    "reference_heartbeat_sequence": 1,
+                    "left_speed_dps": 100,
+                    "right_speed_dps": 100,
+                    "duration_ms": 300,
+                },
+            ),
+            dispatch_at_ms=self.clock.now_ms,
+        )
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], "motion_disabled")
+        self.assertEqual(self.run_timed_write_count(), before)
+
+    def test_protocol_one_shot_motion_budget_and_experiment_limits(self):
+        session_id = self.claim_and_arm()
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+            allow_motion=True,
+            motion_budget=1,
+            experiment_max_abs_speed_dps=100,
+            experiment_max_duration_ms=300,
+        )
+        common = {
+            "session_id": session_id,
+            "sequence_id": 3,
+            "command_id": "drive-1",
+            "reference_heartbeat_sequence": 1,
+            "left_speed_dps": 101,
+            "right_speed_dps": 100,
+            "duration_ms": 300,
+        }
+        rejected = protocol.execute(
+            self.protocol_request(
+                "drive_timed",
+                arguments=common,
+            ),
+            dispatch_at_ms=self.clock.now_ms,
+        )
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(
+            rejected["error"]["code"],
+            "experiment_speed_limit",
+        )
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assertEqual(protocol.remaining_motion_budget, 1)
+
+        common["left_speed_dps"] = 100
+        accepted = protocol.execute(
+            self.protocol_request(
+                "drive_timed",
+                arguments=common,
+            ),
+            dispatch_at_ms=self.clock.now_ms,
+        )
+        self.assertTrue(accepted["ok"])
+        self.assertEqual(accepted["result"]["state"], STATE_RUNNING)
+        self.assertEqual(self.run_timed_write_count(), 2)
+        self.assertEqual(protocol.remaining_motion_budget, 0)
+
+        common["sequence_id"] = 4
+        common["command_id"] = "drive-2"
+        second = protocol.execute(
+            self.protocol_request(
+                "drive_timed",
+                arguments=common,
+                request_id="request-2",
+            ),
+            dispatch_at_ms=self.clock.now_ms,
+        )
+        self.assertFalse(second["ok"])
+        self.assertEqual(
+            second["error"]["code"],
+            "motion_budget_exhausted",
+        )
+        self.assertEqual(self.run_timed_write_count(), 2)
+
+    def test_protocol_rechecks_queue_ttl_immediately_before_start(self):
+        session_id = self.claim_and_arm()
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+            allow_motion=True,
+            motion_budget=1,
+            experiment_max_abs_speed_dps=100,
+            experiment_max_duration_ms=300,
+        )
+        real_idle_check = self.supervisor._check_idle_motors
+
+        def delayed_idle_check():
+            result = real_idle_check()
+            self.clock.advance(2)
+            return result
+
+        request = self.protocol_request(
+            "drive_timed",
+            arguments={
+                "session_id": session_id,
+                "sequence_id": 3,
+                "command_id": "drive-expired",
+                "reference_heartbeat_sequence": 1,
+                "left_speed_dps": 100,
+                "right_speed_dps": 100,
+                "duration_ms": 300,
+            },
+            ttl_ms=1,
+            received_at_ms=self.clock.now_ms,
+        )
+        with patch.object(
+            self.supervisor,
+            "_check_idle_motors",
+            side_effect=delayed_idle_check,
+        ):
+            response = protocol.execute(
+                request,
+                dispatch_at_ms=self.clock.now_ms,
+            )
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], "stale_request")
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assertEqual(protocol.remaining_motion_budget, 0)
+
+    def test_stop_event_between_motor_starts_blocks_second_start(self):
+        session_id = self.claim_and_arm()
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+            allow_motion=True,
+            motion_budget=1,
+            experiment_max_abs_speed_dps=100,
+            experiment_max_duration_ms=300,
+        )
+        cancelled = threading.Event()
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+            max_session_ms=120000,
+            external_shutdown_event=cancelled,
+        )
+        original_side_effect = self.mock_supervisor_write.side_effect
+
+        def cancel_after_first_start(path, value):
+            result = original_side_effect(path, value)
+            if value == "run-timed":
+                cancelled.set()
+            return result
+
+        request = self.protocol_request(
+            "drive_timed",
+            arguments={
+                "session_id": session_id,
+                "sequence_id": 3,
+                "command_id": "drive-cancelled",
+                "reference_heartbeat_sequence": 1,
+                "left_speed_dps": 100,
+                "right_speed_dps": 100,
+                "duration_ms": 300,
+            },
+        )
+        self.mock_supervisor_write.side_effect = (
+            cancel_after_first_start
+        )
+        try:
+            response = protocol.execute(
+                request,
+                dispatch_at_ms=self.clock.now_ms,
+                cancellation_requested=(
+                    session._motion_start_cancelled
+                ),
+            )
+        finally:
+            self.mock_supervisor_write.side_effect = (
+                original_side_effect
+            )
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            response["error"]["code"],
+            "external_stop_requested",
+        )
+        self.assertEqual(self.run_timed_write_count(), 1)
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assert_all_stopped()
+        self.assertEqual(protocol.remaining_motion_budget, 0)
+
+    def test_stale_stop_is_still_prioritized_and_invalidates_session(self):
+        session_id = self.claim_and_arm()
+        self.start_drive(session_id)
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        response = protocol.execute(
+            self.protocol_request(
+                "stop",
+                ttl_ms=20,
+                received_at_ms=self.clock.now_ms,
+            ),
+            dispatch_at_ms=self.clock.now_ms + 1000,
+        )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["result"]["state"], STATE_DISARMED)
+        self.assertFalse(response["result"]["session_active"])
+        self.assert_all_stopped()
+
+    def test_protocol_does_not_mask_unexpected_dispatch_failure(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        with patch.object(
+            self.supervisor,
+            "status",
+            side_effect=RuntimeError("unexpected"),
+        ):
+            with self.assertRaises(RuntimeError):
+                protocol.execute(
+                    self.protocol_request("status"),
+                    dispatch_at_ms=self.clock.now_ms,
+                )
+
+    def test_loop_dispatches_at_most_one_request_after_safety_poll(self):
+        loop = EV3SupervisorLoop(self.supervisor)
+        order = []
+        real_poll = self.supervisor.poll_once
+
+        def poll():
+            order.append("poll")
+            return real_poll()
+
+        def dispatch():
+            order.append("dispatch")
+
+        with patch.object(
+            self.supervisor,
+            "poll_once",
+            side_effect=poll,
+        ):
+            loop.run_once(dispatch_one=dispatch)
+
+        self.assertEqual(order, ["poll", "dispatch"])
+
+    def test_loop_skips_dispatch_when_poll_consumes_the_tick(self):
+        loop = EV3SupervisorLoop(self.supervisor)
+        dispatched = []
+        real_poll = self.supervisor.poll_once
+
+        def full_tick_poll():
+            result = real_poll()
+            self.clock.advance(loop.interval_ms)
+            return result
+
+        with patch.object(
+            self.supervisor,
+            "poll_once",
+            side_effect=full_tick_poll,
+        ):
+            loop.run_once(
+                dispatch_one=lambda: dispatched.append(True)
+            )
+
+        self.assertEqual(dispatched, [])
+        self.assertEqual(self.supervisor.state, STATE_DISARMED)
+
+    def test_loop_faults_and_stops_on_unexpected_dispatch_exception(self):
+        session_id = self.claim_and_arm()
+        self.start_drive(session_id)
+        loop = EV3SupervisorLoop(self.supervisor)
+
+        with self.assertRaises(RuntimeError):
+            loop.run_once(
+                dispatch_one=lambda: (_ for _ in ()).throw(
+                    RuntimeError("boom")
+                )
+            )
+
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "dispatch_failure",
+        )
+        self.assert_all_stopped()
+
+    def test_foreground_session_completes_motion_free_handshake(self):
+        responses = []
+
+        def client(input_stream, output):
+            def exchange(operation, arguments=None, number=1):
+                input_stream.send(
+                    self.protocol_wire(
+                        operation,
+                        arguments=arguments,
+                        request_id="request-{}".format(number),
+                    )
+                )
+                response = output.receive()
+                responses.append(response)
+                self.assertTrue(response["ok"])
+                return response["result"]
+
+            claim = exchange(
+                "claim",
+                {"owner_id": "mac-manual-client"},
+                1,
+            )
+            session_id = claim["session_id"]
+            exchange(
+                "heartbeat",
+                {"session_id": session_id, "sequence_id": 1},
+                2,
+            )
+            exchange(
+                "arm",
+                {"session_id": session_id, "sequence_id": 2},
+                3,
+            )
+            status = exchange("status", number=4)
+            self.assertEqual(status["state"], STATE_ARMED_IDLE)
+            exchange(
+                "release",
+                {"session_id": session_id, "sequence_id": 3},
+                5,
+            )
+            exchange("shutdown", number=6)
+            input_stream.close()
+
+        result = self.run_interactive_session(client)
+
+        self.assertEqual(len(responses), 6)
+        self.assertEqual(result["status"]["state"], STATE_CLOSED)
+        self.assertTrue(result["status"]["audit_complete"])
+        self.assertIsNone(result["transport_failure"])
+        self.assertFalse(result["motion_enabled"])
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assert_all_stopped()
+
+    def test_foreground_session_rejects_drive_when_motion_disabled(self):
+        drive_response = []
+
+        def client(input_stream, output):
+            def exchange(operation, arguments=None, number=1):
+                input_stream.send(
+                    self.protocol_wire(
+                        operation,
+                        arguments=arguments,
+                        request_id="request-{}".format(number),
+                    )
+                )
+                return output.receive()
+
+            claim = exchange(
+                "claim",
+                {"owner_id": "mac-manual-client"},
+                1,
+            )["result"]
+            session_id = claim["session_id"]
+            exchange(
+                "heartbeat",
+                {"session_id": session_id, "sequence_id": 1},
+                2,
+            )
+            exchange(
+                "arm",
+                {"session_id": session_id, "sequence_id": 2},
+                3,
+            )
+            drive_response.append(
+                exchange(
+                    "drive_timed",
+                    {
+                        "session_id": session_id,
+                        "sequence_id": 3,
+                        "command_id": "drive-1",
+                        "reference_heartbeat_sequence": 1,
+                        "left_speed_dps": 100,
+                        "right_speed_dps": 100,
+                        "duration_ms": 300,
+                    },
+                    4,
+                )
+            )
+            exchange("shutdown", number=5)
+            input_stream.close()
+
+        result = self.run_interactive_session(client)
+
+        self.assertFalse(drive_response[0]["ok"])
+        self.assertEqual(
+            drive_response[0]["error"]["code"],
+            "motion_disabled",
+        )
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assertEqual(result["status"]["state"], STATE_CLOSED)
+
+    def test_wrong_controller_shutdown_neither_stops_nor_closes_session(self):
+        observations = []
+
+        def client(input_stream, output):
+            input_stream.send(
+                self.protocol_wire(
+                    "claim",
+                    {"owner_id": "right-controller-client"},
+                )
+            )
+            claim = output.receive()
+            self.assertTrue(claim["ok"])
+
+            input_stream.send(
+                self.protocol_wire(
+                    "shutdown",
+                    request_id="wrong-shutdown",
+                    controller_id="another-controller",
+                )
+            )
+            wrong = output.receive()
+            observations.append(wrong)
+            self.assertFalse(wrong["ok"])
+
+            input_stream.send(
+                self.protocol_wire(
+                    "status",
+                    request_id="status-after-wrong-shutdown",
+                )
+            )
+            status = output.receive()
+            observations.append(status)
+            self.assertTrue(status["ok"])
+            self.assertTrue(status["result"]["session_active"])
+
+            input_stream.send(
+                self.protocol_wire(
+                    "shutdown",
+                    request_id="right-shutdown",
+                )
+            )
+            output.receive()
+            input_stream.close()
+
+        result = self.run_interactive_session(client)
+
+        self.assertEqual(
+            observations[0]["error"]["code"],
+            "wrong_controller",
+        )
+        self.assertTrue(observations[1]["result"]["session_active"])
+        self.assertIsNone(result["transport_failure"])
+        self.assertEqual(result["status"]["state"], STATE_CLOSED)
+
+    def test_duplicate_request_id_is_rejected_without_dispatch(self):
+        responses = []
+
+        def client(input_stream, output):
+            wire = self.protocol_wire(
+                "status",
+                request_id="same-request",
+            )
+            input_stream.send(wire)
+            responses.append(output.receive())
+            input_stream.send(wire)
+            responses.append(output.receive())
+            input_stream.send(
+                self.protocol_wire(
+                    "shutdown",
+                    request_id="shutdown-request",
+                )
+            )
+            output.receive()
+            input_stream.close()
+
+        result = self.run_interactive_session(client)
+
+        self.assertTrue(responses[0]["ok"])
+        self.assertFalse(responses[1]["ok"])
+        self.assertEqual(
+            responses[1]["error"]["code"],
+            "duplicate_request_id",
+        )
+        self.assertEqual(result["status"]["state"], STATE_CLOSED)
+        self.assertEqual(self.run_timed_write_count(), 0)
+
+    def test_foreground_session_eof_stops_and_closes_locally(self):
+        def client(input_stream, output):
+            input_stream.send(
+                self.protocol_wire(
+                    "claim",
+                    {"owner_id": "client-that-dies"},
+                )
+            )
+            claim = output.receive()["result"]
+            input_stream.send(
+                self.protocol_wire(
+                    "heartbeat",
+                    {
+                        "session_id": claim["session_id"],
+                        "sequence_id": 1,
+                    },
+                    request_id="request-2",
+                )
+            )
+            output.receive()
+            input_stream.close()
+
+        result = self.run_interactive_session(client)
+
+        self.assertEqual(result["transport_failure"], "input_eof")
+        self.assertEqual(result["status"]["state"], STATE_CLOSED)
+        self.assertTrue(result["status"]["audit_complete"])
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assert_all_stopped()
+
+    def test_foreground_session_malformed_frame_fails_closed(self):
+        def client(input_stream, _output):
+            input_stream.send(b"{broken json\n")
+
+        result = self.run_interactive_session(client)
+
+        self.assertEqual(result["transport_failure"], "invalid_json")
+        self.assertEqual(result["status"]["state"], STATE_CLOSED)
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assert_all_stopped()
+
+    def test_foreground_session_output_failure_fails_closed(self):
+        output = InteractiveOutput(fail_writes=True)
+
+        def client(input_stream, _output):
+            input_stream.send(self.protocol_wire("status"))
+            deadline = time.monotonic() + 1
+            while (
+                self.supervisor.state != STATE_CLOSED
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
+            input_stream.close()
+
+        result = self.run_interactive_session(
+            client,
+            output=output,
+        )
+
+        self.assertEqual(
+            result["transport_failure"],
+            "output_write_failed",
+        )
+        self.assertEqual(result["status"]["state"], STATE_CLOSED)
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assert_all_stopped()
+
+    def test_real_full_output_pipe_cannot_block_safety_loop(self):
+        read_descriptor, write_descriptor = os.pipe()
+        flags = fcntl.fcntl(write_descriptor, fcntl.F_GETFL)
+        fcntl.fcntl(
+            write_descriptor,
+            fcntl.F_SETFL,
+            flags | os.O_NONBLOCK,
+        )
+        try:
+            while True:
+                try:
+                    os.write(write_descriptor, b"x" * 4096)
+                except OSError:
+                    break
+            output = os.fdopen(
+                write_descriptor,
+                "wb",
+                buffering=0,
+            )
+            write_descriptor = None
+
+            def client(input_stream, _output):
+                input_stream.send(self.protocol_wire("status"))
+                deadline = time.monotonic() + 2
+                while (
+                    self.supervisor.state != STATE_CLOSED
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.001)
+                input_stream.close()
+
+            result = self.run_interactive_session(
+                client,
+                output=output,
+            )
+            output.close()
+        finally:
+            if write_descriptor is not None:
+                os.close(write_descriptor)
+            os.close(read_descriptor)
+
+        self.assertEqual(
+            result["transport_failure"],
+            "output_write_failed",
+        )
+        self.assertEqual(result["status"]["state"], STATE_CLOSED)
+        self.assertTrue(result["status"]["audit_complete"])
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assert_all_stopped()
+
+    def test_run_daemon_rejects_truthy_non_boolean_motion_modes(self):
+        for invalid in ("false", 1, None):
+            with self.assertRaises(SessionError) as context:
+                run_daemon(
+                    None,
+                    None,
+                    None,
+                    None,
+                    allow_one_drive_test=invalid,
+                )
+            self.assertEqual(
+                context.exception.code,
+                "invalid_motion_mode",
+            )
+        self.assertEqual(self.run_timed_write_count(), 0)
+
+    def test_public_daemon_cli_has_no_motion_enable_flag(self):
+        parser = build_daemon_parser()
+        option_strings = {
+            option
+            for action in parser._actions
+            for option in action.option_strings
+        }
+        self.assertNotIn("--allow-one-drive-test", option_strings)
 
     def test_supervisor_loop_returns_fault_after_missed_deadline(self):
         session_id = self.claim_and_arm()
