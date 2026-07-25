@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "robot_id": "ev3rstorm-01",
+  "motors": {
+    "arm": {
+      "port": "outA",
+      "driver": "lego-ev3-m-motor",
+      "physical_role": "propeller-arm",
+      "positive_direction": "spins-propeller-direction-unmapped"
+    },
+    "drive_b": {
+      "port": "outB",
+      "driver": "lego-ev3-l-motor",
+      "physical_role": "left-drive-leg",
+      "positive_direction": "forward"
+    },
+    "drive_c": {
+      "port": "outC",
+      "driver": "lego-ev3-l-motor",
+      "physical_role": "right-drive-leg",
+      "positive_direction": "forward"
+    }
+  },
+  "drive_geometry": {
+    "left_motor_role": "drive_b",
+    "right_motor_role": "drive_c",
+    "forward_speed_sign": {
+      "drive_b": 1,
+      "drive_c": 1
+    }
+  },
+  "calibration": {
+    "turn_in_place": {
+      "status": "single-visual-estimate",
+      "surface": "unspecified-indoor-surface",
+      "speed_dps": 200,
+      "segment_duration_ms": 800,
+      "segments_for_approx_90_degrees": 4,
+      "mean_abs_encoder_delta_degrees": 682,
+      "approx_encoder_degrees_per_body_degree": 7.58
+    },
+    "infrared_proximity": {
+      "status": "provisional-static-and-motor-free-dynamic-evidence",
+      "mode": "IR-PROX",
+      "meaning": "relative reflection/proximity evidence, not distance or clearance",
+      "zones": {
+        "strong_return_max": 16,
+        "near_return_max": 35,
+        "mid_return_max": 47
+      },
+      "obstacle_gate": {
+        "immediate_enter_max": 16,
+        "enter_max": 35,
+        "exit_min": 40,
+        "median_window": 3,
+        "enter_consecutive": 2,
+        "exit_consecutive": 3
+      },
+      "static_evidence": {
+        "light_target_15cm_median": 7,
+        "dark_target_15cm_median": 13,
+        "narrow_10cm_box_15cm_median": 28,
+        "light_target_30cm_median": 25,
+        "dark_target_30cm_median": 28,
+        "light_target_50cm_median": 45,
+        "large_cabinet_approx_100cm_median": 50,
+        "narrow_box_lateral_sweep_15cm_minimum": 26,
+        "narrow_box_lateral_sweep_15cm_edge_maximum": 34,
+        "narrow_box_lateral_sweep_background": 52
+      },
+      "limitations": [
+        "Thresholds are scene- and target-dependent",
+        "Values above the far threshold do not prove a clear path",
+        "IR must not be the sole collision safeguard",
+        "Motor-driven approach validation with a local supervisor, measured stop latency, and braking distance is still required before navigation"
+      ]
+    }
+  },
+  "sensors": {
+    "touch": {
+      "port": "in1",
+      "driver": "lego-ev3-touch",
+      "mode": "TOUCH"
+    },
+    "color": {
+      "port": "in3",
+      "driver": "lego-ev3-color",
+      "mode": "COL-REFLECT"
+    },
+    "infrared": {
+      "port": "in4",
+      "driver": "lego-ev3-ir",
+      "mode": "IR-PROX"
+    }
+  },
+  "limits": {
+    "drive": {
+      "max_abs_speed_dps": 250,
+      "max_duration_ms": 800
+    },
+    "arm": {
+      "max_abs_speed_dps": 150,
+      "max_duration_ms": 400
+    },
+    "speech": {
+      "max_characters": 160,
+      "min_rate_wpm": 100,
+      "max_rate_wpm": 220,
+      "min_amplitude": 0,
+      "max_amplitude": 160,
+      "default_amplitude": 140,
+      "allowed_voices": ["sv"],
+      "max_runtime_ms": 20000
+    },
+    "heartbeat": {
+      "timeout_ms": 500
+    }
+  }
+}

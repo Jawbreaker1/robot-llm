@@ -1,0 +1,409 @@
+# Kontrollerad experimentplan
+
+## Invariant
+
+LLM:n får aldrig direkt tillgång till SSH, godtycklig kodkörning eller
+motorns sysfs-filer. Den får endast begära verktyg från ett strikt robot-API.
+En lokal EV3-supervisor behåller exklusivt motorägarskap.
+
+## Experimentprotokoll
+
+Varje fysisk körning dokumenterar:
+
+1. experiment-ID och hypotes,
+2. fysisk uppställning och abortmetod,
+3. kodversion och konfiguration,
+4. maximalt tillåten hastighet, tid och rörelse,
+5. tillstånd före körningen,
+6. begärt och godkänt kommando,
+7. faktiskt resultat och tillstånd efter körningen,
+8. slutsats och exakt nästa förändring.
+
+En fas passerar först när dess lyckade fall är reproducerbara och dess
+viktigaste felfall har testats avsiktligt.
+
+## Fas 1 – Hårdvarukarakterisering
+
+Status: pågår.
+
+Klart:
+
+- SD-boot, USB CDC, SSH och Python.
+- Högtalare, ton och lokal svensk eSpeak.
+- Passiv motor- och sensorinventering.
+- Tidsbegränsad rörelse av motor B och C med encoderverifiering.
+- Motor C verifierad som höger drivben med positiv riktning framåt.
+- Motor B verifierad som vänster drivben med positiv riktning framåt.
+- Motor A verifierad som propellerarm med encoderåterkoppling.
+- Parade B/C-pulser verifierade med gemensamt lås, lokal timeout, jämna
+  encoderdelta och visuell observation.
+- Högersväng på stället verifierad med encoderpostcondition och visuell
+  observation.
+- Touchsensorn verifierad med tryck- och släppövergångar.
+- IR-sensorn verifierad med varierande närhetsvärden.
+- Färgsensorn verifierad i reflektionsläge.
+- Svensk lokal eSpeak-TTS verifierad över EV3-högtalaren.
+- Första rörelsefria kedjan `IR-observation → kort kommentar → TTS`
+  verifierad manuellt.
+- Samlad icke-interaktiv shadow-CLI verifierad över USB-SSH med publik
+  Mac-nyckel, tre IR-läsningar, lokal Gemma och deterministisk TTS.
+- Lokal motorfri IR-grind verifierad i två dynamiska, röststyrda cykler vid
+  `20 Hz`, inklusive ett sparat rådatareplikat.
+
+Återstår:
+
+- rotationsriktning för motor A:s propeller,
+- motorburen IR-inflygning först efter lokal supervisor, med uppmätt faktisk
+  stopplatens och bromssträcka,
+- färgklassificering mot kontrollerade färgprover,
+- upprepade stopp- och positionstester.
+
+Grind: alla anslutna enheter kan läsas eller aktiveras manuellt med
+reproducerbara, begränsade testfall.
+
+### EXP-F1-TTS-001 – avståndskommentar utan rörelse
+
+- IR-sensorn rapporterade `67 %` i `IR-PROX`; värdet behandlades som relativ
+  närhet och inte centimeter.
+- En deterministiskt vald svensk kommentar spelades med eSpeak i `125 wpm`.
+- Resultat: TTS-pipelinen rapporterade `completed`; inga motorer aktiverades.
+
+### EXP-F1-TTS-002 – härdad agenttextväg
+
+- Ett separat `read-sensor` läste IR-sensorn i verifierat `IR-PROX`-läge och
+  gav ett tidsstämplat relativt värde på `82 %`.
+- Text skickades via stdin till ett fast `speak-stdin`-kommando, inte som
+  shellkod eller ett eSpeak-argument.
+- Lokal svensk eSpeak kördes i `125 wpm`, amplitud `140`, och rapporterade
+  `completed` efter `9411 ms`.
+- Lokala gränser omfattar 160 tecken, tillåten röst, talhastighet, amplitud,
+  exklusivt ljudlås och en hård deadline på `20000 ms`.
+- Samtliga `38` lokala tester passerar, inklusive timeout, processdödning,
+  låsfrigöring, ogiltiga talvärden och fel sensorläge.
+
+### EXP-F1-IR-CAL-001 – statisk IR-kalibrering
+
+Robot och motorer var stilla. Avstånd uppskattades från IR-sensorns framsida
+och varje statiskt test använde 20 behållna värden efter stabilisering.
+
+| Mål | Avstånd | Median | Spann |
+|---|---:|---:|---:|
+| ljust, brett | 15 cm | `7` | `7–8` |
+| mörkt, brett | 15 cm | `13` | `13` |
+| smal låda, cirka 10 cm bred | 15 cm | `28` | `28` |
+| ljust, brett | 30 cm | `25` | `24–27` |
+| mörkt, brett | 30 cm | `28` | `27–28` |
+| ljust, brett | 50 cm | `45` | `44–45` |
+| stort skåp | cirka 100 cm | `50` | `50–51` |
+
+Ett manuellt sidosvep med den smala lådan på cirka 15 cm gav bakgrund `52`
+och två tydliga passager med hinderintervall `26–34`. Ingen av passagerna
+nådde den först föreslagna gränsen `≤16`; den gränsen hade därför missat ett
+verkligt närhinder.
+
+Provisorisk tolkning:
+
+- `≤16`: stark retur, inte ett säkert avståndsmått,
+- `≤35`: kandidat för konservativ närhindergrind,
+- `≥40`: grinden får börja frigöras efter stabila upprepningar,
+- `>47`: fjärrsvag eller oklar retur, aldrig bevis på fri väg.
+
+Grinden använder median över tre värden, två samstämmiga närträffar för
+inträde och tre högre värden för frigivning. Startup och ogiltiga värden är
+fail-closed. En mycket stark råträff `≤16` stoppar omedelbart.
+
+Status: godkänd som provisorisk klassificering och som underlag för dynamiska
+tester, men inte ännu som ensam eller live-ansluten kollisionssäkring. Touch,
+korta rörelsepulser, lokal timeout och en framtida EV3-supervisor kvarstår.
+Samtliga `82` lokala tester passerar, inklusive replay av lådsvepet,
+den dynamiska IR-proben, LM Studio-protokollfel och den rörelsefria
+shadow-kedjan.
+
+### EXP-F1-IR-DYN-001/002 – dynamisk evidensgrind utan motorer
+
+Robotkroppen stod stilla och `stop_all` bekräftade A, B och C som stoppade.
+Lådan fördes för hand mot och bort från IR-sensorn. EV3 samplade lokalt vid
+`20 Hz`; deterministiska röstprompter markerade faserna och varken Gemma
+eller motorstyrning ingick i beslutet.
+
+Första fullständiga cykeln:
+
+- `444` råvärden, spann `52 → 33 → 41`,
+- första råvärdet `≤35` vid `23415 ms`,
+- medianfiltret nådde `≤35` vid `23465 ms`,
+- hinderstatus efter andra samstämmiga filtrerade träffen vid `23515 ms`,
+- beslutslatens `100 ms` från första råträffen och `50 ms` från första
+  filtrerade tröskelkorsningen,
+- första råvärdet `≥40` under returfasen vid `32761 ms`; ett efterföljande
+  `39` bröt råsekvensen,
+- första stabila filtrerade `≥40` vid `32860 ms` och frigivning efter tredje
+  filtrerade träffen vid `32961 ms`,
+- frigivningslatens `101 ms` från första filtrerade tröskelkorsningen och
+  `200 ms` från den tidigaste råträffen.
+
+Det reproducerbara replikatet kördes därefter med
+`ev3/ir_gate_probe.py`, som läser exakt samma policy från konfigurationen:
+
+- `277` råvärden, spann `42 → 31 → 40`,
+- faktisk period `47–53 ms`, medel `50 ms`,
+- första råvärdet `≤35` vid `15651 ms`, första filtrerade `≤35` vid
+  `15701 ms` och hinderstatus vid `15751 ms`,
+- första råvärdet `≥40` vid `24751 ms`, första filtrerade `≥40` vid
+  `24801 ms` och frigivning vid `24901 ms`,
+- resultat `status: completed`.
+
+Full råserie och policy finns i
+`docs/data/EXP-F1-IR-DYN-002.json`.
+
+Slutsats: medianfönster `3`, två inträdesträffar `≤35` och tre
+frigivningsträffar `≥40` fungerar reproducerbart som en lokal
+evidensklassificerare vid `20 Hz`. Detta mäter inte motorstopplatens,
+bromssträcka, sant avstånd eller fri väg. Nästa motorburna test kräver först
+en lokal EV3-supervisor som kan stoppa motorerna i samma pollingloop.
+
+### EXP-F1-SHADOW-001 – Gemma-kandidat med deterministisk talgrind
+
+- Native LM Studio `POST /api/v1/chat` verifierades med
+  `google/gemma-4-26b-a4b`, `reasoning: "off"`, `store: false`,
+  `integrations: []` och utan modellverktyg.
+- Ett separat test med zonen `near_return` och relativvärdet `28` gav en
+  vanlig kort svensk kandidat på cirka `0,19 s` och exakt `0`
+  resonemangstoken. Det äldre OpenAI-kompatibla försöket gav tom `content`
+  eftersom hela budgeten förbrukades av dolt resonemang.
+- I det första fysiska failover-provet läste EV3 ett färskt IR-värde på `58`.
+  Det klassificerades som `far_or_no_clear_return`, vilket inte betyder fri
+  väg. LM Studio-tjänsten var då otillgänglig.
+- Ingen modelltext skickades vidare. EV3 sade den deterministiska frasen
+  "Jag får ingen tydlig närträff framför mig." och den lokala TTS-pipelinen
+  rapporterade `completed` efter `4723 ms`.
+- Därefter installerades endast Macens befintliga publika Ed25519-nyckel för
+  användaren `robot`; `BatchMode=yes` verifierades utan lösenordsprompt.
+- Den fulla CLI-cykeln läste `[58, 58, 58]`, klassificerade medianen `58` som
+  `far_or_no_clear_return` och fick en formellt giltig Gemma-kandidat efter
+  `417 ms`: "Irriterande, IR-zonen är helt otydlig och jag vägrar att
+  analysera den mer."
+- Kandidaten loggades men talades inte. EV3 sade åter den deterministiska
+  frasen och rapporterade `completed` efter `4589 ms`. Hela CLI-körningen
+  rapporterade `status: completed`.
+- Inga motorer aktiverades. Testerna verifierar dessutom att även en
+  strukturellt giltig hallucination, exempelvis en påhittad hund och ett
+  avstånd, bara loggas och aldrig når TTS i shadow-läget.
+
+Status: modellprotokollet, failoverprincipen och den samlade fysiska
+shadow-cykeln är godkända. Modelltext förblir auditdata; eventuell befordran
+till TTS kräver en separat semantisk evalueringsgrind.
+
+### EXP-F1-PAIR-001 – första parade drivpulsen
+
+- Hypotes: samma positiva robotrelativa hastighet får B och C att röra sig
+  framåt med jämförbara encoderdelta.
+- Abortmetod: EV3-knapp eller lyft, lokal `run-timed` på båda motorerna och
+  explicit dubbelstopp efter körningen.
+- Preflight: båda drivmotorerna stilla, touch `0`, batteri `8,0164 V`.
+- Rörelsefritt negativtest: höger `251 dps` avvisades mot gränsen `250 dps`.
+- Godkänt kommando: vänster `+100 dps`, höger `+100 dps`, `300 ms`.
+- Resultat vänster B: position `254 → 280`, delta `+26°`.
+- Resultat höger C: position `231 → 258`, delta `+27°`.
+- Uppmätt förskjutning mellan de sekventiella startskrivningarna: `7 ms`.
+- Efterläge: kommandot rapporterade `completed`; därefter kördes `stop_all`
+  och A, B samt C rapporterades stoppade.
+- Slutsats: den begränsade parade HAL-transaktionen fungerar på fysisk EV3.
+  Encoders verifierar motorrotation; faktisk förflyttning verifierades i
+  uppföljningsexperimentet nedan.
+
+### EXP-F1-PAIR-002 – synlig framåtrörelse
+
+- Syfte: upprepa den parade transaktionen med en tydligt observerbar men fortsatt
+  begränsad rörelse.
+- Preflight och efterläge: `stop_all` kördes före och efter pulsen.
+- Godkänt kommando: vänster `+200 dps`, höger `+200 dps`, `800 ms`.
+- Resultat vänster B: position `307 → 482`, delta `+175°`.
+- Resultat höger C: position `286 → 461`, delta `+175°`.
+- Uppmätt förskjutning mellan startskrivningarna: `5 ms`.
+- Visuell observation: rörelsen bedömdes som mycket bra; ingen avvikelse
+  rapporterades.
+- Slutsats: rak framåtdrift är en reproducerbar fysisk primitive vid denna
+  hastighet och tidsgräns. Detta ändrar inte kravet på supervisor, heartbeat
+  och kollisionsstopp före autonom körning.
+
+
+### EXP-F1-TURN-001 – högersväng och verifierad effekt
+
+- Första försök: vänster `+150 dps`, höger `−150 dps`, `600 ms`.
+- Första resultat: B `+86°`, C `0°`. Den äldre HAL-versionen rapporterade
+  `completed` trots utebliven högerrörelse.
+- Isoleringsprov: B backade `−168°`; C gav först `0°` och därefter `−164°`
+  vid samma `−200 dps` i `800 ms`. Bakåtriktningen fungerar men den uteblivna
+  C-rörelsen var intermittent.
+- Åtgärd: HAL fick en encoderpostcondition. Varje motor måste röra sig minst
+  `3°` i den fysiskt begärda riktningen; annars misslyckas hela handlingen.
+  Meningslöst små rörelsebegäranden avvisas före motorskrivning.
+- Feltester: nollrörelse, fel encoderriktning och ensidig parad rörelse
+  avvisas. Totalt `26` lokala tester passerar.
+- Slutligt kommando: vänster `+200 dps`, höger `−200 dps`, `800 ms`.
+- Slutligt resultat vänster B: position `402 → 574`, delta `+172°`.
+- Slutligt resultat höger C: position `297 → 127`, delta `−170°`.
+- Uppmätt förskjutning mellan startskrivningarna: `6 ms`.
+- Båda encoderpostconditionerna passerade och högersvängen bekräftades
+  visuellt.
+- Slutsats: `turn_right` kan byggas ovanpå den parade primitiven. Verifieringen
+  är ännu en postcondition efter rörelsen; live stall- och kollisionsstopp
+  tillhör EV3-supervisorn.
+
+### EXP-F1-TURN-002 – grov 90-graderskalibrering
+
+- Plan: fyra vänstersegment med vänster `−200 dps`, höger `+200 dps`,
+  `800 ms` per segment.
+- Exekveringsregel: nästa segment startades endast om båda encoderpostconditionerna
+  i föregående segment passerade.
+- Segmentens B-delta: `−171°`, `−173°`, `−169°`, `−172°`; totalt `−685°`.
+- Segmentens C-delta: `+167°`, `+173°`, `+168°`, `+171°`; totalt `+679°`.
+- Samtliga åtta motorpostconditioner passerade.
+- Visuell observation: roboten vred sig ungefär `90°` runt sin egen axel.
+- Första kalibreringsestimat: medelvärdet `682°` encoderrotation motsvarar
+  cirka `90°` kroppsvridning, eller ungefär `7,58` encodergrader per grad.
+- Begränsning: estimatet är underlags-, batteri- och slirningsberoende och har
+  bara en visuell observation. Ett framtida `turn_approx_degrees` måste därför
+  uttrycka osäkerheten och verifierar motorrotation, inte absolut orientering.
+
+## Fas 1B – Trådlös transport
+
+USB behålls som återställningsväg under hela utvärderingen.
+
+Spår:
+
+- Bluetooth-parning och tjänsteinventering.
+- Bluetooth PAN om värddatorn erbjuder nätverksprofilen.
+- Bluetooth RFCOMM för ett litet seriellt kommandoformat.
+- USB Wi-Fi-dongel för normal IP, SSH och senare robot-API.
+
+Mätningar:
+
+- rundturstid och variation,
+- faktisk genomströmning,
+- återanslutning,
+- tappade och duplicerade kommandon,
+- beteende när länken bryts mitt under en begäran.
+
+Grind: länkbortfall stoppar lokalt, gamla kommandon återspelas inte och varje
+kommando har ett unikt ID.
+
+## Fas 2 – EV3-supervisor
+
+Supervisor ska tillhandahålla:
+
+- exklusivt motorägarskap,
+- lokalt tidsbegränsade kommandon,
+- hårda argumentgränser,
+- `stop_all`,
+- monotona tidsstämplar,
+- heartbeat och lokal timeout,
+- touchbaserat kollisionsstopp,
+- upptäckt av motorstall,
+- strukturerad loggning.
+
+Grind: avsiktligt dödad klient, bruten länk, felaktiga argument och programfel
+leder till ett uppmätt och säkert stopp.
+
+## Fas 3 – Robot-API på värddatorn
+
+Ett transportoberoende API byggs ovanpå simulator eller fysisk EV3:
+
+- `get_robot_state`
+- `read_sensors`
+- `drive`
+- `turn`
+- `move_arm`
+- `wave_arm`
+- `speak`
+- `play_tone`
+- `stop`
+
+Grind: alla verktyg och alla nekande fall fungerar manuellt utan LLM.
+
+### Första perceptions-/språkloopen
+
+Den första loopen är medvetet rörelsefri:
+
+`IR → medianfilter → deterministisk zon → Gemma-kandidat i shadow → validering/logg → deterministisk TTS`
+
+Gemma får endast zonen och det relativa mätvärdet och får inte välja verktyg.
+I första grinden talas aldrig Gemmas kandidat; ett ogiltigt, sent eller
+uteblivet modellsvar registreras och samma deterministiska fras används.
+Maxlängd, timeout, ljudlås och pratbudget gäller oberoende av modellen. Först
+efter en separat semantisk evalueringsgrind kan validerad modelltext
+övervägas för TTS, fortfarande utan motorbehörighet.
+
+## Fas 4 – Chatt och kontext
+
+LM Studio får endast se verktygskontraktet och ett litet strukturerat minne:
+
+- aktuellt mål,
+- senaste begärda handling,
+- senaste godkända handling,
+- senaste faktiskt genomförda handling,
+- senaste observation,
+- aktiva fel.
+
+Acceptanstest:
+
+1. "Vinka med höger arm."
+2. "Två gånger till."
+3. "Gör samma sak med vänster."
+4. "Lite långsammare."
+5. "Sluta."
+
+### Röstgränssnitt via värddatorns mikrofon
+
+Den första mikrofonen sitter i Macen och är en inmatningskanal till samma
+chattkontext:
+
+`push-to-talk → lokal STT → synligt transkript → agent → robotverktyg → EV3-TTS`
+
+Första versionens regler:
+
+- push-to-talk i stället för ständig avlyssning,
+- STT-körning bakom ett transportoberoende gränssnitt så motor eller modell
+  kan bytas utan att agenten ändras,
+- transkript, konfidens och tidsstämpel loggas som en observation,
+- låg konfidens eller tvetydig instruktion leder till en kontrollfråga och
+  aldrig till rörelse,
+- samtalssvar får talas automatiskt men rörelse går alltid genom samma
+  deterministiska robot-API och säkerhetspolicy som textkommandon,
+- fysisk nödstopp får aldrig vara beroende av STT eller LLM,
+- mikrofonen spärras eller ekoreduceras under EV3-TTS så att roboten inte
+  transkriberar sitt eget tal och börjar prata med sig själv,
+- varje inspelning och modellbegäran har timeout, avbrytning och episodbudget.
+
+Första acceptanstest:
+
+1. Användaren håller push-to-talk och säger "Vad ser du framför dig?"
+2. Transkriptet visas i applikationen.
+3. Agenten begär en färsk IR-observation.
+4. Gemma formulerar en kort kommentar i vald personlighet.
+5. Validerad text spelas över EV3-högtalaren.
+6. Robotens eget tal skapar inte ett nytt STT-meddelande.
+
+Wake word, kontinuerlig avlyssning och en robotmonterad mikrofon behandlas som
+senare, separata experiment.
+
+## Fas 5 – Sluten målriktad loop
+
+Loop:
+
+`mål → observera → planera → ett steg → observera → verifiera → omplanera`
+
+Varje episod har budget för tid, agentvarv, körsträcka, omplaneringar och
+upprepade handlingar. Framgång måste verifieras med färska observationer.
+
+## Fas 6 – Parallella snurror
+
+Sensorpollning, perception, planering och validering får arbeta parallellt.
+Endast motion supervisor serialiserar förslagen till ett motorbeslut.
+
+## Fas 7 – Kamera, mikrofon och aktiv perception
+
+Kamera och mikrofon behandlas som tidsstämplade observationskällor. Ett
+långsiktigt demonstrationstest är:
+
+`hundskall → ljudriktning → visuell sökning → hund bekräftad → social respons`
