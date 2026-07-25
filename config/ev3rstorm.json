@@ -114,6 +114,22 @@
     },
     "heartbeat": {
       "timeout_ms": 500
+    },
+    "supervisor": {
+      "poll_interval_ms": 20,
+      "max_poll_lateness_ms": 20,
+      "touch_release_samples": 3,
+      "min_abs_drive_speed_dps": 50,
+      "stall_startup_grace_ms": 100,
+      "stall_window_ms": 200,
+      "stall_min_progress_degrees": 3,
+      "stall_min_progress_ratio_percent": 10,
+      "min_completion_ratio_percent": 25,
+      "max_start_skew_ms": 25,
+      "stop_verify_timeout_ms": 200,
+      "stop_poll_interval_ms": 10,
+      "max_commands_per_session": 64,
+      "audit_buffer_events": 512
     }
   }
 }

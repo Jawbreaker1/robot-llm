@@ -6,6 +6,28 @@ LLM:n får aldrig direkt tillgång till SSH, godtycklig kodkörning eller
 motorns sysfs-filer. Den får endast begära verktyg från ett strikt robot-API.
 En lokal EV3-supervisor behåller exklusivt motorägarskap.
 
+## Ansvarsgränser för språk och rörelse
+
+1. **Semantiskt agentplan:** LLM:n får originalinstruktionen,
+   verktygskontraktet och versionsmärkt strukturerad kontext. Den
+   klassificerar avsikt, löser referenser och producerar ett typat
+   beslutsförslag.
+2. **Deterministiskt auktorisationsplan på hosten:** validerar förslaget mot
+   schema, allowlist, aktuellt tillstånd, färska observationer, behörighet,
+   konflikter och episodbudget. Lagret får inte tolka originalspråk eller
+   använda regexp, substrings eller keywords som alternativ klassificerare.
+3. **Lokal EV3-supervisor:** tar emot redan typade, tidsbegränsade
+   motorprimitiver. I målarkitekturen når de den först efter host-policyns
+   auktorisation; transport och autentisering är ännu inte implementerade.
+   Supervisorn äger motorerna exklusivt och verkställer heartbeat, touchstopp,
+   stallstopp, timeout och lokala hårdgränser oberoende av LLM och
+   nätverkslatens.
+
+Ogiltig modell-JSON, okänd avsikt, gammal kontext eller olöst referens leder
+till `reject` eller `clarify`, aldrig till en heuristiskt gissad handling.
+`MotionCommand` är en intern fysisk primitive och får inte vara det kontrakt
+som visas direkt för språkmodellen.
+
 ## Experimentprotokoll
 
 Varje fysisk körning dokumenterar:
@@ -47,7 +69,7 @@ Klart:
   verifierad manuellt.
 - Samlad icke-interaktiv shadow-CLI verifierad över USB-SSH med publik
   Mac-nyckel, tre IR-läsningar, lokal Gemma och deterministisk TTS.
-- Lokal motorfri IR-grind verifierad i två dynamiska, röststyrda cykler vid
+- Lokal motorfri IR-grind verifierad i två dynamiska, röstguidade cykler vid
   `20 Hz`, inklusive ett sparat rådatareplikat.
 
 Återstår:
@@ -290,20 +312,82 @@ kommando har ett unikt ID.
 
 ## Fas 2 – EV3-supervisor
 
-Supervisor ska tillhandahålla:
+Status: språkblind kärna implementerad och verifierad mot fake sysfs/fake
+clock. Den rörelsefria preflighten har även passerat på den fysiska EV3:an.
+Kärnan är fortfarande inte godkänd för autonom fysisk körning.
 
-- exklusivt motorägarskap,
+Implementerat:
+
+- livslångt exklusivt motorlås,
+- serverutfärdad session och strikt stigande sekvens-ID,
 - lokalt tidsbegränsade kommandon,
 - hårda argumentgränser,
-- `stop_all`,
+- prioriterat, sessionsoberoende stopp,
 - monotona tidsstämplar,
 - heartbeat och lokal timeout,
-- touchbaserat kollisionsstopp,
-- upptäckt av motorstall,
-- strukturerad loggning.
+- touchbaserad stop-input,
+- encoderbaserad stall- och riktningskontroll,
+- absolut-deadline-baserad pollingloop med latenhetsgrind,
+- latched fault utan automatisk återstart,
+- stopprekondition, upprepade stoppförsök och verifiering av inaktivt,
+  stabilt motorläge,
+- explicit `brake` före `stop`; okända state-tokens nekas och `holding`
+  behandlas som aktivt motorläge,
+- begränsad, icke-blockerande auditbuffer under supervisorns exekvering,
+- append-only JSONL-flush efter den rörelsefria preflightens shutdown,
+- rörelsefri preflight-CLI.
+
+`68` nya hårdvarufria tester täcker bland annat ägarskap, replay, heartbeat
+exakt vid `500 ms`, touch före och under rörelse, ensidig stall, fel
+encoderriktning, partiell motorstart, oväntad rörelse i tredje motorn,
+auditfel före och efter motorstart, långsam I/O, avbrott mellan parade
+motorstarter, klockregression, missad poll-deadline före och efter poll,
+stopfel, shutdown med bibehållet motorlås och att preflight aldrig skriver
+`run-timed` eller rapporterar framgång efter en misslyckad shutdown/audit.
+
+Återstår:
+
+- långlivad daemontransport med begränsad och autentiserad lokal kommandoyta,
+- subprocess-/signaltester och avsiktligt dödad klient,
+- fysisk polling- och stopplatens,
+- fysisk bromssträcka och låg-hastighetskalibrering av stallgränser,
+- verifiering vid sensorbortfall, motorjam, USB-bortfall och supervisor-krasch.
 
 Grind: avsiktligt dödad klient, bruten länk, felaktiga argument och programfel
 leder till ett uppmätt och säkert stopp.
+
+### EXP-F2-SUP-PREFLIGHT-001 – fysisk rörelsefri supervisor
+
+- Datum: `2026-07-25`.
+- Precondition: A, B och C rapporterade tomt motor-state; touch var `0`.
+  Batteriet rapporterade `6,9414 V`, vilket accepteras för ett rörelsefritt
+  prov men inte för nästa motorfas.
+- Supervisor-SHA-256:
+  `1dca0e018753f78ace19a0363941225d71f097b4b84782da94322f2466539888`.
+- Preflight-CLI-SHA-256:
+  `f4c57d902e1e1c9e1b1d27e3900ddaa95415aab7d5e40b4df420837f35900a11`.
+- EV3 körde Python `3.5.3`; Macens betrodda Ed25519-värdnyckel matchade den
+  anslutna USB-adressen före överföring.
+- Kommando: `python3 ev3/supervisor_cli.py preflight`.
+- Resultat: `status=completed`, `motor_start_commands=0`, stabil touch
+  `3/3`, `DISARMED` före shutdown och `CLOSED` med
+  `audit_complete=true`.
+- Både startup och shutdown skrev `brake` följt av `stop` till A/B/C och
+  verifierade två stabila, inaktiva snapshots utan fel eller fault-tokens.
+- Encoderpositionerna var oförändrade mellan auditposterna:
+  A `770°`, C `1151°`, B `−434°`.
+- Efterkontroll: samtliga motor-state var tomma, `stop_action` var `brake`
+  och ett separat icke-blockerande försök kunde ta och frigöra motorlåset.
+- Audit: `/tmp/robot-llm-supervisor-audit.jsonl` innehöll
+  `startup_complete` följt av `supervisor_closed`.
+- Återställningskopia av föregående konfiguration:
+  `/home/robot/robot-llm/config/ev3rstorm.before-supervisor.json`.
+
+Slutsats: den rörelsefria start-/stopplivscykeln fungerar på den riktiga
+EV3:an och rapporterar inte framgång utan stabil touch, verifierat motorläge,
+terminal audit och stängd supervisor. Experimentet innehöll ingen armering,
+inget `run-timed` och ingen rörelse. Det godkänner därför inte fysisk
+superviserad motorstyrning eller autonomi.
 
 ## Fas 3 – Robot-API på värddatorn
 
@@ -353,6 +437,12 @@ Acceptanstest:
 4. "Lite långsammare."
 5. "Sluta."
 
+Varje mål testas dessutom med svenska parafraser, minst ett annat språk,
+ellipser och pronomen, negation, citerat språk och ett simulerat STT-fel.
+Tvetydiga referenser måste ge `clarify`. Okända fält, gammal kontext,
+ogiltiga verktyg och schemafel måste alltid nekas utan regexp- eller
+keyword-fallback.
+
 ### Röstgränssnitt via värddatorns mikrofon
 
 Den första mikrofonen sitter i Macen och är en inmatningskanal till samma
@@ -395,11 +485,15 @@ Loop:
 
 Varje episod har budget för tid, agentvarv, körsträcka, omplaneringar och
 upprepade handlingar. Framgång måste verifieras med färska observationer.
+Endast nästa fysiska steg auktoriseras; en hel plan får aldrig förhandsgodkänd
+motorbehörighet.
 
 ## Fas 6 – Parallella snurror
 
 Sensorpollning, perception, planering och validering får arbeta parallellt.
-Endast motion supervisor serialiserar förslagen till ett motorbeslut.
+En host-side decision arbiter serialiserar semantiska beslutsförslag. Den
+lokala EV3-supervisorn serialiserar och övervakar endast redan auktoriserade
+motorprimitiver.
 
 ## Fas 7 – Kamera, mikrofon och aktiv perception
 

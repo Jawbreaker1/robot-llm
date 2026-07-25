@@ -1,7 +1,7 @@
 # Robot LLM Lab 🤖
 
 ![Status: physical PoC](https://img.shields.io/badge/status-physical%20PoC-2ea44f)
-![Tests: 82 passing](https://img.shields.io/badge/tests-82%20passing-2ea44f)
+![Tests: 150 passing](https://img.shields.io/badge/tests-150%20passing-2ea44f)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![Motion: manual only](https://img.shields.io/badge/motion-manual%20only-f59e0b)
 
@@ -16,9 +16,21 @@ utan att göra modellens latens eller fantasi till en säkerhetsfunktion.
 > **Designinvariant:** LLM:n får uttrycka avsikt och personlighet.
 > Deterministisk kod avgör om, hur och hur länge kroppen får agera.
 
+> **Semantisk invariant:** Naturligt språk klassificeras och planeras av
+> språkmodellen – aldrig av regexp, substringmatchning, nyckelordslistor eller
+> hårdkodade frasmenyer. Modellens resultat är ett typat beslutsförslag,
+> aldrig ett motoranrop.
+
+Den deterministiska host-policyn validerar endast förslagets schema,
+verktygs-ID, argument, kontextreferenser, färska robotstatus och budget. Den
+försöker inte tolka originalmeningen på nytt. Ogiltiga eller tvetydiga
+förslag ger `reject` eller `clarify`, aldrig en keyword-baserad gissning.
+
 **Status:** Den fysiska PoC-baslinjen är verifierad. Motorer, sensorer och
-svenskt tal fungerar; Gemma kör en rörelsefri shadow-loop. Autonom
-motorstyrning är ännu inte aktiverad.
+svenskt tal fungerar; Gemma kör en rörelsefri shadow-loop. En språkblind
+EV3-supervisor finns nu som hårdvarufritt verifierad kärna och dess
+rörelsefria stop-/inventeringspreflight har passerat på den riktiga EV3:an.
+Autonom motorstyrning är fortfarande inte aktiverad.
 
 ## Vad fungerar på riktigt?
 
@@ -30,14 +42,15 @@ motorstyrning är ännu inte aktiverad.
 | Röst | lokal svensk eSpeak-TTS via en längdbegränsad stdin-väg med ljudlås och timeout |
 | Lokal LLM | Gemma 4 via LM Studio, utan verktyg och utan motoråtkomst, i en komplett fysisk shadow-cykel |
 | IR-evidens | två motorstilla approach/retreat-cykler vid 20 Hz med full auditdata |
+| Supervisor-preflight | fysisk `brake` + `stop`, stabil touch, komplett terminal audit och frigjort motorlås; inga motorstarter |
 
 Det här är alltså inte en simulering med en robotbild bredvid. Kod har kört
 mot riktig sysfs-hårdvara, riktiga encoders, en riktig IR-sensor och den
 överraskande begripliga lilla EV3-högtalaren.
 
-## Två separata nervsystem
+## Tre separata ansvar
 
-Språkexperimentet och rörelseexperimentet är avsiktligt separerade:
+Semantik, auktorisation och fysisk exekvering är avsiktligt separerade:
 
 ```mermaid
 flowchart LR
@@ -54,7 +67,7 @@ flowchart LR
         S["IR · touch · färg · encoders"]
         T["eSpeak / högtalare"]
         M["Motorer A / B / C"]
-        X["Planerad lokal supervisor"]
+        X["Supervisor-kärna<br/>hårdvarufritt verifierad"]
     end
 
     I --> A
@@ -66,18 +79,25 @@ flowchart LR
     H --> T
     C -->|"explicit rörelsekvitto"| H
     H -->|"hårda fart- och tidsgränser"| M
-    X -.->|"nästa grind: exklusivt motorägarskap"| M
+    X -.->|"nästa grind: fysisk processintegration"| M
 ```
 
 Gemmas kandidat är i dag auditdata. Den kan inte välja robotverktyg, tala
 direkt eller röra en motor. Det manuella rörelsespåret kräver ett uttryckligt
 kvitto och går genom separat, begränsad kod.
 
+I målarkitekturen producerar LLM:n ett typat `DecisionProposal`.
+Host-policyn får auktorisera exakt en begränsad handling, och den språkblinda
+EV3-supervisorn avgör lokalt om handlingen fortfarande kan köras. Supervisorn
+får alltid neka eller stoppa, men aldrig byta mål eller hitta på en ny
+handling.
+
 ## Några siffror från verkligheten
 
 | Mätning | Observerat resultat |
 |---|---:|
-| Hårdvarufria tester | `82 / 82` passerar |
+| Hårdvarufria tester | `150 / 150` passerar |
+| Fysisk supervisor-preflight | `completed`, `0` motorstartkommandon |
 | Rak fysisk drivpuls, B/C | `+175° / +175°` encoderrotation |
 | Fysisk svängpuls, B/C | `+172° / −170°` encoderrotation |
 | Sparat dynamiskt IR-replikat | `277` prover |
@@ -179,7 +199,26 @@ Proben guidar människan med deterministiskt tal, samplar lokalt och skriver
 rå/filtrerad audit-JSON. Själva proben gör inga motoranrop; den är inte ett
 lås mot andra motorprocesser.
 
-### 5. Kör en rörelsefri Gemma-shadow från Mac
+### 5. Kör supervisorns rörelsefria preflight på EV3
+
+Preflight tar motorlåset, skriver `stop` till alla upptäckta motorer,
+verifierar motorinventering och stoppläge samt läser touchsensorn. Den har
+ingen kodstig som startar motorerna:
+
+```sh
+python3 ev3/supervisor_cli.py preflight
+```
+
+Resultat och tillståndsövergångar skrivs även som JSONL till
+`/tmp/robot-llm-supervisor-audit.jsonl`.
+
+Detta är endast en stop-/inventeringsgrind. Preflight varken armerar eller
+startar motorer och är inte ett godkännande för autonom körning.
+Om resultatet blir `failed` eller processen avbryts ska roboten betraktas som
+osäker tills motorstatus har kontrollerats på plats; stäng av strömmen om ett
+motorläge inte kan verifieras.
+
+### 6. Kör en rörelsefri Gemma-shadow från Mac
 
 LM Studio ska endast exponeras på loopback. SSH måste fungera med nyckel och
 utan lösenordsprompt:
@@ -228,15 +267,22 @@ pulsen kontrolleras encoderrotationens storlek och riktning.
 - fast SSH-kommandoyta och taltext endast via stdin,
 - LM Studio på loopback med deadline och begränsad svarsbody,
 - modellkandidat endast som shadow/audit,
-- IR-grind med medianfilter och hysteres, ännu inte kopplad till motorerna.
+- IR-grind med medianfilter och hysteres, ännu inte kopplad till motorerna,
+- hårdvarufritt verifierad supervisor-kärna med livslångt motorlås,
+  serverutfärdad session, stigande sekvens-ID, heartbeat, touchstopp,
+  stall-/riktningskontroll, absolut poll-deadline, latched fault och
+  verifierat stopp,
+- fail-closed motorstatus: okända ev3dev-tokens nekas och `holding` räknas
+  som aktivt tills `brake` + `stop` har verifierats,
+- begränsad auditbuffer i minnet under säkerhetskritisk exekvering; den
+  rörelsefria preflight-processen skriver JSONL först efter shutdown.
 
 ### Krävs före autonom rörelse
 
-- lokal EV3-supervisor med exklusivt motorägarskap,
-- heartbeat och lokalt stopp vid tappad klient eller länk,
-- touchbaserat kollisionsstopp och stallövervakning,
+- transport-/processintegration för supervisorn på fysisk EV3,
+- fysisk felinjektion för tappad klient, länk, process och motorskrivning,
 - uppmätt faktisk stopplatens och bromssträcka,
-- avsiktliga felinjektionstester,
+- kalibrering av pollingjitter och stallgränser vid låg hastighet,
 - episodbudget för tid, sträcka, agentvarv och omplaneringar.
 
 ## Roadmap
@@ -246,9 +292,12 @@ pulsen kontrolleras encoderrotationens storlek och riktning.
 - [x] rak körning och svängning med encoderpostcondition
 - [x] statisk IR-kalibrering och motorfri dynamisk evidensgrind
 - [x] rörelsefri Gemma-shadow med deterministisk TTS-fallback
-- [ ] lokal EV3-supervisor, heartbeat och kollisionsstopp
+- [x] hårdvarufri supervisor-kärna med heartbeat, touch och stallstopp
+- [x] fysisk rörelsefri supervisor-preflight med verifierad shutdown
+- [ ] fysisk supervisor-daemon, transport och uppmätta stoppgrindar
 - [ ] transportoberoende robot-API och manuella verktygstester
-- [ ] enkel chatt med strukturerad kontext – exempelvis “två gånger till”
+- [ ] LLM-baserad semantisk klassificering med typat beslutskontrakt och
+  strukturerad kontext – utan regexp/keyword-fallback
 - [ ] sluten loop: `mål → observera → planera → agera → verifiera → omplanera`
 - [ ] push-to-talk STT via Macens mikrofon
 - [ ] parallell perception, planering och validering
@@ -264,7 +313,7 @@ Drömdemon längre fram:
 ```text
 config/                 observerad portkarta och säkerhetsgränser
 docs/                   experimentplan, grindar och fysisk evidens
-ev3/                    Python 3.5-kompatibel HAL och manuella EV3-verktyg
+ev3/                    Python 3.5-HAL, supervisor och manuella EV3-verktyg
 src/robot_agent/        host-policy, LM Studio-klient och shadow-loop
 tests/                  hårdvarufria tester
 ```
