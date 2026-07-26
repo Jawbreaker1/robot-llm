@@ -1,7 +1,7 @@
 # Robot LLM Lab 🤖
 
 ![Status: physical PoC](https://img.shields.io/badge/status-physical%20PoC-2ea44f)
-![Tests: 193 passing](https://img.shields.io/badge/tests-193%20passing-2ea44f)
+![Tests: 246 passing](https://img.shields.io/badge/tests-246%20passing-2ea44f)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![Motion: manual only](https://img.shields.io/badge/motion-manual%20only-f59e0b)
 
@@ -33,7 +33,11 @@ rörelsefria stop-/inventeringspreflight har passerat på den riktiga EV3:an.
 En nodmärkt foreground-transport och en Mac-klient har dessutom verifierats
 mot falsk hårdvara genom riktiga OS-processer, pipes, EOF och signaler.
 Transportens publika entrypoint kan inte aktivera motion. Autonom
-motorstyrning är fortfarande inte aktiverad.
+motorstyrning är fortfarande inte aktiverad. På Macen finns nu dessutom en
+första typad, transportoberoende RobotAPI-slice och en sluten
+`observera → planera → agera → verifiera`-loop mot simulator. Den exponerar
+endast propellerarmen, använder en scriptad fake-planner och är varken
+kopplad till LM Studio eller till fysisk motion ännu.
 
 > **Aktuell fysisk grind · 2026-07-26:** Foreground-daemonen och
 > Mac-transporten är färdigverifierade mot falsk hårdvara men ännu inte
@@ -55,6 +59,8 @@ motorstyrning är fortfarande inte aktiverad.
 | IR-evidens | två motorstilla approach/retreat-cykler vid 20 Hz med full auditdata |
 | Supervisor-preflight | fysisk `brake` + `stop`, stabil touch, komplett terminal audit och frigjort motorlås; inga motorstarter |
 | Foreground-transport | strikt JSONL över stdio, controller-identitet, lokal kö-TTL, replaygrind och fail-closed EOF/signal/backpressure mot falsk sysfs |
+| Host RobotAPI | snapshotbundna armkommandon, explicit capability-allowlist, encoderkvitto, färskhetsgrind och instansbundet stopp mot simulator |
+| Sluten loop | typat ACT/ABORT-kontrakt, hårda episodbudgetar, verifierad framdrift, omplanering och terminalt stopp med scriptad planner |
 | Fysisk foreground-preflight | väntar på åtgärdat EV3-batteri; ännu inte deployad eller körd |
 
 Det här är alltså inte en simulering med en robotbild bredvid. Kod har kört
@@ -112,7 +118,7 @@ handling.
 
 | Mätning | Observerat resultat |
 |---|---:|
-| Hårdvarufria tester | `193 / 193` passerar |
+| Hårdvarufria tester | `246 / 246` passerar |
 | Fysisk supervisor-preflight | `completed`, `0` motorstartkommandon |
 | Rak fysisk drivpuls, B/C | `+175° / +175°` encoderrotation |
 | Fysisk svängpuls, B/C | `+172° / −170°` encoderrotation |
@@ -163,6 +169,11 @@ PYTHONDONTWRITEBYTECODE=1 \
 ```
 
 Testerna använder simulerad sysfs och aktiverar aldrig fysisk hårdvara.
+De omfattar också den typade RobotAPI-slicen och den slutna agentloopen. Den
+simulatorn är avsiktligt **accelererad och synkron**: encodereffekten
+appliceras i samma anrop. Den bevisar därför kontrakt, budgetar och
+verifieringslogik, men inte realtidsrörelse, heartbeat, avbrott under rörelse
+eller fysisk stopplatens.
 
 ### 2. Lägg den minimala EV3-koden på roboten
 
@@ -317,6 +328,15 @@ pulsen kontrolleras encoderrotationens storlek och riktning.
   safety-poll på den enda supervisortråden,
 - rörelsefri host-preflight och riktiga subprocessprov för EOF, `SIGTERM`,
   trasig frame och blockerad stdout; samtliga verifierar noll `run-timed`.
+- typat, snapshotbundet arm-API med explicit allowlist, processinstans,
+  observationstid, deadline och konservativ `at_most_once`-semantik,
+- sluten simulatorloop där modellen endast får lämna exakt `ACT` eller
+  `ABORT`; hosten myntar action-ID, kontrollerar capability, riktning,
+  episodtid och rörelsebudget samt verifierar kvitto och encoderutfall,
+- två verifierade terminala stopförsök och best-effort-stop före återkastning
+  av oväntade backendfel,
+- poison-on-ambiguity i SSH-kanalen: timeout, fel request-ID, partiell
+  skrivning, asynkront läsfel och unsolicited output förbjuder fler writes.
 
 ### Krävs före autonom rörelse
 
@@ -341,10 +361,15 @@ pulsen kontrolleras encoderrotationens storlek och riktning.
 - [x] rörelsefri foreground-daemon och hosttransport mot falsk hårdvara
 - [ ] fysisk rörelsefri daemon-preflight över USB-SSH
 - [ ] motion-enabled process med lock-retaining fail-stop och uppmätta stoppgrindar
-- [ ] transportoberoende robot-API och manuella verktygstester
+- [x] första transportoberoende RobotAPI-slice mot simulator, explicit
+  arm-only och utan fysisk adapter
+- [ ] semantiska verktyg som `drive`, `turn`, `wave_arm`, tal och sensorer
+  samt manuella tester mot fysisk supervisor-adapter
 - [ ] LLM-baserad semantisk klassificering med typat beslutskontrakt och
   strukturerad kontext – utan regexp/keyword-fallback
-- [ ] sluten loop: `mål → observera → planera → agera → verifiera → omplanera`
+- [x] hårdvarufri sluten loop med scriptad planner:
+  `mål → observera → planera → agera → verifiera → omplanera`
+- [ ] samma loop med Gemma via LM Studio och därefter en separat fysisk grind
 - [ ] push-to-talk STT via Macens mikrofon
 - [ ] parallell perception, planering och validering
 - [ ] trådlös kamera/mikrofon, ljudriktning och aktiv visuell perception
@@ -363,7 +388,7 @@ Drömdemon längre fram:
 config/                 observerad portkarta och säkerhetsgränser
 docs/                   experimentplan, grindar och fysisk evidens
 ev3/                    Python 3.5-HAL, supervisor och manuella EV3-verktyg
-src/robot_agent/        host-policy, LM Studio-klient och shadow-loop
+src/robot_agent/        host-policy, RobotAPI, agentloop och LM Studio-klient
 tests/                  hårdvarufria tester
 ```
 

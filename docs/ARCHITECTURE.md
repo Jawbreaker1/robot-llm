@@ -69,8 +69,11 @@ direkt i ett gemensamt objekt. En reducer äger skrivningen och skapar
 snapshots som övriga komponenter får läsa. Detta gör beslut möjliga att
 replaya och analysera i efterhand.
 
-Ett enda globalt `state_version` räcker inte när vision, motorstatus och
-dialog har olika hastighet. Målarkitekturen skiljer därför mellan exempelvis
+Den första simulator-slicens `ObservationEnvelope` fryser motor-, sensor- och
+faultcontainrar, binder dem till controllerinstans, hostklocka,
+`state_version` och mottagningstid. Ett enda globalt `state_version` räcker
+däremot inte när vision, motorstatus och dialog har olika hastighet.
+Målarkitekturen skiljer därför mellan exempelvis
 `goal_epoch`, `plan_revision`, `robot_state_version` och
 `world_model_version`, tillsammans med explicita beroenden och observationer.
 
@@ -91,13 +94,49 @@ Senare observationer bör bära minst:
 
 Självrapporterad modellkonfidens är inte en säkerhetsregel.
 
+## Aktuell hårdvarufri RobotAPI-slice
+
+Den första körbara host-gränsen är medvetet smal:
+
+- `SimulatedRobotAPI` annonserar endast motorroller som finns i en explicit
+  allowlist; i EV3RSTORM-konfigurationen är det bara propellerarmen,
+- drivmotorerna exponeras inte som generiska enmotorsverktyg,
+- varje motion binds till robot, controller, processinstans, hostklocka,
+  färsk observation, state-version, hostmyntat action-/segment-ID och
+  deadline,
+- deadlinen kontrolleras både i adaptern och inne i simulatorns motorägare
+  precis före stateändringen,
+- kvittot måste matcha controllerinstans, state-version och observerade
+  encoderpositioner,
+- `stop_all` är instansbundet men aldrig replayblockerat; ett nödstopp får
+  alltid utfärdas igen.
+
+Capabilities annonserar ärligt
+`motion_execution_model=accelerated_synchronous` och
+`motion_retry_semantics=at_most_once`. Simulatorn applicerar hela
+encodereffekten i samma anrop och modellerar inte `RUNNING`, heartbeat,
+avbrott under rörelse eller förlorade kvitton. Den kan därför verifiera
+kontrakt och beslutslogik men inte realtidssäkerhet.
+
+`ClosedLoopAgent` tar ett typat encoderpositionsmål och anropar en planner
+som endast får returnera exakt `ACT` eller `ABORT` enligt ett strikt
+JSON-kontrakt. Hostkoden kontrollerar statebindning, motor, riktning,
+capability, action-TTL, global episodtid, total rörelsetid och antal
+omplaneringar. Efter varje steg jämförs kvitto, nytt snapshot och faktisk
+encoderprogress. Terminalt resultat kräver ett färskt, säkert snapshot efter
+ett verifierat, instansbundet stopp; oväntade backendfel återkastas först
+efter best-effort-stop.
+
+Denna loop använder ännu en scriptad testplanner. Den tolkar alltså inte
+naturligt språk, anropar inte LM Studio och når inte fysisk EV3.
+
 ## Intern exekveringsyta och publikt agent-API
 
 EV3-protokollets operationer `claim`, `heartbeat`, `arm`, `drive_timed`,
 `release`, `stop` och `shutdown` är en intern backend-yta. De innehåller
 fysiska primitiv och får aldrig visas direkt för en LLM.
 
-Det framtida publika agentkontraktet innehåller semantiska, typade verktyg
+Det fulla framtida publika agentkontraktet innehåller semantiska, typade verktyg
 som `drive`, `turn`, `wave_arm`, `read_sensors` och `stop`. LLM:n löser
 språk, referenser och planering till ett beslutsförslag. Deterministisk
 host-kod validerar schema, capability, färskhet, konflikt och budget och
@@ -105,6 +144,11 @@ host-kod validerar schema, capability, färskhet, konflikt och budget och
 
 Ingen del av exekveringslagren läser originalmeningen eller använder regexp,
 substrings eller keywordlistor som en alternativ språkklassificerare.
+
+SSH-transporten är sekventiell och konservativt `at_most_once`. Timeout,
+partiell skrivning, fel korrelations-ID, dubbla/oväntade svar eller ett
+asynkront läsfel poisonar kanalen och stänger dess stdin. När utfallet är
+okänt får samma kanal aldrig användas för ett nytt motorförslag.
 
 ## Kamera och mikrofon
 

@@ -6,18 +6,21 @@
     "arm": {
       "port": "outA",
       "driver": "lego-ev3-m-motor",
+      "limit_profile": "arm",
       "physical_role": "propeller-arm",
       "positive_direction": "spins-propeller-direction-unmapped"
     },
     "drive_b": {
       "port": "outB",
       "driver": "lego-ev3-l-motor",
+      "limit_profile": "drive",
       "physical_role": "left-drive-leg",
       "positive_direction": "forward"
     },
     "drive_c": {
       "port": "outC",
       "driver": "lego-ev3-l-motor",
+      "limit_profile": "drive",
       "physical_role": "right-drive-leg",
       "positive_direction": "forward"
     }
@@ -29,6 +32,9 @@
       "drive_b": 1,
       "drive_c": 1
     }
+  },
+  "agent_api": {
+    "move_motor_roles": ["arm"]
   },
   "calibration": {
     "turn_in_place": {

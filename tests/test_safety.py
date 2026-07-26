@@ -1,5 +1,8 @@
+import json
 import unittest
 from pathlib import Path
+import tempfile
+from types import MappingProxyType
 
 from robot_agent import (
     MotionCommand,
@@ -83,6 +86,11 @@ class SimulatedRobotTests(unittest.TestCase):
         result = self.robot.execute_motion(command)
 
         self.assertEqual(result.status, "completed")
+        self.assertEqual(result.completed_at_ms, result.started_at_ms)
+        self.assertEqual(
+            result.detail,
+            "accelerated synchronous simulated motion",
+        )
         self.assertEqual(result.position_before, 0)
         self.assertEqual(result.position_after, 120)
         self.assertEqual(
@@ -105,6 +113,48 @@ class SimulatedRobotTests(unittest.TestCase):
     def test_sensor_state_is_explicit(self):
         self.robot.set_sensor("touch", True)
         self.assertTrue(self.robot.read_state().sensors["touch"])
+
+
+class SafetyConfigurationTests(unittest.TestCase):
+    def config(self):
+        with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def write_config(self, config):
+        temporary = tempfile.TemporaryDirectory()
+        path = Path(temporary.name) / "config.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        return temporary, path
+
+    def test_loaded_mappings_are_immutable(self):
+        limits = SafetyLimits.from_file(CONFIG_PATH)
+
+        self.assertIsInstance(limits.motor_roles, MappingProxyType)
+        self.assertIsInstance(limits.role_limits, MappingProxyType)
+        with self.assertRaises(TypeError):
+            limits.motor_roles["arm"] = "outD"
+        with self.assertRaises(TypeError):
+            limits.role_limits["arm"] = limits.drive
+
+    def test_duplicate_ports_and_missing_profiles_fail_closed(self):
+        cases = []
+        duplicate_port = self.config()
+        duplicate_port["motors"]["arm"]["port"] = "outB"
+        cases.append(duplicate_port)
+        missing_profile = self.config()
+        del missing_profile["motors"]["arm"]["limit_profile"]
+        cases.append(missing_profile)
+        invalid_heartbeat = self.config()
+        invalid_heartbeat["limits"]["heartbeat"]["timeout_ms"] = True
+        cases.append(invalid_heartbeat)
+
+        for config in cases:
+            temporary, path = self.write_config(config)
+            try:
+                with self.assertRaises(ValueError):
+                    SafetyLimits.from_file(path)
+            finally:
+                temporary.cleanup()
 
 
 if __name__ == "__main__":

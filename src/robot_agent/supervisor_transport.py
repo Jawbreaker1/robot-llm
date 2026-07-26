@@ -19,6 +19,10 @@ RESPONSE_SCHEMA = "ev3-supervisor-response/v1"
 REMOTE_DAEMON = "/home/robot/robot-llm/ev3/supervisor_daemon.py"
 MAX_RESPONSE_BYTES = 64 * 1024
 MAX_ERROR_BYTES = 16 * 1024
+# Keep every sequential write within the POSIX minimum PIPE_BUF.  With one
+# outstanding request and unbuffered subprocess pipes, a real SSH stdin pipe
+# cannot accumulate a partial multi-frame backlog.
+MAX_REQUEST_BYTES = 512
 
 ProcessFactory = Callable[..., Any]
 
@@ -37,6 +41,18 @@ class SupervisorSSHTransportError(SupervisorSSHError):
 
 class SupervisorSSHTimeoutError(SupervisorSSHTransportError):
     pass
+
+
+class SupervisorSSHChannelPoisonedError(SupervisorSSHTransportError):
+    def __init__(
+        self,
+        message: str,
+        request_id: Optional[str] = None,
+        outcome_unknown: bool = False,
+    ):
+        self.request_id = request_id
+        self.outcome_unknown = outcome_unknown
+        super().__init__(message)
 
 
 class SupervisorSSHProtocolError(SupervisorSSHError):
@@ -172,30 +188,55 @@ def _decode_response(
 
 
 class _StdoutPump(threading.Thread):
-    def __init__(self, stream, destination, failed):
+    def __init__(
+        self,
+        stream,
+        destination,
+        failed,
+        on_failure,
+        on_line,
+    ):
         super().__init__(name="ev3-supervisor-stdout", daemon=True)
         self._stream = stream
         self._destination = destination
         self._failed = failed
+        self._on_failure = on_failure
+        self._on_line = on_line
 
     def run(self) -> None:
         while not self._failed.is_set():
             try:
                 raw = self._stream.readline(MAX_RESPONSE_BYTES + 1)
             except BaseException:
-                self._failed.set()
+                self._on_failure("Supervisor response reader failed")
+                try:
+                    self._destination.put_nowait(("eof", None))
+                except queue.Full:
+                    pass
                 return
             if raw == b"":
-                self._destination.put(("eof", None))
+                self._on_failure("Supervisor response stream reached EOF")
+                try:
+                    self._destination.put_nowait(("eof", None))
+                except queue.Full:
+                    pass
                 return
             if len(raw) > MAX_RESPONSE_BYTES or not raw.endswith(b"\n"):
-                self._destination.put(("invalid", None))
-                self._failed.set()
+                self._on_failure(
+                    "Supervisor response stream produced an invalid frame"
+                )
+                try:
+                    self._destination.put_nowait(("invalid", None))
+                except queue.Full:
+                    pass
                 return
             try:
+                self._on_line()
                 self._destination.put_nowait(("line", raw))
             except queue.Full:
-                self._failed.set()
+                self._on_failure(
+                    "Supervisor response queue overflowed"
+                )
                 return
 
 
@@ -316,19 +357,177 @@ class SupervisorSSHSession:
         )
         self._responses = queue.Queue(maxsize=8)
         self._failed = threading.Event()
+        self._request_lock = threading.Lock()
+        self._request_prefix = secrets.token_hex(8)
+        self._request_number = 0
+        self._shutdown_sent = False
+        self._state_lock = threading.Lock()
+        self._lifecycle_state = "OPEN"
+        self._poison_info = None
+        self._receive_failure = None
+        self._inflight_request_id = None
+        self._inflight_response_lines = 0
+        self._close_started = False
+        self._closed_event = threading.Event()
         self._stdout_pump = _StdoutPump(
             self._process.stdout,
             self._responses,
             self._failed,
+            self._mark_receive_failure,
+            self._mark_response_line,
         )
         self._stderr_pump = _StderrPump(self._process.stderr)
         self._stdout_pump.start()
         self._stderr_pump.start()
-        self._request_lock = threading.Lock()
-        self._request_prefix = secrets.token_hex(8)
-        self._request_number = 0
-        self._closed = False
-        self._shutdown_sent = False
+
+    def _record_receive_failure_locked(self, message: str) -> bool:
+        close_input = False
+        if self._receive_failure is None:
+            self._receive_failure = message
+            close_input = True
+        if (
+            self._inflight_request_id is None
+            and self._lifecycle_state == "OPEN"
+            and not self._shutdown_sent
+            and self._poison_info is None
+        ):
+            self._poison_info = (message, None, False)
+            self._lifecycle_state = "POISONED"
+        return close_input
+
+    def _finish_receive_failure(self, close_input: bool) -> None:
+        self._failed.set()
+        if close_input:
+            try:
+                self._process.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    def _mark_receive_failure(self, message: str) -> None:
+        with self._state_lock:
+            close_input = self._record_receive_failure_locked(message)
+        self._finish_receive_failure(close_input)
+
+    def _mark_response_line(self) -> None:
+        failure_message = None
+        close_input = False
+        with self._state_lock:
+            unsolicited = (
+                self._inflight_request_id is None
+                and self._lifecycle_state in ("OPEN", "CLOSING")
+                and not self._shutdown_sent
+            )
+            if self._inflight_request_id is not None:
+                self._inflight_response_lines += 1
+            duplicate = self._inflight_response_lines > 1
+            if unsolicited or duplicate:
+                failure_message = (
+                    "Supervisor sent an unsolicited or duplicate response frame"
+                )
+                close_input = self._record_receive_failure_locked(
+                    failure_message
+                )
+        if failure_message is not None:
+            self._finish_receive_failure(close_input)
+
+    @property
+    def poisoned(self) -> bool:
+        with self._state_lock:
+            return self._poison_info is not None
+
+    def _poison(
+        self,
+        message: str,
+        request_id: Optional[str],
+        outcome_unknown: bool,
+    ) -> SupervisorSSHChannelPoisonedError:
+        close_input = False
+        with self._state_lock:
+            if self._poison_info is None:
+                self._poison_info = (
+                    message,
+                    request_id,
+                    outcome_unknown,
+                )
+                if self._lifecycle_state != "CLOSED":
+                    self._lifecycle_state = "POISONED"
+                close_input = True
+            stored = self._poison_info
+        self._failed.set()
+        if close_input:
+            try:
+                self._process.stdin.close()
+            except (OSError, ValueError):
+                pass
+        return SupervisorSSHChannelPoisonedError(
+            stored[0],
+            request_id=stored[1],
+            outcome_unknown=stored[2],
+        )
+
+    def _require_open_channel(self, allow_closing: bool = False) -> None:
+        with self._state_lock:
+            lifecycle_state = self._lifecycle_state
+            poison_info = self._poison_info
+            receive_failure = self._receive_failure
+        if lifecycle_state == "CLOSED":
+            raise SupervisorSSHTransportError(
+                "Supervisor session is closed"
+            )
+        if poison_info is not None:
+            raise SupervisorSSHChannelPoisonedError(
+                poison_info[0],
+                request_id=poison_info[1],
+                outcome_unknown=poison_info[2],
+            )
+        if receive_failure is not None and lifecycle_state == "OPEN":
+            raise self._poison(
+                receive_failure,
+                request_id=None,
+                outcome_unknown=False,
+            )
+        if lifecycle_state == "CLOSING" and allow_closing:
+            return
+        if lifecycle_state != "OPEN":
+            raise SupervisorSSHTransportError(
+                "Supervisor session is closing"
+            )
+
+    def _begin_inflight(
+        self,
+        request_id: str,
+        allow_closing: bool,
+    ) -> None:
+        self._require_open_channel(allow_closing=allow_closing)
+        with self._state_lock:
+            if (
+                self._poison_info is not None
+                or self._receive_failure is not None
+                or self._lifecycle_state
+                not in (
+                    ("OPEN", "CLOSING")
+                    if allow_closing
+                    else ("OPEN",)
+                )
+            ):
+                failed = True
+            else:
+                self._inflight_request_id = request_id
+                self._inflight_response_lines = 0
+                failed = False
+        if failed:
+            self._require_open_channel(
+                allow_closing=allow_closing
+            )
+            raise SupervisorSSHTransportError(
+                "Supervisor channel changed before request dispatch"
+            )
+
+    def _end_inflight(self, request_id: str) -> None:
+        with self._state_lock:
+            if self._inflight_request_id == request_id:
+                self._inflight_request_id = None
+                self._inflight_response_lines = 0
 
     def _next_request_id(self) -> str:
         self._request_number += 1
@@ -343,10 +542,7 @@ class SupervisorSSHSession:
         arguments: Optional[Mapping[str, object]] = None,
         ttl_ms: int = 500,
     ) -> Dict[str, object]:
-        if self._closed:
-            raise SupervisorSSHTransportError(
-                "Supervisor session is closed"
-            )
+        self._require_open_channel()
         _validate_identifier("operation", operation, 64)
         if arguments is None:
             arguments = {}
@@ -364,68 +560,132 @@ class SupervisorSSHSession:
             )
 
         with self._request_lock:
-            request_id = self._next_request_id()
-            payload = {
-                "protocol_version": PROTOCOL_VERSION,
-                "controller_id": self.controller_id,
-                "request_id": request_id,
-                "op": operation,
-                "queue_ttl_ms": ttl_ms,
-                "args": dict(arguments),
-            }
-            try:
-                wire = (
-                    json.dumps(
-                        payload,
-                        allow_nan=False,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    ).encode("utf-8")
-                    + b"\n"
-                )
-            except (TypeError, ValueError):
-                raise SupervisorSSHConfigurationError(
-                    "Request arguments are not strict JSON"
-                ) from None
-            try:
-                self._process.stdin.write(wire)
-                self._process.stdin.flush()
-            except (BrokenPipeError, OSError):
-                raise self._transport_failure(
-                    "Could not write supervisor request"
-                ) from None
+            self._require_open_channel()
+            return self._request_locked(operation, arguments, ttl_ms)
 
-            try:
-                kind, raw = self._responses.get(
-                    timeout=self._response_timeout_seconds
-                )
-            except queue.Empty:
-                raise SupervisorSSHTimeoutError(
-                    "Supervisor response timed out"
-                ) from None
-            if kind == "eof":
-                raise self._transport_failure(
-                    "Supervisor process closed the response stream"
-                )
-            if kind != "line":
-                raise SupervisorSSHProtocolError(
-                    "Supervisor returned an invalid response frame"
-                )
+    def _request_locked(
+        self,
+        operation: str,
+        arguments: Mapping[str, object],
+        ttl_ms: int,
+        allow_closing: bool = False,
+    ) -> Dict[str, object]:
+        """Issue one request while the caller owns ``_request_lock``."""
+        self._require_open_channel(allow_closing=allow_closing)
+        request_id = self._next_request_id()
+        payload = {
+            "protocol_version": PROTOCOL_VERSION,
+            "controller_id": self.controller_id,
+            "request_id": request_id,
+            "op": operation,
+            "queue_ttl_ms": ttl_ms,
+            "args": dict(arguments),
+        }
+        try:
+            wire = (
+                json.dumps(
+                    payload,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                + b"\n"
+            )
+        except (TypeError, ValueError):
+            raise SupervisorSSHConfigurationError(
+                "Request arguments are not strict JSON"
+            ) from None
+        if len(wire) > MAX_REQUEST_BYTES:
+            raise SupervisorSSHConfigurationError(
+                "Supervisor request exceeded the byte limit"
+            )
+        self._begin_inflight(request_id, allow_closing)
+        try:
+            return self._exchange_locked(
+                operation,
+                request_id,
+                wire,
+            )
+        finally:
+            self._end_inflight(request_id)
+
+    def _exchange_locked(
+        self,
+        operation: str,
+        request_id: str,
+        wire: bytes,
+    ) -> Dict[str, object]:
+        try:
+            written = self._process.stdin.write(wire)
+            if (
+                isinstance(written, bool)
+                or not isinstance(written, int)
+                or written != len(wire)
+            ):
+                raise OSError("partial write")
+            self._process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            raise self._poison(
+                "Supervisor request write outcome is unknown",
+                request_id=request_id,
+                outcome_unknown=True,
+            ) from None
+
+        try:
+            kind, raw = self._responses.get(
+                timeout=self._response_timeout_seconds
+            )
+        except queue.Empty:
+            raise self._poison(
+                "Supervisor response timed out; request outcome is unknown",
+                request_id=request_id,
+                outcome_unknown=True,
+            ) from None
+        if kind == "eof":
+            raise self._poison(
+                "Supervisor response stream closed unexpectedly",
+                request_id=request_id,
+                outcome_unknown=True,
+            )
+        if kind != "line":
+            raise self._poison(
+                "Supervisor returned an invalid response frame",
+                request_id=request_id,
+                outcome_unknown=True,
+            )
+        try:
             response = _decode_response(
                 raw,
                 expected_request_id=request_id,
                 expected_controller_id=self.controller_id,
             )
-            if response["ok"] is False:
-                error = response["error"]
-                raise SupervisorRemoteError(
-                    error["code"],
-                    error["message"],
-                )
-            if operation == "shutdown":
+        except SupervisorSSHProtocolError as error:
+            raise self._poison(
+                str(error),
+                request_id=request_id,
+                outcome_unknown=True,
+            ) from None
+        clean_shutdown = operation == "shutdown" and response["ok"] is True
+        with self._state_lock:
+            if clean_shutdown:
                 self._shutdown_sent = True
-            return dict(response["result"])
+                if self._lifecycle_state == "OPEN":
+                    self._lifecycle_state = "CLOSING"
+            receive_failure = self._receive_failure
+        if receive_failure is not None and not clean_shutdown:
+            self._poison(
+                receive_failure,
+                request_id=None,
+                outcome_unknown=False,
+            )
+        if response["ok"] is False:
+            error = response["error"]
+            raise SupervisorRemoteError(
+                error["code"],
+                error["message"],
+            )
+        return dict(response["result"])
 
     def _transport_failure(self, message: str):
         detail = self._stderr_pump.summary()
@@ -434,61 +694,99 @@ class SupervisorSSHSession:
         return SupervisorSSHTransportError(message)
 
     def wait_closed(self, timeout_seconds: float = 3.0) -> int:
-        try:
-            returncode = self._process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            raise SupervisorSSHTimeoutError(
-                "Supervisor process did not exit after shutdown"
-            ) from None
-        if (
-            isinstance(returncode, bool)
-            or not isinstance(returncode, int)
-            or returncode != 0
-        ):
-            raise self._transport_failure(
-                "Supervisor process exited unsuccessfully"
-            )
-        return returncode
+        with self._state_lock:
+            if self._lifecycle_state == "OPEN":
+                self._lifecycle_state = "CLOSING"
+        with self._request_lock:
+            try:
+                returncode = self._process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                raise self._poison(
+                    "Supervisor process did not exit after shutdown",
+                    request_id=None,
+                    outcome_unknown=False,
+                ) from None
+            if (
+                isinstance(returncode, bool)
+                or not isinstance(returncode, int)
+                or returncode != 0
+            ):
+                raise self._transport_failure(
+                    "Supervisor process exited unsuccessfully"
+                )
+            return returncode
 
     def close(self) -> None:
-        if self._closed:
+        with self._state_lock:
+            if self._lifecycle_state == "CLOSED":
+                return
+            if self._close_started:
+                close_owner = False
+            else:
+                self._close_started = True
+                close_owner = True
+                if self._lifecycle_state == "OPEN":
+                    self._lifecycle_state = "CLOSING"
+        if not close_owner:
+            self._closed_event.wait()
             return
         try:
-            if self._process.poll() is None and not self._shutdown_sent:
+            with self._request_lock:
+                with self._state_lock:
+                    poisoned = self._poison_info is not None
                 try:
-                    self.request("stop", ttl_ms=1000)
-                except SupervisorSSHError:
-                    pass
-                try:
-                    self.request("shutdown", ttl_ms=1000)
-                except SupervisorSSHError:
-                    pass
-            try:
-                self._process.stdin.close()
-            except OSError:
-                pass
-            if self._process.poll() is None:
-                try:
-                    self._process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self._process.terminate()
+                    if (
+                        self._process.poll() is None
+                        and not self._shutdown_sent
+                        and not poisoned
+                    ):
+                        try:
+                            self._request_locked(
+                                "stop",
+                                {},
+                                1000,
+                                allow_closing=True,
+                            )
+                        except SupervisorSSHError:
+                            pass
+                        try:
+                            self._request_locked(
+                                "shutdown",
+                                {},
+                                1000,
+                                allow_closing=True,
+                            )
+                        except SupervisorSSHError:
+                            pass
                     try:
-                        self._process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        self._process.kill()
-                        self._process.wait(timeout=2)
-        finally:
-            self._closed = True
-            for stream in (
-                self._process.stdout,
-                self._process.stderr,
-            ):
-                close = getattr(stream, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except OSError:
+                        self._process.stdin.close()
+                    except (OSError, ValueError):
                         pass
+                    if self._process.poll() is None:
+                        try:
+                            self._process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            self._process.terminate()
+                            try:
+                                self._process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                self._process.kill()
+                                self._process.wait(timeout=2)
+                finally:
+                    for stream in (
+                        self._process.stdout,
+                        self._process.stderr,
+                    ):
+                        close = getattr(stream, "close", None)
+                        if callable(close):
+                            try:
+                                close()
+                            except OSError:
+                                pass
+        finally:
+            with self._state_lock:
+                self._lifecycle_state = "CLOSED"
+            self._closed_event.set()
 
     def __enter__(self):
         return self

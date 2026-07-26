@@ -1,5 +1,15 @@
 """Transport-independent building blocks for the Robot LLM experiment."""
 
+from .agent_loop import (
+    ClosedLoopAgent,
+    DecisionProposal,
+    EpisodeResult,
+    LoopLimits,
+    MotorPositionGoal,
+    PlanningContext,
+    ProposalError,
+    decode_decision_proposal,
+)
 from .commentary import (
     DEFAULT_OBSTACLE_GATE_POLICY,
     DEFAULT_PROXIMITY_THRESHOLDS,
@@ -18,6 +28,21 @@ from .lm_studio import (
     ModelCandidate,
     NativeLMStudioClient,
 )
+from .robot_api import (
+    ActionContext,
+    ActionReceipt,
+    CapabilityGate,
+    ControllerCapabilities,
+    MotionRequest,
+    MotorCapability,
+    ObservationEnvelope,
+    RobotActionRejected,
+    RobotAPI,
+    RobotAPIContractError,
+    RobotAPIError,
+    SimulatedRobotAPI,
+    StopRequest,
+)
 from .safety import SafetyLimits, SafetyPolicy, SafetyViolation
 from .shadow_commentary import (
     ShadowCommentResult,
@@ -27,16 +52,39 @@ from .shadow_commentary import (
 from .simulated_robot import SimulatedRobot
 from .supervisor_transport import (
     SupervisorRemoteError,
+    SupervisorSSHChannelPoisonedError,
+    SupervisorSSHConfigurationError,
     SupervisorSSHError,
+    SupervisorSSHProtocolError,
     SupervisorSSHSession,
+    SupervisorSSHTimeoutError,
+    SupervisorSSHTransportError,
     run_motion_free_supervisor_preflight,
 )
 
 __all__ = [
+    "ActionContext",
+    "ActionReceipt",
+    "CapabilityGate",
+    "ClosedLoopAgent",
     "CommandResult",
+    "ControllerCapabilities",
+    "DecisionProposal",
+    "EpisodeResult",
+    "LoopLimits",
     "MotionCommand",
+    "MotionRequest",
+    "MotorCapability",
+    "MotorPositionGoal",
     "MotorState",
+    "ObservationEnvelope",
+    "PlanningContext",
+    "ProposalError",
     "RobotState",
+    "RobotActionRejected",
+    "RobotAPI",
+    "RobotAPIContractError",
+    "RobotAPIError",
     "LMStudioError",
     "ModelCandidate",
     "NativeLMStudioClient",
@@ -52,11 +100,19 @@ __all__ = [
     "ShadowCommentResult",
     "ShadowSpeechError",
     "SimulatedRobot",
+    "SimulatedRobotAPI",
+    "StopRequest",
     "SupervisorRemoteError",
+    "SupervisorSSHChannelPoisonedError",
+    "SupervisorSSHConfigurationError",
     "SupervisorSSHError",
+    "SupervisorSSHProtocolError",
     "SupervisorSSHSession",
+    "SupervisorSSHTimeoutError",
+    "SupervisorSSHTransportError",
     "StableZoneTracker",
     "classify_infrared",
+    "decode_decision_proposal",
     "fallback_comment",
     "run_shadow_comment",
     "run_motion_free_supervisor_preflight",

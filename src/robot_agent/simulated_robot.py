@@ -21,8 +21,17 @@ class SimulatedRobot:
             "infrared_proximity_percent": 100,
         }
 
-    def execute_motion(self, command: MotionCommand) -> CommandResult:
+    def execute_motion(
+        self,
+        command: MotionCommand,
+        valid_until_ms: int = None,
+    ) -> CommandResult:
         now_ms = self._clock_ms()
+        if valid_until_ms is not None and now_ms >= valid_until_ms:
+            raise SafetyViolation(
+                "stale_action",
+                "Simulated action deadline expired before dispatch",
+            )
         self._safety.validate_motion(command, now_ms)
         if command.command_id in self._seen_command_ids:
             raise SafetyViolation(
@@ -41,11 +50,19 @@ class SimulatedRobot:
             command_id=command.command_id,
             status="completed",
             started_at_ms=now_ms,
-            completed_at_ms=now_ms + command.duration_ms,
+            completed_at_ms=now_ms,
             position_before=before,
             position_after=self._positions[command.motor_role],
-            detail="simulated run-timed motion",
+            detail="accelerated synchronous simulated motion",
         )
+
+    def validate_motion(
+        self,
+        command: MotionCommand,
+        now_ms: int,
+    ) -> None:
+        """Validate without mutating simulator state."""
+        self._safety.validate_motion(command, now_ms)
 
     def stop_all(self) -> None:
         self._stopped = True

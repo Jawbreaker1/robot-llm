@@ -1,10 +1,12 @@
 import json
 import os
 from pathlib import Path
+import queue
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -12,9 +14,11 @@ from robot_agent.supervisor_transport import (
     REMOTE_DAEMON,
     RESPONSE_SCHEMA,
     SupervisorRemoteError,
+    SupervisorSSHChannelPoisonedError,
     SupervisorSSHConfigurationError,
     SupervisorSSHProtocolError,
     SupervisorSSHSession,
+    SupervisorSSHTransportError,
     _decode_response,
     run_motion_free_supervisor_preflight,
 )
@@ -199,6 +203,17 @@ class EOFBytes:
         return None
 
 
+class FailingOutput:
+    def __init__(self):
+        self.closed = False
+
+    def readline(self, _maximum=-1):
+        raise OSError("simulated reader failure")
+
+    def close(self):
+        self.closed = True
+
+
 class ClosedInput:
     def write(self, _value):
         raise AssertionError("No write expected")
@@ -227,6 +242,153 @@ class AlreadyExitedProcess:
 
     def kill(self):
         raise AssertionError("kill was not expected")
+
+
+class RecordingInput:
+    def __init__(self, partial=False):
+        self.partial = partial
+        self.writes = []
+        self.closed = False
+        self.close_count = 0
+        self._condition = threading.Condition()
+
+    def write(self, value):
+        with self._condition:
+            if self.closed:
+                raise ValueError("closed")
+            self.writes.append(value)
+            self._condition.notify_all()
+            return len(value) - 1 if self.partial else len(value)
+
+    def flush(self):
+        if self.closed:
+            raise ValueError("closed")
+
+    def close(self):
+        with self._condition:
+            if not self.closed:
+                self.closed = True
+                self.close_count += 1
+                self._condition.notify_all()
+
+    def wait_for_writes(self, count, timeout=1.0):
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while len(self.writes) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+
+class BlockingRecordingInput(RecordingInput):
+    def __init__(self):
+        super().__init__()
+        self.write_entered = threading.Event()
+        self.release_write = threading.Event()
+        self.poison_probe = lambda: False
+        self.poisoned_before_write_return = None
+
+    def write(self, value):
+        written = super().write(value)
+        self.write_entered.set()
+        if not self.release_write.wait(timeout=2):
+            raise OSError("test did not release blocked write")
+        self.poisoned_before_write_return = self.poison_probe()
+        return written
+
+
+class PumpStateReleaseGate:
+    def __init__(self, lock):
+        self._lock = lock
+        self.armed = False
+        self.pump_released = threading.Event()
+        self.resume_pump = threading.Event()
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, _error_type, _error, _traceback):
+        self._lock.release()
+        if (
+            self.armed
+            and threading.current_thread().name
+            == "ev3-supervisor-stdout"
+        ):
+            self.pump_released.set()
+            if not self.resume_pump.wait(timeout=2):
+                raise RuntimeError("test did not release stdout pump")
+
+
+class ControlledOutput:
+    def __init__(self):
+        self.items = queue.Queue()
+        self.closed = False
+
+    def send(self, value):
+        self.items.put(value)
+
+    def readline(self, _maximum=-1):
+        value = self.items.get(timeout=2)
+        return b"" if value is None else value
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.items.put(None)
+
+
+class ControlledProcess:
+    def __init__(
+        self,
+        partial_write=False,
+        input_stream=None,
+        output_stream=None,
+    ):
+        self.stdin = (
+            RecordingInput(partial=partial_write)
+            if input_stream is None
+            else input_stream
+        )
+        self.stdout = (
+            ControlledOutput()
+            if output_stream is None
+            else output_stream
+        )
+        self.stderr = EOFBytes()
+
+    def poll(self):
+        return 0 if self.stdin.closed else None
+
+    def wait(self, timeout=None):
+        if self.stdin.closed:
+            return 0
+        raise subprocess.TimeoutExpired("fake", timeout)
+
+    def terminate(self):
+        self.stdin.close()
+
+    def kill(self):
+        self.stdin.close()
+
+
+class ControlledProcessFactory:
+    def __init__(
+        self,
+        partial_write=False,
+        input_stream=None,
+        output_stream=None,
+    ):
+        self.process = ControlledProcess(
+            partial_write=partial_write,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
+
+    def __call__(self, _argv, **_kwargs):
+        return self.process
 
 
 class RecordingProcessFactory:
@@ -393,6 +555,358 @@ class SupervisorSSHConstructionTests(unittest.TestCase):
                     CONTROLLER_ID,
                     process_factory=factory,
                 )
+
+
+class SupervisorChannelPoisonTests(unittest.TestCase):
+    def session(self, factory):
+        session = SupervisorSSHSession(
+            "robot@fake.local",
+            CONTROLLER_ID,
+            process_factory=factory,
+            response_timeout_seconds=0.1,
+        )
+        session._request_prefix = "fixed"
+        return session
+
+    def test_timeout_poisons_and_late_response_cannot_shift_next_request(self):
+        factory = ControlledProcessFactory()
+        session = self.session(factory)
+        try:
+            with self.assertRaises(
+                SupervisorSSHChannelPoisonedError
+            ) as raised:
+                session.request("status")
+            self.assertTrue(raised.exception.outcome_unknown)
+            self.assertEqual(raised.exception.request_id, "fixed-1")
+            self.assertTrue(session.poisoned)
+            self.assertEqual(len(factory.process.stdin.writes), 1)
+            self.assertEqual(factory.process.stdin.close_count, 1)
+
+            factory.process.stdout.send(
+                response_bytes(request_id="fixed-1")
+            )
+            with self.assertRaises(
+                SupervisorSSHChannelPoisonedError
+            ):
+                session.request("status")
+            self.assertEqual(len(factory.process.stdin.writes), 1)
+        finally:
+            session.close()
+        self.assertEqual(factory.process.stdin.close_count, 1)
+
+    def test_request_id_mismatch_poisons_and_close_writes_no_cleanup(self):
+        factory = ControlledProcessFactory()
+        session = self.session(factory)
+        factory.process.stdout.send(
+            response_bytes(request_id="wrong")
+        )
+        with self.assertRaises(
+            SupervisorSSHChannelPoisonedError
+        ) as raised:
+            session.request("status")
+        self.assertTrue(raised.exception.outcome_unknown)
+        self.assertEqual(len(factory.process.stdin.writes), 1)
+
+        session.close()
+        self.assertEqual(len(factory.process.stdin.writes), 1)
+
+    def test_partial_write_poisons_with_unknown_outcome(self):
+        factory = ControlledProcessFactory(partial_write=True)
+        session = self.session(factory)
+        try:
+            with self.assertRaises(
+                SupervisorSSHChannelPoisonedError
+            ) as raised:
+                session.request("status")
+            self.assertTrue(raised.exception.outcome_unknown)
+            self.assertTrue(session.poisoned)
+        finally:
+            session.close()
+
+    def test_valid_remote_rejection_does_not_poison(self):
+        factory = ControlledProcessFactory()
+        session = self.session(factory)
+        try:
+            factory.process.stdout.send(
+                response_bytes(
+                    request_id="fixed-1",
+                    ok=False,
+                )
+            )
+            with self.assertRaises(SupervisorRemoteError):
+                session.request("status")
+            self.assertFalse(session.poisoned)
+
+            factory.process.stdout.send(
+                response_bytes(
+                    request_id="fixed-2",
+                    payload={"state": "DISARMED"},
+                )
+            )
+            self.assertEqual(
+                session.request("status")["state"],
+                "DISARMED",
+            )
+            self.assertFalse(session.poisoned)
+            self.assertEqual(len(factory.process.stdin.writes), 2)
+        finally:
+            session._shutdown_sent = True
+            session.close()
+
+    def test_local_oversize_rejection_does_not_write_or_poison(self):
+        factory = ControlledProcessFactory()
+        session = self.session(factory)
+        try:
+            with self.assertRaises(
+                SupervisorSSHConfigurationError
+            ):
+                session.request(
+                    "claim",
+                    {"owner_id": "x" * 5000},
+                )
+            self.assertFalse(session.poisoned)
+            self.assertEqual(factory.process.stdin.writes, [])
+        finally:
+            session._shutdown_sent = True
+            session.close()
+
+    def test_close_serializes_cleanup_and_rejects_parallel_motion(self):
+        factory = ControlledProcessFactory()
+        session = self.session(factory)
+        close_thread = threading.Thread(target=session.close)
+        close_thread.start()
+
+        self.assertTrue(
+            factory.process.stdin.wait_for_writes(1),
+            "close did not send stop",
+        )
+        stop = json.loads(factory.process.stdin.writes[0])
+        self.assertEqual(stop["op"], "stop")
+
+        request_errors = []
+
+        def request_motion():
+            try:
+                session.request(
+                    "drive_timed",
+                    {"left_speed_dps": 50, "right_speed_dps": 50},
+                )
+            except BaseException as error:
+                request_errors.append(error)
+
+        request_thread = threading.Thread(target=request_motion)
+        request_thread.start()
+        request_thread.join(timeout=0.5)
+        self.assertFalse(request_thread.is_alive())
+        self.assertEqual(len(request_errors), 1)
+        self.assertIsInstance(
+            request_errors[0],
+            SupervisorSSHTransportError,
+        )
+        self.assertEqual(len(factory.process.stdin.writes), 1)
+
+        factory.process.stdout.send(
+            response_bytes(request_id=stop["request_id"])
+        )
+        self.assertTrue(
+            factory.process.stdin.wait_for_writes(2),
+            "close did not send shutdown",
+        )
+        shutdown = json.loads(factory.process.stdin.writes[1])
+        self.assertEqual(shutdown["op"], "shutdown")
+        factory.process.stdout.send(
+            response_bytes(request_id=shutdown["request_id"])
+        )
+        close_thread.join(timeout=1)
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual(
+            [
+                json.loads(frame)["op"]
+                for frame in factory.process.stdin.writes
+            ],
+            ["stop", "shutdown"],
+        )
+
+    def test_wait_closed_cannot_poison_an_inflight_writer(self):
+        input_stream = BlockingRecordingInput()
+        factory = ControlledProcessFactory(input_stream=input_stream)
+        session = self.session(factory)
+        input_stream.poison_probe = lambda: session.poisoned
+        request_results = []
+        request_errors = []
+
+        def make_request():
+            try:
+                request_results.append(session.request("status"))
+            except BaseException as error:
+                request_errors.append(error)
+
+        request_thread = threading.Thread(target=make_request)
+        request_thread.start()
+        self.assertTrue(input_stream.write_entered.wait(timeout=1))
+        request = json.loads(input_stream.writes[0])
+        factory.process.stdout.send(
+            response_bytes(
+                request_id=request["request_id"],
+                payload={"state": "DISARMED"},
+            )
+        )
+
+        wait_errors = []
+
+        def wait_for_close():
+            try:
+                session.wait_closed(timeout_seconds=0.1)
+            except BaseException as error:
+                wait_errors.append(error)
+
+        wait_thread = threading.Thread(target=wait_for_close)
+        wait_thread.start()
+        time.sleep(0.02)
+        self.assertFalse(session.poisoned)
+        self.assertTrue(wait_thread.is_alive())
+
+        input_stream.release_write.set()
+        request_thread.join(timeout=1)
+        wait_thread.join(timeout=1)
+        self.assertFalse(request_thread.is_alive())
+        self.assertFalse(wait_thread.is_alive())
+        self.assertEqual(request_results, [{"state": "DISARMED"}])
+        self.assertEqual(request_errors, [])
+        self.assertIs(
+            input_stream.poisoned_before_write_return,
+            False,
+        )
+        self.assertEqual(len(wait_errors), 1)
+        self.assertIsInstance(
+            wait_errors[0],
+            SupervisorSSHChannelPoisonedError,
+        )
+        self.assertTrue(session.poisoned)
+        session.close()
+
+    def test_known_async_reader_failure_rejects_before_any_write(self):
+        factory = ControlledProcessFactory(
+            output_stream=FailingOutput()
+        )
+        session = self.session(factory)
+        self.assertTrue(session._failed.wait(timeout=1))
+
+        with self.assertRaises(SupervisorSSHChannelPoisonedError):
+            session.request(
+                "drive_timed",
+                {"left_speed_dps": 50, "right_speed_dps": 50},
+            )
+
+        self.assertTrue(session.poisoned)
+        self.assertEqual(factory.process.stdin.writes, [])
+        session.close()
+
+    def test_unsolicited_invalid_frame_rejects_before_any_write(self):
+        factory = ControlledProcessFactory()
+        session = self.session(factory)
+        factory.process.stdout.send(b"{broken\n")
+        self.assertTrue(session._failed.wait(timeout=1))
+
+        with self.assertRaises(SupervisorSSHChannelPoisonedError):
+            session.request(
+                "drive_timed",
+                {"left_speed_dps": 50, "right_speed_dps": 50},
+            )
+
+        self.assertEqual(factory.process.stdin.writes, [])
+        session.close()
+
+    def test_unsolicited_line_commits_failure_before_lock_release(self):
+        factory = ControlledProcessFactory()
+        session = self.session(factory)
+        state_gate = PumpStateReleaseGate(session._state_lock)
+        session._state_lock = state_gate
+        state_gate.armed = True
+        factory.process.stdout.send(
+            response_bytes(request_id="unsolicited")
+        )
+        self.assertTrue(state_gate.pump_released.wait(timeout=1))
+
+        try:
+            with self.assertRaises(
+                SupervisorSSHChannelPoisonedError
+            ):
+                session.request(
+                    "drive_timed",
+                    {"left_speed_dps": 50, "right_speed_dps": 50},
+                )
+            self.assertEqual(factory.process.stdin.writes, [])
+        finally:
+            state_gate.resume_pump.set()
+            session.close()
+
+    def test_duplicate_response_is_detected_before_a_future_write(self):
+        input_stream = BlockingRecordingInput()
+        factory = ControlledProcessFactory(input_stream=input_stream)
+        session = self.session(factory)
+        errors = []
+
+        def make_request():
+            try:
+                session.request("status")
+            except BaseException as error:
+                errors.append(error)
+
+        request_thread = threading.Thread(target=make_request)
+        request_thread.start()
+        self.assertTrue(input_stream.write_entered.wait(timeout=1))
+        request = json.loads(input_stream.writes[0])
+        response = response_bytes(request_id=request["request_id"])
+        factory.process.stdout.send(response)
+        factory.process.stdout.send(response)
+        self.assertTrue(session._failed.wait(timeout=1))
+
+        input_stream.release_write.set()
+        request_thread.join(timeout=1)
+        self.assertFalse(request_thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(
+            errors[0],
+            SupervisorSSHChannelPoisonedError,
+        )
+
+        with self.assertRaises(SupervisorSSHChannelPoisonedError):
+            session.request(
+                "drive_timed",
+                {"left_speed_dps": 50, "right_speed_dps": 50},
+            )
+        self.assertEqual(len(input_stream.writes), 1)
+        session.close()
+
+    def test_successful_shutdown_closes_request_lifecycle(self):
+        factory = ControlledProcessFactory()
+        session = self.session(factory)
+        factory.process.stdout.send(
+            response_bytes(
+                request_id="fixed-1",
+                payload={"state": "DISARMED"},
+            )
+        )
+
+        self.assertEqual(
+            session.request("shutdown"),
+            {"state": "DISARMED"},
+        )
+        with self.assertRaises(SupervisorSSHTransportError):
+            session.request(
+                "drive_timed",
+                {"left_speed_dps": 50, "right_speed_dps": 50},
+            )
+
+        self.assertEqual(
+            [
+                json.loads(frame)["op"]
+                for frame in factory.process.stdin.writes
+            ],
+            ["shutdown"],
+        )
+        session.close()
 
 
 class ForegroundSubprocessTests(unittest.TestCase):

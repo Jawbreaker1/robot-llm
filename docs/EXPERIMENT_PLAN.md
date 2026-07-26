@@ -350,9 +350,12 @@ Implementerat:
 - publik daemon-entrypoint som alltid annonserar och verkställer
   `motion_enabled=false` och saknar motion-enable-flagga,
 - rörelsefri Mac-preflight som aldrig konstruerar eller skickar
-  `drive_timed`.
+  `drive_timed`,
+- explicit `OPEN → CLOSING/POISONED → CLOSED` i hosttransporten,
+- kanalpoison före nästa write vid timeout, partiell skrivning,
+  korrelationsfel, dubbla/oväntade svar, EOF eller asynkront readerfel.
 
-Den fulla sviten på `193` tester täcker bland annat ägarskap, replay,
+Den fulla sviten på `246` tester täcker bland annat ägarskap, replay,
 feladresserat shutdown, heartbeat exakt vid `500 ms`, touch före och under
 rörelse, ensidig stall, fel
 encoderriktning, partiell motorstart, oväntad rörelse i tredje motorn,
@@ -362,6 +365,9 @@ stopfel, shutdown med bibehållet motorlås, deadline/cancel mellan parade
 motorstarter och att preflight aldrig skriver `run-timed` eller rapporterar
 framgång efter en misslyckad shutdown/audit. Riktiga subprocessprov omfattar
 ren handshake, stdin-EOF, `SIGTERM`, trasig JSON-frame och fylld stdout-pipe.
+Raceprov täcker dessutom request under close, wait/poison mot pågående
+writer, samtidiga stop-/motionförslag och att känd streamdesynk aldrig följs
+av en ny write.
 
 Återstår före en första motorpuls:
 
@@ -426,7 +432,12 @@ superviserad motorstyrning eller autonomi.
 
 ## Fas 3 – Robot-API på värddatorn
 
-Ett transportoberoende API byggs ovanpå simulator eller fysisk EV3:
+Status: en första transportoberoende, typad slice är implementerad mot den
+deterministiska simulatorn. Den exponerar endast den explicit allowlistade
+propellerarmen; drivning, tal, semantiska kompositverktyg och fysisk adapter
+återstår.
+
+Det fulla framtida API:t byggs ovanpå simulator eller fysisk EV3:
 
 - `get_robot_state`
 - `read_sensors`
@@ -439,6 +450,27 @@ Ett transportoberoende API byggs ovanpå simulator eller fysisk EV3:
 - `stop`
 
 Grind: alla verktyg och alla nekande fall fungerar manuellt utan LLM.
+
+### EXP-F3-API-SIM-001 – typad armgräns utan hårdvara
+
+- Immutable observationer binds till robot, controller, processinstans,
+  hostklocka, state-version och mottagningstid.
+- Motion kräver exakt capability, färsk snapshotreferens, unik hostmyntad
+  action/segment-identitet och kort deadline.
+- Allowlisten innehåller endast `arm`; två drivmotorer och en olistad framtida
+  hjälpmotor nekas.
+- Check, dispatch, state-version och stop serialiseras under en single-writer-
+  lock. Två parallella förslag baserade på samma snapshot kan därför inte
+  båda exekveras, och inget validerat förslag kan starta efter ett returnerat
+  stopkvitto.
+- Nödstopp är instansbundet men får upprepas; motionsegment har konservativ
+  `at_most_once`-semantik och ett tappat kvitto återvinns ännu inte.
+- Simulatorn annonserar `accelerated_synchronous`: encodereffekten appliceras
+  omedelbart. Provet säger inget om live-avbrott, heartbeat eller fysisk
+  stopplatens.
+
+Resultat: godkänd hårdvarufri kontraktsgrind för armprimitiven. Inte godkänd
+som fysiskt RobotAPI.
 
 ### Första perceptions-/språkloopen
 
@@ -522,6 +554,33 @@ Varje episod har budget för tid, agentvarv, körsträcka, omplaneringar och
 upprepade handlingar. Framgång måste verifieras med färska observationer.
 Endast nästa fysiska steg auktoriseras; en hel plan får aldrig förhandsgodkänd
 motorbehörighet.
+
+Status: loopens första hårdvarufria vertikala slice är implementerad med ett
+typat encoderpositionsmål och en scriptad planner. LM Studio, naturlig
+språkklassificering och fysisk exekvering ingår ännu inte.
+
+### EXP-F5-LOOP-SIM-001 – observera, agera, verifiera, omplanera
+
+- Plannern får bara returnera exakt `ACT` eller `ABORT` enligt ett strikt
+  JSON-schema; duplicerade nycklar, extra fält, boolska heltal och
+  icke-finita värden nekas.
+- Hostkoden kontrollerar mål-ID, state-version, motorroll, riktning,
+  capability, action-TTL, total rörelsetid, global episoddeadline och
+  omplaneringsbudget.
+- Två begränsade armsteg når `100°`; varje steg verifieras mot kvitto,
+  state-version och faktisk encoderprogress innan nästa planeringsvarv.
+- Fel riktning, fel motor, för hög fart, gammalt state, replay, plannerfel,
+  osäker touch och utebliven progress leder till stopp eller kontrollerad
+  omplanering.
+- Terminal framgång kräver färsk, säker observation efter exakt verifierat,
+  instansbundet stopp. Stopprekonditionen provas två gånger; oväntade
+  backendfel återkastas först efter best-effort-stop.
+- Episoddeadlinen kontrolleras efter planner, före dispatch och efter
+  exekvering, med reserverad rörelse- och stopptid.
+
+Resultat: godkänd som simulatorbevis för den generiska beslutspipelinen. Nästa
+separata grind är en LM Studio-planner mot samma kontrakt, fortfarande utan
+fysisk motion.
 
 ## Fas 6 – Parallella snurror
 
