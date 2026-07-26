@@ -11,11 +11,14 @@ import json
 import socket
 import time
 from typing import Callable, Mapping, Optional
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
 
 from .commentary import FALLBACK_PHRASES, ProximityObservation
+from .http_transport import (
+    DirectHTTPTimeoutError,
+    DirectHTTPTransportError,
+    direct_http_request,
+)
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
@@ -143,29 +146,23 @@ def _stdlib_post(
     timeout_seconds: float,
     max_response_bytes: int,
 ) -> bytes:
-    request = Request(
-        url,
-        data=body,
-        headers=dict(headers),
-        method="POST",
-    )
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            result = response.read(max_response_bytes + 1)
-    except HTTPError as error:
-        try:
-            error.close()
-        finally:
-            raise LMStudioHTTPError(error.code) from None
-    except (socket.timeout, TimeoutError):
+        response = direct_http_request(
+            "POST",
+            url,
+            headers,
+            body,
+            timeout_seconds,
+            max_response_bytes,
+        )
+    except DirectHTTPTimeoutError:
         raise LMStudioTimeoutError("LM Studio request timed out") from None
-    except URLError as error:
-        if isinstance(error.reason, (socket.timeout, TimeoutError)):
-            raise LMStudioTimeoutError("LM Studio request timed out") from None
+    except DirectHTTPTransportError:
         raise LMStudioTransportError("LM Studio request failed") from None
-    except OSError:
-        raise LMStudioTransportError("LM Studio request failed") from None
+    if not 200 <= response.status_code < 300:
+        raise LMStudioHTTPError(response.status_code)
 
+    result = response.body
     if len(result) > max_response_bytes:
         raise LMStudioResponseTooLargeError("LM Studio response was too large")
     return result

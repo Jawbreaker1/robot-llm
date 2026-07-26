@@ -1,9 +1,14 @@
 import json
 import socket
 import unittest
-from unittest.mock import ANY
+from unittest.mock import ANY, patch
 
+import robot_agent.lm_studio as lm_studio
 from robot_agent.commentary import ProximityObservation
+from robot_agent.http_transport import (
+    DirectHTTPResponse,
+    DirectHTTPTimeoutError,
+)
 from robot_agent.lm_studio import (
     CHAT_PATH,
     DEFAULT_MODEL,
@@ -275,6 +280,52 @@ class NativeLMStudioClientTests(unittest.TestCase):
         error = LMStudioHTTPError(503)
         self.assertEqual(error.status_code, 503)
         self.assertEqual(str(error), "LM Studio returned HTTP status 503")
+
+    def test_default_transport_uses_direct_request_and_rejects_redirect(self):
+        with patch.object(
+            lm_studio,
+            "direct_http_request",
+            return_value=DirectHTTPResponse(
+                status_code=302,
+                headers=(("Location", "http://external.invalid/"),),
+                body=b"",
+            ),
+        ) as direct:
+            with self.assertRaises(LMStudioHTTPError) as raised:
+                lm_studio._stdlib_post(
+                    "http://127.0.0.1:1234/chat",
+                    b"{}",
+                    {"Content-Type": "application/json"},
+                    1.0,
+                    1_024,
+                )
+
+        self.assertEqual(raised.exception.status_code, 302)
+        direct.assert_called_once_with(
+            "POST",
+            "http://127.0.0.1:1234/chat",
+            {"Content-Type": "application/json"},
+            b"{}",
+            1.0,
+            1_024,
+        )
+
+    def test_default_transport_maps_absolute_timeout(self):
+        with patch.object(
+            lm_studio,
+            "direct_http_request",
+            side_effect=DirectHTTPTimeoutError("private"),
+        ):
+            with self.assertRaises(LMStudioTimeoutError) as raised:
+                lm_studio._stdlib_post(
+                    "http://127.0.0.1:1234/chat",
+                    b"secret",
+                    {},
+                    0.1,
+                    1_024,
+                )
+        self.assertNotIn("private", str(raised.exception))
+        self.assertNotIn("secret", str(raised.exception))
 
     def test_elapsed_deadline_is_enforced_if_transport_returns_late(self):
         client = NativeLMStudioClient(

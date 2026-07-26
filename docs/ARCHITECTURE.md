@@ -94,6 +94,75 @@ Senare observationer bör bära minst:
 
 Självrapporterad modellkonfidens är inte en säkerhetsregel.
 
+## Separat read-only research-plan
+
+Extern kunskap är en perceptionskälla, inte en exekveringscapability. Den
+första körbara slicen använder samma lokala Gemma-modell för semantiskt
+verktygsval och svarssyntes, men ligger i en egen modulgräns utan import av
+RobotAPI, SSH, TTS, supervisor eller motorprimitiver:
+
+```mermaid
+flowchart LR
+    Q["Användarfråga"]
+    L["Lokal Gemma<br/>strikt beslutsschema"]
+    V["ResearchLoop<br/>validering + budget"]
+    W["weather.current<br/>fasta Open-Meteo-origins"]
+    E["Passiv evidens<br/>provenance + TTL + hash"]
+    A["Citerat svar"]
+    X["Fysisk exekvering"]
+
+    Q --> L
+    L -->|"CALL_TOOL"| V
+    V --> W
+    W --> E
+    E --> L
+    L -->|"ANSWER + evidence_ids"| V
+    V --> A
+    E -.->|"ingen capability-väg"| X
+    L -.->|"ingen capability-väg"| X
+```
+
+LM Studio-anropet går endast till loopback och använder OpenAI-kompatibel
+structured output med ett dynamiskt JSON-schema. Modellen får välja exakt
+`CALL_TOOL`, `ANSWER`, `CLARIFY` eller `ABORT`. Hostkoden tolkar inte
+originalspråk med regexp eller keywords; den validerar bara schema,
+kontextversion, unikt proposal-ID, tool-allowlist, argument, budget och
+citationer. LM Studio returnerar alltså bara typad JSON; hostens
+`ResearchLoop` exekverar verktyget. LM Studios structured-output-protokoll
+dokumenteras under
+[Structured Output](https://beta.lmstudio.ai/docs/developer/openai-compat/structured-output).
+
+I första registryt finns endast `weather.current`. Verktyget gör två
+proxyfria HTTPS-GET mot fasta Open-Meteo-origins, följer inga redirects och
+accepterar endast begränsad JSON. Resultatet binds till exakt request-ID,
+platsfråga, geocoding-URL, koordinater, providerns modellgiltighetstid och
+monotona deadlines. Varje evidensdel bär provider, källtyp, URL,
+hämtningstid, TTL, byteantal, SHA-256, attribution och licens. Extern text
+märks `untrusted_external_data`; ett svar som kräver evidens måste citera
+minst ett fortfarande färskt hostmyntat evidence-ID.
+
+Toolresultat och modellbeslut är tidsbegränsade och replaygrindade.
+Planner-timeouten skickas hela vägen till HTTP-transporten, så den är en
+verklig avbrottsgräns och inte bara en mätning i efterhand. Oväntade
+programmeringsfel döljs inte som ett vanligt providersvar, medan förväntade
+transport-/providerfel kan ge en budgeterad omplanering.
+
+Open-Meteos `current`-fält är 15-minuters modellbaserade väderdata, inte en
+instrumentmätning; `precipitation` summerar föregående 15-minutersintervall.
+Gratis-endpoints är avsedda för icke-kommersiell, rate-limited användning
+utan upptidsgaranti enligt providerns
+[pricing](https://open-meteo.com/en/pricing) och
+[terms](https://open-meteo.com/en/terms).
+
+Godtycklig `fetch_page(url)` är uttryckligen uppskjuten. En generell transport
+måste först lösa och pinna publik destination-IP, neka loopback, privata,
+link-local, multicast och övriga specialnät, bevara TLS/SNI-verifiering,
+omvalidera varje redirect, ignorera ambient proxykonfiguration och ha absoluta
+byte-, MIME- och tidsgränser. Webbinnehåll får därefter fortfarande bara bli
+passiv evidens. Samma princip ska senare gälla kamera- och ljudanalys:
+observationer kan påverka resonemang, men bara den separata auktorisations- och
+supervisorvägen får skapa fysisk handling.
+
 ## Aktuell hårdvarufri RobotAPI-slice
 
 Den första körbara host-gränsen är medvetet smal:

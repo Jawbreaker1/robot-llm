@@ -1,7 +1,7 @@
 # Robot LLM Lab 🤖
 
 ![Status: physical PoC](https://img.shields.io/badge/status-physical%20PoC-2ea44f)
-![Tests: 246 passing](https://img.shields.io/badge/tests-246%20passing-2ea44f)
+![Tests: 305 passing](https://img.shields.io/badge/tests-305%20passing-2ea44f)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![Motion: manual only](https://img.shields.io/badge/motion-manual%20only-f59e0b)
 
@@ -39,6 +39,12 @@ första typad, transportoberoende RobotAPI-slice och en sluten
 endast propellerarmen, använder en scriptad fake-planner och är varken
 kopplad till LM Studio eller till fysisk motion ännu.
 
+Ett separat, strikt rörelsefritt research-plan är nu också live-verifierat:
+Gemma väljer det typade verktyget `weather.current`, hosten hämtar aktuell
+Open-Meteo-data från två fasta HTTPS-endpoints och modellen får därefter
+formulera ett svar med en verifierad evidence-referens. Research-loopen har
+ingen importväg till RobotAPI, SSH, TTS, supervisor eller motorer.
+
 > **Aktuell fysisk grind · 2026-07-26:** Foreground-daemonen och
 > Mac-transporten är färdigverifierade mot falsk hårdvara men ännu inte
 > körda på EV3:an. Senaste kontrollen visade `5,889 V`, så deployment
@@ -61,6 +67,7 @@ kopplad till LM Studio eller till fysisk motion ännu.
 | Foreground-transport | strikt JSONL över stdio, controller-identitet, lokal kö-TTL, replaygrind och fail-closed EOF/signal/backpressure mot falsk sysfs |
 | Host RobotAPI | snapshotbundna armkommandon, explicit capability-allowlist, encoderkvitto, färskhetsgrind och instansbundet stopp mot simulator |
 | Sluten loop | typat ACT/ABORT-kontrakt, hårda episodbudgetar, verifierad framdrift, omplanering och terminalt stopp med scriptad planner |
+| Read-only research | lokal Gemma väljer `weather.current`, Open-Meteo-evidens binds till request, plats, tid, hash och TTL, och svaret måste citera ett färskt evidence-ID |
 | Fysisk foreground-preflight | väntar på åtgärdat EV3-batteri; ännu inte deployad eller körd |
 
 Det här är alltså inte en simulering med en robotbild bredvid. Kod har kört
@@ -118,7 +125,7 @@ handling.
 
 | Mätning | Observerat resultat |
 |---|---:|
-| Hårdvarufria tester | `246 / 246` passerar |
+| Hårdvarufria tester | `305 / 305` passerar |
 | Fysisk supervisor-preflight | `completed`, `0` motorstartkommandon |
 | Rak fysisk drivpuls, B/C | `+175° / +175°` encoderrotation |
 | Fysisk svängpuls, B/C | `+172° / −170°` encoderrotation |
@@ -155,7 +162,7 @@ deterministiskt vald fras kan nå högtalaren.
 - USB eller annan fungerande SSH-transport till EV3.
 - `espeak` och `aplay` på EV3 för tal.
 - LM Studio på `127.0.0.1:1234` med
-  `google/gemma-4-26b-a4b` laddad för den valfria shadow-cykeln.
+  `google/gemma-4-26b-a4b` laddad för valfri shadow- eller research-körning.
 
 Host-koden och testerna använder bara Pythons standardbibliotek.
 
@@ -175,7 +182,43 @@ appliceras i samma anrop. Den bevisar därför kontrakt, budgetar och
 verifieringslogik, men inte realtidsrörelse, heartbeat, avbrott under rörelse
 eller fysisk stopplatens.
 
-### 2. Lägg den minimala EV3-koden på roboten
+### 2. Kör den skrivskyddade väderagenten på Mac
+
+Det här kommandot kräver ingen EV3 och kan därför köras medan roboten saknar
+batterier:
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.research_cli --pretty \
+  'Behöver jag paraply i Stockholm just nu?'
+```
+
+Gemma väljer verktyg semantiskt från ett strikt JSON-schema; hosten gör ingen
+regexp-, substring- eller keyword-routing. Den enda registrerade externa
+förmågan är för närvarande `weather.current`. Den använder Open-Meteos
+[geocoding-API](https://open-meteo.com/en/docs/geocoding-api) och
+[forecast-API](https://open-meteo.com/en/docs) för **aktuella modellbaserade
+väderförhållanden**, inte en fysisk instrumentobservation eller en hel dags
+prognos. Fältet `precipitation` avser mängden under föregående
+15-minutersintervall.
+
+Resultatet innehåller modellens svar, citation-ID, tidsstämplar, TTL,
+käll-URL:er, byteantal och SHA-256 för råsvaren. Extern text markeras alltid
+som opålitlig data. Open-Meteos attribution och
+[CC BY 4.0-villkor](https://open-meteo.com/en/license) följer med evidensen.
+Platsfrågan ingår i provenance-URL:n och auditloggen bör därför behandlas som
+potentiellt privat data.
+
+De fasta gratis-endpoints som används här är avsedda för
+icke-kommersiell prototypanvändning, är rate-limited och saknar
+upptidsgaranti; se Open-Meteos [pricing](https://open-meteo.com/en/pricing)
+och [terms](https://open-meteo.com/en/terms).
+
+Ett generiskt `fetch_page(url)` ingår medvetet inte ännu. Innan godtyckliga
+webbadresser tillåts behövs bland annat DNS-/IP-pinning, blockering av privata
+och lokala nät, validering av varje redirect, hårda MIME-/byte-/tidsgränser
+och samma passiva evidence-gräns.
+
+### 3. Lägg den minimala EV3-koden på roboten
 
 Byt `<EV3-host>` mot exempelvis `ev3dev.local` eller robotens USB-adress:
 
@@ -195,7 +238,7 @@ Den incheckade portkartan är specifik för den färdigbyggda EV3RSTORM som
 används i experimentet. Jämför alltid fysisk inkoppling med
 [`config/ev3rstorm.json`](config/ev3rstorm.json).
 
-### 3. Läs en sensor eller prova TTS utan rörelse
+### 4. Läs en sensor eller prova TTS utan rörelse
 
 På EV3:
 
@@ -213,7 +256,7 @@ printf '%s\n' 'Jag märker något framför mig.' |
 `IR-PROX` är ett relativt reflektions-/närhetsvärde mellan 0 och 100. Det är
 inte centimeter, objektidentifiering eller ett löfte om fri väg.
 
-### 4. Kör den motorfria IR-proben på EV3
+### 5. Kör den motorfria IR-proben på EV3
 
 Stoppa först motorerna och säkerställ att ingen annan process styr dem:
 
@@ -226,7 +269,7 @@ Proben guidar människan med deterministiskt tal, samplar lokalt och skriver
 rå/filtrerad audit-JSON. Själva proben gör inga motoranrop; den är inte ett
 lås mot andra motorprocesser.
 
-### 5. Kör supervisorns rörelsefria preflight på EV3
+### 6. Kör supervisorns rörelsefria preflight på EV3
 
 Preflight tar motorlåset, skriver `stop` till alla upptäckta motorer,
 verifierar motorinventering och stoppläge samt läser touchsensorn. Den har
@@ -245,7 +288,7 @@ Om resultatet blir `failed` eller processen avbryts ska roboten betraktas som
 osäker tills motorstatus har kontrollerats på plats; stäng av strömmen om ett
 motorläge inte kan verifieras.
 
-### 6. Kör en rörelsefri Gemma-shadow från Mac
+### 7. Kör en rörelsefri Gemma-shadow från Mac
 
 LM Studio ska endast exponeras på loopback. SSH måste fungera med nyckel och
 utan lösenordsprompt:
@@ -264,7 +307,7 @@ Begäran till LM Studio använder native `POST /api/v1/chat`,
 en tresekunders deadline. Modellfel leder till deterministisk fallback och
 skapar ingen motoråtkomst.
 
-### 7. Kör foreground-daemonens rörelsefria preflight
+### 8. Kör foreground-daemonens rörelsefria preflight
 
 Kopiera först aktuell `ev3/` och `config/` till roboten. Den publika
 daemon-entrypointen saknar en flagga för att aktivera motorstart. Mac-klienten
@@ -313,6 +356,9 @@ pulsen kontrolleras encoderrotationens storlek och riktning.
 - fast SSH-kommandoyta och taltext endast via stdin,
 - LM Studio på loopback med deadline och begränsad svarsbody,
 - modellkandidat endast som shadow/audit,
+- read-only research med exakt tool-allowlist, request-/provenancebindning,
+  observationstidsgrind, citationer, replaygrind och hårda episodbudgetar;
+  varken modell eller webbevidens kan nå fysisk exekvering,
 - IR-grind med medianfilter och hysteres, ännu inte kopplad till motorerna,
 - hårdvarufritt verifierad supervisor-kärna med livslångt motorlås,
   serverutfärdad session, stigande sekvens-ID, heartbeat, touchstopp,
@@ -369,7 +415,10 @@ pulsen kontrolleras encoderrotationens storlek och riktning.
   strukturerad kontext – utan regexp/keyword-fallback
 - [x] hårdvarufri sluten loop med scriptad planner:
   `mål → observera → planera → agera → verifiera → omplanera`
-- [ ] samma loop med Gemma via LM Studio och därefter en separat fysisk grind
+- [x] live-verifierad read-only Gemma-loop:
+  `fråga → verktygsval → Open-Meteo → evidens → citerat svar`
+- [ ] den fysiska `ACT`/`ABORT`-loopen med Gemma via LM Studio och därefter
+  en separat fysisk grind
 - [ ] push-to-talk STT via Macens mikrofon
 - [ ] parallell perception, planering och validering
 - [ ] trådlös kamera/mikrofon, ljudriktning och aktiv visuell perception
@@ -388,7 +437,7 @@ Drömdemon längre fram:
 config/                 observerad portkarta och säkerhetsgränser
 docs/                   experimentplan, grindar och fysisk evidens
 ev3/                    Python 3.5-HAL, supervisor och manuella EV3-verktyg
-src/robot_agent/        host-policy, RobotAPI, agentloop och LM Studio-klient
+src/robot_agent/        host-policy, RobotAPI, agentloop, research och LM Studio
 tests/                  hårdvarufria tester
 ```
 

@@ -355,7 +355,8 @@ Implementerat:
 - kanalpoison före nästa write vid timeout, partiell skrivning,
   korrelationsfel, dubbla/oväntade svar, EOF eller asynkront readerfel.
 
-Den fulla sviten på `246` tester täcker bland annat ägarskap, replay,
+Vid denna supervisorslice omfattade den dåvarande fulla sviten `246` tester.
+Dess supervisor- och transportfall täcker bland annat ägarskap, replay,
 feladresserat shutdown, heartbeat exakt vid `500 ms`, touch före och under
 rörelse, ensidig stall, fel
 encoderriktning, partiell motorstart, oväntad rörelse i tredje motorn,
@@ -543,6 +544,70 @@ Första acceptanstest:
 
 Wake word, kontinuerlig avlyssning och en robotmonterad mikrofon behandlas som
 senare, separata experiment.
+
+### EXP-F4-RESEARCH-001 – lokal Gemma med färsk, citerad väderevidens
+
+Hypotes: samma lokala modell som senare ska tolka robotmål kan redan nu välja
+ett externt informationsverktyg, observera ett typat resultat och formulera
+ett källbundet svar i en sluten loop utan språkheuristiker och utan någon
+fysisk capability.
+
+Säkerhetsgräns:
+
+- research-modulerna importerar inte RobotAPI, SSH, TTS, supervisor eller
+  motorprimitiver,
+- plannern får endast returnera `CALL_TOOL`, `ANSWER`, `CLARIFY` eller
+  `ABORT` enligt ett dynamiskt strikt JSON-schema,
+- enda registrerade verktyget är `weather.current`,
+- nättransporten använder två fasta Open-Meteo HTTPS-origins, inga proxies
+  och inga redirects; godtyckliga URL:er accepteras inte,
+- toolanrop, proposal-ID:n, host-ID:n, kontextversioner, plannerlatens,
+  episodtid och antal omplaneringar har separata grindar,
+- svar med `require_evidence=true` måste citera ett exakt, färskt
+  hostmyntat evidence-ID,
+- providertext behandlas som passiv `untrusted_external_data`.
+
+Hårdvarufria negativtest omfattar duplicerade JSON-nycklar, okända och
+fysiska verktygsnamn, prompt injection i providerdata, gamla
+kontextversioner, proposal-replay, host-ID-kollisioner, fel request/plats,
+fel geocoding-query, fel koordinater, gammal observationstid, utgången
+evidens, falska citationer, överskridna bytegränser, redirects, proxyfri
+transport, MIME-fel och verkligt vidarebefordrad planner-timeout.
+
+Liveprov 2026-07-26:
+
+1. användarfråga: "Behöver jag paraply i Stockholm just nu?",
+2. Gemma `google/gemma-4-26b-a4b` valde typat
+   `weather.current(location_query="Stockholm")`,
+3. Open-Meteos
+   [geocoding-API](https://open-meteo.com/en/docs/geocoding-api) löste
+   Stockholm och dess [forecast-API](https://open-meteo.com/en/docs)
+   returnerade aktuella fält,
+4. evidensen bands till requesten med provider-URL:er, hämtningstid, TTL,
+   byteantal, SHA-256, attribution och
+   [CC BY 4.0](https://open-meteo.com/en/license),
+5. nästa Gemma-varv returnerade `ANSWER` med exakt det aktuella
+   evidence-ID:t.
+
+Resultat: `ANSWERED` efter `2` planner-varv, `1` toolanrop och `1`
+evidensdriven omplanering. Providerns aktuella modellvärde hade
+giltighetstiden `2026-07-26T21:45 UTC`; Open-Meteos `current` är
+15-minuters modellbaserade data, inte en fysisk instrumentobservation, och
+`precipitation` avser föregående 15-minutersintervall. Detta är ett enskilt
+liveprov, inte ett benchmark eller en garanti om hela dagens väder. De fasta
+gratis-endpoints som används är avsedda för icke-kommersiell, rate-limited
+prototypanvändning utan upptidsgaranti enligt
+[pricing](https://open-meteo.com/en/pricing) och
+[terms](https://open-meteo.com/en/terms). EV3:an kontaktades inte och ingen
+TTS eller motorväg fanns i processen. Hela hårdvarufria sviten passerar
+`305 / 305`.
+
+Grind: godkänd som första lokala, evidensbaserade agentloop och som
+byggkloss för ett framtida chattgränssnitt. Inte godkänd som generell
+webfetch. En sådan transport kräver först DNS-/IP-pinning, blockering av
+lokala/särskilda nät, redirectvalidering per hopp samt hårda
+MIME-/byte-/deadline-regler. Research-evidens får inte heller i framtiden
+föra fysisk auktoritet.
 
 ## Fas 5 – Sluten målriktad loop
 
