@@ -35,9 +35,17 @@ mot falsk hårdvara genom riktiga OS-processer, pipes, EOF och signaler.
 Transportens publika entrypoint kan inte aktivera motion. Autonom
 motorstyrning är fortfarande inte aktiverad.
 
+> **Aktuell fysisk grind · 2026-07-26:** Foreground-daemonen och
+> Mac-transporten är färdigverifierade mot falsk hårdvara men ännu inte
+> körda på EV3:an. Senaste kontrollen visade `5,889 V`, så deployment
+> pausades före filöverföring för att undvika brownout och onödig risk för
+> SD-kortet. Inga filer kopierades och inga motorstartkommandon skickades.
+> Nästa steg är ny spänningskontroll, backup, hashverifierad överföring och
+> en helt rörelsefri handshake.
+
 ## Vad fungerar på riktigt?
 
-| Lager | Verifierat på den fysiska roboten |
+| Lager | Verifierad status |
 |---|---|
 | Linux och transport | ev3dev från microSDHC, USB CDC och icke-interaktiv SSH från Mac |
 | Kropp | motor A som propellerarm, B/C som vänster/höger drivning, tidsbegränsade pulser och encoderverifiering |
@@ -47,6 +55,7 @@ motorstyrning är fortfarande inte aktiverad.
 | IR-evidens | två motorstilla approach/retreat-cykler vid 20 Hz med full auditdata |
 | Supervisor-preflight | fysisk `brake` + `stop`, stabil touch, komplett terminal audit och frigjort motorlås; inga motorstarter |
 | Foreground-transport | strikt JSONL över stdio, controller-identitet, lokal kö-TTL, replaygrind och fail-closed EOF/signal/backpressure mot falsk sysfs |
+| Fysisk foreground-preflight | väntar på åtgärdat EV3-batteri; ännu inte deployad eller körd |
 
 Det här är alltså inte en simulering med en robotbild bredvid. Kod har kört
 mot riktig sysfs-hårdvara, riktiga encoders, en riktig IR-sensor och den
