@@ -5,6 +5,12 @@
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![Motion: manual only](https://img.shields.io/badge/motion-manual%20only-f59e0b)
 
+<p align="center">
+  <img src="src/robot_agent/dashboard_web/robot-llm-mascot.png" alt="Robot LLM Labs lätt griniga modulrobot vinkar" width="300">
+</p>
+
+<p align="center"><em>En lokal hjärna med mycket begränsade motorprivilegier.</em></p>
+
 **En lokal språkmodell får en riktig LEGO-kropp – men inte nycklarna till
 motorerna.**
 

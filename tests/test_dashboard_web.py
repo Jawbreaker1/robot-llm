@@ -62,6 +62,14 @@ class DashboardWebContractTests(unittest.TestCase):
             ["assets/app.js"],
         )
         self.assertIn("assets/styles.css", self.parser.links)
+        self.assertEqual(
+            self.html.count("assets/robot-llm-mascot.png"),
+            3,
+        )
+        mascot = (WEB_ROOT / "robot-llm-mascot.png").read_bytes()
+        self.assertTrue(mascot.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(mascot[25], 6)
+        self.assertLess(len(mascot), 2 * 1024 * 1024)
         self.assertEqual(self.parser.inline_script_data, [])
         self.assertNotIn("<style", self.html.lower())
 

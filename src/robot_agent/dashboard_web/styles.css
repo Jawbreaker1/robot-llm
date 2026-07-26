@@ -144,33 +144,23 @@ textarea:focus-visible,
   min-width: 0;
 }
 
-.brand-mark {
-  display: grid;
-  grid-template-columns: repeat(2, 7px);
-  grid-template-rows: repeat(2, 7px);
-  gap: 3px;
+.brand-avatar {
+  width: 44px;
+  height: 44px;
+  overflow: hidden;
   flex: 0 0 auto;
-  padding: 7px;
   border: 1px solid var(--line);
   background: var(--panel-raised);
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
   box-shadow: inset 0 0 0 1px rgb(255 255 255 / 2%);
 }
 
-.brand-mark span:nth-child(1) {
-  background: var(--danger);
-}
-
-.brand-mark span:nth-child(2) {
-  background: var(--warning);
-}
-
-.brand-mark span:nth-child(3) {
-  background: var(--evidence);
-}
-
-.brand-mark span:nth-child(4) {
-  background: var(--ready);
+.brand-avatar img {
+  display: block;
+  width: 94px;
+  max-width: none;
+  height: 94px;
+  transform: translate(-25px, -4px);
 }
 
 .brand h1,
@@ -540,6 +530,20 @@ textarea:focus-visible,
   border-left: 1px solid var(--line);
 }
 
+.welcome-message::after {
+  display: block;
+  clear: both;
+  content: "";
+}
+
+.welcome-mascot {
+  float: right;
+  width: min(42%, 250px);
+  height: auto;
+  margin: -38px -20px 12px 28px;
+  filter: drop-shadow(0 18px 22px rgb(0 0 0 / 26%));
+}
+
 .welcome-signal {
   display: flex;
   gap: 5px;
@@ -583,6 +587,7 @@ textarea:focus-visible,
 
 .starter-prompts {
   display: flex;
+  clear: both;
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 26px;
@@ -2168,6 +2173,11 @@ textarea:focus-visible,
     margin-top: 30px;
   }
 
+  .welcome-mascot {
+    width: min(42vw, 190px);
+    margin: -12px -4px 14px 22px;
+  }
+
   .welcome-message h3 {
     font-size: 34px;
   }
@@ -2237,8 +2247,20 @@ textarea:focus-visible,
     font-size: 13px;
   }
 
-  .brand-mark {
-    padding: 6px;
+  .brand-avatar {
+    width: 40px;
+    height: 40px;
+  }
+
+  .brand-avatar img {
+    transform: translate(-27px, -6px);
+  }
+
+  .welcome-mascot {
+    float: none;
+    display: block;
+    width: 170px;
+    margin: 0 auto 18px;
   }
 
   .local-badge {

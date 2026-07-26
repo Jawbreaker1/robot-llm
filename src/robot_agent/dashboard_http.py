@@ -143,6 +143,10 @@ class DashboardRouter:
             "app.js",
             "text/javascript; charset=utf-8",
         ),
+        "assets/robot-llm-mascot.png": (
+            "robot-llm-mascot.png",
+            "image/png",
+        ),
     }
 
     def __init__(
