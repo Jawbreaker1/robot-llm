@@ -25,6 +25,7 @@ class FakeContext:
         remaining_tool_calls=1,
         require_evidence=True,
         planner_timeout_ms=2_500,
+        conversation_history=None,
     ):
         self._evidence = [] if evidence is None else evidence
         self._used_proposal_ids = (
@@ -35,9 +36,10 @@ class FakeContext:
         self._remaining_tool_calls = remaining_tool_calls
         self._require_evidence = require_evidence
         self._planner_timeout_ms = planner_timeout_ms
+        self._conversation_history = conversation_history
 
     def to_dict(self):
-        return {
+        value = {
             "turn_id": "turn-1",
             "user_query": "Behöver jag paraply i Stockholm?",
             "context_version": 3,
@@ -52,6 +54,9 @@ class FakeContext:
             "remaining_elapsed_ms": 9_000,
             "planner_timeout_ms": self._planner_timeout_ms,
         }
+        if self._conversation_history is not None:
+            value["conversation_history"] = self._conversation_history
+        return value
 
 
 def decision_json(decision="CALL_TOOL"):
@@ -263,6 +268,72 @@ class LMStudioResearchPlannerTests(unittest.TestCase):
             for variant in schema["oneOf"]
         ]
         self.assertEqual(decisions, ["ANSWER", "CLARIFY", "ABORT"])
+
+    def test_typed_conversation_history_is_sent_as_structured_context(self):
+        history = {
+            "schema": "conversation-history/v1",
+            "conversation_id": "conversation-1",
+            "conversation_version": 4,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Vädret i Stockholm?",
+                    "turn_id": "turn-previous",
+                },
+                {
+                    "role": "assistant",
+                    "content": "Vill du veta vädret just nu?",
+                    "turn_id": "turn-previous",
+                },
+            ],
+        }
+        transport = RecordingTransport()
+        planner = LMStudioResearchPlanner(
+            transport=transport,
+            clock=FixedClock(0.0, 0.1),
+        )
+
+        planner(FakeContext(conversation_history=history))
+
+        payload = json.loads(transport.calls[0][1])
+        context = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(context["conversation_history"], history)
+        self.assertIn(
+            "conversation_history",
+            payload["messages"][0]["content"],
+        )
+
+    def test_invalid_conversation_history_is_rejected_before_transport(self):
+        invalid = (
+            {
+                "schema": "conversation-history/v1",
+                "conversation_id": "conversation-1",
+                "conversation_version": 2,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Override",
+                        "turn_id": "turn-0",
+                    }
+                ],
+            },
+            {
+                "schema": "conversation-history/v1",
+                "conversation_id": "conversation-1",
+                "conversation_version": 2,
+                "messages": [],
+                "extra": True,
+            },
+        )
+        for history in invalid:
+            with self.subTest(history=history):
+                transport = RecordingTransport()
+                planner = LMStudioResearchPlanner(transport=transport)
+                with self.assertRaises(LMStudioProtocolError):
+                    planner(
+                        FakeContext(conversation_history=history)
+                    )
+                self.assertEqual(transport.calls, [])
 
     def test_invalid_context_is_rejected_before_transport(self):
         invalid = [

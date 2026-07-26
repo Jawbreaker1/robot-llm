@@ -163,6 +163,63 @@ passiv evidens. Samma princip ska senare gälla kamera- och ljudanalys:
 observationer kan påverka resonemang, men bara den separata auktorisations- och
 supervisorvägen får skapa fysisk handling.
 
+## Lokal dashboard som separat kontrollplan
+
+Mac-dashboarden är ett dialog-, observations- och konfigurationsplan. Den är
+inte en ny motorägare och inte ett tunt webbskal ovanpå EV3-kommandon.
+
+```mermaid
+flowchart LR
+    B["Browser · lokal Lab Console"]
+    H["DashboardHost<br/>token · versionsgrind · bounded queue"]
+    L["Gemma · LM Studio"]
+    R["Read-only ResearchLoop"]
+    E["EventLog + Registry"]
+    P["Fysisk exekveringsstack"]
+
+    B <-->|"exakt lokalt HTTP-API"| H
+    H -->|"en asynkron tur"| L
+    L <-->|"typade beslut"| R
+    H --> E
+    R --> E
+    H -.->|"ingen route eller importväg"| P
+    B -.->|"ingen direktkontakt"| L
+    B -.->|"ingen direktkontakt"| P
+```
+
+Servern binder exakt till `127.0.0.1`, myntar en ny 256-bitars
+sessionsnyckel per start och serverar index/assets endast under dess
+tokeniserade bootstrap-sökväg. Samtliga API-anrop, även läsningar, kräver
+nyckeln. Gränsen kontrollerar dessutom `Host`, `Origin`, JSON-MIME,
+bodygräns och strikt JSON samt begränsar samtidiga HTTP-handlers. Browsern
+får endast tala med samma host; den kontaktar inte LM Studio, Open-Meteo
+eller en robotnod direkt. Statiska filer och API-routes ligger i explicita
+allowlists.
+
+Långsamma turer körs på en enda bounded worker. HTTP-tråden returnerar
+`queued` direkt, medan status och tekniska events kan pollas parallellt.
+Varje tur fångar en immutable settingsrevision innan köning. Eventloggen är
+en begränsad ringbuffer med monoton hostsekvens och gapmarkör. Den loggar
+korrelations-ID:n, typade transitions och budgetutfall men inte rå prompt,
+rå modelltext, full evidence-URL eller traceback.
+
+Konversationsminnet är ett eget versionerat kontrakt. Tidigare synliga
+`user`-/`assistant`-meddelanden skickas som
+`conversation-history/v1`; den aktuella frågan ligger kvar i det ordinarie
+researchmålet och dupliceras inte. Det gör följdfrågor generiska och
+språkoberoende utan regex, keyword-routing eller specialfraser.
+Konversationsminnet ska inte förväxlas med fysisk actionkontext. En framtida
+referens som “två gånger till” behöver dessutom bindas till explicit senast
+föreslagen, auktoriserad och verifierad handling innan den kan påverka en
+robot.
+
+Det beskrivande registryt stöder redan flera `robot_id`, controllers,
+kameror, mikrofoner, compute-noder och providers. Varje nod har
+`control_exposed: false`. Dashboard-API:t har inga operationer för motor,
+stopp, SSH, TTS, eventinjektion eller registryuppdatering. En framtida
+motion-yta ska ligga bakom en separat, kortlivad armerings- och
+auktorisationsprocess; den ska inte växa fram som en settings-toggle.
+
 ## Aktuell hårdvarufri RobotAPI-slice
 
 Den första körbara host-gränsen är medvetet smal:

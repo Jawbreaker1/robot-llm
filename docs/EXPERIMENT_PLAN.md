@@ -599,8 +599,9 @@ gratis-endpoints som används är avsedda för icke-kommersiell, rate-limited
 prototypanvändning utan upptidsgaranti enligt
 [pricing](https://open-meteo.com/en/pricing) och
 [terms](https://open-meteo.com/en/terms). EV3:an kontaktades inte och ingen
-TTS eller motorväg fanns i processen. Hela hårdvarufria sviten passerar
-`305 / 305`.
+TTS eller motorväg fanns i processen. Vid denna researchgrind passerade den
+dåvarande hårdvarufria sviten `305 / 305`; den aktuella totalsviten redovisas
+i README och efterföljande experiment.
 
 Grind: godkänd som första lokala, evidensbaserade agentloop och som
 byggkloss för ett framtida chattgränssnitt. Inte godkänd som generell
@@ -608,6 +609,57 @@ webfetch. En sådan transport kräver först DNS-/IP-pinning, blockering av
 lokala/särskilda nät, redirectvalidering per hopp samt hårda
 MIME-/byte-/deadline-regler. Research-evidens får inte heller i framtiden
 föra fysisk auktoritet.
+
+### EXP-F4-DASHBOARD-001 – lokal Lab Console utan robotström
+
+Hypotes: Macapplikationen kan redan utan EV3-batterier ge ett användbart
+agentgränssnitt för dialog, följdfrågor, research, komponentstatus,
+agentbudgetar och tekniska loggar utan att skapa en ny fysisk
+exekveringsväg.
+
+Implementation:
+
+- fem responsiva ytor: Arbetsbänk, Kroppar, Händelser, Experiment och
+  Inställningar,
+- loopback-only standardbiblioteksserver med slumpad 256-bitars
+  sessionstoken, tokeniserad bootstrap-/assetväg, autentiserade läs-API:n,
+  strikt `Host`/`Origin`, CSP, begränsad HTTP-concurrency och exakt
+  route-/assetlista,
+- bounded kö med en researchworker; HTTP-status och eventpollning blockeras
+  inte av en pågående modellförfrågan,
+- revisionsmärkt, sessionsbunden settingssnapshot per köad tur,
+- versionerad `typed_history` med endast tidigare synliga
+  user/assistant-turer, utan textkonkatenering, regexp eller keyword-routing,
+- multi-robot-registry med EV3RSTORM, framtida Robot Inventor/BOOST,
+  kameror och mikrofoner; alla noder har `control_exposed=false`,
+- teknisk ringbufferlogg med monotona sekvenser, cursor-gap och
+  korrelations-ID:n; prompt, rå modelltext, evidence-URL och traceback
+  utelämnas.
+
+Liveprov 2026-07-27:
+
+1. dashboarden startade på `127.0.0.1:8765` och returnerade strikt CSP,
+2. LM Studio-proben hittade den konfigurerade
+   `google/gemma-4-26b-a4b` som laddad,
+3. en vanlig fråga gav `ANSWERED` på ett planner-varv utan toolanrop,
+4. tvåturstestet `Mitt namn är Johan` → `Vad heter jag?` gav
+   `Du heter Johan.` med fyra synliga meddelanden i `typed_history`,
+5. researchfrågan om paraply i Stockholm gav `ANSWERED` efter två
+   planner-varv, ett `weather.current`-anrop och ett citerat evidence-ID.
+
+Negativtest täcker bland annat DNS-rebinding-form, fel Origin/sessionstoken,
+dubblettnycklar, `NaN`, okänd MIME, för stor body, traversal, queue-full,
+settings- och konversationsrace, idempotent retry, stale resultatidentitet,
+rå prompt/exception i eventloggen samt frånvaro av `/move`, `/stop`, `/ssh`
+och `/tts`.
+
+Resultat: godkänd som lokal, rörelsefri agentarbetsbänk. Hela den
+hårdvarufria sviten passerar `381 / 381`. EV3 kontaktades inte och servern
+importerar inte RobotAPI, supervisortransport, TTS eller motorprimitiver.
+
+Grind: godkänd för fortsatt dialog-, research- och GUI-utveckling utan
+robotström. Inte godkänd som fysisk kontrollpanel. Settings lagras endast i
+minnet i denna slice och återställs vid omstart.
 
 ## Fas 5 – Sluten målriktad loop
 

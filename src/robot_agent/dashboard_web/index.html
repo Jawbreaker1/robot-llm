@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="robot-dashboard-token" content="__ROBOT_DASHBOARD_TOKEN__">
+  <title>Robot LLM Lab</title>
+  <link rel="stylesheet" href="assets/styles.css">
+  <script src="assets/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Hoppa till innehållet</a>
+
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+        </span>
+        <div>
+          <h1>Robot LLM Lab</h1>
+          <p>Lokal agent- och robotarbetsbänk</p>
+        </div>
+      </div>
+
+      <div class="runtime-strip" aria-label="Systemstatus">
+        <div class="status-item" data-status="unknown" id="status-lm-studio">
+          <span class="status-light" aria-hidden="true"></span>
+          <span class="status-name">Gemma</span>
+          <span class="status-value">kontrollerar…</span>
+        </div>
+        <div class="status-item" data-status="ready" id="status-research">
+          <span class="status-light" aria-hidden="true"></span>
+          <span class="status-name">Research</span>
+          <span class="status-value">weather.current</span>
+        </div>
+        <div class="status-item" data-status="idle" id="status-ev3">
+          <span class="status-light" aria-hidden="true"></span>
+          <span class="status-name">EV3RSTORM</span>
+          <span class="status-value">inte observerad</span>
+        </div>
+        <div class="status-item" data-status="locked" id="status-motion">
+          <span class="status-light" aria-hidden="true"></span>
+          <span class="status-name">Rörelse</span>
+          <span class="status-value">låst</span>
+        </div>
+      </div>
+
+      <div class="local-badge" title="All applikationslogik körs på denna Mac">
+        <span aria-hidden="true">●</span>
+        Lokalt
+      </div>
+    </header>
+
+    <nav class="sidebar" aria-label="Huvudnavigation">
+      <div class="nav-group">
+        <p class="nav-label">Labbet</p>
+        <button class="nav-item is-active" type="button" data-view="workbench" aria-current="page">
+          <span class="nav-index" aria-hidden="true">01</span>
+          <span>
+            <strong>Arbetsbänk</strong>
+            <small>Chatt och aktivitet</small>
+          </span>
+        </button>
+        <button class="nav-item" type="button" data-view="bodies">
+          <span class="nav-index" aria-hidden="true">02</span>
+          <span>
+            <strong>Kroppar</strong>
+            <small>Noder och status</small>
+          </span>
+        </button>
+        <button class="nav-item" type="button" data-view="events">
+          <span class="nav-index" aria-hidden="true">03</span>
+          <span>
+            <strong>Händelser</strong>
+            <small>Teknisk logg</small>
+          </span>
+        </button>
+        <button class="nav-item" type="button" data-view="experiments">
+          <span class="nav-index" aria-hidden="true">04</span>
+          <span>
+            <strong>Experiment</strong>
+            <small>Evidens och historik</small>
+          </span>
+        </button>
+        <button class="nav-item" type="button" data-view="settings">
+          <span class="nav-index" aria-hidden="true">05</span>
+          <span>
+            <strong>Inställningar</strong>
+            <small>Runtime och budgetar</small>
+          </span>
+        </button>
+      </div>
+
+      <div class="sidebar-note">
+        <span class="lock-glyph" aria-hidden="true">×</span>
+        <div>
+          <strong>Read-only V1</strong>
+          <p>Inga motor-, SSH- eller TTS-funktioner exponeras.</p>
+        </div>
+      </div>
+    </nav>
+
+    <main id="main-content" class="main-content" tabindex="-1">
+      <section class="view-panel is-active workbench-view" id="view-workbench" data-view-panel="workbench" aria-labelledby="workbench-heading">
+        <div class="conversation-panel">
+          <header class="panel-header conversation-header">
+            <div>
+              <p class="eyebrow">Aktiv session</p>
+              <h2 id="workbench-heading">Arbetsbänk</h2>
+              <p class="panel-subtitle" id="conversation-subtitle">Lokal Gemma, utan fysisk exekvering</p>
+            </div>
+            <div class="conversation-actions">
+              <button class="button button-secondary inspector-toggle" type="button" id="open-inspector-button" aria-controls="agent-inspector" aria-expanded="false">
+                Aktivitet
+              </button>
+              <button class="button button-secondary" type="button" id="new-conversation-button">
+                Ny konversation
+              </button>
+            </div>
+          </header>
+
+          <div class="message-feed" id="message-feed" role="region" aria-label="Konversationshistorik">
+            <div class="welcome-message" id="welcome-message">
+              <div class="welcome-signal" aria-hidden="true">
+                <span></span><span></span><span></span>
+              </div>
+              <p class="eyebrow">Systemet väntar</p>
+              <h3>God kväll.</h3>
+              <p>Jag kör lokalt och kan samtala eller använda godkända, skrivskyddade verktyg. EV3RSTORM är inte observerad och rörelse är låst.</p>
+              <div class="starter-prompts" aria-label="Exempelfrågor">
+                <button type="button" data-prompt="Behöver jag paraply i Stockholm just nu?" data-prompt-mode="research_required">Behöver jag paraply i Stockholm?</button>
+                <button type="button" data-prompt="Förklara vad du kan göra i det här läget." data-prompt-mode="conversation">Vad kan du göra just nu?</button>
+              </div>
+            </div>
+          </div>
+          <div class="sr-only" id="chat-announcer" aria-live="polite" aria-atomic="true"></div>
+
+          <form class="composer" id="composer-form">
+            <div class="composer-meta">
+              <label for="turn-mode">Körläge</label>
+              <select id="turn-mode" name="mode">
+                <option value="conversation">Lokalt samtal · read-only verktyg vid behov</option>
+                <option value="research_required">Research · färska källor krävs</option>
+              </select>
+              <span class="capability-note" id="mode-capability-note">Ingen fysisk capability</span>
+            </div>
+            <label class="sr-only" for="message-input">Meddelande till Gemma</label>
+            <textarea id="message-input" name="message" rows="3" maxlength="4000" placeholder="Prata med Gemma eller be den undersöka något…" disabled></textarea>
+            <div class="composer-footer">
+              <span id="composer-status" role="status">Startar den lokala arbetsbänken…</span>
+              <button class="button button-primary" type="submit" id="send-button" disabled>
+                Skicka
+                <span aria-hidden="true">↵</span>
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <aside class="inspector" id="agent-inspector" aria-label="Agentinspektör">
+          <button class="inspector-close" type="button" id="close-inspector-button">Stäng inspektör</button>
+          <div class="inspector-tabs" role="tablist" aria-label="Detaljvy">
+            <button type="button" role="tab" aria-selected="true" aria-controls="inspector-activity" id="tab-activity" data-inspector-tab="activity">Aktivitet</button>
+            <button type="button" role="tab" aria-selected="false" aria-controls="inspector-context" id="tab-context" data-inspector-tab="context" tabindex="-1">Kontext</button>
+            <button type="button" role="tab" aria-selected="false" aria-controls="inspector-evidence" id="tab-evidence" data-inspector-tab="evidence" tabindex="-1">Evidens</button>
+          </div>
+
+          <section class="inspector-panel is-active" id="inspector-activity" role="tabpanel" aria-labelledby="tab-activity" data-inspector-panel="activity">
+            <div class="inspector-heading">
+              <div>
+                <p class="eyebrow">Senaste episod</p>
+                <h3>Agentaktivitet</h3>
+              </div>
+              <span class="small-status" id="episode-status">Väntar</span>
+            </div>
+            <ol class="activity-trace" id="activity-trace">
+              <li data-state="idle">
+                <span class="trace-dot" aria-hidden="true"></span>
+                <div>
+                  <strong>Ingen episod ännu</strong>
+                  <p>Typade beslut och verktygsanrop visas här.</p>
+                </div>
+              </li>
+            </ol>
+            <dl class="metric-grid" id="episode-metrics">
+              <div><dt>Planner turns</dt><dd>—</dd></div>
+              <div><dt>Tool calls</dt><dd>—</dd></div>
+              <div><dt>Replans</dt><dd>—</dd></div>
+              <div><dt>Kontextversion</dt><dd>—</dd></div>
+            </dl>
+          </section>
+
+          <section class="inspector-panel" id="inspector-context" role="tabpanel" aria-labelledby="tab-context" data-inspector-panel="context" hidden>
+            <div class="inspector-heading">
+              <div>
+                <p class="eyebrow">Synligt minne</p>
+                <h3>Kontext</h3>
+              </div>
+            </div>
+            <p class="inspector-copy">Endast konversationens synliga turer och versionsmärkta fakta visas. Dold chain-of-thought loggas inte.</p>
+            <dl class="detail-list" id="context-details">
+              <div><dt>Conversation ID</dt><dd>Inte skapad</dd></div>
+              <div><dt>Context version</dt><dd>—</dd></div>
+              <div><dt>Antal turer</dt><dd>0</dd></div>
+            </dl>
+          </section>
+
+          <section class="inspector-panel" id="inspector-evidence" role="tabpanel" aria-labelledby="tab-evidence" data-inspector-panel="evidence" hidden>
+            <div class="inspector-heading">
+              <div>
+                <p class="eyebrow">Passiv kunskap</p>
+                <h3>Evidens</h3>
+              </div>
+            </div>
+            <div class="empty-compact" id="evidence-list">
+              <p>Ingen extern evidens har hämtats.</p>
+              <small>Researchresultat visas med provider, TTL och hash.</small>
+            </div>
+          </section>
+        </aside>
+      </section>
+
+      <section class="view-panel standard-view" id="view-bodies" data-view-panel="bodies" aria-labelledby="bodies-heading" hidden>
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">Distribuerad robotkropp</p>
+            <h2 id="bodies-heading">Kroppar</h2>
+            <p>Controllers exekverar. Kameror och mikrofoner observerar. De är olika typer av noder.</p>
+          </div>
+          <span class="read-only-seal">Read-only inventering</span>
+        </header>
+
+        <div class="fleet-layout">
+          <section class="instrument-panel">
+            <header class="instrument-header">
+              <div>
+                <p class="eyebrow">Logisk kropp</p>
+                <h3>EV3RSTORM</h3>
+              </div>
+              <span class="state-chip state-idle" id="fleet-aggregate-status">Inte observerad</span>
+            </header>
+            <div class="node-tree" id="registry-tree">
+              <div class="node-row node-root">
+                <span class="node-connector" aria-hidden="true"></span>
+                <div class="node-icon" aria-hidden="true">R</div>
+                <div class="node-copy">
+                  <strong>EV3RSTORM</strong>
+                  <small>robot_id väntar på registry</small>
+                </div>
+                <span class="node-state">konfigurerad</span>
+              </div>
+              <div class="node-row">
+                <span class="node-connector" aria-hidden="true"></span>
+                <div class="node-icon" aria-hidden="true">C</div>
+                <div class="node-copy">
+                  <strong>EV3 Main</strong>
+                  <small>controller · USB / SSH</small>
+                </div>
+                <span class="node-state">inte observerad</span>
+              </div>
+              <div class="node-row is-future">
+                <span class="node-connector" aria-hidden="true"></span>
+                <div class="node-icon" aria-hidden="true">V</div>
+                <div class="node-copy">
+                  <strong>Front Camera</strong>
+                  <small>framtida perceptionskälla</small>
+                </div>
+                <span class="node-state">ej konfigurerad</span>
+              </div>
+              <div class="node-row is-future">
+                <span class="node-connector" aria-hidden="true"></span>
+                <div class="node-icon" aria-hidden="true">M</div>
+                <div class="node-copy">
+                  <strong>Microphone Array</strong>
+                  <small>framtida perceptionskälla</small>
+                </div>
+                <span class="node-state">ej konfigurerad</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="instrument-panel">
+            <header class="instrument-header">
+              <div>
+                <p class="eyebrow">Controllerdetaljer</p>
+                <h3>EV3 Main</h3>
+              </div>
+            </header>
+            <dl class="telemetry-list" id="controller-details">
+              <div><dt>Tillstånd</dt><dd>Inte observerad</dd></div>
+              <div><dt>Controller ID</dt><dd>—</dd></div>
+              <div><dt>Instance ID</dt><dd>—</dd></div>
+              <div><dt>State version</dt><dd>—</dd></div>
+              <div><dt>Heartbeat</dt><dd>—</dd></div>
+              <div><dt>Fysiska funktioner</dt><dd>Låsta</dd></div>
+            </dl>
+            <div class="safety-notice">
+              <span aria-hidden="true">×</span>
+              <div>
+                <strong>Ingen exekveringsväg</strong>
+                <p>Att en controller blir synlig innebär aldrig automatiskt att motion är tillåten.</p>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view-panel standard-view" id="view-events" data-view-panel="events" aria-labelledby="events-heading" hidden>
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">Append-only observationsström</p>
+            <h2 id="events-heading">Händelser</h2>
+            <p>Tekniska events från agent, modell, research och framtida robotnoder.</p>
+          </div>
+          <div class="page-actions">
+            <button class="button button-secondary" type="button" id="export-events-button">Exportera JSONL</button>
+            <button class="button button-secondary" type="button" id="pause-events-button" aria-pressed="false">Pausa ström</button>
+          </div>
+        </header>
+
+        <div class="event-toolbar" aria-label="Loggfilter">
+          <label>
+            <span>Nivå</span>
+            <select id="event-severity-filter">
+              <option value="">Alla</option>
+              <option value="debug">Debug</option>
+              <option value="info">Info</option>
+              <option value="warning">Warning</option>
+              <option value="error">Error</option>
+              <option value="critical">Critical</option>
+            </select>
+          </label>
+          <label>
+            <span>Plan</span>
+            <select id="event-plane-filter">
+              <option value="">Alla</option>
+              <option value="dashboard">Dashboard</option>
+              <option value="agent">Agent</option>
+              <option value="model">Model</option>
+              <option value="research">Research</option>
+              <option value="policy">Policy</option>
+              <option value="transport">Transport</option>
+              <option value="supervisor">Supervisor</option>
+              <option value="perception">Perception</option>
+            </select>
+          </label>
+          <label class="event-search">
+            <span>Sök i sammanfattning</span>
+            <input id="event-search-input" type="search" placeholder="ID eller exakt loggtext">
+          </label>
+          <div class="event-stream-state">
+            <span class="stream-light" aria-hidden="true"></span>
+            <span id="event-stream-label">Ansluter…</span>
+          </div>
+        </div>
+
+        <div class="event-gap-notice" id="event-gap-notice" role="status" hidden></div>
+
+        <div class="event-table-wrap">
+          <table class="event-table">
+            <caption class="sr-only">Teknisk händelselogg</caption>
+            <thead>
+              <tr>
+                <th scope="col">Tid</th>
+                <th scope="col">Nivå</th>
+                <th scope="col">Plan</th>
+                <th scope="col">Händelse</th>
+                <th scope="col">Sammanfattning</th>
+                <th scope="col"><span class="sr-only">Detaljer</span></th>
+              </tr>
+            </thead>
+            <tbody id="event-table-body">
+              <tr class="empty-row">
+                <td colspan="6">Väntar på den första tekniska händelsen.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <aside class="event-detail" id="event-detail" aria-labelledby="event-detail-heading" hidden>
+          <header>
+            <div>
+              <p class="eyebrow">Event payload</p>
+              <h3 id="event-detail-heading">Händelsedetaljer</h3>
+            </div>
+            <button class="icon-button" type="button" id="close-event-detail" aria-label="Stäng händelsedetaljer">×</button>
+          </header>
+          <dl class="detail-list" id="event-detail-fields"></dl>
+          <div class="raw-json-block">
+            <div>
+              <span>Rå JSON</span>
+              <button type="button" class="text-button" id="copy-event-json">Kopiera</button>
+            </div>
+            <pre id="event-detail-json" tabindex="0"></pre>
+          </div>
+        </aside>
+      </section>
+
+      <section class="view-panel standard-view" id="view-experiments" data-view-panel="experiments" aria-labelledby="experiments-heading" hidden>
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">Reproducerbar loggbok</p>
+            <h2 id="experiments-heading">Experiment</h2>
+            <p>Verifierade körningar, konfigurationer och evidens. Den här vyn startar aldrig hårdvara.</p>
+          </div>
+          <span class="read-only-seal">Historik</span>
+        </header>
+        <div class="experiment-list" id="experiment-list">
+          <div class="large-empty">
+            <div class="empty-grid" aria-hidden="true">
+              <span></span><span></span><span></span><span></span>
+            </div>
+            <p class="eyebrow">Ingen API-historik</p>
+            <h3>Experimentregistret är tomt.</h3>
+            <p>När episoder senare sparas här kommer git-SHA, konfiguration, evidens och slutsats att följa med.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="view-panel standard-view settings-view" id="view-settings" data-view-panel="settings" aria-labelledby="settings-heading" hidden>
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">Lokal konfiguration</p>
+            <h2 id="settings-heading">Inställningar</h2>
+            <p>Modell, agentbudgetar och loggning. Fysisk armering hör inte hemma här.</p>
+          </div>
+          <span class="settings-revision" id="settings-revision">Revision —</span>
+        </header>
+
+        <form id="settings-form">
+          <section class="settings-section" aria-labelledby="settings-runtime-heading">
+            <header>
+              <div>
+                <span class="section-number" aria-hidden="true">01</span>
+                <div>
+                  <h3 id="settings-runtime-heading">LM Studio</h3>
+                  <p>Endast en lokal loopback-endpoint accepteras.</p>
+                </div>
+              </div>
+              <button class="button button-secondary" type="button" id="probe-lm-studio-button">Testa anslutning</button>
+            </header>
+            <div class="form-grid">
+              <label class="field field-wide">
+                <span>Endpoint</span>
+                <input id="setting-lm-base-url" type="url" autocomplete="off" spellcheck="false" readonly>
+                <small>Runtimevärde · ändras utanför dashboarden</small>
+              </label>
+              <label class="field">
+                <span>Modell</span>
+                <input id="setting-lm-model" type="text" autocomplete="off" spellcheck="false" readonly>
+              </label>
+              <label class="field">
+                <span>Planner-timeout, ms</span>
+                <input id="setting-planner-latency-ms" type="number" min="1" max="300000" step="1">
+              </label>
+            </div>
+            <div class="inline-result" id="probe-result" role="status">Ingen anslutningskontroll körd ännu.</div>
+          </section>
+
+          <section class="settings-section" aria-labelledby="settings-agent-heading">
+            <header>
+              <div>
+                <span class="section-number" aria-hidden="true">02</span>
+                <div>
+                  <h3 id="settings-agent-heading">Agentbudgetar</h3>
+                  <p>Hårda tak för varje lokal episod.</p>
+                </div>
+              </div>
+            </header>
+            <div class="form-grid four-columns">
+              <label class="field">
+                <span>Planner turns</span>
+                <input id="setting-max-planner-turns" type="number" min="1" max="100" step="1">
+              </label>
+              <label class="field">
+                <span>Replans</span>
+                <input id="setting-max-replans" type="number" min="0" max="100" step="1">
+              </label>
+              <label class="field">
+                <span>Tool calls</span>
+                <input id="setting-max-tool-calls" type="number" min="0" max="100" step="1">
+              </label>
+              <label class="field">
+                <span>Total tid, ms</span>
+                <input id="setting-max-elapsed-ms" type="number" min="1" max="300000" step="1">
+              </label>
+              <label class="field">
+                <span>Tool request TTL, ms</span>
+                <input id="setting-tool-request-ttl-ms" type="number" min="1" max="300000" step="1">
+              </label>
+              <label class="field">
+                <span>Evidence TTL, ms</span>
+                <input id="setting-evidence-ttl-ms" type="number" min="1" max="86400000" step="1">
+              </label>
+              <label class="field">
+                <span>Max väderskevhet, ms</span>
+                <input id="setting-weather-skew-ms" type="number" min="1" max="86400000" step="1">
+              </label>
+              <label class="field">
+                <span>Standardläge</span>
+                <select id="setting-chat-mode">
+                  <option value="conversation">Lokalt samtal</option>
+                  <option value="research_required">Research</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Loggnivå</span>
+                <select id="setting-log-level">
+                  <option value="debug">Debug</option>
+                  <option value="info">Info</option>
+                  <option value="warning">Warning</option>
+                  <option value="error">Error</option>
+                </select>
+              </label>
+            </div>
+          </section>
+
+          <section class="settings-section" aria-labelledby="settings-tools-heading">
+            <header>
+              <div>
+                <span class="section-number" aria-hidden="true">03</span>
+                <div>
+                  <h3 id="settings-tools-heading">Verktyg</h3>
+                  <p>Exakt allowlist. Verktyg får endast producera passiv evidens.</p>
+                </div>
+              </div>
+            </header>
+            <div class="tool-registry" id="settings-tool-registry">
+              <div class="tool-row">
+                <div class="tool-symbol" aria-hidden="true">W</div>
+                <div>
+                  <strong>weather.current</strong>
+                  <small>Open-Meteo · fast HTTPS-origin</small>
+                </div>
+                <span class="state-chip state-ready">Tillgängligt</span>
+              </div>
+              <div class="tool-row is-disabled">
+                <div class="tool-symbol" aria-hidden="true">F</div>
+                <div>
+                  <strong>Generisk webbhämtning</strong>
+                  <small>Väntar på DNS-pinning och SSRF-grind</small>
+                </div>
+                <span class="state-chip state-idle">Ej installerad</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section safety-section" aria-labelledby="settings-safety-heading">
+            <header>
+              <div>
+                <span class="section-number" aria-hidden="true">04</span>
+                <div>
+                  <h3 id="settings-safety-heading">Fysisk säkerhet</h3>
+                  <p>Informationsyta, inte en kontroll.</p>
+                </div>
+              </div>
+              <span class="state-chip state-locked">Låst</span>
+            </header>
+            <div class="safety-banner">
+              <span class="large-lock" aria-hidden="true">×</span>
+              <div>
+                <strong>Rörelse är inte aktiverad i denna version.</strong>
+                <p>Ingen exekveringsprofil är installerad. Fysisk armering blir senare ett separat, kortlivat och granskat arbetsflöde.</p>
+              </div>
+            </div>
+            <dl class="capability-matrix">
+              <div><dt>Physical control</dt><dd>Av</dd></div>
+              <div><dt>SSH</dt><dd>Ej exponerat</dd></div>
+              <div><dt>TTS</dt><dd>Ej exponerat</dd></div>
+              <div><dt>Research</dt><dd>Skrivskyddat</dd></div>
+            </dl>
+          </section>
+
+          <div class="settings-actions">
+            <span id="settings-status" role="status">Inga osparade ändringar.</span>
+            <button class="button button-secondary" type="button" id="reset-settings-button" disabled>Återställ</button>
+            <button class="button button-primary" type="submit" id="save-settings-button" disabled>Spara lokalt</button>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <footer class="mobile-nav" aria-label="Mobil navigation">
+      <button type="button" data-view="workbench" class="is-active" aria-current="page"><span aria-hidden="true">01</span>Arbetsbänk</button>
+      <button type="button" data-view="bodies"><span aria-hidden="true">02</span>Kroppar</button>
+      <button type="button" data-view="events"><span aria-hidden="true">03</span>Händelser</button>
+      <button type="button" data-view="experiments"><span aria-hidden="true">04</span>Experiment</button>
+      <button type="button" data-view="settings"><span aria-hidden="true">05</span>Inställningar</button>
+    </footer>
+  </div>
+
+  <div class="toast-region" id="toast-region" aria-live="assertive" aria-atomic="true"></div>
+</body>
+</html>
