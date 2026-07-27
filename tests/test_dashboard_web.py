@@ -73,7 +73,7 @@ class DashboardWebContractTests(unittest.TestCase):
         self.assertEqual(self.parser.inline_script_data, [])
         self.assertNotIn("<style", self.html.lower())
 
-    def test_html_ids_are_unique_and_core_surfaces_exist(self):
+    def test_html_ids_core_surfaces_and_plain_language_welcome(self):
         self.assertEqual(
             len(self.parser.ids),
             len(set(self.parser.ids)),
@@ -93,6 +93,22 @@ class DashboardWebContractTests(unittest.TestCase):
         }
         self.assertTrue(required <= set(self.parser.ids))
         self.assertIn('lang="sv"', self.html)
+        self.assertIn("Hallå! Vad ska vi hitta på?", self.html)
+        self.assertIn("Jag kör lokalt på din Mac.", self.html)
+        self.assertNotIn("God kväll.", self.html)
+        self.assertNotIn("godkända, skrivskyddade verktyg", self.html)
+        self.assertNotIn("Ingen fysisk capability", self.html)
+        self.assertNotIn("EV3RSTORM är offline just nu", self.html)
+        self.assertNotIn("weather.current</span>", self.html)
+        self.assertIn("Redo att chatta · robotstyrning är avstängd", self.javascript)
+        self.assertNotIn(
+            "modellresultat saknar fysisk auktoritet",
+            self.javascript,
+        )
+        self.assertNotIn(
+            "Read-only verktyg kan väljas semantiskt",
+            self.javascript,
+        )
 
     def test_no_inline_handlers_external_urls_or_physical_controls(self):
         for tag, name, value in self.parser.attributes:

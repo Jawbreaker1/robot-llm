@@ -310,10 +310,10 @@
     setStatus(
       "status-research",
       researchOption.disabled ? "idle" : "ready",
-      researchOption.disabled ? "inga verktyg" : "weather.current",
+      researchOption.disabled ? "inte tillgänglig" : "väder redo",
     );
     byId("composer-status").textContent = chatEnabled
-      ? "Redo · modellresultat saknar fysisk auktoritet"
+      ? "Redo att chatta · robotstyrning är avstängd"
       : state.modelReady === false
         ? "LM Studio eller den konfigurerade modellen är inte redo"
         : "Chatt är inte tillgänglig";
@@ -1130,8 +1130,8 @@
   function updateModeCopy() {
     const research = byId("turn-mode").value === "research_required";
     byId("mode-capability-note").textContent = research
-      ? "Skrivskyddad evidens · weather.current"
-      : "Read-only verktyg kan väljas semantiskt · ingen fysisk capability";
+      ? "Aktuella väderkällor krävs · ingen robotstyrning"
+      : "Kan kolla upp väder vid behov · ingen robotstyrning";
   }
 
   async function probeLMStudio() {

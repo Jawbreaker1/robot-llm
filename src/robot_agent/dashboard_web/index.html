@@ -33,8 +33,8 @@
         </div>
         <div class="status-item" data-status="ready" id="status-research">
           <span class="status-light" aria-hidden="true"></span>
-          <span class="status-name">Research</span>
-          <span class="status-value">weather.current</span>
+          <span class="status-name">Aktuell info</span>
+          <span class="status-value">väder redo</span>
         </div>
         <div class="status-item" data-status="idle" id="status-ev3">
           <span class="status-light" aria-hidden="true"></span>
@@ -97,8 +97,8 @@
       <div class="sidebar-note">
         <span class="lock-glyph" aria-hidden="true">×</span>
         <div>
-          <strong>Read-only V1</strong>
-          <p>Inga motor-, SSH- eller TTS-funktioner exponeras.</p>
+          <strong>Fysisk styrning avstängd</strong>
+          <p>Motorstyrning, SSH och TTS är avstängda i den här versionen.</p>
         </div>
       </div>
     </nav>
@@ -110,7 +110,7 @@
             <div>
               <p class="eyebrow">Aktiv session</p>
               <h2 id="workbench-heading">Arbetsbänk</h2>
-              <p class="panel-subtitle" id="conversation-subtitle">Lokal Gemma, utan fysisk exekvering</p>
+              <p class="panel-subtitle" id="conversation-subtitle">Lokal Gemma · robotstyrning avstängd</p>
             </div>
             <div class="conversation-actions">
               <button class="button button-secondary inspector-toggle" type="button" id="open-inspector-button" aria-controls="agent-inspector" aria-expanded="false">
@@ -128,9 +128,9 @@
               <div class="welcome-signal" aria-hidden="true">
                 <span></span><span></span><span></span>
               </div>
-              <p class="eyebrow">Systemet väntar</p>
-              <h3>God kväll.</h3>
-              <p>Jag kör lokalt och kan samtala eller använda godkända, skrivskyddade verktyg. EV3RSTORM är inte observerad och rörelse är låst.</p>
+              <p class="eyebrow">Redo när du är</p>
+              <h3>Hallå! Vad ska vi hitta på?</h3>
+              <p>Jag kör lokalt på din Mac. Vi kan prata eller kolla upp aktuell information, som väder. Jag styr inte robotkroppen från den här chatten ännu.</p>
               <div class="starter-prompts" aria-label="Exempelfrågor">
                 <button type="button" data-prompt="Behöver jag paraply i Stockholm just nu?" data-prompt-mode="research_required">Behöver jag paraply i Stockholm?</button>
                 <button type="button" data-prompt="Förklara vad du kan göra i det här läget." data-prompt-mode="conversation">Vad kan du göra just nu?</button>
@@ -143,10 +143,10 @@
             <div class="composer-meta">
               <label for="turn-mode">Körläge</label>
               <select id="turn-mode" name="mode">
-                <option value="conversation">Lokalt samtal · read-only verktyg vid behov</option>
-                <option value="research_required">Research · färska källor krävs</option>
+                <option value="conversation">Lokalt samtal · kan kolla upp saker vid behov</option>
+                <option value="research_required">Aktuell information · färska källor krävs</option>
               </select>
-              <span class="capability-note" id="mode-capability-note">Ingen fysisk capability</span>
+              <span class="capability-note" id="mode-capability-note">Ingen robotstyrning</span>
             </div>
             <label class="sr-only" for="message-input">Meddelande till Gemma</label>
             <textarea id="message-input" name="message" rows="3" maxlength="4000" placeholder="Prata med Gemma eller be den undersöka något…" disabled></textarea>
