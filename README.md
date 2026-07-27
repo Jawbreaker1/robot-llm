@@ -1,413 +1,298 @@
 # Robot LLM Lab 🤖
 
-![Status: physical PoC](https://img.shields.io/badge/status-physical%20PoC-2ea44f)
+![Status: controlled experiment](https://img.shields.io/badge/status-controlled%20experiment-2ea44f)
 ![Tests: 448 passing](https://img.shields.io/badge/tests-448%20passing-2ea44f)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
-![Motion: manual only](https://img.shields.io/badge/motion-manual%20only-f59e0b)
+![UI: English + Swedish](https://img.shields.io/badge/UI-English%20%2B%20Swedish-0ea5e9)
+![Physical motion: manual only](https://img.shields.io/badge/physical%20motion-manual%20only-f59e0b)
 ![Navigation: simulator only](https://img.shields.io/badge/navigation-simulator%20only-2563eb)
 
 <p align="center">
-  <img src="src/robot_agent/dashboard_web/robot-llm-mascot.png" alt="Robot LLM Labs lätt griniga modulrobot vinkar" width="300">
+  <img src="src/robot_agent/dashboard_web/robot-llm-mascot.png" alt="Robot LLM Lab's mildly grumpy modular mascot waving" width="280">
 </p>
 
-<p align="center"><em>En lokal hjärna med mycket begränsade motorprivilegier.</em></p>
+<p align="center"><em>Mildly grumpy by design. Personality lives in the language layer; safety does not.</em></p>
 
-**En lokal språkmodell får en riktig LEGO-kropp – men inte nycklarna till
-motorerna.**
+**A local LLM gets a real LEGO body—without getting direct access to the
+motors.**
 
-Robot LLM Lab är ett kontrollerat experiment med en fysisk LEGO MINDSTORMS
-EV3RSTORM, ev3dev och en lokal Gemma-modell via LM Studio. Målet är att
-utforska perception, språk, kontext, planering och slutna agentiska loopar
-utan att göra modellens latens eller fantasi till en säkerhetsfunktion.
+Robot LLM Lab is a controlled experiment built around a physical LEGO
+MINDSTORMS EV3RSTORM, ev3dev, and a local Gemma model served by LM Studio. It
+explores conversation, context, planning, perception, and closed agentic loops
+while deterministic code remains solely responsible for authorization and
+physical execution.
 
-> **Designinvariant:** LLM:n får uttrycka avsikt och personlighet.
-> Deterministisk kod avgör om, hur och hur länge kroppen får agera.
+The project deliberately avoids phrase menus, regular-expression intent
+matching, and language-specific keyword heuristics. The model classifies
+natural language and proposes typed actions; strict host policy either accepts
+that proposal as written, rejects it, or asks for clarification. It never
+reinterprets the user's sentence into a motor command.
 
-> **Semantisk invariant:** Naturligt språk klassificeras och planeras av
-> språkmodellen – aldrig av regexp, substringmatchning, nyckelordslistor eller
-> hårdkodade frasmenyer. Modellens resultat är ett typat beslutsförslag,
-> aldrig ett motoranrop.
+> **Semantic invariant:** the LLM may propose intent and express personality,
+> but it never owns a motor.
 
-Den deterministiska host-policyn validerar endast förslagets schema,
-verktygs-ID, argument, kontextreferenser, färska robotstatus och budget. Den
-försöker inte tolka originalmeningen på nytt. Ogiltiga eller tvetydiga
-förslag ger `reject` eller `clarify`, aldrig en keyword-baserad gissning.
+> **Execution invariant:** parallel perception and reasoning are welcome;
+> physical execution is serialized, bounded, interruptible, and deterministic.
 
-**Status:** Den fysiska PoC-baslinjen är verifierad. Motorer, sensorer och
-svenskt tal fungerar; Gemma kör en rörelsefri shadow-loop. En språkblind
-EV3-supervisor finns nu som hårdvarufritt verifierad kärna och dess
-rörelsefria stop-/inventeringspreflight har passerat på den riktiga EV3:an.
-En nodmärkt foreground-transport och en Mac-klient har dessutom verifierats
-mot falsk hårdvara genom riktiga OS-processer, pipes, EOF och signaler.
-Transportens publika entrypoint kan inte aktivera motion. Autonom
-motorstyrning är fortfarande inte aktiverad. På Macen finns nu dessutom en
-första typad, transportoberoende RobotAPI-slice och en sluten
-`observera → planera → agera → verifiera`-loop mot simulator. Den exponerar
-endast propellerarmen, använder en scriptad fake-planner och är varken
-kopplad till LM Studio eller till fysisk motion ännu.
+## See it in action
 
-Ett separat, strikt rörelsefritt research-plan är nu också live-verifierat:
-Gemma väljer det typade verktyget `weather.current`, hosten hämtar aktuell
-Open-Meteo-data från två fasta HTTPS-endpoints och modellen får därefter
-formulera ett svar med en verifierad evidence-referens. Research-loopen har
-ingen importväg till RobotAPI, SSH, TTS, supervisor eller motorer.
+### The English Lab Console
 
-På Macen finns nu dessutom en lokal, responsiv **Lab Console** med riktig
-Gemma-chatt, versionsmärkt dialogminne, research/evidens, teknisk eventlogg,
-agentbudgetar och ett beskrivande register för EV3RSTORM, framtida
-controllers, kameror och mikrofoner. Dashboarden fungerar utan
-EV3-batterier. Dess HTTP-server saknar helt endpoints för motorer, stopp,
-SSH och TTS.
+![English Robot LLM Lab workbench with the mascot, local Gemma, and motion visibly locked](docs/images/dashboard-workbench-en.jpg)
 
-Utan batterier kan vi nu även köra en separat autonom
-navigationsvertikal hela vägen i 2D-simulator:
-`waypoint → oberoende, parallelliserbara förslag → MotionSupervisor → kort puls →
-encoder-/poseverifiering → omplanering`. En goal-seeker tar sig till mål,
-en högre prioriterad hinderundvikare tar sig runt ett syntetiskt hinder och
-ett oberoende swept-body-facit fångar kollision/tunnling. Denna kod har
-ingen fysisk adapter och kan inte importera SSH-transporten eller öppna
-drivmotorerna.
+The Mac workbench provides local Gemma chat, session context, agent traces,
+evidence, settings, experiment history, and technical events. The dashboard
+cannot control the robot yet, and says so visibly.
 
-> **Aktuell fysisk grind · 2026-07-26:** Foreground-daemonen och
-> Mac-transporten är färdigverifierade mot falsk hårdvara men ännu inte
-> körda på EV3:an. Senaste kontrollen visade `5,889 V`, så deployment
-> pausades före filöverföring för att undvika brownout och onödig risk för
-> SD-kortet. Inga filer kopierades och inga motorstartkommandon skickades.
-> Nästa steg är ny spänningskontroll, backup, hashverifierad överföring och
-> en helt rörelsefri handshake.
+### A live read-only agent episode
 
-## Vad fungerar på riktigt?
+![A completed English weather episode with the typed activity trace visible](docs/images/dashboard-weather-en.jpg)
 
-| Lager | Verifierad status |
-|---|---|
-| Linux och transport | ev3dev från microSDHC, USB CDC och icke-interaktiv SSH från Mac |
-| Kropp | motor A som propellerarm, B/C som vänster/höger drivning, tidsbegränsade pulser och encoderverifiering |
-| Perception | touch, färg, motorpositioner och relativ IR-närhet |
-| Röst | lokal svensk eSpeak-TTS via en längdbegränsad stdin-väg med ljudlås och timeout |
-| Lokal LLM | Gemma 4 via LM Studio, utan verktyg och utan motoråtkomst, i en komplett fysisk shadow-cykel |
-| IR-evidens | två motorstilla approach/retreat-cykler vid 20 Hz med full auditdata |
-| Supervisor-preflight | fysisk `brake` + `stop`, stabil touch, komplett terminal audit och frigjort motorlås; inga motorstarter |
-| Foreground-transport | strikt JSONL över stdio, controller-identitet, lokal kö-TTL, replaygrind och fail-closed EOF/signal/backpressure mot falsk sysfs |
-| Host RobotAPI | snapshotbundna armkommandon, explicit capability-allowlist, encoderkvitto, färskhetsgrind och instansbundet stopp mot simulator |
-| Sluten loop | typat ACT/ABORT-kontrakt, hårda episodbudgetar, verifierad framdrift, omplanering och terminalt stopp med scriptad planner |
-| Autonom navigation | simulator-only waypoint, två förslagsproducenter, bounded inbox, versions-/TTL-grind, ensam MotionSupervisor, korta differentialpulser och swept collision oracle |
-| Read-only research | lokal Gemma väljer `weather.current`, Open-Meteo-evidens binds till request, plats, tid, hash och TTL, och svaret måste citera ett färskt evidence-ID |
-| Lokal Mac-dashboard | fempanels Lab Console med asynkron Gemma-chatt, `typed_history`, research/evidens, flerrobotsregister, sessionssettings och cursorbaserad eventlogg |
-| Internationalisering | komplett svensk och engelsk dashboard, standardsbaserat locale-val och typat `response_locale` genom hela agentturen utan språkdetektion |
-| Fysisk foreground-preflight | väntar på åtgärdat EV3-batteri; ännu inte deployad eller körd |
+In this captured run, Gemma selected the single allowlisted
+`weather.current` tool, the host fetched Open-Meteo data, bound it as fresh
+evidence, and required the final answer to cite that evidence. The model and
+agent run locally; only the explicit, allowlisted weather request leaves the
+Mac.
 
-Det här är alltså inte en simulering med en robotbild bredvid. Kod har kört
-mot riktig sysfs-hårdvara, riktiga encoders, en riktig IR-sensor och den
-överraskande begripliga lilla EV3-högtalaren.
+### Honest experiment status
 
-## Tre separata ansvar
+![The experiment register separating verified results from a waiting physical preflight](docs/images/dashboard-experiments-en.jpg)
 
-Semantik, auktorisation och fysisk exekvering är avsiktligt separerade:
+The experiment register keeps verified evidence separate from work that is
+still waiting on a physical gate.
+
+<details>
+<summary><strong>Component registry</strong></summary>
+
+![The declarative Bodies registry for robot controllers, cameras, and microphones](docs/images/dashboard-bodies-en.jpg)
+
+This is a declarative inventory, not a control surface. The future camera,
+microphone, Robot Inventor, and BOOST nodes are currently offline declarations
+with no exposed control path. Seeing a controller in the registry never grants
+permission to execute motion.
+
+</details>
+
+## What works today
+
+Status snapshot: **2026-07-27**.
+
+| Area | Verified now | Important boundary |
+|---|---|---|
+| Physical EV3 baseline | ev3dev boot, USB/SSH, motors A/B/C, bounded manual drive/turn pulses, encoders, touch, relative IR, reflected-light sensing, and Swedish eSpeak TTS | This verifies the assembled EV3RSTORM, not autonomous motion |
+| Physical LLM path | One complete motion-free shadow cycle: IR readings → deterministic zone → Gemma comment as audit data → deterministic Swedish TTS | Gemma had no tools or motor access |
+| EV3 supervisor | Motion-free `brake`/`stop`/inventory/touch preflight passed on the real robot with zero motor starts | The newer foreground daemon has only been verified against fake sysfs |
+| Lab Console | Local Gemma chat, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | No motor, SSH, TTS, or stop routes exist in the dashboard |
+| RobotAPI loop | Typed, snapshot-bound arm API and a closed `observe → plan → act → verify → replan` loop | Simulator-only and currently driven by a scripted fake planner |
+| Navigation | Waypoint following, obstacle avoidance, proposal inbox, one MotionSupervisor, and an independent collision oracle | 2D simulator only; no physical navigation adapter |
+| Physical autonomy | Not enabled | Waiting for reliable EV3 power, physical transport validation, calibration, stop-latency evidence, and fault injection |
+
+The latest EV3 power check measured **5.889 V**. Physical deployment of the
+foreground daemon was intentionally stopped before file transfer to avoid a
+brownout and unnecessary SD-card risk. Physical testing remains paused until
+reliable battery power is available.
+
+English and Swedish are verified for the dashboard and model text responses.
+English STT, English EV3 speech, multilingual robot personality, camera
+vision, and physical language-to-action classification are not yet verified.
+The locale contract is generic so more languages can be added without
+language detection in the safety layer.
+
+## How it works
 
 ```mermaid
 flowchart LR
-    subgraph MAC["Mac"]
-        I["Instruktion"]
-        A["Shadow-agent"]
-        L["LM Studio · Gemma 4"]
-        V["Validering + audit"]
+    U["User goal"] --> A["Main agent / dialogue"]
+    A <--> L["LM Studio · local Gemma"]
+    A --> P["Typed proposal"]
+    W["Allowlisted read-only research"] --> E["Bound evidence"]
+    E --> A
+
+    subgraph HOST["Mac · policy and orchestration"]
+        P --> H["Schema, capability, freshness,<br/>state version, TTL, and budget checks"]
+        O["Parallel observation / validation<br/>producers"] --> I["Versioned proposal inbox"]
+        H --> I
+        I --> M["MotionSupervisor<br/>exactly one decision per tick"]
     end
 
-    subgraph EV3["EV3RSTORM · ev3dev"]
-        C["Manuellt robot-CLI"]
-        H["Begränsad Python-HAL"]
-        S["IR · touch · färg · encoders"]
-        T["eSpeak / högtalare"]
-        M["Motorer A / B / C"]
-        X["Foreground-daemon<br/>motion avstängd"]
-        Y["Supervisor-kärna<br/>enda motorägaren"]
+    subgraph EV3["EV3 · deterministic execution"]
+        M -.->|"physical adapter pending"| S["Local safety supervisor<br/>sole motor owner"]
+        R["IR · touch · encoders"] --> S
+        S --> B["Motors A / B / C"]
     end
-
-    I --> A
-    A <--> L
-    A --> V
-    V -->|"endast fast TTS-anrop"| H
-    S --> H
-    H -->|"färsk observation"| A
-    H --> T
-    C -->|"explicit rörelsekvitto"| H
-    H -->|"hårda fart- och tidsgränser"| M
-    V -.->|"fast SSH + strikt JSONL"| X
-    X --> Y
-    Y -.->|"nästa grind: fysisk daemon-preflight"| M
 ```
 
-Gemmas kandidat är i dag auditdata. Den kan inte välja robotverktyg, tala
-direkt eller röra en motor. Det manuella rörelsespåret kräver ett uttryckligt
-kvitto och går genom separat, begränsad kod.
+Every future AI result can carry `timestamp`, `state_version`, `confidence`,
+`source`, and `valid_until`. A goal may live for minutes; a suggestion such
+as “turn six degrees left now” may expire in milliseconds. The
+MotionSupervisor never waits for every producer. At each tick it uses only
+fresh, version-compatible proposals and emits at most one short-lived motor
+decision.
 
-I målarkitekturen producerar LLM:n ett typat `DecisionProposal`.
-Host-policyn får auktorisera exakt en begränsad handling, och den språkblinda
-EV3-supervisorn avgör lokalt om handlingen fortfarande kan köras. Supervisorn
-får alltid neka eller stoppa, men aldrig byta mål eller hitta på en ny
-handling.
+Touch stop, distance gates, heartbeat, timeout, speed limits, stall checks,
+and emergency stop are deterministic. They do not wait for an LLM response.
+Only the supervisor may own the motor bus; planning, validation, dialogue,
+vision, and audio processes are proposal producers.
 
-## Några siffror från verkligheten
+The same node and identity model is intended to grow from one EV3 into a
+composite LEGO body with EV3, Robot Inventor 51515, BOOST, cameras, and
+microphones. Multiple controllers still result in one coordinated,
+authoritative physical decision.
 
-| Mätning | Observerat resultat |
-|---|---:|
-| Hårdvarufria tester | `448 / 448` passerar |
-| Fysisk supervisor-preflight | `completed`, `0` motorstartkommandon |
-| Rak fysisk drivpuls, B/C | `+175° / +175°` encoderrotation |
-| Fysisk svängpuls, B/C | `+172° / −170°` encoderrotation |
-| Sparat dynamiskt IR-replikat | `277` prover |
-| IR-samplingsperiod inom mätfaserna | medel `50 ms`, spann `47–53 ms` |
-| IR-grind till hinder | `100 ms` efter första råa värdet `≤35` |
-| IR-grind frigiven | `100 ms` efter första filtrerade värdet `≥40` |
-| Gemma-kandidat i en fysisk shadow-körning | `417 ms` |
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the detailed state,
+identity, freshness, and multi-controller design.
 
-IR-tiderna verifierar filter- och hystereslogiken i just dessa motorstilla
-tester. De är **inte** motorstopptid, bromssträcka, realtidsgaranti eller bevis
-på fri väg. Gemma-tiden är en enskild observerad körning, inte ett benchmark.
+## Safety boundaries
 
-Fulla protokoll, begränsningar och rådata finns i
-[experimentplanen](docs/EXPERIMENT_PLAN.md) och
-[EXP-F1-IR-DYN-002.json](docs/data/EXP-F1-IR-DYN-002.json).
+Verified or enforced today:
 
-## Grinig, inte farlig
+- hard speed, duration, speech-length, queue, response-size, and episode
+  budgets;
+- explicit acknowledgement for every current manual physical motion command;
+- motor and audio locks plus encoder postconditions;
+- fixed SSH commands and speech text passed through stdin, never interpolated
+  into shell code;
+- loopback-only LM Studio with deadlines and bounded responses;
+- a supervisor core with exclusive motor ownership, heartbeat, touch stop,
+  stall/direction checks, latched faults, and verified stop;
+- strict JSONL transport identity, sequence, TTL, replay, EOF, signal, and
+  backpressure handling, verified against fake hardware;
+- snapshot-bound RobotAPI actions with explicit capability allowlists and
+  conservative at-most-once semantics;
+- an exact read-only research allowlist with provenance, hashes, timestamps,
+  TTL, evidence IDs, and citations;
+- a loopback-only dashboard with a fresh 256-bit session URL, Host/Origin
+  checks, strict route/asset allowlists, CSP, bounded jobs, and no physical
+  endpoints;
+- two simulator-only closed-loop paths with no physical adapter.
 
-Robotens framtida personlighet får gärna vara en gammal, lätt svärande gubbe:
+Still required before autonomous physical motion:
 
-> “Vad fan är det där framför mig?”
+- foreground daemon deployment and motion-free handshake on the real EV3;
+- a motion-enabled physical adapter with lock-retaining fail-stop behavior;
+- measured stop latency, braking distance, polling jitter, and stall
+  thresholds;
+- linear and turn calibration plus controlled reflected-light samples;
+- fault injection for lost client, link, process, heartbeat, and motor writes;
+- explicit time, distance, action, and replan budgets for each physical
+  episode.
 
-Humorn hör hemma i språkplanet. Säkerhetslagret får aldrig ha humör. I
-nuvarande shadow-läge loggas Gemmas kommentar, medan endast en
-deterministiskt vald fras kan nå högtalaren.
+IR-PROX is a relative reflection/proximity signal from 0 to 100. It is not
+centimeters, object identification, or proof that the path is clear.
 
-## Snabbstart
+## Try it locally
 
-### Förutsättningar
+The host code and tests use Python's standard library. Python 3.9+ is
+recommended on macOS or Linux.
 
-- Mac eller Linux med Python `3.9+` för host-agenten.
-- LEGO MINDSTORMS EV3 med ev3dev-stretch och Python `3.5`.
-- USB eller annan fungerande SSH-transport till EV3.
-- `espeak` och `aplay` på EV3 för tal.
-- LM Studio på `127.0.0.1:1234` med
-  `google/gemma-4-26b-a4b` laddad för valfri shadow- eller research-körning.
+### Start the Lab Console
 
-Host-koden och testerna använder bara Pythons standardbibliotek.
+With LM Studio running on `127.0.0.1:1234` and
+`google/gemma-4-26b-a4b` loaded:
 
-### 1. Kör den helt hårdvarufria testsviten på Mac
+```sh
+PYTHONPATH=src python3 -m robot_agent.dashboard_cli
+```
 
-Från repots rot:
+Open the unique loopback session URL printed by the server:
+
+```text
+http://127.0.0.1:8765/session/<session-token>/
+```
+
+Restarting the server invalidates the token. The language selector switches
+the complete UI and sends a typed `response_locale` with every model turn;
+conversation state and form state survive the switch.
+
+### Run the hardware-free tests
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 \
   PYTHONPATH=src python3 -m unittest discover -s tests -q
 ```
 
-Testerna använder simulerad sysfs och aktiverar aldrig fysisk hårdvara.
-De omfattar också den typade RobotAPI-slicen och den slutna agentloopen. Den
-simulatorn är avsiktligt **accelererad och synkron**: encodereffekten
-appliceras i samma anrop. Den bevisar därför kontrakt, budgetar och
-verifieringslogik, men inte realtidsrörelse, heartbeat, avbrott under rörelse
-eller fysisk stopplatens.
+The suite uses simulated sysfs and never activates physical hardware. It
+verifies contracts, budgets, process behavior, agent loops, and the
+accelerated synchronous simulator—not real stop latency or braking distance.
 
-### 2. Kör autonom waypointnavigation i 2D-simulatorn
-
-Det förvalda scenariot kör mot ett syntetiskt hinder och skriver ett kort
-JSON-resultat:
+### Run autonomous navigation in the 2D simulator
 
 ```sh
 PYTHONPATH=src python3 -m robot_agent.navigation_demo
 ```
 
-Använd `--scenario clear` för rak waypointkörning och `--full` för hela den
-reproducerbara tick-tracen. Alla mått i
-`config/navigation_simulation.json` är märkta `simulation_only`; de är inte
-EV3-kalibrering. Kommandot importerar inte RobotAPI, SSH-transport eller
-EV3-HAL och kan inte röra den fysiska roboten.
+Use `--scenario clear` for a direct waypoint and `--full` for the reproducible
+tick trace. Every measurement in `config/navigation_simulation.json` is
+labelled `simulation_only`. The command cannot import RobotAPI, SSH transport,
+or the EV3 HAL.
 
-### 3. Starta den lokala Mac-dashboarden
-
-Dashboarden kräver ingen EV3. Med LM Studio igång får du lokal dialog,
-följdfrågor och read-only research:
-
-```sh
-PYTHONPATH=src python3 -m robot_agent.dashboard_cli
-```
-
-Öppna den sessionsunika adress som skrivs ut, i formen
-`http://127.0.0.1:8765/session/<session-token>/`. Servern binder bara till
-numerisk loopback, skapar en ny 256-bitars webbsession vid varje start och
-serverar inga externa assets. Den tokeniserade länken är en lokal
-bearer-hemlighet; en omstart gör länken ogiltig och skriver ut en ny.
-
-Språkväljaren i toppfältet byter hela gränssnittet mellan svenska och
-engelska utan omladdning. Vald locale skickas också som ett typat
-`response_locale` på varje tur, så Gemma instrueras uttryckligen vilket språk
-`ANSWER` och `CLARIFY` ska använda. Varken hosten eller säkerhetslagret
-försöker detektera språk med regexp, nyckelord eller specialfraser. Fler
-språk kan läggas till som kataloger bakom samma generiska kontrakt.
-
-Följande är separata, explicita lägen i chatten:
-
-- **Lokalt samtal** tillåter direktsvar; Gemma kan fortfarande välja ett
-  allowlistat read-only verktyg när färsk data behövs.
-- **Research** kräver verifierad evidens innan svar.
-
-Tidigare synliga user/assistant-turer skickas som ett separat,
-versionsmärkt `conversation_history`-objekt. De klistras inte in i en
-specialprompt och hosten försöker inte tolka följdfrågor med regexp eller
-keywords. Settings är sessionsbundna och återställs vid omstart.
-
-Se [dashboarddokumentationen](docs/DASHBOARD.md) för UI-, API- och
-säkerhetskontrakt.
-
-### 4. Kör den skrivskyddade väderagenten på Mac
-
-Det här kommandot kräver ingen EV3 och kan därför köras medan roboten saknar
-batterier:
+### Run the read-only weather agent
 
 ```sh
 PYTHONPATH=src python3 -m robot_agent.research_cli --pretty \
-  'Behöver jag paraply i Stockholm just nu?'
+  'Do I need an umbrella in Stockholm right now?'
 ```
 
-Gemma väljer verktyg semantiskt från ett strikt JSON-schema; hosten gör ingen
-regexp-, substring- eller keyword-routing. Den enda registrerade externa
-förmågan är för närvarande `weather.current`. Den använder Open-Meteos
-[geocoding-API](https://open-meteo.com/en/docs/geocoding-api) och
-[forecast-API](https://open-meteo.com/en/docs) för **aktuella modellbaserade
-väderförhållanden**, inte en fysisk instrumentobservation eller en hel dags
-prognos. Fältet `precipitation` avser mängden under föregående
-15-minutersintervall.
+Gemma chooses semantically from a strict schema; the host performs no regex,
+substring, or keyword routing. The current registry contains only
+`weather.current`, backed by Open-Meteo's
+[geocoding](https://open-meteo.com/en/docs/geocoding-api) and
+[forecast](https://open-meteo.com/en/docs) APIs. Responses include evidence
+IDs, timestamps, TTL, source URLs, byte counts, and SHA-256 hashes.
 
-Resultatet innehåller modellens svar, citation-ID, tidsstämplar, TTL,
-käll-URL:er, byteantal och SHA-256 för råsvaren. Extern text markeras alltid
-som opålitlig data. Open-Meteos attribution och
-[CC BY 4.0-villkor](https://open-meteo.com/en/license) följer med evidensen.
-Platsfrågan ingår i provenance-URL:n och auditloggen bör därför behandlas som
-potentiellt privat data.
+<details>
+<summary><strong>Physical EV3 operator path</strong></summary>
 
-De fasta gratis-endpoints som används här är avsedda för
-icke-kommersiell prototypanvändning, är rate-limited och saknar
-upptidsgaranti; se Open-Meteos [pricing](https://open-meteo.com/en/pricing)
-och [terms](https://open-meteo.com/en/terms).
+Do not deploy or test on the EV3 until it has reliable power. Back up current
+files, verify the destination and hashes, keep a physical abort method ready,
+and compare the assembled wiring with
+[`config/ev3rstorm.json`](config/ev3rstorm.json). The committed map is
+specific to this EV3RSTORM.
 
-Ett generiskt `fetch_page(url)` ingår medvetet inte ännu. Innan godtyckliga
-webbadresser tillåts behövs bland annat DNS-/IP-pinning, blockering av privata
-och lokala nät, validering av varje redirect, hårda MIME-/byte-/tidsgränser
-och samma passiva evidence-gräns.
-
-### 5. Lägg den minimala EV3-koden på roboten
-
-Byt `<EV3-host>` mot exempelvis `ev3dev.local` eller robotens USB-adress:
+Deploy and inventory:
 
 ```sh
 ssh 'robot@<EV3-host>' 'mkdir -p /home/robot/robot-llm'
 scp -r ev3 config 'robot@<EV3-host>:/home/robot/robot-llm/'
-```
-
-Inventera sedan portarna från EV3:
-
-```sh
 ssh 'robot@<EV3-host>' \
   'cd /home/robot/robot-llm && python3 ev3/robot_cli.py inventory'
 ```
 
-Den incheckade portkartan är specifik för den färdigbyggda EV3RSTORM som
-används i experimentet. Jämför alltid fysisk inkoppling med
-[`config/ev3rstorm.json`](config/ev3rstorm.json).
-
-### 6. Läs en sensor eller prova TTS utan rörelse
-
-På EV3:
+Read the IR sensor or test the already verified **Swedish** TTS path without
+motion:
 
 ```sh
 python3 ev3/robot_cli.py read-sensor --role infrared
-```
-
-Agenttext skickas som data över stdin, aldrig interpolerad i shellkod:
-
-```sh
-printf '%s\n' 'Jag märker något framför mig.' |
+printf '%s\n' 'Jag ser något framför mig.' |
   python3 ev3/robot_cli.py speak-stdin
 ```
 
-`IR-PROX` är ett relativt reflektions-/närhetsvärde mellan 0 och 100. Det är
-inte centimeter, objektidentifiering eller ett löfte om fri väg.
-
-### 7. Kör den motorfria IR-proben på EV3
-
-Stoppa först motorerna och säkerställ att ingen annan process styr dem:
+Run the motion-free local probes:
 
 ```sh
 python3 ev3/robot_cli.py stop
 python3 ev3/ir_gate_probe.py
-```
-
-Proben guidar människan med deterministiskt tal, samplar lokalt och skriver
-rå/filtrerad audit-JSON. Själva proben gör inga motoranrop; den är inte ett
-lås mot andra motorprocesser.
-
-### 8. Kör supervisorns rörelsefria preflight på EV3
-
-Preflight tar motorlåset, skriver `stop` till alla upptäckta motorer,
-verifierar motorinventering och stoppläge samt läser touchsensorn. Den har
-ingen kodstig som startar motorerna:
-
-```sh
 python3 ev3/supervisor_cli.py preflight
 ```
 
-Resultat och tillståndsövergångar skrivs även som JSONL till
-`/tmp/robot-llm-supervisor-audit.jsonl`.
-
-Detta är endast en stop-/inventeringsgrind. Preflight varken armerar eller
-startar motorer och är inte ett godkännande för autonom körning.
-Om resultatet blir `failed` eller processen avbryts ska roboten betraktas som
-osäker tills motorstatus har kontrollerats på plats; stäng av strömmen om ett
-motorläge inte kan verifieras.
-
-### 9. Kör en rörelsefri Gemma-shadow från Mac
-
-LM Studio ska endast exponeras på loopback. SSH måste fungera med nyckel och
-utan lösenordsprompt:
+Run one motion-free Gemma shadow cycle from the Mac:
 
 ```sh
 PYTHONPATH=src python3 -m robot_agent.shadow_cli \
   --ssh-target 'robot@<EV3-host>'
 ```
 
-Flödet är:
-
-`tre IR-läsningar → deterministisk zon → Gemma-kandidat → audit → deterministisk EV3-TTS`
-
-Begäran till LM Studio använder native `POST /api/v1/chat`,
-`reasoning: "off"`, `store: false`, `stream: false`, inga integrationer och
-en tresekunders deadline. Modellfel leder till deterministisk fallback och
-skapar ingen motoråtkomst.
-
-### 10. Kör foreground-daemonens rörelsefria preflight
-
-Kopiera först aktuell `ev3/` och `config/` till roboten. Den publika
-daemon-entrypointen saknar en flagga för att aktivera motorstart. Mac-klienten
-begär endast:
-
-`describe → status → claim → heartbeat → status → arm → status → release → status → shutdown`
+The foreground daemon preflight is the next physical gate. Its public entry
+point cannot enable motion, and the host sends only
+`describe → status → claim → heartbeat → status → arm → status → release → status → shutdown`:
 
 ```sh
 PYTHONPATH=src python3 -m robot_agent.supervisor_preflight_cli \
   --ssh-target 'robot@<EV3-host>'
 ```
 
-`describe` måste rapportera `motion_enabled=false`, differentialdrift som
-avstängd och rörelsebudget `0` innan sessionen får fortsätta. Detta prov
-armerar supervisorns state machine men skickar aldrig `drive_timed`.
-Framgång kräver dessutom ren remote processexit; fysisk audit och
-motor-write-log kontrolleras separat i experimentprotokollet.
-
-<details>
-<summary><strong>Manuellt fysiskt drivprov – läs säkerhetsnotisen först</strong></summary>
-
-Placera roboten med fri yta, håll abortmetoden redo och kör endast från EV3.
-Kommandot nedan är en kort manuell puls, inte autonom navigation:
+Only after the experiment protocol's power, wiring, clearance, exclusivity,
+and abort checks may an operator run a bounded manual pulse:
 
 ```sh
 python3 ev3/robot_cli.py drive-test \
@@ -417,127 +302,67 @@ python3 ev3/robot_cli.py drive-test \
   --acknowledge-physical-motion
 ```
 
-Rörelsen avvisas om argumenten bryter mot konfigurerade gränser. Efter
-pulsen kontrolleras encoderrotationens storlek och riktning.
+This is a manual hardware test, not autonomous navigation. Read the full
+[experiment plan](docs/EXPERIMENT_PLAN.md) before physical work.
 
 </details>
 
-## Säkerhetsmodell
+## Verified results
 
-### Verifierat nu
+| Measurement | Result |
+|---|---:|
+| Hardware-free test suite | `448 / 448` passing |
+| Physical supervisor preflight | `completed`, `0` motor-start commands |
+| Straight physical B/C pulse | `+175° / +175°` |
+| Physical B/C turn pulse | `+172° / −170°` |
+| Stored dynamic IR replicate | `277` samples |
+| IR measurement sampling | mean `50 ms`, range `47–53 ms` |
+| IR gate blocked | `100 ms` after first raw value `≤35` |
+| IR gate released | `100 ms` after first filtered value `≥40` |
+| Gemma proposal in one physical shadow run | `417 ms` |
 
-- hårda fart-, tids- och textgränser,
-- tidsbegränsade motorpulser och explicit fysisk bekräftelse,
-- motor- och ljudlås,
-- encoderpostcondition efter manuella rörelser,
-- fast SSH-kommandoyta och taltext endast via stdin,
-- LM Studio på loopback med deadline och begränsad svarsbody,
-- modellkandidat endast som shadow/audit,
-- read-only research med exakt tool-allowlist, request-/provenancebindning,
-  observationstidsgrind, citationer, replaygrind och hårda episodbudgetar;
-  varken modell eller webbevidens kan nå fysisk exekvering,
-- loopback-only dashboard med autentiserad session-/assetväg, tokenkrav även
-  på läs-API, Host-/Origin-grind, strikt CSP, exakt route-/asset-allowlist,
-  begränsade HTTP-handlers och jobbkö, typad dialoghistorik och redigerad
-  eventlogg; inga fysiska endpoints finns,
-- IR-grind med medianfilter och hysteres, ännu inte kopplad till motorerna,
-- hårdvarufritt verifierad supervisor-kärna med livslångt motorlås,
-  serverutfärdad session, stigande sekvens-ID, heartbeat, touchstopp,
-  stall-/riktningskontroll, absolut poll-deadline, latched fault och
-  verifierat stopp,
-- fail-closed motorstatus: okända ev3dev-tokens nekas och `holding` räknas
-  som aktivt tills `brake` + `stop` har verifierats,
-- begränsad auditbuffer i minnet under säkerhetskritisk exekvering; den
-  rörelsefria preflight-processen skriver JSONL först efter shutdown.
-- strikt, nodmärkt foreground-protokoll med exakt schema, unika request-ID:n,
-  lokal `queue_ttl_ms`, processinstans-ID och annonserade capabilities,
-- separat reader/writer-I/O, prioriterat korrekt adresserat stopp och
-  safety-poll på den enda supervisortråden,
-- rörelsefri host-preflight och riktiga subprocessprov för EOF, `SIGTERM`,
-  trasig frame och blockerad stdout; samtliga verifierar noll `run-timed`.
-- typat, snapshotbundet arm-API med explicit allowlist, processinstans,
-  observationstid, deadline och konservativ `at_most_once`-semantik,
-- sluten simulatorloop där modellen endast får lämna exakt `ACT` eller
-  `ABORT`; hosten myntar action-ID, kontrollerar capability, riktning,
-  episodtid och rörelsebudget samt verifierar kvitto och encoderutfall,
-- separat simulator-only navigation där producenter bara får föreslå
-  `ADVANCE`, `TURN`, `HOLD` eller `ABORT`; hoststämplad TTL/authority,
-  versionsbunden mailbox och en ensam MotionSupervisor skapar högst en
-  kort differentialpuls per tick,
-- fysisk IR-reflektion behandlas aldrig som positiv centimeter-clearance;
-  endast simulatorns oberoende metric-värld får öppna framåtgrinden,
-- två verifierade terminala stopförsök och best-effort-stop före återkastning
-  av oväntade backendfel,
-- poison-on-ambiguity i SSH-kanalen: timeout, fel request-ID, partiell
-  skrivning, asynkront läsfel och unsolicited output förbjuder fler writes.
-
-### Krävs före autonom rörelse
-
-- transport-/processintegration för supervisorn på fysisk EV3,
-- fysisk felinjektion för tappad klient, länk, process och motorskrivning,
-- uppmätt faktisk stopplatens och bromssträcka,
-- kalibrering av pollingjitter och stallgränser vid låg hastighet,
-- episodbudget för tid, sträcka, agentvarv och omplaneringar,
-- lock-retaining fail-stop/retry om ett framtida motion-enabled processläge
-  inte kan verifiera shutdown; den publika daemonen är därför fortsatt
-  strikt rörelsefri.
+The IR figures verify filtering and hysteresis in stationary tests. They are
+not motor stop time, braking distance, a real-time guarantee, or a benchmark.
+Protocols, limitations, and raw data are in the
+[experiment plan](docs/EXPERIMENT_PLAN.md) and
+[EXP-F1-IR-DYN-002.json](docs/data/EXP-F1-IR-DYN-002.json).
 
 ## Roadmap
 
-- [x] ev3dev, USB/SSH och fysisk inventering
-- [x] begränsad EV3-HAL, motorer, sensorer och svensk TTS
-- [x] rak körning och svängning med encoderpostcondition
-- [x] statisk IR-kalibrering och motorfri dynamisk evidensgrind
-- [x] rörelsefri Gemma-shadow med deterministisk TTS-fallback
-- [x] hårdvarufri supervisor-kärna med heartbeat, touch och stallstopp
-- [x] fysisk rörelsefri supervisor-preflight med verifierad shutdown
-- [x] rörelsefri foreground-daemon och hosttransport mot falsk hårdvara
-- [ ] fysisk rörelsefri daemon-preflight över USB-SSH
-- [ ] motion-enabled process med lock-retaining fail-stop och uppmätta stoppgrindar
-- [x] första transportoberoende RobotAPI-slice mot simulator, explicit
-  arm-only och utan fysisk adapter
-- [ ] semantiska verktyg som `drive`, `turn`, `wave_arm`, tal och sensorer
-  samt manuella tester mot fysisk supervisor-adapter
-- [x] LLM-baserad semantisk read-only dialog/research med typat
-  beslutskontrakt och strukturerad kontext – utan regexp/keyword-fallback
-- [x] lokal Mac-dashboard med chatt, research, eventlogg, settings och
-  flerrobots-/komponentregister
-- [x] hårdvarufri sluten loop med scriptad planner:
-  `mål → observera → planera → agera → verifiera → omplanera`
-- [x] simulator-first autonom waypointnavigation med oberoende,
-  parallelliserbara beteendeförslag, serialiserad MotionSupervisor,
-  hinderundvikning och
-  oberoende kollisionsfacit
-- [x] live-verifierad read-only Gemma-loop:
-  `fråga → verktygsval → Open-Meteo → evidens → citerat svar`
-- [ ] den fysiska `ACT`/`ABORT`-loopen med Gemma via LM Studio och därefter
-  en separat fysisk grind
-- [ ] push-to-talk STT via Macens mikrofon
-- [ ] riktiga asynkrona Gemma-/perceptionsproducenter ovanpå navigationens
-  trådsäkra proposal-inbox
-- [ ] fysisk navigationsadapter efter linjär/sväng-/stoppkalibrering och
-  persistent heartbeat-/preemption-protokoll
-- [ ] parallell perception, planering och validering över flera processer
-- [ ] trådlös kamera/mikrofon, ljudriktning och aktiv visuell perception
-- [ ] adaptrar för Robot Inventor 51515 och BOOST Droid Commander
+- [x] Physical EV3 baseline: ev3dev, USB/SSH, manual motors, sensors, encoders,
+  and Swedish TTS
+- [x] Motion-free physical Gemma shadow cycle and supervisor preflight
+- [x] Foreground transport verified against fake sysfs and real subprocesses
+- [x] English/Swedish Lab Console, typed response locale, local chat, and
+  read-only cited weather
+- [x] Typed RobotAPI and closed arm loop in simulation
+- [x] Simulator-first waypoint navigation with parallelizable proposals and
+  serialized supervision
+- [ ] Reliable EV3 power and physical motion-free foreground handshake
+- [ ] Physical RobotAPI adapter, semantic tools, calibration, and safety
+  evidence
+- [ ] Gemma-driven physical `ACT`/`ABORT` loop behind a separate motion gate
+- [ ] Push-to-talk STT through the Mac microphone
+- [ ] Wi-Fi, camera, microphones, vision, and sound-source localization
+- [ ] Multi-controller orchestration across EV3, Robot Inventor, and BOOST
 
-Den långsiktiga nod-, state- och multi-controller-arkitekturen beskrivs i
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+The dream demo:
 
-Drömdemon längre fram:
+`dog bark → locate sound → look for the source → confirm dog → turn toward it → “woof right back at you”`
 
-`hundskall → ljudriktning → visuell sökning → hund bekräftad → “voff på dig med”`
-
-## Repostruktur
+## Repository layout
 
 ```text
-config/                 portkarta, säkerhetsgränser och syntetisk navsim
-docs/                   experimentplan, grindar och fysisk evidens
-ev3/                    Python 3.5-HAL, supervisor och manuella EV3-verktyg
-src/robot_agent/        host-policy, RobotAPI, agentloop, navigation, research, dashboard och LM Studio
-tests/                  hårdvarufria tester
+config/                 port map, safety limits, and simulator configuration
+docs/                   architecture, experiment protocols, evidence, and UI captures
+ev3/                    Python 3.5 HAL, supervisor, and manual EV3 tools
+src/robot_agent/        host policy, agent loops, navigation, research, and dashboard
+tests/                  hardware-free test suite
 ```
 
-Projektet är medvetet litet och bygger inte på ett stort robotikramverk.
-Abstraktionerna får förtjänas av verkliga problem, ett kontrollerat experiment
-i taget.
+Robot LLM Lab deliberately stays small and avoids a large robotics framework.
+Abstractions must earn their place through real experiments.
+
+LEGO, MINDSTORMS, EV3, Robot Inventor, and BOOST are trademarks of the LEGO
+Group. This independent experimental project is not affiliated with or
+endorsed by the LEGO Group.
