@@ -410,6 +410,28 @@ class NavigationStateTests(unittest.TestCase):
         with self.assertRaises(NavigationContractError):
             replace(evidence, forward_mm=1_000)
 
+    def test_non_simulation_evidence_cannot_forge_object_identity(self):
+        for source in ("physical_ir_reflection", "none"):
+            with self.subTest(source=source):
+                arguments = {
+                    "source": source,
+                    "observed_at_ms": 10_000,
+                    "near_obstacle_latched": False,
+                    "forward_object_id": "forged-object",
+                }
+                if source == "physical_ir_reflection":
+                    arguments["raw_ir_proximity"] = 52
+
+                with self.assertRaises(
+                    NavigationContractError
+                ) as caught:
+                    ClearanceEvidence(**arguments)
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "untrusted_forward_object_identity",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

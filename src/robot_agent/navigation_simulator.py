@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from collections import deque
 import math
 import threading
-from typing import Tuple
+from typing import Optional, Tuple
 
 from .navigation_contract import (
     DriveCalibrationProfile,
@@ -248,25 +248,29 @@ class DifferentialDriveSimulator:
                 return True
         return False
 
-    def _ray_clearance_mm(self, angle_rad: float) -> int:
+    def _ray_clearance_observation(
+        self,
+        angle_rad: float,
+    ) -> Tuple[int, Optional[str]]:
         dx = math.cos(angle_rad)
         dy = math.sin(angle_rad)
         radius = self.settings.robot_radius_mm
-        candidates = []
+        boundary_candidates = []
 
         if dx > 1e-12:
-            candidates.append(
+            boundary_candidates.append(
                 (self.world.width_mm - radius - self._x_mm) / dx
             )
         elif dx < -1e-12:
-            candidates.append((radius - self._x_mm) / dx)
+            boundary_candidates.append((radius - self._x_mm) / dx)
         if dy > 1e-12:
-            candidates.append(
+            boundary_candidates.append(
                 (self.world.height_mm - radius - self._y_mm) / dy
             )
         elif dy < -1e-12:
-            candidates.append((radius - self._y_mm) / dy)
+            boundary_candidates.append((radius - self._y_mm) / dy)
 
+        obstacle_candidates = []
         for obstacle in self.world.obstacles:
             expanded = radius + obstacle.radius_mm
             offset_x = obstacle.x_mm - self._x_mm
@@ -284,15 +288,56 @@ class DifferentialDriveSimulator:
             )
             entry = projection - half_chord
             if entry >= 0:
-                candidates.append(entry)
+                obstacle_candidates.append(
+                    (entry, obstacle.obstacle_id)
+                )
 
-        positive = [value for value in candidates if value >= 0]
+        positive_boundaries = [
+            value for value in boundary_candidates if value >= 0
+        ]
+        positive_obstacles = [
+            candidate
+            for candidate in obstacle_candidates
+            if candidate[0] >= 0
+        ]
+        positive = positive_boundaries + [
+            value for value, _obstacle_id in positive_obstacles
+        ]
         clearance = (
             self.settings.range_max_mm
             if not positive
             else min(self.settings.range_max_mm, min(positive))
         )
-        return max(0, int(math.floor(clearance)))
+        nearest_boundary = (
+            min(positive_boundaries)
+            if positive_boundaries
+            else math.inf
+        )
+        nearest_obstacle = (
+            min(
+                positive_obstacles,
+                key=lambda candidate: (candidate[0], candidate[1]),
+            )
+            if positive_obstacles
+            else None
+        )
+        forward_object_id = None
+        if (
+            nearest_obstacle is not None
+            and nearest_obstacle[0] <= nearest_boundary
+            and nearest_obstacle[0] <= self.settings.range_max_mm
+        ):
+            forward_object_id = nearest_obstacle[1]
+        return (
+            max(0, int(math.floor(clearance))),
+            forward_object_id,
+        )
+
+    def _ray_clearance_mm(self, angle_rad: float) -> int:
+        clearance_mm, _object_id = self._ray_clearance_observation(
+            angle_rad
+        )
+        return clearance_mm
 
     def _pose(self) -> PoseEstimate:
         return PoseEstimate(
@@ -316,7 +361,9 @@ class DifferentialDriveSimulator:
                 "invalid_goal",
                 "Simulator observation requires WaypointGoal",
             )
-        forward = self._ray_clearance_mm(self._heading_rad)
+        forward, forward_object_id = self._ray_clearance_observation(
+            self._heading_rad
+        )
         left = self._ray_clearance_mm(
             self._heading_rad + math.radians(45)
         )
@@ -348,6 +395,7 @@ class DifferentialDriveSimulator:
                 forward_mm=forward,
                 left_mm=left,
                 right_mm=right,
+                forward_object_id=forward_object_id,
             ),
         )
 

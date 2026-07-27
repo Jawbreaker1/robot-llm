@@ -13,6 +13,7 @@ from robot_agent.navigation_contract import (
     WaypointGoal,
 )
 from robot_agent.navigation_episode import (
+    NAVIGATION_ABORTED,
     NAVIGATION_BUDGET_EXHAUSTED,
     NAVIGATION_EXECUTION_FAILED,
     NAVIGATION_GOAL_REACHED,
@@ -162,6 +163,97 @@ class FaultAtGoalSimulator(DifferentialDriveSimulator):
 
 
 class NavigationSimulatorTests(unittest.TestCase):
+    def test_forward_ray_reports_nearest_obstacle_identity(self):
+        nearer = CircleObstacle(
+            obstacle_id="near-box",
+            x_mm=400,
+            y_mm=300,
+            radius_mm=30,
+        )
+        farther = CircleObstacle(
+            obstacle_id="far-box",
+            x_mm=700,
+            y_mm=300,
+            radius_mm=30,
+        )
+        plant, _supervisor, _inbox, _authority = make_stack(
+            (farther, nearer)
+        )
+
+        observed = plant.observe(waypoint())
+
+        self.assertEqual(observed.clearance.forward_mm, 155)
+        self.assertEqual(
+            observed.clearance.forward_object_id,
+            "near-box",
+        )
+
+    def test_forward_object_identity_is_none_for_clear_space_and_wall(self):
+        clear_plant, _supervisor, _inbox, _authority = make_stack()
+
+        clear_observation = clear_plant.observe(waypoint())
+
+        self.assertEqual(clear_observation.clearance.forward_mm, 1_000)
+        self.assertIsNone(
+            clear_observation.clearance.forward_object_id
+        )
+
+        wall_plant = DifferentialDriveSimulator(
+            SimulationWorld(width_mm=500, height_mm=700),
+            simulation_profile(),
+            PoseEstimate(150, 300, 0),
+            MotionAuthority(),
+        )
+
+        wall_observation = wall_plant.observe(waypoint())
+
+        self.assertEqual(wall_observation.clearance.forward_mm, 285)
+        self.assertIsNone(
+            wall_observation.clearance.forward_object_id
+        )
+
+    def test_world_update_changes_forward_object_identity(self):
+        first = CircleObstacle(
+            obstacle_id="first-box",
+            x_mm=400,
+            y_mm=300,
+            radius_mm=30,
+        )
+        second = CircleObstacle(
+            obstacle_id="second-box",
+            x_mm=400,
+            y_mm=300,
+            radius_mm=30,
+        )
+        plant, _supervisor, _inbox, _authority = make_stack((first,))
+
+        before = plant.observe(waypoint())
+        plant.update_world(
+            SimulationWorld(
+                width_mm=1_300,
+                height_mm=700,
+                obstacles=(second,),
+            )
+        )
+        after = plant.observe(waypoint())
+
+        self.assertEqual(
+            before.clearance.forward_object_id,
+            "first-box",
+        )
+        self.assertEqual(
+            after.clearance.forward_object_id,
+            "second-box",
+        )
+        self.assertEqual(
+            after.clearance.forward_mm,
+            before.clearance.forward_mm,
+        )
+        self.assertGreater(
+            after.world_model_version,
+            before.world_model_version,
+        )
+
     def test_goal_seeking_reaches_waypoint_and_verifies_terminal_stop(self):
         plant, supervisor, inbox, _authority = make_stack()
         episode = NavigationEpisode(
@@ -603,6 +695,128 @@ class NavigationSimulatorTests(unittest.TestCase):
                 for pulse in plant.applied_pulses
             )
         )
+
+    def test_runtime_hooks_observe_each_committed_tick_before_arbitration(self):
+        plant, supervisor, inbox, _authority = make_stack()
+        observations = []
+        arbitration_versions = []
+        episode = NavigationEpisode(
+            plant,
+            supervisor,
+            inbox,
+            (GoalSeekingBehavior(),),
+            limits=NavigationLimits(
+                max_ticks=2,
+                max_elapsed_ms=10_000,
+                max_proposals=10,
+                max_replans=2,
+                max_actions=2,
+                max_total_motion_ms=1_000,
+                max_no_progress_ticks=10,
+            ),
+            observation_sink=observations.append,
+            before_arbitration=lambda value: (
+                arbitration_versions.append(value.state_version)
+            ),
+        )
+
+        result = episode.run(waypoint())
+
+        self.assertEqual(result.ticks, 2)
+        self.assertEqual(
+            [value.state_version for value in observations],
+            [1, 2, 3],
+        )
+        self.assertEqual(arbitration_versions, [1, 2])
+
+    def test_post_commit_sink_failure_accounts_and_stops_current_state(
+        self,
+    ):
+        plant, supervisor, inbox, _authority = make_stack()
+        observed_versions = []
+
+        def fail_after_first_drive(snapshot):
+            observed_versions.append(snapshot.state_version)
+            if len(observed_versions) == 2:
+                raise RuntimeError("synthetic observation delivery failure")
+
+        episode = NavigationEpisode(
+            plant,
+            supervisor,
+            inbox,
+            (GoalSeekingBehavior(),),
+            observation_sink=fail_after_first_drive,
+        )
+
+        result = episode.run(waypoint())
+        current = plant.observe(waypoint())
+        pulses = plant.applied_pulses
+
+        self.assertEqual(result.termination, NAVIGATION_ABORTED)
+        self.assertEqual(observed_versions, [1, 2])
+        self.assertEqual(result.ticks, 1)
+        self.assertEqual(result.actions, 1)
+        self.assertEqual(result.total_motion_ms, pulses[0].duration_ms)
+        self.assertEqual(len(result.steps), 1)
+        self.assertEqual(result.steps[0].decision_kind, "DRIVE")
+        self.assertEqual(
+            result.steps[0].state_after,
+            observed_versions[-1],
+        )
+        self.assertEqual([pulse.kind for pulse in pulses], ["DRIVE", "STOP"])
+        self.assertTrue(result.terminal_stop_verified)
+        self.assertFalse(result.final_snapshot.motors_running)
+        self.assertEqual(
+            result.final_snapshot.state_version,
+            current.state_version,
+        )
+        self.assertEqual(result.final_snapshot.pose, current.pose)
+        self.assertIn("OBSERVATION_SINK_FAILED", result.trace)
+
+    def test_initial_sink_failure_aborts_without_a_navigation_action(self):
+        plant, supervisor, inbox, _authority = make_stack()
+
+        def fail_initial_observation(_snapshot):
+            raise RuntimeError("synthetic initial delivery failure")
+
+        episode = NavigationEpisode(
+            plant,
+            supervisor,
+            inbox,
+            (GoalSeekingBehavior(),),
+            observation_sink=fail_initial_observation,
+        )
+
+        result = episode.run(waypoint())
+
+        self.assertEqual(result.termination, NAVIGATION_ABORTED)
+        self.assertEqual(result.ticks, 0)
+        self.assertEqual(result.actions, 0)
+        self.assertEqual(result.total_motion_ms, 0)
+        self.assertEqual(
+            [pulse.kind for pulse in plant.applied_pulses],
+            ["STOP"],
+        )
+        self.assertTrue(result.terminal_stop_verified)
+
+    def test_cancel_event_stops_before_any_navigation_action(self):
+        plant, supervisor, inbox, _authority = make_stack()
+        cancel_event = threading.Event()
+        cancel_event.set()
+        episode = NavigationEpisode(
+            plant,
+            supervisor,
+            inbox,
+            (GoalSeekingBehavior(),),
+            cancel_event=cancel_event,
+        )
+
+        result = episode.run(waypoint())
+
+        self.assertEqual(result.termination, NAVIGATION_ABORTED)
+        self.assertEqual(result.actions, 0)
+        self.assertTrue(result.terminal_stop_verified)
+        self.assertIn("CANCELLED", result.trace)
 
     def test_async_inbox_proposals_count_toward_episode_budget(self):
         plant, supervisor, inbox, _authority = make_stack()

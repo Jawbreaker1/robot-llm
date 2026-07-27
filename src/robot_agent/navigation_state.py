@@ -45,6 +45,7 @@ class ClearanceEvidence:
     left_mm: Optional[int] = None
     right_mm: Optional[int] = None
     raw_ir_proximity: Optional[int] = None
+    forward_object_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.source not in (
@@ -72,6 +73,13 @@ class ClearanceEvidence:
                 0,
                 100,
             )
+        if self.forward_object_id is not None:
+            identifier("forward_object_id", self.forward_object_id)
+            if self.source != "simulation_metric":
+                raise NavigationContractError(
+                    "untrusted_forward_object_identity",
+                    "Only simulation evidence may identify an object",
+                )
         if self.source == "simulation_metric":
             if self.forward_mm is None:
                 raise NavigationContractError(

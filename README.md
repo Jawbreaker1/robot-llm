@@ -1,7 +1,7 @@
 # Robot LLM Lab 🤖
 
 ![Status: controlled experiment](https://img.shields.io/badge/status-controlled%20experiment-2ea44f)
-![Tests: 448 passing](https://img.shields.io/badge/tests-448%20passing-2ea44f)
+![Tests: 517 passing](https://img.shields.io/badge/tests-517%20passing-2ea44f)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![UI: English + Swedish](https://img.shields.io/badge/UI-English%20%2B%20Swedish-0ea5e9)
 ![Physical motion: manual only](https://img.shields.io/badge/physical%20motion-manual%20only-f59e0b)
@@ -85,6 +85,7 @@ Status snapshot: **2026-07-27**.
 | Lab Console | Local Gemma chat, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | No motor, SSH, TTS, or stop routes exist in the dashboard |
 | RobotAPI loop | Typed, snapshot-bound arm API and a closed `observe → plan → act → verify → replan` loop | Simulator-only and currently driven by a scripted fake planner |
 | Navigation | Waypoint following, obstacle avoidance, proposal inbox, one MotionSupervisor, and an independent collision oracle | 2D simulator only; no physical navigation adapter |
+| Concurrent interaction | Independent bounded workers plus one live local-Gemma simulator run where model speech overlapped a later navigation tick | Virtual callbacks only; no physical drive, speaker, or arm adapter |
 | Physical autonomy | Not enabled | Waiting for reliable EV3 power, physical transport validation, calibration, stop-latency evidence, and fault injection |
 
 The latest EV3 power check measured **5.889 V**. Physical deployment of the
@@ -122,12 +123,21 @@ flowchart LR
     end
 ```
 
-Every future AI result can carry `timestamp`, `state_version`, `confidence`,
-`source`, and `valid_until`. A goal may live for minutes; a suggestion such
-as “turn six degrees left now” may expire in milliseconds. The
-MotionSupervisor never waits for every producer. At each tick it uses only
-fresh, version-compatible proposals and emits at most one short-lived motor
-decision.
+The concurrent simulator runtime now uses independent bounded workers and
+latest-snapshot mailboxes for its navigation behaviors. Obstruction-triggered
+expression planning, speech playback, and the propeller reaction have separate
+bounded queues. Each result is bound to controller, goal, plan, world model,
+evidence, locale, and a host-owned lifetime. The MotionSupervisor never waits
+for every producer; each tick uses the best fresh proposals already available
+and emits at most one short-lived wheel decision.
+
+Speech generation and playback may overlap later navigation ticks. A propeller
+wave may not overlap wheel motion: it requests a pause, waits for a verified
+stopped-boundary acknowledgement, revalidates the current obstruction, runs
+fixed host-owned alternating segments, and releases navigation. Speech-only
+reactions never pause the wheels. A slow or failed model/audio callback is
+isolated from navigation. A per-object cooldown and total planner budget stop
+repeated sensor reacquisition from turning into model or speech spam.
 
 Touch stop, distance gates, heartbeat, timeout, speed limits, stall checks,
 and emergency stop are deterministic. They do not wait for an LLM response.
@@ -164,7 +174,9 @@ Verified or enforced today:
 - a loopback-only dashboard with a fresh 256-bit session URL, Host/Origin
   checks, strict route/asset allowlists, CSP, bounded jobs, and no physical
   endpoints;
-- two simulator-only closed-loop paths with no physical adapter.
+- simulator-only closed loops for typed arm actions, waypoint navigation, and
+  concurrent navigation/expression/speech/propeller coordination, all without
+  a physical autonomy adapter.
 
 Still required before autonomous physical motion:
 
@@ -178,7 +190,9 @@ Still required before autonomous physical motion:
   episode.
 
 IR-PROX is a relative reflection/proximity signal from 0 to 100. It is not
-centimeters, object identification, or proof that the path is clear.
+centimeters, object identification, or proof that the path is clear. Object
+IDs in the concurrent experiment are labels on synthetic simulator obstacles;
+physical IR observations are never allowed to claim an identity.
 
 ## Try it locally
 
@@ -225,6 +239,31 @@ Use `--scenario clear` for a direct waypoint and `--full` for the reproducible
 tick trace. Every measurement in `config/navigation_simulation.json` is
 labelled `simulation_only`. The command cannot import RobotAPI, SSH transport,
 or the EV3 HAL.
+
+### Run concurrent navigation and object interaction
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.concurrent_demo
+```
+
+The default planner and simulated world are deterministic and offline; thread
+timestamps and event interleaving are intentionally not byte-reproducible. The
+run exercises independent navigation, expression, speech, and arm workers with
+virtual callbacks and prints bounded JSON evidence, including whether speech
+actually interleaved with navigation ticks and whether the propeller pause/ack
+gate ran.
+
+To use the loaded local model for the typed expression decision:
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.concurrent_demo \
+  --lm-studio --locale en-US --tick-ms 50
+```
+
+This remains a 2D simulation. Its speech and propeller callbacks record what
+would happen; they do not play audio or contact EV3 hardware. A live LM Studio
+run is therefore evidence for asynchronous model orchestration, not physical
+TTS or motion.
 
 ### Run the read-only weather agent
 
@@ -311,7 +350,7 @@ This is a manual hardware test, not autonomous navigation. Read the full
 
 | Measurement | Result |
 |---|---:|
-| Hardware-free test suite | `448 / 448` passing |
+| Hardware-free test suite | `517 / 517` passing |
 | Physical supervisor preflight | `completed`, `0` motor-start commands |
 | Straight physical B/C pulse | `+175° / +175°` |
 | Physical B/C turn pulse | `+172° / −170°` |
@@ -320,6 +359,7 @@ This is a manual hardware test, not autonomous navigation. Read the full
 | IR gate blocked | `100 ms` after first raw value `≤35` |
 | IR gate released | `100 ms` after first filtered value `≥40` |
 | Gemma proposal in one physical shadow run | `417 ms` |
+| Live concurrent Gemma simulator run | `1` accepted expression; speech/navigation interleaving observed; `98` actions; verified stop |
 
 The IR figures verify filtering and hysteresis in stationary tests. They are
 not motor stop time, braking distance, a real-time guarantee, or a benchmark.
@@ -338,6 +378,8 @@ Protocols, limitations, and raw data are in the
 - [x] Typed RobotAPI and closed arm loop in simulation
 - [x] Simulator-first waypoint navigation with parallelizable proposals and
   serialized supervision
+- [x] Concurrent simulator runtime: asynchronous navigation/expression/speech,
+  optional propeller reaction, and serialized wheel ownership
 - [ ] Reliable EV3 power and physical motion-free foreground handshake
 - [ ] Physical RobotAPI adapter, semantic tools, calibration, and safety
   evidence

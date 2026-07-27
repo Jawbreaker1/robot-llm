@@ -435,8 +435,10 @@ superviserad motorstyrning eller autonomi.
 
 Status: en första transportoberoende, typad slice är implementerad mot den
 deterministiska simulatorn. Den exponerar endast den explicit allowlistade
-propellerarmen; drivning, tal, semantiska kompositverktyg och fysisk adapter
-återstår.
+propellerarmen. En separat concurrent-slice orkestrerar nu bounded
+speech-callback och en semantisk, pausgrindad propellerreaktion bredvid
+simulatornavigationen. Generella RobotAPI-verktyg för drivning och tal, varje
+fysisk adapter och faktisk samtidig EV3-TTS återstår.
 
 Det fulla framtida API:t byggs ovanpå simulator eller fysisk EV3:
 
@@ -485,6 +487,10 @@ uteblivet modellsvar registreras och samma deterministiska fras används.
 Maxlängd, timeout, ljudlås och pratbudget gäller oberoende av modellen. Först
 efter en separat semantisk evalueringsgrind kan validerad modelltext
 övervägas för TTS, fortfarande utan motorbehörighet.
+
+Detta fysiska shadow-resultat är separat från concurrent-simulatorn. Ingen
+modellgenererad expression-text från den nya runtime-vägen har ännu skickats
+till EV3-högtalaren.
 
 ## Fas 4 – Chatt och kontext
 
@@ -836,12 +842,87 @@ A*. Fysisk readiness är false eftersom linjär kalibrering, verifierad
 turn-kalibrering, stopplatens, bromssträcka och ett persistent
 flerpulsprotokoll saknas. Ingen EV3 kontaktades.
 
+### EXP-F5-CONCURRENT-SIM-003 – parallell navigation, uttryck, tal och pausgrindad propeller
+
+Hypotes: långsam semantisk planering och taluppspelning kan isoleras från
+navigationens tick, medan en armreaktion fortfarande kan serialiseras med
+hjulen genom en explicit stoppgrind.
+
+Implementation och acceptans:
+
+- `ConcurrentBehaviorRuntime` kräver uttryckligen
+  `DifferentialDriveSimulator`, `MotionSupervisor` och en bounded
+  `ProposalInbox`; det finns ingen fysisk adapter i processen.
+- Goal seeking och obstacle avoidance kör i oberoende bounded
+  latest-snapshot-workers. Motionsticken väntar inte in alla workers och
+  `MotionSupervisor` producerar fortfarande exakt ett hjulbeslut per tick.
+- En interaction-reducer skapar stabila obstruction epochs och
+  hostattribuerad evidens. Expression-resultat binds till robot,
+  controllerinstans, mål, planrevision, world model, response locale,
+  obstruction epoch och evidence-ID samt får en hostägd TTL.
+- Expression-anrop har både en total episodbudget och en cooldown per stabilt
+  objekt-ID; oidentifierade hinder delar en konservativ unknown-nyckel.
+  Upprepade återträffar på samma låda auditloggas men skapar inte en
+  modell-/talspamloop, medan ett nytt objekt-ID är omedelbart valbart.
+- LM Studio-adaptern använder strikt structured output och får endast svara
+  `EXPRESS`, `HOLD` eller `ABORT`. `EXPRESS` innehåller en replik och antingen
+  ingen gest eller exakt `PROPELLER_WAVE`; modellen kan inte ange motorport,
+  hastighet, varaktighet, TTL, priority, authority eller source.
+- Tal har en egen bounded och kooperativt cancellable worker. Ett fortfarande
+  giltigt hinder-event får kommenteras medan navigationen fortsätter;
+  blockerad eller felande planner/talcallback stoppar inte senare
+  motionstick.
+- Propeller-workern kräver däremot att samma hinder fortfarande är aktuellt.
+  Den begär navigationspaus, väntar på stopped-boundary-kvittens, revaliderar
+  evidens och TTL, kör fasta hostägda alternerande segment med cooldown-,
+  antal- och tidsbudget och släpper sedan navigationen. Tester förbjuder
+  wheel/arm-overlap.
+- Köoverflow, malformad eller gammal modelloutput, callbackfel och
+  cancellation ger typade metrics/auditevents. Cancellation signalerar
+  aktiva callbacks kooperativt och navigationen gör fortfarande ett
+  verifierat terminalt STOP. En host-watchdog begränsar den exklusiva
+  armpausen och aborterar episoden om callbacken inte släpper, men fysisk
+  fail-stop kräver fortfarande en lokal motortimeout i den framtida adaptern.
+- `forward_object_id` får endast komma från simulatorns metric-raycast.
+  Fysisk IR-reflektion kan varken identifiera ett objekt eller bevisa fri väg.
+
+Resultat: godkänd som simulatorbevis för bounded parallell
+förslagsproduktion, expression-resonemang och tal ovanpå serialiserad fysisk
+avsikt. Själva sensorobservationen och interaction-reducern kör fortfarande
+synkront på navigationens tråd; generell parallell perception är målarkitektur,
+inte ett verifierat resultat här. Speech kan överlappa hjulnavigation;
+propellern pausar avsiktligt hjulen. Testcallbacks är inte EV3-TTS eller en
+fysisk armmotor, och slicen bevisar inte stopplatens, bromssträcka, fysisk
+objektdetektion, kameraidentitet eller multi-controller-samordning. LM Studio-
+adaptern och runtimen är kontraktstestade tillsammans via rå strukturerad
+output.
+
+Liveprov mot lokala `google/gemma-4-26b-a4b`:
+
+- första concurrent-försöket fick ett LM Studio HTTP-fel; felet isolerades
+  till expression-workern medan navigationen ändå nådde målet och stoppade
+  verifierat,
+- ett direkt efterföljande structured-output-prov gav en giltig svensk
+  speech-only-proposal på cirka `2,94 s`,
+- nästa kompletta concurrent-episod accepterade en svensk speech-only-
+  expression efter cirka `3,7 s`; en navigationstick inträffade mellan
+  `speech_started` och `speech_completed`,
+- navigationen nådde waypointen efter `98` korta handlingar, terminalt stopp
+  verifierades, inga workers levde kvar och modellen begärde ingen
+  propellergest,
+- speech-callbacken var fortfarande virtuell. Provet aktiverade varken
+  högtalare, arm, EV3 eller annan fysisk hårdvara.
+
 ## Fas 6 – Parallella snurror
 
-Sensorpollning, perception, planering och validering får arbeta parallellt.
-En host-side decision arbiter serialiserar semantiska beslutsförslag. Den
-lokala EV3-supervisorn serialiserar och övervakar endast redan auktoriserade
-motorprimitiver.
+Simulator-slicen bevisar nu en avgränsad del av
+schemaläggningsmönstret: synkrona sensorobservationer matar parallella workers
+för navigation proposals, expression planning och tal, medan ett enda
+motionplan serialiserar hjulen och pausgrindar propellern. Den fysiska
+målarkitekturen är fortfarande att även sensorpollning, perception, planering
+och validering arbetar parallellt, en host-side decision arbiter serialiserar
+semantiska beslutsförslag och varje lokal LEGO-supervisor ensam serialiserar
+och övervakar redan auktoriserade motorprimitiver.
 
 En logisk robot kan bestå av flera exekveringsnoder. Varje EV3-, Robot
 Inventor- eller BOOST-controller får exakt en lokal motorägare. En gemensam

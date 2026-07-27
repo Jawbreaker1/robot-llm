@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 import math
-from typing import Mapping, Optional, Tuple
+from typing import Callable, Mapping, Optional, Tuple
 
 from .navigation_contract import (
     AdvanceSegment,
@@ -407,6 +407,13 @@ class NavigationEpisode:
         inbox: ProposalInbox,
         local_behaviors: Tuple[object, ...],
         limits: NavigationLimits = NavigationLimits(),
+        observation_sink: Optional[
+            Callable[[NavigationSnapshot], None]
+        ] = None,
+        before_arbitration: Optional[
+            Callable[[NavigationSnapshot], None]
+        ] = None,
+        cancel_event=None,
     ):
         if not isinstance(plant, DifferentialDriveSimulator):
             raise NavigationContractError(
@@ -444,11 +451,46 @@ class NavigationEpisode:
                 "invalid_navigation_limits",
                 "Navigation limits are invalid",
             )
+        if observation_sink is not None and not callable(observation_sink):
+            raise NavigationContractError(
+                "invalid_observation_sink",
+                "Observation sink must be callable",
+            )
+        if before_arbitration is not None and not callable(
+            before_arbitration
+        ):
+            raise NavigationContractError(
+                "invalid_tick_hook",
+                "Before-arbitration hook must be callable",
+            )
+        if cancel_event is not None and not callable(
+            getattr(cancel_event, "is_set", None)
+        ):
+            raise NavigationContractError(
+                "invalid_cancel_event",
+                "Cancel event must expose is_set()",
+            )
         self.plant = plant
         self.supervisor = supervisor
         self.inbox = inbox
         self.local_behaviors = local_behaviors
         self.limits = limits
+        self.observation_sink = observation_sink
+        self.before_arbitration = before_arbitration
+        self.cancel_event = cancel_event
+
+    def _cancelled(self) -> bool:
+        return (
+            self.cancel_event is not None
+            and bool(self.cancel_event.is_set())
+        )
+
+    def _publish_observation(
+        self,
+        snapshot: NavigationSnapshot,
+    ) -> None:
+        if self.observation_sink is not None:
+            self.observation_sink(snapshot)
 
     def _publish_local(
         self,
@@ -621,9 +663,33 @@ class NavigationEpisode:
         best_distance = distance_to_goal_mm(snapshot, goal)
         no_progress_ticks = 0
 
+        try:
+            self._publish_observation(snapshot)
+        except Exception:
+            return self._finish(
+                goal,
+                NAVIGATION_ABORTED,
+                counters,
+                trace,
+                steps,
+                snapshot,
+                already_stopped=False,
+            )
+
         while True:
             snapshot = reducer.snapshot()
             current_distance = distance_to_goal_mm(snapshot, goal)
+            if self._cancelled():
+                trace.append("CANCELLED")
+                return self._finish(
+                    goal,
+                    NAVIGATION_ABORTED,
+                    counters,
+                    trace,
+                    steps,
+                    snapshot,
+                    already_stopped=False,
+                )
             if (
                 snapshot.touch_pressed
                 or snapshot.active_faults
@@ -672,7 +738,20 @@ class NavigationEpisode:
             trace.append("PUBLISHING")
             try:
                 self._publish_local(goal, snapshot)
+                if self.before_arbitration is not None:
+                    self.before_arbitration(snapshot)
             except Exception:
+                return self._finish(
+                    goal,
+                    NAVIGATION_ABORTED,
+                    counters,
+                    trace,
+                    steps,
+                    snapshot,
+                    already_stopped=False,
+                )
+            if self._cancelled():
+                trace.append("CANCELLED")
                 return self._finish(
                     goal,
                     NAVIGATION_ABORTED,
@@ -770,6 +849,23 @@ class NavigationEpisode:
                     progress_verified=progress_verified,
                 )
             )
+            try:
+                self._publish_observation(after)
+            except Exception:
+                # The plant transition is already committed and accounted
+                # above.  A downstream observation-delivery failure is a safe
+                # orchestration abort, not a reason to erase the action or
+                # issue terminal STOP against the stale pre-action snapshot.
+                trace.append("OBSERVATION_SINK_FAILED")
+                return self._finish(
+                    goal,
+                    NAVIGATION_ABORTED,
+                    counters,
+                    trace,
+                    steps,
+                    after,
+                    already_stopped=False,
+                )
             if after.touch_pressed or after.active_faults:
                 return self._finish(
                     goal,

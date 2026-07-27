@@ -174,11 +174,13 @@ och innehåller inga regexp, keywords eller språkfraser. En framtida
 LM Studio-planner ska lämna samma strikta `NEXT_SEGMENT | HOLD | ABORT`,
 medan hostens supervisor förblir oförändrad.
 
-Endast de två exakta, inbyggda och ändliga referensbeteendena får anropas
-synkront inne i demoepisoden. Godtyckliga eller långsamma producenter nekas
-där; LLM, vision och andra processer ska publicera asynkront till inboxen.
-Motionsticken dränerar vad som redan är klart och blockerar aldrig i väntan
-på dem.
+Den ursprungliga, reproducerbara `NavigationEpisode`-demon får fortfarande
+anropa de två exakta, inbyggda och ändliga referensbeteendena synkront.
+`ConcurrentBehaviorRuntime` kör i stället samma allowlistade beteenden i var
+sin bounded worker med en latest-snapshot-mailbox. Motionsticken tar bästa
+tillgängliga batch och blockerar aldrig i väntan på att alla producenter ska
+bli klara. Godtycklig LLM-, vision- eller I/O-latens får inte flyttas in i
+motionstråden.
 
 Simulatorn integrerar två hjul i korta tidssteg, producerar pose, encoders
 och riktade avståndsstrålar samt kontrollerar den svepta robotkroppen mot
@@ -206,6 +208,82 @@ dessutom exakt en fysisk `drive_timed` per motion-session och är inte en
 backend för en pollande flerpulsloop. En fysisk adapter kräver därför en
 senare protokollgrind med batterier, persistent heartbeat/preemption,
 kalibrering, stopplatens och felinjektion – inte en SSH-session per tick.
+
+### Parallell interaktion ovanpå serialiserad navigation
+
+Den körbara concurrent-slicen lägger uttryck och objektreaktioner bredvid
+navigationen utan att skapa en andra motorägare:
+
+```mermaid
+flowchart LR
+    O["Versionerat nav-snapshot"] --> N1["Latest queue<br/>goal seeking"]
+    O --> N2["Latest queue<br/>obstacle avoidance"]
+    N1 --> I["Bounded ProposalInbox"]
+    N2 --> I
+    I --> M["MotionSupervisor<br/>ett hjulbeslut per tick"]
+
+    O --> R["InteractionReducer<br/>obstruction epoch + evidens"]
+    R --> Q["Bounded expression queue"]
+    Q --> L["LM/typad expression planner"]
+    L --> S["Speech queue + worker"]
+    L --> G["Gesture queue + worker"]
+    S -.->|"får överlappa hjulnavigation"| A["Talcallback"]
+    G --> P["pause request"]
+    M --> K["stopped-boundary ack"]
+    P --> K
+    K --> V["revalidera TTL + aktuellt hinder"]
+    V --> W["hostägd fast propellervåg"]
+    W --> X["release navigation"]
+```
+
+Varje kö är begränsad och har ett explicit overflowutfall i auditloggen.
+Expression-plannern har dessutom en total episodbudget och en hostägd
+cooldown per stabilt objekt-ID; hinder utan betrodd identitet delar en
+konservativ unknown-obstruction-nyckel. Samma låda som återkommer i sensorns
+stråle blir därför inte en modell- och talspamloop, medan ett annat
+simulatorobjekt kan reageras på direkt. Navigation, expression planning, tal
+och propeller kör i separata workers. En blockerad eller felande modell- eller
+talcallback hindrar därför inte senare motionstick. Tal är en kortlivad
+reaktion på ett versionsbundet hinder-event och kan fortsätta medan roboten
+navigerar vidare, så länge robot-, controller-, mål-, plan- och
+world-model-bindningar samt hostens TTL fortfarande gäller. Callback-
+cancellation är kooperativ: callbacken får ett Event och ska lämna snabbt.
+Armgrindens host-watchdog avbryter hela episoden och framtvingar terminalt
+hjulstopp om den exklusiva pausen inte släpps, men kan inte själv stoppa en
+godtycklig callbacktråd eller fysisk motor. Den fysiska adaptern behöver därför
+fortfarande en lokal, deterministisk motortimeout.
+
+Propellern har en strängare fysisk grind. Ett semantiskt
+`PROPELLER_WAVE`-förslag är valfritt; vanlig speech-only-dialog pausar aldrig
+hjulen. Gesture-workern begär paus, väntar på kvittens vid en verifierat
+stoppad pulsgräns, kontrollerar att samma hinder och färska evidens fortfarande
+är aktuella, kör en fast hostägd växling av riktning med tids-, antal- och
+cooldownbudget och släpper därefter navigationen. Modellen får inte ange
+motorport, hastighet, segmenttid, TTL, priority, authority eller source.
+
+`response_locale` ägs av hosten, binds både i interaction-snapshot och
+modellens strikta schema och kontrolleras igen innan tal accepteras. Den lokala
+Gemma-adaptern returnerar endast `EXPRESS | HOLD | ABORT`; för `EXPRESS` är
+replik, affect och en valfri allowlistad propeller-gest semantiska data.
+
+Objektidentitet i denna slice är endast simulator-evidens. Ett
+`forward_object_id` får komma från `simulation_metric` och är då etiketten på
+ett syntetiskt cirkelhinder. Fysisk IR-reflektion får aldrig bära eller
+härleda objektidentitet, och modellen instrueras att inte namnge objektet när
+identity-evidens saknas.
+
+Ett liveprov med lokala Gemma accepterade en svensk speech-only-expression
+efter ungefär `3,7 s`. Tal-workern startade, navigationen genomförde ytterligare
+en tick innan talet avslutades och episoden nådde waypointen med verifierat
+terminalstopp. Det är evidens för asynkron modell-/talorkestrering med virtuellt
+ljud, inte för fysisk TTS.
+
+Detta bevisar en bounded trådad schemaläggningsmodell, inte en fullt
+paralleliserad fysisk robot. Tal- och armcallbacks är simulatoriska
+testgränser. Nuvarande EV3-supervisor betraktar dessutom samtidig arm- och
+hjulmotion som oväntad motoraktivitet; fysisk propellervåg måste därför börja
+med samma paus-/stoppgrind tills en framtida ensam motorägare uttryckligen
+stöder atomiska multi-actuator-beslut.
 
 ## Separat read-only research-plan
 
@@ -341,13 +419,16 @@ locale-instruktion. Svenska och engelska är första kompletta katalogparet;
 fler språk är en katalog-, språkmetadata- och allowlistutökning, inte nya
 språkberoende beslutskodvägar.
 
-Framtida röststöd ska använda samma princip. STT får publicera transkript med
+En transportoberoende, bounded och kooperativt cancellable speech-worker finns nu i
+concurrent-simulatorn, och tester visar att både blockerad och felande
+uppspelning isoleras från navigationen. Den är ännu inte kopplad till EV3-TTS
+och verifierar inte en fysisk röst. Framtida STT får publicera transkript med
 ett separat, tidsstämplat `detected_locale` och confidence som observation;
-det får inte tyst skriva över användarens valda `response_locale`. TTS får i
-sin tur ett explicit `voice_locale` och ett allowlistat voice-ID. Om en
-passande röst saknas ska anropet neka eller kräva ett synligt val, aldrig
-råka falla tillbaka till svenska. Engelskt STT/TTS är därför en egen
-YouTube-demo-grind även om engelsk textdialog redan fungerar.
+det får inte tyst skriva över användarens valda `response_locale`. Den fysiska
+TTS-adaptern får i sin tur ett explicit `voice_locale` och ett allowlistat
+voice-ID. Om en passande röst saknas ska anropet neka eller kräva ett synligt
+val, aldrig råka falla tillbaka till svenska. Engelskt STT/TTS är därför en
+egen YouTube-demo-grind även om engelsk textdialog redan fungerar.
 
 Det beskrivande registryt stöder redan flera `robot_id`, controllers,
 kameror, mikrofoner, compute-noder och providers. Varje nod har
@@ -399,10 +480,14 @@ EV3-protokollets operationer `claim`, `heartbeat`, `arm`, `drive_timed`,
 fysiska primitiv och får aldrig visas direkt för en LLM.
 
 Det fulla framtida publika agentkontraktet innehåller semantiska, typade verktyg
-som `drive`, `turn`, `wave_arm`, `read_sensors` och `stop`. LLM:n löser
-språk, referenser och planering till ett beslutsförslag. Deterministisk
-host-kod validerar schema, capability, färskhet, konflikt och budget och
-översätter först därefter till en fysisk primitive.
+som `drive`, `turn`, `wave_arm`, `read_sensors` och `stop`. Dagens smalare
+expression-kontrakt är separat: ett versionsbundet hinder-event kan ge
+speech-only eller tal plus exakt den semantiska allowlistade gesten
+`PROPELLER_WAVE`. Det är inte ett allmänt `wave_arm`-verktyg och kan inte
+välja en fysisk primitive. LLM:n löser språk, referenser och planering till
+ett beslutsförslag. Deterministisk host-kod validerar schema, capability,
+färskhet, konflikt och budget och översätter först därefter till en fysisk
+primitive.
 
 Ingen del av exekveringslagren läser originalmeningen eller använder regexp,
 substrings eller keywordlistor som en alternativ språkklassificerare.
