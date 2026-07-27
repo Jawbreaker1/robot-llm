@@ -94,6 +94,119 @@ Senare observationer bör bära minst:
 
 Självrapporterad modellkonfidens är inte en säkerhetsregel.
 
+## Körbar simulator-first-navigation
+
+Den första autonoma navigationsvertikalen är nu implementerad som ett helt
+separat plan från det befintliga arm-API:t:
+
+```mermaid
+flowchart LR
+    G["Typat waypointmål"]
+    B1["GoalSeekingBehavior"]
+    B2["ObstacleAvoidanceBehavior"]
+    L["Framtida LLM-planner"]
+    I["Bounded ProposalInbox<br/>hoststämplad source · TTL · authority"]
+    S["Versionsbundet snapshot<br/>pose · encoders · safety evidence"]
+    A["MotionSupervisor<br/>exakt ett beslut per tick"]
+    P["Simulatorisk motorbuss<br/>korta DrivePulse"]
+    W["2D-värld<br/>oberoende collision oracle"]
+
+    G --> B1
+    S --> B1
+    S --> B2
+    S -.-> L
+    B1 -->|"NEXT_SEGMENT / HOLD / ABORT"| I
+    B2 -->|"högre hostauktoritet vid hinder"| I
+    L -.->|"samma strikta semantiska kontrakt"| I
+    I --> A
+    S --> A
+    A -->|"STOP eller en kort puls"| P
+    P --> W
+    W --> S
+```
+
+En producent får endast föreslå `ADVANCE` eller `TURN`, aldrig hjulhastighet
+eller motorport. Förslaget binds till `goal_id`, `goal_epoch`,
+`plan_revision`, `robot_state_version` och `world_model_version`.
+`source_id`, source-sekvens, mottagningstid, TTL, authority och priority
+stämplas av en allowlistad host-wrapper; modellen får inte själv höja sin
+auktoritet eller förlänga sin giltighet. Mailboxen är trådsäker och
+begränsad. Varje tick dränerar hela batchen, så även icke-vinnande förslag
+förbrukas och kan inte återuppstå senare.
+
+Hostsekvensen fortsätter över episoder, medan proposal-ID:t innehåller goal
+epoch och supervisorgrinden kräver exakt aktivt epoch. Inbox, arbiter,
+motion-authority och simulatortrace har explicita replay-/historikfönster;
+kontinuerlig drift samlar inte obegränsade ID-set eller pulsloggar.
+
+`MotionSupervisor` väntar inte på en viss producent. Den använder bara de
+förslag som redan finns, avslår gamla eller felbundna resultat och skapar
+exakt ett `STOP` eller en kort `DrivePulse`. Touch, fault, aktiv motor,
+gammalt snapshot och gammal safety-observation kontrolleras före
+förslagen. Touch/fault latchas och kräver ett nytt goal epoch samt flera
+färska säkra observationer för rearm. Likvärdiga topprankade förslag får
+dedupliceras reproducerbart; semantiskt motstridiga topprankade förslag ger
+`ambiguous_top_priority` och stopp.
+
+Simulatorns motorbuss accepterar inte `arbiter_id` som ensam behörighet.
+Supervisor och plant delar en privat hostlokal `MotionAuthority` som
+registrerar och atomiskt förbrukar exakt varje auktoriserad puls en gång.
+Själva capabilityn färdas aldrig i `DrivePulse`, audit-JSON eller plantens
+pulslogg. Pulsen binds dessutom hela vägen till `plan_revision`. En annan
+komponent kan därför inte få exekvering genom att bara konstruera rätt
+strängfält, och en redan auktoriserad puls blir ogiltig om world model eller
+planrevision ändras före dispatch.
+
+Om episodbudgeten nekar en redan arbitrerad DRIVE återkallas dess one-shot
+före terminalstoppet. En STOP-auktorisation ogiltigförklarar dessutom alla
+väntande rörelsepulser innan den registreras och får därmed inte blockeras av
+en full pending-kö.
+
+Hela motion-bus-transaktionen
+`consume → identity/version check → swept execution → state increment`
+ligger under samma reentranta plantlås. Två samtidiga, i sig auktoriserade
+pulser från samma snapshot kan därför inte båda passera: den första
+serialiseras och den andra avslås som stale.
+
+Den deterministiska referensplannern är en simulatorisk test-orakel/baslinje,
+inte en alternativ naturlig-språkstolk. Den ser redan ett typat waypointmål
+och innehåller inga regexp, keywords eller språkfraser. En framtida
+LM Studio-planner ska lämna samma strikta `NEXT_SEGMENT | HOLD | ABORT`,
+medan hostens supervisor förblir oförändrad.
+
+Endast de två exakta, inbyggda och ändliga referensbeteendena får anropas
+synkront inne i demoepisoden. Godtyckliga eller långsamma producenter nekas
+där; LLM, vision och andra processer ska publicera asynkront till inboxen.
+Motionsticken dränerar vad som redan är klart och blockerar aldrig i väntan
+på dem.
+
+Simulatorn integrerar två hjul i korta tidssteg, producerar pose, encoders
+och riktade avståndsstrålar samt kontrollerar den svepta robotkroppen mot
+världsgränser och cirkulära hinder. Kollisionsfacit ligger separat från
+sensorvärdet; ett grovt sensorsteg kan därför inte tunnla genom ett hinder
+och ändå rapportera framgång. Episoden verifierar hjulens riktning,
+parvis encoderprogress, poseprogress, målprogress, stateversioner, budgetar
+och terminalt stopp.
+
+All geometri i `config/navigation_simulation.json` är märkt
+`simulation_only`. Den är syntetisk och får inte återanvändas som
+EV3-kalibrering. Den fysiska uppskattningen på ungefär `7,58`
+encodergrader per kroppsgrad är fortfarande preliminär, linjär
+encodergrader-per-millimeter saknas och faktisk stopp-/bromssträcka är inte
+verifierad.
+
+EV3:s `IR-PROX` är dessutom reflektionsstyrka, inte centimeter. Stabilt höga
+värden kan släppa en närhetslatch men bevisar aldrig fri väg. Därför kan
+endast simulatorns `simulation_metric` ge positiv clearance i denna slice;
+fysisk framåtkörning förblir explicit nekad.
+
+Det finns ingen import från navigationen till `RobotAPI`,
+`SupervisorSSHSession` eller EV3-HAL. Nuvarande EV3-protokoll budgeterar
+dessutom exakt en fysisk `drive_timed` per motion-session och är inte en
+backend för en pollande flerpulsloop. En fysisk adapter kräver därför en
+senare protokollgrind med batterier, persistent heartbeat/preemption,
+kalibrering, stopplatens och felinjektion – inte en SSH-session per tick.
+
 ## Separat read-only research-plan
 
 Extern kunskap är en perceptionskälla, inte en exekveringscapability. Den

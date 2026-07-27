@@ -699,6 +699,85 @@ Resultat: godkänd som simulatorbevis för den generiska beslutspipelinen. Näst
 separata grind är en LM Studio-planner mot samma kontrakt, fortfarande utan
 fysisk motion.
 
+### EXP-F5-NAV-SIM-002 – autonom waypoint och reaktiv hinderundvikning
+
+Hypotes: den framtida navigationsarkitekturen kan provas end-to-end utan
+EV3-batterier om perception, förslag, arbitrering, kort fysisk exekvering
+och verifiering hålls som separata kontrakt, och om simulatorns
+kollisionsfacit inte delas med plannern.
+
+Implementation:
+
+- strikt `robot-navigation-proposal/v1` där en planner endast får returnera
+  `NEXT_SEGMENT`, `HOLD` eller `ABORT`; ett nästa segment är semantiskt
+  `ADVANCE` eller `TURN`, aldrig råa hjul- eller motoranrop,
+- hoststämplad `source_id`, source-sekvens, mottagningstid, TTL,
+  authority-rank och priority; dessa fält kan inte sättas i modellens JSON,
+- trådsäker bounded `ProposalInbox` som replaygrindar både proposal-ID och
+  source-sekvens samt förbrukar hela batchen varje tick,
+- immutable snapshot bundet till controllerinstans, goal epoch,
+  plan revision, robot-state och world-model-version samt separata
+  tidsstämplar för state och safety evidence,
+- ensam `MotionSupervisor` som aldrig väntar på en producent, avgör exakt
+  ett `STOP` eller en kort differential `DrivePulse` och stoppar vid stale,
+  konflikt, touch, fault, aktiv motor eller okänd positiv clearance,
+- syntetisk 2D-differential-drive-värld med pose, parvisa encoders,
+  riktade metric-raycasts och ett separat swept-body collision oracle,
+- bounded episodloop som verifierar hjulriktning, encoderpar,
+  poseförflyttning, goal progress, budgetar, livelock och terminalt stopp.
+
+Två lokala referensbeteenden används endast som simulatorbaslinjer:
+`GoalSeekingBehavior` söker ett redan typat waypointmål och
+`ObstacleAvoidanceBehavior` får högre hostauktoritet när ett hinder behöver
+kringgås. De klassificerar inte text och innehåller inga språkregexp,
+keywordlistor eller frasmenyer. En framtida asynkron Gemma-planner kan
+publicera samma typ av förslag utan att MotionSupervisor ändras.
+
+Deterministiskt demoscenario:
+
+1. syntetisk robotradie `65 mm`, start `(150, 300)`, mål `(1000, 300)`,
+2. cirkulärt hinder med centrum `(600, 300)` och radie `70 mm`,
+3. högst `120 ms` per motorpuls,
+4. waypoint nådd inom `30 mm` efter `98` ticks och `98` korta handlingar,
+5. `147` förslag behandlade, `11 709 ms` total syntetisk motion,
+6. noll collision-oracle-träffar och verifierat terminalt stopp.
+
+Siffrorna ovan är reproducerbara simulatorutfall, inte mått på EV3RSTORM.
+Konfigurationen ligger i `config/navigation_simulation.json` och är
+uttryckligen `simulation_only`.
+
+Negativ- och adversarialtest omfattar:
+
+- duplicerad JSON-nyckel, extra auktoritetsfält och reverse som inte ingår i
+  första kontraktet,
+- proposal-ID-/source-sequence-replay, fel goal epoch, fel state-version,
+  gammalt snapshot, gammal safety-observation, framtids-/TTL-gräns och
+  förbrukade icke-vinnare,
+- permutationsoberoende arbitrering där motstridiga likvärdiga förslag
+  alltid stoppar,
+- touch-latch och rearm först med nytt epoch och flera säkra snapshots,
+- fysisk IR-reflektion `52` utan närträff som fortfarande inte får bli
+  positiv metric clearance,
+- tunnlingsförsök mot ett tunt hinder, återanvänt motorbeslut, encoderstall,
+  falsk arbitersträng utan privat one-shot-auktorisation, gammal planrevision,
+  world-model-byte efter auktorisation, trasig stoppobservation,
+  två samtidiga auktoriserade pulser från samma snapshot, nytt goal epoch
+  med nya producentinstanser, bounded replayfönster, asynkrona förslag som
+  försöker kringgå proposal-budgeten, nekad rörelsebudget med
+  `MotionAuthority(max_pending=1)` över upprepade episoder, safety-fault vid
+  målet, tom producer-loop och exakta episodbudgetar,
+- cold import som verifierar att navigationen inte laddar RobotAPI eller
+  supervisortransport.
+
+Efter slicen passerar hela den hårdvarufria reposviten `429 / 429`.
+
+Grind: godkänd som simulator-first bevis för parallella förslagsproducenter,
+serialiserad motion och sluten waypointnavigation. Inte godkänd för fysisk
+drivning, fysisk centimeteravståndsmätning, robust okänd terräng, SLAM eller
+A*. Fysisk readiness är false eftersom linjär kalibrering, verifierad
+turn-kalibrering, stopplatens, bromssträcka och ett persistent
+flerpulsprotokoll saknas. Ingen EV3 kontaktades.
+
 ## Fas 6 – Parallella snurror
 
 Sensorpollning, perception, planering och validering får arbeta parallellt.
