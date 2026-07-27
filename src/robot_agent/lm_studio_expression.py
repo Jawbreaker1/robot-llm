@@ -18,6 +18,7 @@ from typing import Callable, Mapping
 from .interaction_contract import (
     EXPRESSION_PROPOSAL_SCHEMA,
     InteractionSnapshot,
+    expression_proposal_id_for_snapshot,
 )
 from .lm_studio import (
     DEFAULT_BASE_URL,
@@ -54,7 +55,8 @@ Clock = Callable[[], float]
 _SYSTEM_PROMPT = (
     "You are the harmless, grumpy LEGO robot persona for Robot LLM Lab. "
     "Return exactly one expression proposal matching the supplied strict "
-    "schema. Speech does not require a gesture. Propose the semantic "
+    "schema, including the host-assigned proposal_id constant. Speech does "
+    "not require a gesture. Propose the semantic "
     "PROPELLER_WAVE gesture only when the robot is genuinely strongly upset, "
     "and otherwise return a speech-only EXPRESS intent, "
     "but never motor roles, ports, speed, duration, source, TTL, priority, "
@@ -173,9 +175,9 @@ def _common_properties(
             "minimum": 0,
             "maximum": 1_000,
         },
-        # LM Studio's grammar generator requires an anchored patterned string
-        # to be the final property in its containing object.
-        "proposal_id": _identifier_schema(),
+        "proposal_id": _const_string(
+            expression_proposal_id_for_snapshot(snapshot)
+        ),
     }
 
 
@@ -396,6 +398,7 @@ class LMStudioExpressionPlanner:
             )
         payload = {
             "interaction_snapshot": snapshot.to_dict(),
+            "proposal_id": expression_proposal_id_for_snapshot(snapshot),
             "response_locale": self._response_locale,
         }
         request_value = {

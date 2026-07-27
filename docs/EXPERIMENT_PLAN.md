@@ -860,6 +860,12 @@ Implementation och acceptans:
   hostattribuerad evidens. Expression-resultat binds till robot,
   controllerinstans, mål, planrevision, world model, response locale,
   obstruction epoch och evidence-ID samt får en hostägd TTL.
+- Hosten härleder ett unikt expression-`proposal_id` från varje exakt
+  snapshot, låser structured-output-schemat till detta konstanta värde och
+  förbrukar ID:t exakt en gång per episod. Modellen kan därför inte svälta
+  senare giltiga events genom att återanvända ett generiskt ID. Replay nekas
+  och auditloggas; ett nytt obstruction epoch gör väntande expression- och
+  taljobb stale, medan enbart fri väg inte skapar ett nytt epoch.
 - Expression-anrop har både en total episodbudget och en cooldown per stabilt
   objekt-ID; oidentifierade hinder delar en konservativ unknown-nyckel.
   Upprepade återträffar på samma låda auditloggas men skapar inte en
@@ -907,6 +913,10 @@ Liveprov mot lokala `google/gemma-4-26b-a4b`:
 - nästa kompletta concurrent-episod accepterade en svensk speech-only-
   expression efter cirka `3,7 s`; en navigationstick inträffade mellan
   `speech_started` och `speech_completed`,
+- efter att `proposal_id` gjordes hostägt svarade Gemma giltigt mot det
+  låsta schemat, men resultatet hann passera in i ett nytt obstruction epoch
+  och släpptes därför som stale; navigationen fortsatte och stoppade
+  verifierat,
 - navigationen nådde waypointen efter `98` korta handlingar, terminalt stopp
   verifierades, inga workers levde kvar och modellen begärde ingen
   propellergest,

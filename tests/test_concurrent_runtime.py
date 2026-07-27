@@ -13,6 +13,7 @@ from robot_agent.concurrent_runtime import (
 from robot_agent.interaction_contract import (
     ExpressionIntent,
     ExpressionProposal,
+    expression_proposal_id_for_snapshot,
 )
 from robot_agent.navigation_contract import (
     DriveCalibrationProfile,
@@ -169,9 +170,11 @@ def make_stack(
 
 def expression_for(
     snapshot,
-    proposal_id="expression-1",
+    proposal_id=None,
     gesture_kind="PROPELLER_WAVE",
 ):
+    if proposal_id is None:
+        proposal_id = expression_proposal_id_for_snapshot(snapshot)
     repetitions = 1 if gesture_kind == "PROPELLER_WAVE" else 0
     return ExpressionProposal(
         proposal_id=proposal_id,
@@ -445,6 +448,97 @@ class PlannerAdmissionPolicyTests(unittest.TestCase):
             request.valid_until_ms,
         ))
 
+    def test_new_obstruction_epoch_invalidates_pending_expression(self):
+        runtime, original = self.make_runtime(
+            expression_cooldown_ms=0,
+        )
+        first = self.blocked_snapshot(
+            original,
+            state_version=1,
+            object_id="first-box",
+        )
+        runtime._observation_sink(first)
+        request = runtime._planner_queue.get_nowait()
+        proposal = expression_for(
+            request.snapshot,
+            gesture_kind=None,
+        )
+
+        runtime._observation_sink(
+            self.clear_snapshot(first, state_version=2)
+        )
+        self.assertTrue(runtime._event_is_current(
+            proposal,
+            request.snapshot,
+            request.valid_until_ms,
+        ))
+
+        runtime._observation_sink(self.blocked_snapshot(
+            first,
+            state_version=3,
+            object_id="second-box",
+        ))
+        current = runtime._interaction.current()
+        self.assertGreater(
+            current.obstruction_epoch,
+            request.snapshot.obstruction_epoch,
+        )
+        self.assertFalse(runtime._event_is_current(
+            proposal,
+            request.snapshot,
+            request.valid_until_ms,
+        ))
+
+    def test_duplicate_expression_proposal_id_is_rejected(self):
+        runtime, original = self.make_runtime()
+        first = self.blocked_snapshot(
+            original,
+            state_version=1,
+            object_id="box",
+        )
+        runtime._observation_sink(first)
+        request = runtime._planner_queue.get_nowait()
+        runtime._planner_queue.put_nowait(request)
+        runtime._planner_queue.put_nowait(request)
+        runtime._close_queues()
+
+        runtime._planner_worker()
+
+        metrics = self.metrics(runtime)
+        self.assertEqual(metrics.expressions_accepted, 1)
+        self.assertEqual(metrics.duplicate_expression_drops, 1)
+        self.assertTrue(any(
+            event.kind == "duplicate_expression_drop"
+            and event.detail == request.proposal_id
+            for event in runtime._events.snapshot()
+        ))
+
+    def test_model_chosen_proposal_id_is_rejected(self):
+        runtime, original = self.make_runtime()
+        runtime.expression_planner = lambda item: expression_for(
+            item,
+            proposal_id="model-chosen-id",
+        )
+        first = self.blocked_snapshot(
+            original,
+            state_version=1,
+            object_id="box",
+        )
+        runtime._observation_sink(first)
+        runtime._close_queues()
+
+        runtime._planner_worker()
+
+        metrics = self.metrics(runtime)
+        self.assertEqual(metrics.expressions_accepted, 0)
+        self.assertEqual(metrics.planner_failures, 1)
+        self.assertEqual(metrics.duplicate_expression_drops, 0)
+        self.assertTrue(any(
+            event.kind == "proposal_id_mismatch_drop"
+            and event.detail == "model-chosen-id"
+            for event in runtime._events.snapshot()
+        ))
+
 
 class ConcurrentNavigationTests(unittest.TestCase):
     def test_blocked_expression_planner_does_not_block_navigation(self):
@@ -644,8 +738,8 @@ class ExpressionIsolationTests(unittest.TestCase):
             planner_calls[0] += 1
             if planner_calls[0] > 1:
                 return ExpressionProposal(
-                    proposal_id="later-hold-{}".format(
-                        planner_calls[0]
+                    proposal_id=expression_proposal_id_for_snapshot(
+                        snapshot
                     ),
                     robot_id=snapshot.robot_id,
                     controller_instance_id=(
@@ -960,7 +1054,6 @@ class ExpressionIsolationTests(unittest.TestCase):
             planner_calls.append(snapshot)
             return expression_for(
                 snapshot,
-                proposal_id="speech-{}".format(len(planner_calls)),
                 gesture_kind=None,
             )
 
@@ -1050,7 +1143,8 @@ class ExpressionIsolationTests(unittest.TestCase):
         self.assertEqual(result.metrics.stale_speech_drops, 1)
         self.assertTrue(any(
             event.kind == "stale_speech_drop"
-            and event.detail == "speech-2"
+            and event.detail
+            == expression_proposal_id_for_snapshot(planner_calls[1])
             for event in result.events
         ))
 

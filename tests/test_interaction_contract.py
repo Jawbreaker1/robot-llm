@@ -15,6 +15,7 @@ from robot_agent.interaction_contract import (
     decode_expression_proposal,
     decode_interaction_snapshot,
     decode_object_evidence,
+    expression_proposal_id_for_snapshot,
 )
 
 
@@ -162,6 +163,32 @@ class InteractionSnapshotContractTests(unittest.TestCase):
 
         self.assertIsNone(decoded.evidence)
         self.assertEqual(decoded.drive_phase, "MOVING")
+
+    def test_host_proposal_id_is_deterministic_and_snapshot_bound(self):
+        original = snapshot()
+        proposal_id = expression_proposal_id_for_snapshot(original)
+        changed = replace(
+            original,
+            interaction_state_version=12,
+            obstruction_epoch=3,
+            evidence=replace(
+                original.evidence,
+                evidence_id="evidence-8",
+            ),
+        )
+
+        self.assertEqual(
+            proposal_id,
+            expression_proposal_id_for_snapshot(original),
+        )
+        self.assertTrue(proposal_id.startswith("host-expression-"))
+        self.assertEqual(len(proposal_id), 80)
+        self.assertNotEqual(
+            proposal_id,
+            expression_proposal_id_for_snapshot(changed),
+        )
+        with self.assertRaises(InteractionContractError):
+            expression_proposal_id_for_snapshot({})
 
     def test_rejects_bad_phase_future_evidence_and_unversioned_evidence(self):
         invalid_changes = (

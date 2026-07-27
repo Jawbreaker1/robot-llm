@@ -1,7 +1,7 @@
 # Robot LLM Lab 🤖
 
 ![Status: controlled experiment](https://img.shields.io/badge/status-controlled%20experiment-2ea44f)
-![Tests: 517 passing](https://img.shields.io/badge/tests-517%20passing-2ea44f)
+![Tests: 521 passing](https://img.shields.io/badge/tests-521%20passing-2ea44f)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![UI: English + Swedish](https://img.shields.io/badge/UI-English%20%2B%20Swedish-0ea5e9)
 ![Physical motion: manual only](https://img.shields.io/badge/physical%20motion-manual%20only-f59e0b)
@@ -350,7 +350,7 @@ This is a manual hardware test, not autonomous navigation. Read the full
 
 | Measurement | Result |
 |---|---:|
-| Hardware-free test suite | `517 / 517` passing |
+| Hardware-free test suite | `521 / 521` passing |
 | Physical supervisor preflight | `completed`, `0` motor-start commands |
 | Straight physical B/C pulse | `+175° / +175°` |
 | Physical B/C turn pulse | `+172° / −170°` |

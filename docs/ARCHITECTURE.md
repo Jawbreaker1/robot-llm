@@ -241,13 +241,18 @@ Expression-plannern har dessutom en total episodbudget och en hostägd
 cooldown per stabilt objekt-ID; hinder utan betrodd identitet delar en
 konservativ unknown-obstruction-nyckel. Samma låda som återkommer i sensorns
 stråle blir därför inte en modell- och talspamloop, medan ett annat
-simulatorobjekt kan reageras på direkt. Navigation, expression planning, tal
-och propeller kör i separata workers. En blockerad eller felande modell- eller
+simulatorobjekt kan reageras på direkt. Hosten härleder ett unikt
+expression-`proposal_id` från varje exakt snapshot, låser modellens schema
+till detta värde och förbrukar ID:t exakt en gång per episod; modellen får
+alltså varken välja eller återanvända det. Navigation, expression planning,
+tal och propeller kör i separata workers. En blockerad eller felande modell- eller
 talcallback hindrar därför inte senare motionstick. Tal är en kortlivad
 reaktion på ett versionsbundet hinder-event och kan fortsätta medan roboten
-navigerar vidare, så länge robot-, controller-, mål-, plan- och
-world-model-bindningar samt hostens TTL fortfarande gäller. Callback-
-cancellation är kooperativ: callbacken får ett Event och ska lämna snabbt.
+navigerar vidare, så länge robot-, controller-, mål-, plan-, world-model- och
+obstruction-epoch-bindningar samt hostens TTL fortfarande gäller. Att vägen
+blir fri ändrar inte epoken, men ett nytt hinder gör ett väntande taljobb
+stale. Callback-cancellation är kooperativ: callbacken får ett Event och ska
+lämna snabbt.
 Armgrindens host-watchdog avbryter hela episoden och framtvingar terminalt
 hjulstopp om den exklusiva pausen inte släpps, men kan inte själv stoppa en
 godtycklig callbacktråd eller fysisk motor. Den fysiska adaptern behöver därför

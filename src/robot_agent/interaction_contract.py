@@ -13,6 +13,7 @@ be checked against the current snapshot immediately before it is accepted.
 """
 
 from dataclasses import dataclass
+import hashlib
 import json
 from typing import Mapping, Optional
 
@@ -322,6 +323,28 @@ class InteractionSnapshot:
                 None if self.evidence is None else self.evidence.to_dict()
             ),
         }
+
+
+def expression_proposal_id_for_snapshot(
+    snapshot: InteractionSnapshot,
+) -> str:
+    """Return the host-owned proposal ID for one exact snapshot."""
+
+    if not isinstance(snapshot, InteractionSnapshot):
+        raise InteractionContractError(
+            "invalid_interaction_snapshot",
+            "snapshot must be InteractionSnapshot",
+        )
+    canonical = json.dumps(
+        snapshot.to_dict(),
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return "host-expression-{}".format(
+        hashlib.sha256(canonical).hexdigest()
+    )
 
 
 def decode_interaction_snapshot(raw: bytes) -> InteractionSnapshot:

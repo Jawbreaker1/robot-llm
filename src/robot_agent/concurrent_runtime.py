@@ -38,6 +38,7 @@ from .interaction_contract import (
     InteractionSnapshot,
     ObjectEvidence,
     decode_expression_proposal,
+    expression_proposal_id_for_snapshot,
 )
 from .navigation_contract import (
     NavigationContractError,
@@ -252,6 +253,7 @@ class ConcurrentRuntimeMetrics:
     expression_holds: int
     expressions_accepted: int
     stale_expression_drops: int
+    duplicate_expression_drops: int
     speech_queue_drops: int
     stale_speech_drops: int
     speech_started: int
@@ -349,6 +351,7 @@ class _Metrics:
         "expression_holds",
         "expressions_accepted",
         "stale_expression_drops",
+        "duplicate_expression_drops",
         "speech_queue_drops",
         "stale_speech_drops",
         "speech_started",
@@ -393,6 +396,7 @@ class _Metrics:
 @dataclass(frozen=True)
 class _PlannerRequest:
     snapshot: InteractionSnapshot
+    proposal_id: str
     submitted_at_ms: int
     valid_until_ms: int
 
@@ -672,6 +676,9 @@ class ConcurrentBehaviorRuntime:
             response_locale,
         )
         self._submitted_obstruction_epochs = set()
+        # One planner worker owns this bounded per-run replay registry.
+        # Its maximum size is capped by max_planner_requests.
+        self._expression_proposal_ids = set()
         self._planner_request_count = 0
         self._last_expression_request_ms = {}
         self._submission_lock = threading.Lock()
@@ -865,6 +872,9 @@ class ConcurrentBehaviorRuntime:
                 return
             request = _PlannerRequest(
                 snapshot=interaction,
+                proposal_id=expression_proposal_id_for_snapshot(
+                    interaction
+                ),
                 submitted_at_ms=now_ms,
                 valid_until_ms=(
                     now_ms + self.policy.expression_ttl_ms
@@ -954,6 +964,8 @@ class ConcurrentBehaviorRuntime:
             and current.plan_revision == basis_snapshot.plan_revision
             and current.world_model_version
             == basis_snapshot.world_model_version
+            and current.obstruction_epoch
+            == basis_snapshot.obstruction_epoch
             and current.response_locale
             == basis_snapshot.response_locale
         )
@@ -993,6 +1005,23 @@ class ConcurrentBehaviorRuntime:
                     proposal.proposal_id,
                 )
                 break
+            if proposal.proposal_id != item.proposal_id:
+                self._metrics.add("planner_failures")
+                self._events.append(
+                    "expression-planner",
+                    "proposal_id_mismatch_drop",
+                    proposal.proposal_id,
+                )
+                continue
+            if proposal.proposal_id in self._expression_proposal_ids:
+                self._metrics.add("duplicate_expression_drops")
+                self._events.append(
+                    "expression-planner",
+                    "duplicate_expression_drop",
+                    proposal.proposal_id,
+                )
+                continue
+            self._expression_proposal_ids.add(proposal.proposal_id)
             if not self._event_is_current(
                 proposal,
                 item.snapshot,

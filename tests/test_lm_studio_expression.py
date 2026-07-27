@@ -8,6 +8,7 @@ from robot_agent.interaction_contract import (
     InteractionSnapshot,
     ObjectEvidence,
     decode_expression_proposal,
+    expression_proposal_id_for_snapshot,
 )
 from robot_agent.lm_studio import (
     LMStudioConfigurationError,
@@ -58,7 +59,7 @@ def proposal_value(
 ):
     value = {
         "schema": EXPRESSION_PROPOSAL_SCHEMA,
-        "proposal_id": "expression-12",
+        "proposal_id": expression_proposal_id_for_snapshot(snapshot()),
         "robot_id": "ev3rstorm-1",
         "controller_instance_id": "controller-7",
         "goal_id": "goal-waypoint-2",
@@ -237,6 +238,10 @@ class LMStudioExpressionRequestTests(unittest.TestCase):
         user_payload = json.loads(request["messages"][1]["content"])
         self.assertEqual(user_payload["response_locale"], "en-GB")
         self.assertEqual(
+            user_payload["proposal_id"],
+            expression_proposal_id_for_snapshot(snapshot()),
+        )
+        self.assertEqual(
             user_payload["interaction_snapshot"],
             snapshot().to_dict(),
         )
@@ -253,6 +258,9 @@ class LMStudioExpressionRequestTests(unittest.TestCase):
         self.assertEqual(len(express_variants), 2)
         expected_constants = {
             "schema": EXPRESSION_PROPOSAL_SCHEMA,
+            "proposal_id": expression_proposal_id_for_snapshot(
+                snapshot()
+            ),
             "robot_id": "ev3rstorm-1",
             "controller_instance_id": "controller-7",
             "goal_id": "goal-waypoint-2",
@@ -314,9 +322,9 @@ class LMStudioExpressionRequestTests(unittest.TestCase):
         for invalid in (" leading", "trailing ", "line\nbreak"):
             with self.subTest(invalid=invalid):
                 self.assertIsNone(re.search(pattern, invalid))
-        self.assertEqual(
-            express_variants[0]["properties"]["proposal_id"]["pattern"],
-            pattern,
+        self.assertNotIn(
+            "pattern",
+            express_variants[0]["properties"]["proposal_id"],
         )
         forbidden = {
             "motor_role",
@@ -371,6 +379,9 @@ class LMStudioExpressionRequestTests(unittest.TestCase):
             evidence=None,
         )
         response_value = proposal_value("HOLD")
+        response_value["proposal_id"] = (
+            expression_proposal_id_for_snapshot(no_evidence)
+        )
         response_value["obstruction_epoch"] = 0
         response_value["based_on_evidence_id"] = None
         transport = CapturingTransport(

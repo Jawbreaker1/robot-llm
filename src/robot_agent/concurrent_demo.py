@@ -22,6 +22,7 @@ from .interaction_contract import (
     ExpressionProposal,
     InteractionContractError,
     InteractionSnapshot,
+    expression_proposal_id_for_snapshot,
 )
 from .lm_studio import (
     DEFAULT_BASE_URL,
@@ -141,10 +142,7 @@ class DeterministicGrumpyExpressionPlanner:
             else snapshot.evidence.evidence_id
         )
         common = {
-            "proposal_id": "demo-expression-{}-{}".format(
-                snapshot.obstruction_epoch,
-                snapshot.interaction_state_version,
-            ),
+            "proposal_id": expression_proposal_id_for_snapshot(snapshot),
             "robot_id": snapshot.robot_id,
             "controller_instance_id": snapshot.controller_instance_id,
             "goal_id": snapshot.goal_id,
