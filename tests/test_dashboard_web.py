@@ -64,12 +64,56 @@ class DashboardWebContractTests(unittest.TestCase):
         self.assertIn("assets/styles.css", self.parser.links)
         self.assertEqual(
             self.html.count("assets/robot-llm-mascot.png"),
-            3,
+            1,
         )
-        mascot = (WEB_ROOT / "robot-llm-mascot.png").read_bytes()
-        self.assertTrue(mascot.startswith(b"\x89PNG\r\n\x1a\n"))
-        self.assertEqual(mascot[25], 6)
-        self.assertLess(len(mascot), 2 * 1024 * 1024)
+        self.assertEqual(
+            self.html.count("assets/robot-llm-head.png"),
+            2,
+        )
+        self.assertIn(
+            (
+                "link",
+                {
+                    "rel": "icon",
+                    "type": "image/png",
+                    "href": "assets/robot-llm-head.png",
+                },
+            ),
+            self.parser.elements,
+        )
+        self.assertIn(
+            (
+                "img",
+                {
+                    "src": "assets/robot-llm-head.png",
+                    "alt": "",
+                    "width": "512",
+                    "height": "512",
+                },
+            ),
+            self.parser.elements,
+        )
+        self.assertIn(
+            (
+                "img",
+                {
+                    "class": "welcome-mascot",
+                    "src": "assets/robot-llm-mascot.png",
+                    "alt": "Robot LLM Labs lätt griniga modulrobot vinkar",
+                    "width": "250",
+                    "height": "250",
+                },
+            ),
+            self.parser.elements,
+        )
+        for filename in (
+            "robot-llm-mascot.png",
+            "robot-llm-head.png",
+        ):
+            image = (WEB_ROOT / filename).read_bytes()
+            self.assertTrue(image.startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertEqual(image[25], 6)
+            self.assertLess(len(image), 2 * 1024 * 1024)
         self.assertEqual(self.parser.inline_script_data, [])
         self.assertNotIn("<style", self.html.lower())
 
@@ -177,6 +221,9 @@ class DashboardWebContractTests(unittest.TestCase):
         self.assertIn(":focus-visible", self.css)
         self.assertIn("-apple-system", self.css)
         self.assertIn("--canvas: #0b0e10", self.css.lower())
+        self.assertIn("transform: scale(1.15)", self.css)
+        self.assertNotIn("translate(-25px", self.css)
+        self.assertNotIn("translate(-27px", self.css)
         self.assertNotIn("linear-gradient(", self.css)
         self.assertNotIn("@import", self.css)
 

@@ -150,6 +150,9 @@ def asset_directory():
     (root / "robot-llm-mascot.png").write_bytes(
         b"\x89PNG\r\n\x1a\nfixture",
     )
+    (root / "robot-llm-head.png").write_bytes(
+        b"\x89PNG\r\n\x1a\nhead-fixture",
+    )
     return temporary, root
 
 
@@ -266,6 +269,12 @@ class DashboardHTTPTests(unittest.TestCase):
             + "assets/robot-llm-mascot.png",
             self.headers(authenticated=False),
         )
+        head_asset = self.router.handle(
+            "GET",
+            self.router.session_path
+            + "assets/robot-llm-head.png",
+            self.headers(authenticated=False),
+        )
 
         self.assertEqual(unauthenticated_api.status, 403)
         self.assertEqual(wrong_api.status, 403)
@@ -278,7 +287,19 @@ class DashboardHTTPTests(unittest.TestCase):
             dict(mascot_asset.headers)["Content-Type"],
             "image/png",
         )
-        self.assertTrue(mascot_asset.body.startswith(b"\x89PNG"))
+        self.assertEqual(
+            mascot_asset.body,
+            b"\x89PNG\r\n\x1a\nfixture",
+        )
+        self.assertEqual(head_asset.status, 200)
+        self.assertEqual(
+            dict(head_asset.headers)["Content-Type"],
+            "image/png",
+        )
+        self.assertEqual(
+            head_asset.body,
+            b"\x89PNG\r\n\x1a\nhead-fixture",
+        )
         self.assertEqual(self.service.calls, [])
 
     def test_mutations_require_token_origin_and_exact_json_mime(self):

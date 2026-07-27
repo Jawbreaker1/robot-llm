@@ -147,6 +147,10 @@ class DashboardRouter:
             "robot-llm-mascot.png",
             "image/png",
         ),
+        "assets/robot-llm-head.png": (
+            "robot-llm-head.png",
+            "image/png",
+        ),
     }
 
     def __init__(
