@@ -326,6 +326,29 @@ referens som “två gånger till” behöver dessutom bindas till explicit sena
 föreslagen, auktoriserad och verifierad handling innan den kan påverka en
 robot.
 
+Presentationsspråk och svarsspråk är också explicita kontrakt, inte något
+hosten försöker detektera ur naturligt språk. Browsern väljer en allowlistad
+locale via `Intl.Locale` och en lokal katalog. Varje agenttur bär sedan
+`response_locale` genom HTTP-kontrakt, köat turn-state och
+plannerkontext. LM-plannern instrueras att använda detta fält för all
+naturlig `ANSWER`-/`CLARIFY`-text och att lämna egennamn, protokoll-ID:n och
+evidensidentiteter oförändrade. En hostskapad
+`response_language_instruction` innehåller locale-kod och språkets namn,
+ligger sist i den strukturerade modellkontexten och upprepas som description
+på schemats user-facing textfält. Denna ordning är avsiktlig: liveprovet
+visade att en avslutande användarfråga annars kunde vinna över en tidigare
+locale-instruktion. Svenska och engelska är första kompletta katalogparet;
+fler språk är en katalog-, språkmetadata- och allowlistutökning, inte nya
+språkberoende beslutskodvägar.
+
+Framtida röststöd ska använda samma princip. STT får publicera transkript med
+ett separat, tidsstämplat `detected_locale` och confidence som observation;
+det får inte tyst skriva över användarens valda `response_locale`. TTS får i
+sin tur ett explicit `voice_locale` och ett allowlistat voice-ID. Om en
+passande röst saknas ska anropet neka eller kräva ett synligt val, aldrig
+råka falla tillbaka till svenska. Engelskt STT/TTS är därför en egen
+YouTube-demo-grind även om engelsk textdialog redan fungerar.
+
 Det beskrivande registryt stöder redan flera `robot_id`, controllers,
 kameror, mikrofoner, compute-noder och providers. Varje nod har
 `control_exposed: false`. Dashboard-API:t har inga operationer för motor,

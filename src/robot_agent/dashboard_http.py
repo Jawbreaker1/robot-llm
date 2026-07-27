@@ -139,6 +139,10 @@ class DashboardRouter:
 
     _STATIC_ROUTES = {
         "assets/styles.css": ("styles.css", "text/css; charset=utf-8"),
+        "assets/i18n.js": (
+            "i18n.js",
+            "text/javascript; charset=utf-8",
+        ),
         "assets/app.js": (
             "app.js",
             "text/javascript; charset=utf-8",
@@ -587,6 +591,7 @@ class DashboardRouter:
                     "expected_conversation_version",
                     "content",
                     "mode",
+                    "response_locale",
                 ),
             )
             turn = self._service_call(
@@ -596,6 +601,7 @@ class DashboardRouter:
                     request["expected_conversation_version"],
                     request["content"],
                     request["mode"],
+                    request["response_locale"],
                 )
             )
             return self._response(202, {"turn": turn})

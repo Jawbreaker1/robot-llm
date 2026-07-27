@@ -661,6 +661,64 @@ Grind: godkänd för fortsatt dialog-, research- och GUI-utveckling utan
 robotström. Inte godkänd som fysisk kontrollpanel. Settings lagras endast i
 minnet i denna slice och återställs vid omstart.
 
+### EXP-F4-I18N-002 – explicit svenska och engelska utan språkheuristik
+
+Hypotes: gränssnitt och modellrespons kan byta språk reproducerbart utan att
+hosten försöker klassificera användarens naturliga språk och utan att
+språkbyte påverkar konversationens tekniska state.
+
+Implementation:
+
+- kompletta, nyckelmatchade svenska och engelska kataloger för statisk och
+  dynamisk UI-copy, inklusive ARIA, placeholders, fel och tomlägen,
+- standardsbaserat locale-val via `Intl.Locale`, lokalt sparat explicit val,
+  browserlocale som fallback och locale-medveten datum-/nummerformatering,
+- språkbyte utan omladdning, nätverksanrop, förlorat fokus, tappad
+  textmarkering eller återställd konversationsscroll,
+- typat och exakt allowlistat `response_locale` genom HTTP, idempotens,
+  köad tur, kontext och LM Studio-systeminstruktion,
+- hostskapad språkmetadata och `response_language_instruction` sist i
+  modellkontexten samt på JSON-schemats user-facing textfält,
+- auktoritativt svarsspråk för både `ANSWER` och `CLARIFY`, oberoende av
+  språk i prompt, historik, evidens eller verktygsresultat,
+- oförändrade tekniska värden såsom ID:n, hashes, modellnamn, eventtyper,
+  verktygs-ID:n och rå JSON.
+
+Kontrakts- och browserfria VM-tester verifierar katalogparitet, uppmärkning av
+all statisk copy, locale-resolver, lagring, formatering, språkbyte utan
+nätverk samt att servern avvisar saknad eller okänd `response_locale`.
+Agenttester verifierar dessutom att valt språk följer exakt den köade turen
+hela vägen till modellkontexten och ingår i idempotensidentiteten.
+
+Resultat: svenska och engelska är godkända som förstaklasspråk för den lokala
+dashboarden och agentens textsvar. Arkitekturen är förberedd för fler
+kataloger, men andra språk är ännu inte innehålls- eller modelltestade. Hela
+den hårdvarufria reposviten passerar `448 / 448`. Ingen EV3 kontaktades.
+
+Liveprov 2026-07-27 med `google/gemma-4-26b-a4b`:
+
+1. engelsk UI-copy, kuraterade experimentkort och registry-namn visades utan
+   kvarvarande svensk presentationscopy,
+2. språkbyte bevarade samtal, formulärstate och ett färdigt LM Studio-probe,
+3. en första version lät vid ett tillfälle en engelsk prompt och engelsk
+   historik vinna över svensk `response_locale`; detta fångades före commit,
+4. efter att den hostskapade språkregeln placerats sist i kontexten passerade
+   motexempel i båda riktningarna: svensk prompt som uttryckligen begärde
+   svenska gav engelska i `en`, och engelsk prompt som uttryckligen begärde
+   engelska gav svenska i `sv`,
+5. samma resultat höll efter språkbyte mitt i en blandad konversation, och
+   den engelska introduktionen blev naturlig user-facing copy: modellen
+   beskrev sig som Robot LLM Labs lokala AI-assistent, inte som en intern
+   planner.
+
+Grind: godkänd för svensk och engelsk demo i den rörelsefria dashboarden.
+Inte ett bevis på framtida flerspråkig STT, TTS, robotpersonlighet eller
+fysisk instruktionsklassificering. Liveprovet är heller ingen matematisk
+garanti för varje framtida modellutdata; en separat typad LLM-validator är
+nästa förstärkning om svarsspråk ska ha en egen slutna-loop-grind. Före en
+talande YouTube-demo ska engelskt STT och TTS verifieras som separata,
+explicita locale-/voice-kontrakt.
+
 ## Fas 5 – Sluten målriktad loop
 
 Loop:

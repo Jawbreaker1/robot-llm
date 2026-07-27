@@ -26,6 +26,7 @@ class FakeContext:
         require_evidence=True,
         planner_timeout_ms=2_500,
         conversation_history=None,
+        response_locale="sv",
     ):
         self._evidence = [] if evidence is None else evidence
         self._used_proposal_ids = (
@@ -37,6 +38,7 @@ class FakeContext:
         self._require_evidence = require_evidence
         self._planner_timeout_ms = planner_timeout_ms
         self._conversation_history = conversation_history
+        self._response_locale = response_locale
 
     def to_dict(self):
         value = {
@@ -53,6 +55,7 @@ class FakeContext:
             "remaining_replans": 2,
             "remaining_elapsed_ms": 9_000,
             "planner_timeout_ms": self._planner_timeout_ms,
+            "response_locale": self._response_locale,
         }
         if self._conversation_history is not None:
             value["conversation_history"] = self._conversation_history
@@ -175,6 +178,71 @@ class LMStudioResearchPlannerTests(unittest.TestCase):
         self.assertNotIn("RobotAPI", serialized)
         self.assertNotIn("drive_timed", serialized)
         self.assertIn("weather.current", serialized)
+        self.assertIn("response_locale is authoritative", serialized)
+        context = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(context["response_locale"], "sv")
+
+    def test_english_response_locale_is_bound_without_language_detection(self):
+        transport = RecordingTransport()
+        planner = LMStudioResearchPlanner(
+            transport=transport,
+            clock=FixedClock(10.0, 10.1),
+        )
+
+        planner(
+            FakeContext(
+                response_locale="en",
+                require_evidence=False,
+            )
+        )
+
+        payload = json.loads(transport.calls[0][1])
+        context_content = payload["messages"][1]["content"]
+        self.assertGreater(
+            context_content.rfind('"response_language_instruction"'),
+            context_content.rfind('"user_query"'),
+        )
+        context = json.loads(context_content)
+        self.assertEqual(context["response_locale"], "en")
+        self.assertEqual(
+            context["response_language"],
+            {"locale": "en", "name": "English"},
+        )
+        language_instruction = context[
+            "response_language_instruction"
+        ]
+        self.assertIn("exclusively in English", language_instruction)
+        self.assertIn(
+            "user_query, conversation_history, evidence, or tool output",
+            language_instruction,
+        )
+        schema = payload["response_format"]["json_schema"]["schema"]
+        answer_description = schema["oneOf"][1]["properties"][
+            "answer"
+        ]["properties"]["text"]["description"]
+        clarify_description = schema["oneOf"][2]["properties"][
+            "question"
+        ]["description"]
+        self.assertEqual(answer_description, language_instruction)
+        self.assertEqual(clarify_description, language_instruction)
+        system_prompt = payload["messages"][0]["content"]
+        self.assertIn(
+            "Do not infer the output language from the user text",
+            system_prompt,
+        )
+        self.assertIn(
+            "Robot LLM Lab's local assistant and robot intelligence",
+            system_prompt,
+        )
+        self.assertIn(
+            "present yourself simply as Robot LLM Lab's local AI assistant",
+            system_prompt,
+        )
+        self.assertIn(
+            "Never call yourself a component, engine, or internal planner",
+            system_prompt,
+        )
+        self.assertIn("This dashboard has no motor access", system_prompt)
 
     def test_schema_binds_context_and_real_evidence_ids(self):
         evidence = [
@@ -350,6 +418,7 @@ class LMStudioResearchPlannerTests(unittest.TestCase):
             ),
             FakeContext(remaining_tool_calls=-1),
             FakeContext(planner_timeout_ms=0),
+            FakeContext(response_locale="fr"),
         ]
         for context in invalid:
             with self.subTest(context=context):

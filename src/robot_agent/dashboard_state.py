@@ -9,6 +9,7 @@ from typing import Callable, Mapping, Optional, Tuple
 
 from .dashboard_contract import (
     CHAT_MODES,
+    RESPONSE_LOCALES,
     ChatMessage,
     ChatTurn,
     Conversation,
@@ -467,12 +468,18 @@ class ConversationStore:
         expected_version: int,
         content: str,
         mode: str,
+        response_locale: str = "sv",
         settings_revision: int = 1,
     ) -> Tuple[Conversation, ChatTurn, bool]:
         if mode not in CHAT_MODES:
             raise DashboardStateError(
                 "invalid_chat_mode",
                 "Chat turn mode is unsupported",
+            )
+        if response_locale not in RESPONSE_LOCALES:
+            raise DashboardStateError(
+                "invalid_response_locale",
+                "Chat response locale is unsupported",
             )
         with self._lock:
             try:
@@ -489,6 +496,7 @@ class ConversationStore:
                 if (
                     existing.content != content
                     or existing.mode != mode
+                    or existing.response_locale != response_locale
                     or existing.settings_revision != settings_revision
                 ):
                     raise DashboardStateError(
@@ -525,6 +533,7 @@ class ConversationStore:
                 conversation_id=conversation_id,
                 client_request_id=client_request_id,
                 mode=mode,
+                response_locale=response_locale,
                 settings_revision=settings_revision,
                 status="queued",
                 content=content,

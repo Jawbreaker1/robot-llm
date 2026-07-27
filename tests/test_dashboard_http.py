@@ -32,6 +32,18 @@ class FakeDashboardService:
             "api_version": "robot-dashboard/v1",
             "server_instance_id": "server-1",
             "physical_control_enabled": False,
+            "experiments": [
+                {
+                    "schema": "dashboard-experiment/v1",
+                    "experiment_id": "EXP-F1-IR-DYN-002",
+                    "title_key": "experiments.curated.dynamic_ir.title",
+                    "summary_key": (
+                        "experiments.curated.dynamic_ir.summary"
+                    ),
+                    "status": "verified",
+                    "component_ids": ["ev3rstorm-01.ev3-main"],
+                }
+            ],
         }
 
     def settings(self):
@@ -90,6 +102,7 @@ class FakeDashboardService:
         expected_conversation_version,
         content,
         mode,
+        response_locale,
     ):
         self.calls.append(
             (
@@ -99,6 +112,7 @@ class FakeDashboardService:
                 expected_conversation_version,
                 content,
                 mode,
+                response_locale,
             )
         )
         return {
@@ -141,6 +155,10 @@ def asset_directory():
     )
     (root / "styles.css").write_text(
         "body { color: white; }",
+        encoding="utf-8",
+    )
+    (root / "i18n.js").write_text(
+        '"use strict";',
         encoding="utf-8",
     )
     (root / "app.js").write_text(
@@ -224,6 +242,21 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertFalse(
             self.decoded(bootstrap)["physical_control_enabled"]
         )
+        self.assertEqual(
+            self.decoded(bootstrap)["experiments"],
+            [
+                {
+                    "schema": "dashboard-experiment/v1",
+                    "experiment_id": "EXP-F1-IR-DYN-002",
+                    "title_key": "experiments.curated.dynamic_ir.title",
+                    "summary_key": (
+                        "experiments.curated.dynamic_ir.summary"
+                    ),
+                    "status": "verified",
+                    "component_ids": ["ev3rstorm-01.ev3-main"],
+                }
+            ],
+        )
         self.assertEqual(registry.status, 200)
         self.assertEqual(
             self.service.calls,
@@ -253,6 +286,11 @@ class DashboardHTTPTests(unittest.TestCase):
             "/assets/app.js",
             self.headers(authenticated=False),
         )
+        old_i18n_asset_path = self.router.handle(
+            "GET",
+            "/assets/i18n.js",
+            self.headers(authenticated=False),
+        )
         wrong_session = self.router.handle(
             "GET",
             "/session/{}/".format("b" * 64),
@@ -261,6 +299,11 @@ class DashboardHTTPTests(unittest.TestCase):
         session_asset = self.router.handle(
             "GET",
             self.router.session_path + "assets/app.js",
+            self.headers(authenticated=False),
+        )
+        i18n_asset = self.router.handle(
+            "GET",
+            self.router.session_path + "assets/i18n.js",
             self.headers(authenticated=False),
         )
         mascot_asset = self.router.handle(
@@ -280,8 +323,28 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertEqual(wrong_api.status, 403)
         self.assertEqual(public_root.status, 404)
         self.assertEqual(old_asset_path.status, 404)
+        self.assertEqual(old_i18n_asset_path.status, 404)
         self.assertEqual(wrong_session.status, 403)
         self.assertEqual(session_asset.status, 200)
+        self.assertEqual(
+            dict(session_asset.headers)["Content-Type"],
+            "text/javascript; charset=utf-8",
+        )
+        self.assertEqual(i18n_asset.status, 200)
+        self.assertEqual(
+            dict(i18n_asset.headers)["Content-Type"],
+            "text/javascript; charset=utf-8",
+        )
+        self.assertEqual(
+            dict(i18n_asset.headers)["X-Content-Type-Options"],
+            "nosniff",
+        )
+        self.assertEqual(i18n_asset.body, b'"use strict";')
+        static_routes = tuple(DashboardRouter._STATIC_ROUTES)
+        self.assertLess(
+            static_routes.index("assets/i18n.js"),
+            static_routes.index("assets/app.js"),
+        )
         self.assertEqual(mascot_asset.status, 200)
         self.assertEqual(
             dict(mascot_asset.headers)["Content-Type"],
@@ -429,6 +492,7 @@ class DashboardHTTPTests(unittest.TestCase):
                     "expected_conversation_version": 0,
                     "content": "Hur är vädret?",
                     "mode": "research_required",
+                    "response_locale": "sv",
                 }
             ).encode("utf-8"),
         )
@@ -450,6 +514,7 @@ class DashboardHTTPTests(unittest.TestCase):
                 0,
                 "Hur är vädret?",
                 "research_required",
+                "sv",
             ),
         )
 

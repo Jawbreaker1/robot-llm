@@ -7,6 +7,11 @@ import time
 import unittest
 from dataclasses import replace
 
+from robot_agent.dashboard_contract import (
+    EXPERIMENT_SUMMARY_KEYS,
+    EXPERIMENT_TITLE_KEYS,
+    REGISTRY_DISPLAY_NAME_KEYS,
+)
 from robot_agent.dashboard_service import (
     DashboardService,
     DashboardServiceError,
@@ -121,13 +126,22 @@ class DashboardServiceTests(unittest.TestCase):
         self.services.append(service)
         return service
 
-    def submit(self, service, conversation, request_id, content, mode):
+    def submit(
+        self,
+        service,
+        conversation,
+        request_id,
+        content,
+        mode,
+        response_locale="sv",
+    ):
         return service.submit_turn(
             conversation["conversation_id"],
             request_id,
             conversation["version"],
             content,
             mode,
+            response_locale,
         )
 
     def test_answer_clarification_and_failure_are_safe_terminal_views(self):
@@ -148,9 +162,15 @@ class DashboardServiceTests(unittest.TestCase):
             "request-answer",
             "Hej",
             "conversation",
+            response_locale="en",
         )
         answered = wait_for_terminal(service, first["turn_id"])
         self.assertEqual(answered["status"], "answered")
+        self.assertEqual(answered["response_locale"], "en")
+        self.assertEqual(
+            runner.calls[0]["turn"].response_locale,
+            "en",
+        )
         self.assertEqual(answered["answer_text"], "Hej tillbaka.")
         self.assertEqual(answered["episode"]["termination"], ANSWERED)
 
@@ -211,9 +231,23 @@ class DashboardServiceTests(unittest.TestCase):
             999,
             "Samma innehåll",
             "conversation",
+            "sv",
         )
         self.assertEqual(replay["turn_id"], first["turn_id"])
         self.assertEqual(replay["settings_revision"], 1)
+        with self.assertRaises(DashboardServiceError) as locale_conflict:
+            service.submit_turn(
+                first_conversation["conversation_id"],
+                "stable-request",
+                999,
+                "Samma innehåll",
+                "conversation",
+                "en",
+            )
+        self.assertEqual(
+            locale_conflict.exception.code,
+            "idempotency_conflict",
+        )
 
         second_conversation = service.create_conversation()
         with self.assertRaises(DashboardServiceError) as raised:
@@ -233,6 +267,30 @@ class DashboardServiceTests(unittest.TestCase):
             "answered",
         )
         self.assertEqual(blocker.calls[0][3].revision, 1)
+
+    def test_unsupported_response_locale_is_rejected_before_queueing(self):
+        service = self.make_service(
+            episode_runner=ScriptedRunner(
+                episode(ANSWERED, answer_text="Unused")
+            )
+        )
+        conversation = service.create_conversation()
+
+        with self.assertRaises(DashboardServiceError) as raised:
+            service.submit_turn(
+                conversation["conversation_id"],
+                "request-fr",
+                conversation["version"],
+                "Bonjour",
+                "conversation",
+                "fr",
+            )
+
+        self.assertEqual(raised.exception.status, 400)
+        self.assertEqual(
+            raised.exception.code,
+            "invalid_response_locale",
+        )
 
     def test_planner_receives_bounded_typed_history_without_current_user(self):
         contexts = []
@@ -290,10 +348,12 @@ class DashboardServiceTests(unittest.TestCase):
             "history-2",
             "Två gånger till",
             "conversation",
+            response_locale="en",
         )
         wait_for_terminal(service, second["turn_id"])
 
         history = contexts[-1]["conversation_history"]
+        self.assertEqual(contexts[-1]["response_locale"], "en")
         self.assertEqual(history["schema"], "conversation-history/v1")
         self.assertEqual(
             [(item["role"], item["content"]) for item in history["messages"]],
@@ -475,6 +535,68 @@ class DashboardServiceTests(unittest.TestCase):
             all(not node["control_exposed"] for node in registry["nodes"])
         )
         self.assertFalse(bootstrap["capabilities"]["ssh"])
+
+    def test_bootstrap_uses_typed_catalog_keys_for_curated_copy(self):
+        service = self.make_service(
+            episode_runner=ScriptedRunner(
+                episode(ANSWERED, answer_text="ok")
+            )
+        )
+        bootstrap = service.bootstrap()
+        experiments = bootstrap["experiments"]
+
+        self.assertEqual(len(experiments), 3)
+        self.assertEqual(
+            {item["title_key"] for item in experiments},
+            set(EXPERIMENT_TITLE_KEYS),
+        )
+        self.assertEqual(
+            {item["summary_key"] for item in experiments},
+            set(EXPERIMENT_SUMMARY_KEYS),
+        )
+        self.assertEqual(
+            {item["schema"] for item in experiments},
+            {"dashboard-experiment/v1"},
+        )
+        self.assertEqual(
+            len({item["experiment_id"] for item in experiments}),
+            len(experiments),
+        )
+        for item in experiments:
+            self.assertNotIn("title", item)
+            self.assertNotIn("summary", item)
+
+    def test_registry_localizes_only_explicit_generic_names(self):
+        service = self.make_service(
+            episode_runner=ScriptedRunner(
+                episode(ANSWERED, answer_text="ok")
+            )
+        )
+        registry = service.registry()
+        records = registry["robots"] + registry["nodes"]
+        keyed = {
+            record["display_name"]: record["display_name_key"]
+            for record in records
+            if record["display_name_key"] is not None
+        }
+        raw_names = {
+            record["display_name"]
+            for record in records
+            if record["display_name_key"] is None
+        }
+
+        self.assertEqual(set(keyed.values()), set(REGISTRY_DISPLAY_NAME_KEYS))
+        self.assertTrue(
+            {
+                "EV3RSTORM",
+                "EV3 Main",
+                "Robot Inventor 51515",
+                "BOOST Move Hub",
+                "LM Studio",
+                "Open-Meteo",
+            }
+            <= raw_names
+        )
 
     def test_lm_probe_is_fixed_loopback_get_and_bounded(self):
         calls = []

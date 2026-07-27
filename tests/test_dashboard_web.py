@@ -1,6 +1,16 @@
 from html.parser import HTMLParser
+import json
 from pathlib import Path
+import re
+import subprocess
 import unittest
+
+from robot_agent.dashboard_contract import (
+    EXPERIMENT_SUMMARY_KEYS,
+    EXPERIMENT_TITLE_KEYS,
+    REGISTRY_DISPLAY_NAME_KEYS,
+    RESPONSE_LOCALES,
+)
 
 
 WEB_ROOT = (
@@ -18,6 +28,7 @@ class AssetParser(HTMLParser):
         self.attributes = []
         self.elements = []
         self.scripts = []
+        self.script_elements = []
         self.links = []
         self._script_without_src = False
         self.inline_script_data = []
@@ -30,6 +41,7 @@ class AssetParser(HTMLParser):
             self.ids.append(values["id"])
         if tag == "script":
             self.scripts.append(values.get("src"))
+            self.script_elements.append(values)
             self._script_without_src = "src" not in values
         if tag == "link":
             self.links.append(values.get("href"))
@@ -48,9 +60,225 @@ class DashboardWebContractTests(unittest.TestCase):
     def setUpClass(cls):
         cls.html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
         cls.css = (WEB_ROOT / "styles.css").read_text(encoding="utf-8")
+        cls.i18n = (WEB_ROOT / "i18n.js").read_text(encoding="utf-8")
         cls.javascript = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+        cls.javascript_assets = cls.i18n + "\n" + cls.javascript
         cls.parser = AssetParser()
         cls.parser.feed(cls.html)
+        cls.i18n_contract = cls._inspect_i18n_contract()
+
+    @classmethod
+    def _inspect_i18n_contract(cls):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const window = {};
+vm.runInNewContext(source, { window, Intl }, { filename: process.argv[1] });
+const api = window.RobotI18n;
+if (!api || !api.CATALOGS || typeof api.resolveLocale !== "function") {
+  throw new Error("i18n.js did not expose the RobotI18n contract");
+}
+const catalogs = {};
+for (const [locale, catalog] of Object.entries(api.CATALOGS)) {
+  const entries = Object.entries(catalog.messages || {});
+  catalogs[locale] = {
+    keys: entries.map(([key]) => key).sort(),
+    values: Object.fromEntries(
+      entries.filter(([, value]) => typeof value === "string"),
+    ),
+    invalidValues: entries
+      .filter(([, value]) => (
+        typeof value !== "function"
+        && (typeof value !== "string" || value.trim().length === 0)
+      ))
+      .map(([key]) => key),
+    formatLocale: catalog.formatLocale,
+    direction: catalog.dir,
+  };
+}
+const cases = {
+  swedishRegion: ["sv-SE"],
+  swedishExtension: ["sv-FI-u-ca-gregory"],
+  britishEnglish: ["en-GB"],
+  americanEnglish: ["en-US"],
+  invalid: ["not_a_locale"],
+  unsupported: ["fr-FR"],
+  skipInvalidAndUnsupported: ["not_a_locale", "fr-FR", "en-US"],
+};
+const resolutions = {};
+for (const [name, candidates] of Object.entries(cases)) {
+  resolutions[name] = api.resolveLocale(candidates);
+}
+const copySamples = {};
+for (const locale of Object.keys(api.CATALOGS)) {
+  const instance = api.createDefaultI18n({
+    candidates: [locale],
+    environment: {},
+  });
+  copySamples[locale] = {
+    droppedEvents: instance.t("events.gap", { count: "7" }),
+    unknownKey: instance.t("future.unknown.key"),
+  };
+}
+
+const persistedReads = [];
+const persistedEnvironment = {
+  localStorage: {
+    getItem(key) {
+      persistedReads.push(key);
+      return "en";
+    },
+    setItem() {},
+  },
+  navigator: {
+    languages: ["sv-SE"],
+    language: "sv-SE",
+  },
+  document: {
+    documentElement: { lang: "sv" },
+  },
+};
+const persisted = api.createDefaultI18n({
+  environment: persistedEnvironment,
+});
+
+const blockedEnvironment = {
+  localStorage: {
+    getItem() {
+      throw new Error("storage read blocked");
+    },
+    setItem() {
+      throw new Error("storage write blocked");
+    },
+  },
+  navigator: {
+    languages: ["en-US"],
+    language: "en-US",
+  },
+};
+const blocked = api.createDefaultI18n({
+  environment: blockedEnvironment,
+});
+const blockedInitial = {
+  locale: blocked.locale,
+  formatLocale: blocked.formatLocale,
+};
+let blockedSetSurvived = true;
+try {
+  blocked.setLocale("sv-SE");
+} catch (_error) {
+  blockedSetSurvived = false;
+}
+
+const storageWrites = [];
+const switching = api.createDefaultI18n({
+  environment: {
+    localStorage: {
+      getItem() {
+        return null;
+      },
+      setItem(key, value) {
+        storageWrites.push([key, value]);
+      },
+    },
+    navigator: {
+      languages: ["sv-SE"],
+      language: "sv-SE",
+    },
+  },
+});
+const sampleNumber = 1234567.89;
+const sampleDate = Date.UTC(2026, 6, 27, 10, 5, 0);
+const dateOptions = {
+  timeZone: "UTC",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+};
+const swedishNumber = switching.number(sampleNumber);
+const swedishDate = switching.dateTime(sampleDate, dateOptions);
+const swedishPlural = switching.plural(2);
+const swedishUnknown = switching.t("common.unknown");
+const notifications = [];
+const unsubscribe = switching.subscribe((instance) => {
+  notifications.push({
+    locale: instance.locale,
+    formatLocale: instance.formatLocale,
+  });
+});
+const switched = switching.setLocale("en-US");
+const englishNumber = switching.number(sampleNumber);
+const englishDate = switching.dateTime(sampleDate, dateOptions);
+const englishPlural = switching.plural(2);
+const englishUnknown = switching.t("common.unknown");
+unsubscribe();
+switching.setLocale("sv", { persist: false });
+
+process.stdout.write(JSON.stringify({
+  exports: Object.keys(api).sort(),
+  catalogs,
+  resolutions,
+  copySamples,
+  runtime: {
+    persisted: {
+      reads: persistedReads,
+      locale: persisted.locale,
+      formatLocale: persisted.formatLocale,
+      translation: persisted.t("common.unknown"),
+    },
+    blockedStorage: {
+      initial: blockedInitial,
+      setSurvived: blockedSetSurvived,
+      localeAfterSet: blocked.locale,
+      formatLocaleAfterSet: blocked.formatLocale,
+    },
+    switching: {
+      supportedLocales: switching.supportedLocales,
+      switched,
+      notifications,
+      storageWrites,
+      finalLocale: switching.locale,
+      finalFormatLocale: switching.formatLocale,
+      translationsChanged: swedishUnknown !== englishUnknown,
+      numberChanged: swedishNumber !== englishNumber,
+      formatterMatches: {
+        swedishNumber: swedishNumber
+          === new Intl.NumberFormat("sv-SE").format(sampleNumber),
+        swedishDate: swedishDate
+          === new Intl.DateTimeFormat("sv-SE", dateOptions).format(sampleDate),
+        swedishPlural: swedishPlural
+          === new Intl.PluralRules("sv-SE").select(2),
+        englishNumber: englishNumber
+          === new Intl.NumberFormat("en-US").format(sampleNumber),
+        englishDate: englishDate
+          === new Intl.DateTimeFormat("en-US", dateOptions).format(sampleDate),
+        englishPlural: englishPlural
+          === new Intl.PluralRules("en-US").select(2),
+      },
+    },
+  },
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(WEB_ROOT / "i18n.js"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr)
+        return json.loads(completed.stdout)
 
     def test_html_has_one_token_placeholder_and_external_assets_only(self):
         self.assertEqual(
@@ -59,7 +287,13 @@ class DashboardWebContractTests(unittest.TestCase):
         )
         self.assertEqual(
             self.parser.scripts,
-            ["assets/app.js"],
+            ["assets/i18n.js", "assets/app.js"],
+        )
+        self.assertTrue(
+            all(
+                "defer" in attributes
+                for attributes in self.parser.script_elements
+            )
         )
         self.assertIn("assets/styles.css", self.parser.links)
         self.assertEqual(
@@ -93,18 +327,28 @@ class DashboardWebContractTests(unittest.TestCase):
             ),
             self.parser.elements,
         )
-        self.assertIn(
-            (
-                "img",
-                {
-                    "class": "welcome-mascot",
-                    "src": "assets/robot-llm-mascot.png",
-                    "alt": "Robot LLM Labs lätt griniga modulrobot vinkar",
-                    "width": "250",
-                    "height": "250",
-                },
-            ),
-            self.parser.elements,
+        mascot = next(
+            attributes
+            for tag, attributes in self.parser.elements
+            if tag == "img"
+            and attributes.get("src") == "assets/robot-llm-mascot.png"
+        )
+        self.assertEqual(
+            {
+                name: mascot.get(name)
+                for name in ("class", "src", "alt", "width", "height")
+            },
+            {
+                "class": "welcome-mascot",
+                "src": "assets/robot-llm-mascot.png",
+                "alt": "Robot LLM Labs lätt griniga modulrobot vinkar",
+                "width": "250",
+                "height": "250",
+            },
+        )
+        self.assertEqual(
+            mascot.get("data-i18n-alt"),
+            "workbench.welcome.mascot_alt",
         )
         for filename in (
             "robot-llm-mascot.png",
@@ -144,15 +388,478 @@ class DashboardWebContractTests(unittest.TestCase):
         self.assertNotIn("Ingen fysisk capability", self.html)
         self.assertNotIn("EV3RSTORM är offline just nu", self.html)
         self.assertNotIn("weather.current</span>", self.html)
-        self.assertIn("Redo att chatta · robotstyrning är avstängd", self.javascript)
+        self.assertIn("Redo att chatta · robotstyrning är avstängd", self.i18n)
+        self.assertNotIn(
+            "Redo att chatta · robotstyrning är avstängd",
+            self.javascript,
+        )
         self.assertNotIn(
             "modellresultat saknar fysisk auktoritet",
-            self.javascript,
+            self.javascript_assets,
         )
         self.assertNotIn(
             "Read-only verktyg kan väljas semantiskt",
+            self.javascript_assets,
+        )
+        for raw_value in (
+            "Gemma",
+            "EV3RSTORM",
+            "EV3 Main",
+            "LM Studio",
+            "weather.current",
+            "SSH",
+            "TTS",
+        ):
+            with self.subTest(raw_value=raw_value):
+                self.assertIn(">{}<".format(raw_value), self.html)
+
+    def test_i18n_catalogs_have_the_exact_same_nonempty_keyset(self):
+        self.assertTrue(
+            {
+                "CATALOGS",
+                "createDefaultI18n",
+                "createI18n",
+                "resolveLocale",
+            }
+            <= set(self.i18n_contract["exports"]),
+        )
+        catalogs = self.i18n_contract["catalogs"]
+        self.assertEqual(set(catalogs), {"sv", "en"})
+        self.assertGreater(len(catalogs["sv"]["keys"]), 0)
+        self.assertEqual(catalogs["sv"]["keys"], catalogs["en"]["keys"])
+        self.assertEqual(catalogs["sv"]["invalidValues"], [])
+        self.assertEqual(catalogs["en"]["invalidValues"], [])
+        self.assertEqual(catalogs["sv"]["formatLocale"], "sv-SE")
+        self.assertEqual(catalogs["en"]["formatLocale"], "en-GB")
+        self.assertEqual(catalogs["sv"]["direction"], "ltr")
+        self.assertEqual(catalogs["en"]["direction"], "ltr")
+
+    def test_locale_codes_match_html_javascript_and_python_contract(self):
+        selector_values = [
+            attributes["value"]
+            for tag, attributes in self.parser.elements
+            if tag == "option"
+            and attributes.get("data-i18n")
+            in {"locale.swedish", "locale.english"}
+        ]
+
+        self.assertEqual(selector_values, list(RESPONSE_LOCALES))
+        self.assertEqual(
+            list(self.i18n_contract["catalogs"]),
+            list(RESPONSE_LOCALES),
+        )
+        self.assertEqual(
+            self.i18n_contract["runtime"]["switching"][
+                "supportedLocales"
+            ],
+            list(RESPONSE_LOCALES),
+        )
+
+    def test_curated_experiment_and_registry_keys_are_catalog_backed(self):
+        catalogs = self.i18n_contract["catalogs"]
+        expected_keys = (
+            set(EXPERIMENT_TITLE_KEYS)
+            | set(EXPERIMENT_SUMMARY_KEYS)
+            | set(REGISTRY_DISPLAY_NAME_KEYS)
+        )
+        for locale in RESPONSE_LOCALES:
+            with self.subTest(locale=locale):
+                self.assertTrue(
+                    expected_keys <= set(catalogs[locale]["keys"])
+                )
+                for key in expected_keys:
+                    self.assertTrue(catalogs[locale]["values"][key])
+
+        for key in EXPERIMENT_TITLE_KEYS + EXPERIMENT_SUMMARY_KEYS:
+            with self.subTest(key=key):
+                self.assertNotEqual(
+                    catalogs["sv"]["values"][key],
+                    catalogs["en"]["values"][key],
+                )
+
+        render_start = self.javascript.index(
+            "  function renderExperiments(experiments) {"
+        )
+        render_end = self.javascript.index(
+            "\n  function renderBootstrap(",
+            render_start,
+        )
+        render_source = self.javascript[render_start:render_end]
+        self.assertIn("localizedCatalogValue(", render_source)
+        self.assertIn("experiment.title_key", render_source)
+        self.assertIn("experiment.summary_key", render_source)
+        self.assertIn(
+            'safeText(experiment.title, t("experiments.untitled"))',
+            render_source,
+        )
+        self.assertIn(
+            'safeText(experiment.summary, t("experiments.no_summary"))',
+            render_source,
+        )
+        self.assertIn("node.display_name_key", self.javascript)
+        self.assertIn("robot.display_name_key", self.javascript)
+
+    def test_swedish_dynamic_labels_share_canonical_static_copy(self):
+        values = self.i18n_contract["catalogs"]["sv"]["values"]
+        equivalent_pairs = (
+            (
+                "registry.field.controller_id",
+                "bodies.controller.controller_id",
+            ),
+            (
+                "registry.field.instance_id",
+                "bodies.controller.instance_id",
+            ),
+            (
+                "registry.field.physical_capabilities",
+                "bodies.controller.physical_capabilities",
+            ),
+            (
+                "chat.context.conversation_id",
+                "inspector.context.conversation_id",
+            ),
+            (
+                "chat.context.version",
+                "inspector.context.context_version",
+            ),
+            (
+                "chat.context.turn_count",
+                "inspector.context.turn_count",
+            ),
+            ("events.field.time", "events.table.time"),
+            ("events.field.level", "events.table.severity"),
+        )
+        for dynamic_key, static_key in equivalent_pairs:
+            with self.subTest(
+                dynamic_key=dynamic_key,
+                static_key=static_key,
+            ):
+                self.assertEqual(
+                    values[dynamic_key],
+                    values[static_key],
+                )
+
+        self.assertEqual(
+            {
+                key: values[key]
+                for key in (
+                    "events.field.event_id",
+                    "events.field.source_id",
+                    "events.field.robot_id",
+                    "events.field.node_id",
+                    "events.field.turn_id",
+                    "events.field.tool_call_id",
+                    "events.field.request_id",
+                )
+            },
+            {
+                "events.field.event_id": "Händelse-ID",
+                "events.field.source_id": "Käll-ID",
+                "events.field.robot_id": "Robot-ID",
+                "events.field.node_id": "Nod-ID",
+                "events.field.turn_id": "Tur-ID",
+                "events.field.tool_call_id": "Verktygsanrops-ID",
+                "events.field.request_id": "Begärans-ID",
+            },
+        )
+
+    def test_locale_resolver_uses_intl_locale_without_string_heuristics(self):
+        self.assertIn("new Intl.Locale(", self.i18n)
+        for forbidden in (
+            "RegExp(",
+            ".match(",
+            ".test(",
+            ".startsWith(",
+            ".split(",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.i18n)
+
+        self.assertEqual(
+            self.i18n_contract["resolutions"],
+            {
+                "swedishRegion": {
+                    "locale": "sv",
+                    "formatLocale": "sv-SE",
+                    "direction": "ltr",
+                },
+                "swedishExtension": {
+                    "locale": "sv",
+                    "formatLocale": "sv-FI",
+                    "direction": "ltr",
+                },
+                "britishEnglish": {
+                    "locale": "en",
+                    "formatLocale": "en-GB",
+                    "direction": "ltr",
+                },
+                "americanEnglish": {
+                    "locale": "en",
+                    "formatLocale": "en-US",
+                    "direction": "ltr",
+                },
+                "invalid": {
+                    "locale": "sv",
+                    "formatLocale": "sv-SE",
+                    "direction": "ltr",
+                },
+                "unsupported": {
+                    "locale": "sv",
+                    "formatLocale": "sv-SE",
+                    "direction": "ltr",
+                },
+                "skipInvalidAndUnsupported": {
+                    "locale": "en",
+                    "formatLocale": "en-US",
+                    "direction": "ltr",
+                },
+            },
+        )
+
+    def test_i18n_runtime_persists_switches_and_rebuilds_formatters(self):
+        runtime = self.i18n_contract["runtime"]
+        self.assertEqual(
+            runtime["persisted"]["reads"],
+            ["robot-dashboard-locale"],
+        )
+        self.assertEqual(runtime["persisted"]["locale"], "en")
+        self.assertEqual(runtime["persisted"]["formatLocale"], "en-GB")
+        self.assertNotEqual(
+            runtime["persisted"]["translation"],
+            "common.unknown",
+        )
+
+        self.assertEqual(
+            runtime["blockedStorage"]["initial"],
+            {
+                "locale": "en",
+                "formatLocale": "en-US",
+            },
+        )
+        self.assertTrue(runtime["blockedStorage"]["setSurvived"])
+        self.assertEqual(
+            (
+                runtime["blockedStorage"]["localeAfterSet"],
+                runtime["blockedStorage"]["formatLocaleAfterSet"],
+            ),
+            ("sv", "sv-SE"),
+        )
+
+        switching = runtime["switching"]
+        self.assertEqual(switching["supportedLocales"], ["sv", "en"])
+        self.assertEqual(
+            switching["switched"],
+            {
+                "locale": "en",
+                "formatLocale": "en-US",
+                "direction": "ltr",
+            },
+        )
+        self.assertEqual(
+            switching["notifications"],
+            [{"locale": "en", "formatLocale": "en-US"}],
+        )
+        self.assertEqual(
+            switching["storageWrites"],
+            [["robot-dashboard-locale", "en"]],
+        )
+        self.assertEqual(
+            (
+                switching["finalLocale"],
+                switching["finalFormatLocale"],
+            ),
+            ("sv", "sv-SE"),
+        )
+        self.assertTrue(switching["translationsChanged"])
+        self.assertTrue(switching["numberChanged"])
+        self.assertTrue(all(switching["formatterMatches"].values()))
+
+    def test_language_switch_rerenders_state_without_network_or_reload(self):
+        self.assertIn(
+            "i18n.setLocale(event.currentTarget.value)",
             self.javascript,
         )
+        self.assertIn(
+            "i18n.subscribe(renderLocalizedState)",
+            self.javascript,
+        )
+        render_start = self.javascript.index(
+            "  function renderLocalizedState() {"
+        )
+        render_end = self.javascript.index(
+            "\n  function bindInteractions()",
+            render_start,
+        )
+        render_source = self.javascript[render_start:render_end]
+
+        for expected in (
+            "applyStaticTranslations()",
+            "renderConversation()",
+            "renderEvents()",
+            "renderProbeResult()",
+            "document.activeElement",
+            "setSelectionRange(",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, render_source)
+        for forbidden in (
+            "fetch(",
+            "api(",
+            "location.reload",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, render_source)
+                self.assertNotIn(forbidden, self.i18n)
+
+    def test_probe_result_is_stateful_and_relocalized_after_switch(self):
+        probe_start = self.javascript.index(
+            "  function renderProbeResult() {"
+        )
+        probe_end = self.javascript.index(
+            "\n  async function refreshBootstrap(",
+            probe_start,
+        )
+        probe_source = self.javascript[probe_start:probe_end]
+
+        self.assertIn("state.lmProbe", self.javascript)
+        for phase in ("idle", "checking", "completed", "failed"):
+            with self.subTest(phase=phase):
+                self.assertIn('"{}"'.format(phase), probe_source)
+        self.assertGreaterEqual(
+            probe_source.count("renderProbeResult()"),
+            3,
+        )
+        self.assertIn(
+            't("settings.runtime.probe_idle")',
+            probe_source,
+        )
+
+    def test_evidence_copy_hides_internal_monotonic_deadline(self):
+        evidence_start = self.javascript.index(
+            "  function renderEvidence("
+        )
+        evidence_end = self.javascript.index(
+            "\n  function renderTurnAnnouncement(",
+            evidence_start,
+        )
+        evidence_source = self.javascript[evidence_start:evidence_end]
+        values = self.i18n_contract["catalogs"]
+
+        self.assertIn('t("chat.evidence.validity")', evidence_source)
+        self.assertNotIn(
+            "valid_until_monotonic_ms",
+            evidence_source,
+        )
+        self.assertEqual(
+            values["sv"]["values"]["chat.evidence.validity"],
+            "Giltigheten verifieras av den lokala värden",
+        )
+        self.assertEqual(
+            values["en"]["values"]["chat.evidence.validity"],
+            "Freshness is verified by the local host",
+        )
+        self.assertIn(
+            "leverantör, giltighet och hash",
+            self.html,
+        )
+
+    def test_reviewed_english_copy_is_unambiguous(self):
+        values = self.i18n_contract["catalogs"]["en"]["values"]
+        self.assertEqual(
+            values["bodies.safety.body"],
+            (
+                "Seeing a controller in the registry never automatically "
+                "authorizes motion."
+            ),
+        )
+        self.assertIn(
+            "Physical arming is intentionally handled elsewhere.",
+            values["settings.description"],
+        )
+        self.assertEqual(
+            values["settings.safety.description"],
+            "Status information only — not a control.",
+        )
+        self.assertEqual(
+            self.i18n_contract["copySamples"]["en"]["droppedEvents"],
+            "Some log events are missing. Total events dropped: 7.",
+        )
+        self.assertEqual(
+            self.i18n_contract["copySamples"]["sv"]["unknownKey"],
+            "future.unknown.key",
+        )
+        self.assertEqual(
+            self.i18n_contract["copySamples"]["en"]["unknownKey"],
+            "future.unknown.key",
+        )
+
+    def test_every_declarative_translation_key_exists_in_both_catalogs(self):
+        allowed_attributes = {
+            "data-i18n",
+            "data-i18n-alt",
+            "data-i18n-aria-label",
+            "data-i18n-placeholder",
+            "data-i18n-prompt",
+            "data-i18n-title",
+        }
+        target_attributes = {
+            "data-i18n-alt": "alt",
+            "data-i18n-aria-label": "aria-label",
+            "data-i18n-placeholder": "placeholder",
+            "data-i18n-prompt": "data-prompt",
+            "data-i18n-title": "title",
+        }
+        catalog_keys = set(self.i18n_contract["catalogs"]["sv"]["keys"])
+        localized = []
+        invalid_attribute_names = set()
+        missing_keys = set()
+
+        for tag, attributes in self.parser.elements:
+            for name, key in attributes.items():
+                if not name.startswith("data-i18n"):
+                    continue
+                localized.append((tag, name, key))
+                if name not in allowed_attributes:
+                    invalid_attribute_names.add(name)
+                self.assertIsInstance(key, str)
+                self.assertTrue(key)
+                if key not in catalog_keys:
+                    missing_keys.add(key)
+                if name in target_attributes:
+                    self.assertIn(target_attributes[name], attributes)
+
+        self.assertGreater(len(localized), 0)
+        self.assertEqual(invalid_attribute_names, set())
+        self.assertEqual(missing_keys, set())
+
+        language_selector = next(
+            attributes
+            for tag, attributes in self.parser.elements
+            if tag == "select" and attributes.get("id") == "ui-language"
+        )
+        self.assertEqual(
+            language_selector.get("data-i18n-aria-label"),
+            "locale.selector.aria_label",
+        )
+        self.assertEqual(
+            {
+                attributes.get("value")
+                for tag, attributes in self.parser.elements
+                if tag == "option"
+                and attributes.get("data-i18n")
+                in {"locale.swedish", "locale.english"}
+            },
+            {"sv", "en"},
+        )
+
+        static_calls = set(
+            re.findall(
+                r"""\b(?:i18n\.)?t\(\s*["']([a-z0-9_.-]+)["']""",
+                self.javascript,
+            )
+        )
+        self.assertTrue(static_calls)
+        self.assertEqual(static_calls - catalog_keys, set())
 
     def test_no_inline_handlers_external_urls_or_physical_controls(self):
         for tag, name, value in self.parser.attributes:
@@ -183,10 +890,18 @@ class DashboardWebContractTests(unittest.TestCase):
             "eval(",
             "new Function",
         )
-        for token in forbidden:
-            self.assertNotIn(token, self.javascript)
-        self.assertIn("textContent", self.javascript)
+        for filename, source in (
+            ("i18n.js", self.i18n),
+            ("app.js", self.javascript),
+        ):
+            for token in forbidden:
+                with self.subTest(filename=filename, token=token):
+                    self.assertNotIn(token, source)
+        self.assertIn("textContent", self.javascript_assets)
         self.assertIn("replaceChildren", self.javascript)
+        self.assertNotIn("error.message", self.javascript)
+        self.assertIn("ERROR_MESSAGE_KEYS", self.javascript)
+        self.assertIn("localizedError(", self.javascript)
         self.assertIn(
             "/api/v1/events?after_sequence=",
             self.javascript,
@@ -213,6 +928,10 @@ class DashboardWebContractTests(unittest.TestCase):
             'mode: byId("turn-mode").value',
             self.javascript,
         )
+        self.assertIn("response_locale: i18n.locale", self.javascript)
+        self.assertNotIn('"sv-SE"', self.javascript)
+        self.assertIn("i18n.time(", self.javascript)
+        self.assertIn("i18n.dateTime(", self.javascript)
 
     def test_css_has_responsive_accessible_motion_aware_layout(self):
         self.assertIn("@media (max-width: 1220px)", self.css)
@@ -226,6 +945,17 @@ class DashboardWebContractTests(unittest.TestCase):
         self.assertNotIn("translate(-27px", self.css)
         self.assertNotIn("linear-gradient(", self.css)
         self.assertNotIn("@import", self.css)
+        composer_meta = self.css[
+            self.css.index(".composer-meta {"):
+            self.css.index(".composer-meta label")
+        ]
+        capability_note = self.css[
+            self.css.index(".capability-note {"):
+            self.css.index(".composer textarea")
+        ]
+        self.assertIn("flex-wrap: wrap", composer_meta)
+        self.assertIn("flex: 1 1 240px", capability_note)
+        self.assertIn("white-space: normal", capability_note)
 
     def test_server_instance_change_forces_reload_before_reusing_state(self):
         comparison = "previousInstanceId !== nextInstanceId"
@@ -295,7 +1025,8 @@ class DashboardWebContractTests(unittest.TestCase):
         self.assertIn("state.modelReady", self.javascript)
         self.assertIn("modelLoaded === true", self.javascript)
         self.assertIn("state.modelReady === true", self.javascript)
-        self.assertIn("konfigurerad modell ej laddad", self.javascript)
+        self.assertIn("konfigurerad modell ej laddad", self.i18n)
+        self.assertNotIn("konfigurerad modell ej laddad", self.javascript)
 
     def test_chat_history_uses_a_separate_live_announcer(self):
         elements_by_id = {

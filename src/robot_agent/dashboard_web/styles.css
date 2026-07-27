@@ -193,6 +193,42 @@ textarea:focus-visible,
   overflow: hidden;
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-width: 0;
+  margin-left: 16px;
+}
+
+.locale-control {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.locale-control > span {
+  color: var(--faint);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.locale-control select {
+  min-height: 31px;
+  max-width: 112px;
+  padding: 5px 25px 5px 8px;
+  color: var(--text-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  font-size: 10px;
+}
+
 .status-item {
   display: grid;
   grid-template-columns: auto auto;
@@ -274,7 +310,11 @@ textarea:focus-visible,
   text-transform: uppercase;
 }
 
-.local-badge span {
+.topbar-actions .local-badge {
+  margin-left: 0;
+}
+
+.local-badge > span[aria-hidden="true"] {
   color: var(--ready);
   font-size: 8px;
 }
@@ -766,6 +806,7 @@ textarea:focus-visible,
 }
 
 .composer-meta {
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 8px;
 }
@@ -790,6 +831,9 @@ textarea:focus-visible,
 }
 
 .composer select {
+  min-width: 180px;
+  max-width: 360px;
+  flex: 1 1 260px;
   min-height: 28px;
   padding: 4px 26px 4px 8px;
   color: var(--text-soft);
@@ -797,10 +841,15 @@ textarea:focus-visible,
 }
 
 .capability-note {
+  min-width: 0;
+  flex: 1 1 240px;
   margin-left: auto;
   color: var(--warning);
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 9px;
+  line-height: 1.4;
+  text-align: right;
+  white-space: normal;
 }
 
 .composer textarea {
@@ -850,6 +899,11 @@ textarea:focus-visible,
 .composer-footer .button span {
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 11px;
+}
+
+.composer-footer .button .button-label {
+  font-family: inherit;
+  font-size: inherit;
 }
 
 .inspector {
@@ -2082,7 +2136,8 @@ textarea:focus-visible,
     display: none;
   }
 
-  .local-badge {
+  .topbar-actions {
+    gap: 8px;
     margin-left: 8px;
   }
 
@@ -2112,7 +2167,7 @@ textarea:focus-visible,
     font-size: 8px;
   }
 
-  .mobile-nav button span {
+  .mobile-nav button > span[aria-hidden="true"] {
     font-family: "SFMono-Regular", Consolas, monospace;
     font-size: 8px;
   }
@@ -2263,6 +2318,20 @@ textarea:focus-visible,
   .local-badge {
     padding: 6px 7px;
     font-size: 8px;
+  }
+
+  .locale-control {
+    gap: 0;
+  }
+
+  .locale-control > span {
+    display: none;
+  }
+
+  .locale-control select {
+    max-width: 92px;
+    padding-inline: 7px 22px;
+    font-size: 9px;
   }
 
   .conversation-header .button {

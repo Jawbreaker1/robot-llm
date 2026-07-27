@@ -8,7 +8,10 @@ from robot_agent.dashboard_contract import (
     DashboardContractError,
     DashboardSettings,
     EventPage,
+    ExperimentDescriptor,
     NodeDescriptor,
+    RESPONSE_LOCALES,
+    RESPONSE_LOCALE_NAMES,
     RegistrySnapshot,
     RobotDescriptor,
     TechnicalEvent,
@@ -61,6 +64,12 @@ class StrictJSONTests(unittest.TestCase):
             "JSON object",
         ):
             strict_json_object(b"[]")
+
+    def test_response_locale_names_cover_the_exact_allowlist(self):
+        self.assertEqual(
+            tuple(RESPONSE_LOCALE_NAMES),
+            RESPONSE_LOCALES,
+        )
 
 
 class DashboardSettingsTests(unittest.TestCase):
@@ -250,6 +259,76 @@ class RegistryContractTests(unittest.TestCase):
                 source_id="camera-source-1",
             )
 
+    def test_registry_display_name_key_is_typed_and_optional(self):
+        localized = NodeDescriptor(
+            node_id="camera-1",
+            display_name="Front Camera",
+            display_name_key="registry.names.front_camera",
+            node_kind="camera",
+            source_id="camera-source-1",
+        )
+        raw_product_name = NodeDescriptor(
+            node_id="model-1",
+            display_name="LM Studio",
+            node_kind="model_server",
+        )
+
+        self.assertEqual(
+            localized.to_dict()["display_name_key"],
+            "registry.names.front_camera",
+        )
+        self.assertIsNone(raw_product_name.to_dict()["display_name_key"])
+        with self.assertRaisesRegex(
+            DashboardContractError,
+            "display-name catalog key",
+        ):
+            NodeDescriptor(
+                node_id="camera-2",
+                display_name="Unknown Camera",
+                display_name_key="registry.names.unknown",
+                node_kind="camera",
+                source_id="camera-source-2",
+            )
+
+
+class ExperimentContractTests(unittest.TestCase):
+    def descriptor(self, **changes):
+        values = {
+            "experiment_id": "EXP-F1-IR-DYN-002",
+            "title_key": "experiments.curated.dynamic_ir.title",
+            "summary_key": "experiments.curated.dynamic_ir.summary",
+            "status": "verified",
+            "component_ids": ("ev3rstorm-01.ev3-main",),
+        }
+        values.update(changes)
+        return ExperimentDescriptor(**values)
+
+    def test_serializes_locale_neutral_catalog_keys(self):
+        self.assertEqual(
+            self.descriptor().to_dict(),
+            {
+                "schema": "dashboard-experiment/v1",
+                "experiment_id": "EXP-F1-IR-DYN-002",
+                "title_key": "experiments.curated.dynamic_ir.title",
+                "summary_key": "experiments.curated.dynamic_ir.summary",
+                "status": "verified",
+                "component_ids": ["ev3rstorm-01.ev3-main"],
+            },
+        )
+
+    def test_rejects_unknown_keys_status_and_invalid_components(self):
+        invalid = (
+            {"title_key": "experiments.curated.unknown.title"},
+            {"summary_key": "experiments.curated.unknown.summary"},
+            {"status": "running"},
+            {"component_ids": ["not-a-tuple"]},
+            {"component_ids": ("duplicate", "duplicate")},
+        )
+        for changes in invalid:
+            with self.subTest(changes=changes):
+                with self.assertRaises(DashboardContractError):
+                    self.descriptor(**changes)
+
 
 class ConversationContractTests(unittest.TestCase):
     def test_conversation_returns_typed_history(self):
@@ -280,6 +359,7 @@ class ConversationContractTests(unittest.TestCase):
             conversation_id="conversation-1",
             client_request_id="request-1",
             mode="research_required",
+            response_locale="en",
             settings_revision=2,
             status="queued",
             content="Vädret?",
@@ -287,6 +367,7 @@ class ConversationContractTests(unittest.TestCase):
         )
 
         self.assertTrue(queued.to_dict()["require_evidence"])
+        self.assertEqual(queued.to_dict()["response_locale"], "en")
         self.assertFalse(queued.terminal)
         with self.assertRaisesRegex(
             DashboardContractError,
@@ -297,11 +378,27 @@ class ConversationContractTests(unittest.TestCase):
                 conversation_id="conversation-1",
                 client_request_id="request-1",
                 mode="conversation",
+                response_locale="sv",
                 settings_revision=1,
                 status="answered",
                 content="Hej",
                 created_at_unix_ms=100,
                 answer_text="Hej",
+            )
+        with self.assertRaisesRegex(
+            DashboardContractError,
+            "locale",
+        ):
+            ChatTurn(
+                turn_id="turn-2",
+                conversation_id="conversation-1",
+                client_request_id="request-2",
+                mode="conversation",
+                response_locale="fr",
+                settings_revision=1,
+                status="queued",
+                content="Bonjour",
+                created_at_unix_ms=100,
             )
 
 

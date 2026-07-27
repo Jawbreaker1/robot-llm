@@ -266,11 +266,13 @@ class ConversationStoreTests(unittest.TestCase):
             conversation.version,
             "Behöver jag paraply?",
             "research_required",
+            response_locale="en",
             settings_revision=3,
         )
         self.assertTrue(created)
         self.assertEqual(turn.status, "queued")
         self.assertEqual(turn.mode, "research_required")
+        self.assertEqual(turn.response_locale, "en")
         self.assertEqual(queued_conversation.active_turn_id, turn.turn_id)
         self.assertEqual(
             queued_conversation.messages[0].content,
@@ -334,8 +336,32 @@ class ConversationStoreTests(unittest.TestCase):
                 conversation.conversation_id,
                 "client-1",
                 current.version,
+                "Hej",
+                "conversation",
+                response_locale="en",
+            )
+        with self.assertRaisesRegex(
+            DashboardStateError,
+            "other content",
+        ):
+            store.submit_turn(
+                conversation.conversation_id,
+                "client-1",
+                current.version,
                 "Annat",
                 "conversation",
+            )
+        with self.assertRaisesRegex(
+            DashboardStateError,
+            "locale",
+        ):
+            store.submit_turn(
+                conversation.conversation_id,
+                "client-2",
+                current.version,
+                "Bonjour",
+                "conversation",
+                response_locale="fr",
             )
 
     def test_version_and_single_active_turn_are_enforced(self):

@@ -18,10 +18,12 @@ from typing import Callable, Mapping, Optional, Tuple
 
 from .dashboard_contract import (
     CHAT_MODES,
+    RESPONSE_LOCALES,
     ChatMessage,
     ChatTurn,
     DashboardContractError,
     DashboardSettings,
+    ExperimentDescriptor,
     NodeDescriptor,
     RobotDescriptor,
     strict_json_object,
@@ -104,9 +106,11 @@ class _ContextWithHistory:
     conversation_id: str
     conversation_version: int
     history: Tuple[ChatMessage, ...]
+    response_locale: str
 
     def to_dict(self):
         value = dict(self.context.to_dict())
+        value["response_locale"] = self.response_locale
         value["conversation_history"] = {
             "schema": "conversation-history/v1",
             "conversation_id": self.conversation_id,
@@ -197,6 +201,7 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
             robot_id="lab-composite",
             display_name="Composite Lab Robot",
             robot_kind="multi-controller-lego",
+            display_name_key="registry.names.composite_lab_robot",
             lifecycle="declared",
             node_ids=composite_nodes,
         ),
@@ -224,6 +229,7 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
             node_id=ev3_nodes[1],
             display_name="Front Camera",
             node_kind="camera",
+            display_name_key="registry.names.front_camera",
             lifecycle="declared",
             robot_id="ev3rstorm-01",
             source_id="ev3rstorm-01.front-camera",
@@ -234,6 +240,7 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
             node_id=ev3_nodes[2],
             display_name="Microphone Array",
             node_kind="microphone",
+            display_name_key="registry.names.microphone_array",
             lifecycle="declared",
             robot_id="ev3rstorm-01",
             source_id="ev3rstorm-01.microphone-array",
@@ -264,6 +271,7 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
             node_id=composite_nodes[2],
             display_name="Vision Node",
             node_kind="camera",
+            display_name_key="registry.names.vision_node",
             lifecycle="declared",
             robot_id="lab-composite",
             source_id="lab-composite.vision",
@@ -274,6 +282,7 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
             node_id=composite_nodes[3],
             display_name="Audio Node",
             node_kind="microphone",
+            display_name_key="registry.names.audio_node",
             lifecycle="declared",
             robot_id="lab-composite",
             source_id="lab-composite.audio",
@@ -284,6 +293,7 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
             node_id="mac-host",
             display_name="Mac Host",
             node_kind="compute",
+            display_name_key="registry.names.mac_host",
             lifecycle="declared",
             capabilities=("agent.host", "dashboard.host"),
             status_reason_code="descriptive_only",
@@ -503,38 +513,37 @@ class DashboardService:
 
     @staticmethod
     def experiments():
-        return [
-            {
-                "experiment_id": "EXP-F1-IR-DYN-002",
-                "title": "Dynamisk IR-evidens",
-                "status": "verified",
-                "component_ids": [
+        descriptors = (
+            ExperimentDescriptor(
+                experiment_id="EXP-F1-IR-DYN-002",
+                title_key="experiments.curated.dynamic_ir.title",
+                summary_key="experiments.curated.dynamic_ir.summary",
+                status="verified",
+                component_ids=(
                     "ev3rstorm-01.ev3-main",
-                ],
-                "summary": (
-                    "277 motorstilla prover verifierar den "
-                    "provisoriska närhetsgrinden."
                 ),
-            },
-            {
-                "experiment_id": "READONLY-WEATHER-001",
-                "title": "Gemma väljer weather.current",
-                "status": "verified",
-                "component_ids": ["lm-studio", "open-meteo"],
-                "summary": (
-                    "Tvåstegs plan–tool–answer-loop med bunden evidens."
+            ),
+            ExperimentDescriptor(
+                experiment_id="READONLY-WEATHER-001",
+                title_key="experiments.curated.weather_tool.title",
+                summary_key="experiments.curated.weather_tool.summary",
+                status="verified",
+                component_ids=(
+                    "lm-studio",
+                    "open-meteo",
                 ),
-            },
-            {
-                "experiment_id": "EV3-FOREGROUND-PREFLIGHT",
-                "title": "Fysisk foreground-preflight",
-                "status": "waiting",
-                "component_ids": ["ev3rstorm-01.ev3-main"],
-                "summary": (
-                    "Väntar på batterier; inga motorstartkommandon skickas."
+            ),
+            ExperimentDescriptor(
+                experiment_id="EV3-FOREGROUND-PREFLIGHT",
+                title_key="experiments.curated.ev3_preflight.title",
+                summary_key="experiments.curated.ev3_preflight.summary",
+                status="waiting",
+                component_ids=(
+                    "ev3rstorm-01.ev3-main",
                 ),
-            },
-        ]
+            ),
+        )
+        return [descriptor.to_dict() for descriptor in descriptors]
 
     def create_conversation(self, title: Optional[str] = None):
         try:
@@ -565,12 +574,19 @@ class DashboardService:
         expected_conversation_version: int,
         content: str,
         mode: str,
+        response_locale: str,
     ):
         if mode not in CHAT_MODES:
             raise DashboardServiceError(
                 400,
                 "invalid_chat_mode",
                 "Chat turn mode is unsupported",
+            )
+        if response_locale not in RESPONSE_LOCALES:
+            raise DashboardServiceError(
+                400,
+                "invalid_response_locale",
+                "Chat response locale is unsupported",
             )
         request_key = (conversation_id, client_request_id)
         with self._submit_lock:
@@ -580,7 +596,11 @@ class DashboardService:
                     existing = self._conversations.get_turn(existing_id)
                 except Exception as error:
                     self._translate(error)
-                if existing.content != content or existing.mode != mode:
+                if (
+                    existing.content != content
+                    or existing.mode != mode
+                    or existing.response_locale != response_locale
+                ):
                     raise DashboardServiceError(
                         409,
                         "idempotency_conflict",
@@ -608,6 +628,7 @@ class DashboardService:
                     expected_conversation_version,
                     content,
                     mode,
+                    response_locale,
                     settings.revision,
                 )
                 if not created:
@@ -635,6 +656,7 @@ class DashboardService:
             turn_id=turn.turn_id,
             data={
                 "mode": mode,
+                "response_locale": response_locale,
                 "settings_revision": settings.revision,
                 "conversation_version": updated.version,
             },
@@ -1008,6 +1030,7 @@ class DashboardService:
                 conversation_id=turn.conversation_id,
                 conversation_version=conversation_version,
                 history=history,
+                response_locale=turn.response_locale,
             )
             try:
                 decision = base_planner(wrapped)

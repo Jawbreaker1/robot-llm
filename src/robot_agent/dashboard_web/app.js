@@ -10,6 +10,43 @@
   ]);
   const EVENT_LIMIT = 100;
   const MAX_LOCAL_EVENTS = 500;
+  const i18n = window.RobotI18n.createDefaultI18n();
+  const t = (key, args) => i18n.t(key, args);
+  const ERROR_MESSAGE_KEYS = Object.freeze({
+    dashboard_session_missing: "errors.dashboard_session_missing",
+    invalid_server_json: "errors.invalid_server_json",
+    request_timeout: "errors.request_timeout",
+    network_error: "errors.network_error",
+    host_rejected: "errors.origin_rejected",
+    origin_rejected: "errors.origin_rejected",
+    session_token_rejected: "errors.session_token_rejected",
+    invalid_headers: "errors.invalid_request",
+    invalid_query: "errors.invalid_request",
+    invalid_json: "errors.invalid_request",
+    invalid_request: "errors.invalid_request",
+    invalid_request_fields: "errors.invalid_request",
+    invalid_target: "errors.invalid_request",
+    content_encoding_rejected: "errors.invalid_request",
+    content_type_rejected: "errors.invalid_request",
+    transfer_encoding_rejected: "errors.invalid_request",
+    request_too_large: "errors.invalid_request",
+    method_not_allowed: "errors.invalid_request",
+    route_not_found: "errors.invalid_request",
+    conversation_not_found: "errors.conversation_not_found",
+    turn_not_found: "errors.turn_not_found",
+    settings_revision_conflict: "errors.settings_revision_conflict",
+    conversation_version_conflict: "errors.conversation_version_conflict",
+    duplicate_client_request: "errors.duplicate_client_request",
+    idempotency_conflict: "errors.idempotency_conflict",
+    chat_queue_full: "errors.chat_queue_full",
+    service_stopping: "errors.service_stopping",
+    conversation_turn_active: "errors.conversation_turn_active",
+    invalid_response_locale: "errors.invalid_response_locale",
+    invalid_chat_mode: "errors.invalid_chat_mode",
+    runtime_unavailable: "errors.runtime_unavailable",
+    lm_studio_unreachable: "errors.runtime_unavailable",
+    model_not_ready: "errors.model_not_ready",
+  });
 
   const state = {
     bootstrap: null,
@@ -31,6 +68,15 @@
     bootstrapBusy: false,
     settingsDirty: false,
     modelReady: null,
+    lmProbe: {
+      phase: "idle",
+      result: null,
+      errorCode: null,
+    },
+    readOnlyViolationAnnounced: false,
+    eventStreamState: "live",
+    eventGapActive: false,
+    eventGapDroppedTotal: 0,
   };
 
   const byId = (id) => document.getElementById(id);
@@ -39,7 +85,7 @@
   const safeObject = (value) => (
     value && typeof value === "object" && !Array.isArray(value) ? value : {}
   );
-  const safeText = (value, fallback = "—") => (
+  const safeText = (value, fallback = t("common.missing")) => (
     typeof value === "string" && value.length > 0 ? value : fallback
   );
   const safeInteger = (value, fallback = null) => (
@@ -72,49 +118,49 @@
   }
 
   function formatTime(unixMs) {
-    if (!Number.isFinite(unixMs)) {
-      return "—";
-    }
-    try {
-      return new Intl.DateTimeFormat("sv-SE", {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        fractionalSecondDigits: 3,
-      }).format(new Date(unixMs));
-    } catch (_error) {
-      return new Date(unixMs).toLocaleTimeString("sv-SE");
-    }
+    return i18n.time(unixMs, {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      fractionalSecondDigits: 3,
+    });
   }
 
   function formatDateTime(unixMs) {
-    if (!Number.isFinite(unixMs)) {
-      return "—";
-    }
-    return new Intl.DateTimeFormat("sv-SE", {
+    return i18n.dateTime(unixMs, {
       dateStyle: "medium",
       timeStyle: "medium",
-    }).format(new Date(unixMs));
+    });
   }
 
   function humanState(value) {
-    const labels = {
-      unknown: "okänd",
-      online: "ansluten",
-      offline: "offline",
-      unobserved: "inte observerad",
-      configured: "konfigurerad",
-      active: "aktiv",
-      inactive: "inaktiv",
-      queued: "köad",
-      running: "arbetar",
-      answered: "besvarad",
-      clarification_required: "behöver förtydligande",
-      failed: "misslyckad",
-      verified: "verifierad",
-      waiting: "väntar",
-    };
-    return labels[value] || safeText(value, "okänd");
+    const key = `state.${value}`;
+    const translated = t(key);
+    return translated === key ? safeText(value, t("state.unknown")) : translated;
+  }
+
+  function localizedError(error, fallbackKey = "errors.generic") {
+    const code = safeText(error && error.code, "");
+    const key = ERROR_MESSAGE_KEYS[code] || fallbackKey;
+    return t(key);
+  }
+
+  function localizedCatalogValue(key, fallback) {
+    if (typeof key !== "string" || key.length === 0) {
+      return fallback;
+    }
+    const translated = t(key);
+    return translated === key ? fallback : translated;
+  }
+
+  function requestError(code, status = null, cause = null) {
+    const error = new Error(code);
+    error.code = code;
+    error.status = status;
+    if (cause) {
+      error.cause = cause;
+    }
+    return error;
   }
 
   async function api(path, options = {}) {
@@ -128,7 +174,7 @@
     };
     if (path.startsWith("/api/")) {
       if (!SESSION_TOKEN || SESSION_TOKEN === "__ROBOT_DASHBOARD_TOKEN__") {
-        throw new Error("Dashboardens sessionsnyckel saknas.");
+        throw requestError("dashboard_session_missing");
       }
       headers["X-Robot-Dashboard-Token"] = SESSION_TOKEN;
     }
@@ -147,24 +193,25 @@
         try {
           payload = JSON.parse(raw);
         } catch (_error) {
-          throw new Error("Servern returnerade ogiltig JSON.");
+          throw requestError("invalid_server_json", response.status);
         }
       }
       if (!response.ok) {
         const error = safeObject(payload.error);
-        const requestError = new Error(
-          safeText(error.message, `HTTP ${response.status}`),
+        throw requestError(
+          safeText(error.code, "http_error"),
+          response.status,
         );
-        requestError.status = response.status;
-        requestError.code = safeText(error.code, "http_error");
-        throw requestError;
       }
       return payload;
     } catch (error) {
       if (error && error.name === "AbortError") {
-        throw new Error("Den lokala servern svarade inte inom tidsgränsen.");
+        throw requestError("request_timeout", null, error);
       }
-      throw error;
+      if (error && error.code) {
+        throw error;
+      }
+      throw requestError("network_error", null, error);
     } finally {
       window.clearTimeout(timer);
     }
@@ -186,6 +233,45 @@
     const valueNode = node.querySelector(".status-value");
     if (valueNode) {
       valueNode.textContent = value;
+    }
+  }
+
+  function applyStaticTranslations() {
+    document.documentElement.lang = i18n.locale;
+    document.documentElement.dir = i18n.direction;
+    const bindings = [
+      ["data-i18n", null],
+      ["data-i18n-aria-label", "aria-label"],
+      ["data-i18n-title", "title"],
+      ["data-i18n-placeholder", "placeholder"],
+      ["data-i18n-alt", "alt"],
+    ];
+    const roots = [document];
+    if (welcomeMessage && !welcomeMessage.isConnected) {
+      roots.push(welcomeMessage);
+    }
+    bindings.forEach(([dataAttribute, targetAttribute]) => {
+      roots.forEach((root) => root.querySelectorAll(`[${dataAttribute}]`).forEach((node) => {
+        const key = node.getAttribute(dataAttribute);
+        if (!key) {
+          return;
+        }
+        if (targetAttribute) {
+          node.setAttribute(targetAttribute, t(key));
+        } else {
+          node.textContent = t(key);
+        }
+      }));
+    });
+    roots.forEach((root) => root.querySelectorAll("[data-i18n-prompt]").forEach((node) => {
+      const key = node.getAttribute("data-i18n-prompt");
+      if (key) {
+        node.dataset.prompt = t(key);
+      }
+    }));
+    const selector = byId("ui-language");
+    if (selector) {
+      selector.value = i18n.locale;
     }
   }
 
@@ -260,9 +346,9 @@
           ? "offline"
           : "unknown";
     const lmLabel = lmState === "online" && modelLoaded === false
-      ? "konfigurerad modell ej laddad"
+      ? t("runtime.model_not_loaded")
       : lmState === "online"
-        ? safeText(lmStudio.model, "ansluten")
+        ? safeText(lmStudio.model, t("runtime.connected"))
         : humanState(lmState);
     setStatus(
       "status-lm-studio",
@@ -292,7 +378,7 @@
     setStatus(
       "status-motion",
       state.readOnlyInvariant ? "locked" : "fault",
-      state.readOnlyInvariant ? "låst" : "kontraktsbrott",
+      state.readOnlyInvariant ? t("capability.locked") : t("capability.contract_breach"),
     );
 
     const turnActive = state.activeTurn
@@ -310,15 +396,18 @@
     setStatus(
       "status-research",
       researchOption.disabled ? "idle" : "ready",
-      researchOption.disabled ? "inte tillgänglig" : "väder redo",
+      researchOption.disabled ? t("capability.unavailable") : t("capability.weather_ready"),
     );
     byId("composer-status").textContent = chatEnabled
-      ? "Redo att chatta · robotstyrning är avstängd"
+      ? t("capability.chat_ready")
       : state.modelReady === false
-        ? "LM Studio eller den konfigurerade modellen är inte redo"
-        : "Chatt är inte tillgänglig";
-    if (!state.readOnlyInvariant) {
-      showToast("Servern bröt mot dashboardens read-only-kontrakt. Mutationer har stängts.", true);
+        ? t("capability.model_not_ready")
+        : t("capability.chat_unavailable");
+    if (!state.readOnlyInvariant && !state.readOnlyViolationAnnounced) {
+      state.readOnlyViolationAnnounced = true;
+      showToast(t("capability.read_only_violation"), true);
+    } else if (state.readOnlyInvariant) {
+      state.readOnlyViolationAnnounced = false;
     }
   }
 
@@ -331,9 +420,17 @@
     icon.setAttribute("aria-hidden", "true");
     row.appendChild(icon);
     const copy = createElement("div", "node-copy");
-    copy.appendChild(createElement("strong", "", safeText(node.display_name, safeText(node.node_id, "Namnlös nod"))));
+    const fallbackName = safeText(
+      node.display_name,
+      safeText(node.node_id, t("registry.unnamed_node")),
+    );
+    copy.appendChild(createElement(
+      "strong",
+      "",
+      localizedCatalogValue(node.display_name_key, fallbackName),
+    ));
     const identity = [
-      safeText(node.node_kind, root ? "robot" : "nod"),
+      safeText(node.node_kind, root ? t("registry.robot") : t("registry.node")),
       safeText(node.controller_id || node.source_id, ""),
     ].filter(Boolean).join(" · ");
     copy.appendChild(createElement("small", "", identity));
@@ -358,6 +455,7 @@
     robots.forEach((robot) => {
       appendNodeRow(tree, {
         display_name: safeText(robot.display_name, robot.robot_id),
+        display_name_key: robot.display_name_key,
         node_kind: safeText(robot.robot_kind, "robot"),
         lifecycle: safeText(robot.lifecycle, "configured"),
       }, true);
@@ -369,7 +467,7 @@
     const systemNodes = nodes.filter((node) => !node.robot_id);
     if (systemNodes.length > 0) {
       appendNodeRow(tree, {
-        display_name: "Host & providers",
+        display_name: t("registry.host_and_providers"),
         node_kind: "system",
         lifecycle: "configured",
       }, true);
@@ -382,22 +480,27 @@
       icon.setAttribute("aria-hidden", "true");
       future.appendChild(icon);
       const copy = createElement("div", "node-copy");
-      copy.appendChild(createElement("strong", "", "Kameror och mikrofoner"));
-      copy.appendChild(createElement("small", "", "framtida perceptionskällor"));
+      copy.appendChild(createElement("strong", "", t("registry.future_sources")));
+      copy.appendChild(createElement("small", "", t("registry.future_sources_note")));
       future.appendChild(copy);
-      future.appendChild(createElement("span", "node-state", "ej konfigurerade"));
+      future.appendChild(createElement("span", "node-state", t("registry.not_configured")));
       tree.appendChild(future);
     }
     const controller = nodes.find((node) => node.node_kind === "controller") || nodes[0] || {};
     const details = byId("controller-details");
     details.replaceChildren();
     [
-      ["Tillstånd", humanState(controller.lifecycle)],
-      ["Controller ID", safeText(controller.controller_id)],
-      ["Instance ID", safeText(controller.controller_instance_id)],
-      ["Senast observerad", formatDateTime(controller.last_observed_at_unix_ms)],
-      ["Statusorsak", safeText(controller.status_reason_code)],
-      ["Fysiska funktioner", controller.control_exposed === true ? "Avvisade" : "Låsta"],
+      [t("registry.field.state"), humanState(controller.lifecycle)],
+      [t("registry.field.controller_id"), safeText(controller.controller_id)],
+      [t("registry.field.instance_id"), safeText(controller.controller_instance_id)],
+      [t("registry.field.last_observed"), formatDateTime(controller.last_observed_at_unix_ms)],
+      [t("registry.field.status_reason"), safeText(controller.status_reason_code)],
+      [
+        t("registry.field.physical_capabilities"),
+        controller.control_exposed === true
+          ? t("registry.physical_rejected")
+          : t("registry.physical_locked"),
+      ],
     ].forEach(([label, value]) => {
       const row = createElement("div");
       row.appendChild(createElement("dt", "", label));
@@ -406,10 +509,10 @@
     });
     byId("fleet-aggregate-status").textContent = robots.length > 0
       ? humanState(robots[0].lifecycle)
-      : "Inte observerad";
+      : t("registry.not_observed");
     if (nodes.some((node) => node.control_exposed === true)) {
       state.readOnlyInvariant = false;
-      setStatus("status-motion", "fault", "capability avvisad");
+      setStatus("status-motion", "fault", t("capability.rejected"));
     }
   }
 
@@ -422,10 +525,28 @@
     list.replaceChildren();
     state.experiments.forEach((experiment) => {
       const card = createElement("article", "experiment-card");
-      card.appendChild(createElement("div", "experiment-id", safeText(experiment.experiment_id, "EXP-—")));
+      card.appendChild(createElement(
+        "div",
+        "experiment-id",
+        safeText(experiment.experiment_id, t("experiments.missing_id")),
+      ));
       const copy = createElement("div");
-      copy.appendChild(createElement("h3", "", safeText(experiment.title, "Namnlöst experiment")));
-      copy.appendChild(createElement("p", "", safeText(experiment.summary, "Ingen sammanfattning.")));
+      copy.appendChild(createElement(
+        "h3",
+        "",
+        localizedCatalogValue(
+          experiment.title_key,
+          safeText(experiment.title, t("experiments.untitled")),
+        ),
+      ));
+      copy.appendChild(createElement(
+        "p",
+        "",
+        localizedCatalogValue(
+          experiment.summary_key,
+          safeText(experiment.summary, t("experiments.no_summary")),
+        ),
+      ));
       card.appendChild(copy);
       card.appendChild(createElement("span", "state-chip state-idle", humanState(experiment.status)));
       list.appendChild(card);
@@ -509,8 +630,8 @@
     byId("save-settings-button").disabled = !dirty || !state.readOnlyInvariant;
     byId("reset-settings-button").disabled = !dirty;
     byId("settings-status").textContent = dirty
-      ? "Osparade lokala ändringar."
-      : "Inga osparade ändringar.";
+      ? t("settings.unsaved")
+      : t("settings.no_unsaved");
   }
 
   function renderSettings(settings) {
@@ -527,7 +648,9 @@
     byId("setting-tool-request-ttl-ms").value = safeInteger(research.tool_request_ttl_ms, 8000);
     byId("setting-evidence-ttl-ms").value = safeInteger(research.evidence_ttl_ms, 600000);
     byId("setting-weather-skew-ms").value = safeInteger(research.max_weather_observation_skew_ms, 3600000);
-    byId("settings-revision").textContent = `Revision ${safeInteger(settings.revision, "—")}`;
+    byId("settings-revision").textContent = t("settings.revision", {
+      revision: safeInteger(settings.revision, t("common.missing")),
+    });
     byId("turn-mode").value = settings.chat_mode === "research_required"
       ? "research_required"
       : "conversation";
@@ -546,7 +669,7 @@
       return;
     }
     byId("save-settings-button").disabled = true;
-    byId("settings-status").textContent = "Sparar och validerar…";
+    byId("settings-status").textContent = t("settings.saving");
     try {
       const payload = await api("/api/v1/settings", {
         method: "PUT",
@@ -556,11 +679,12 @@
         },
       });
       renderSettings(payload.settings);
-      showToast("Inställningarna sparades lokalt.");
+      showToast(t("settings.saved"));
     } catch (error) {
-      byId("settings-status").textContent = safeText(error.message, "Inställningarna kunde inte sparas.");
       updateSettingsDirtyState();
-      showToast(safeText(error.message, "Inställningarna kunde inte sparas."), true);
+      const message = localizedError(error, "settings.save_failed");
+      byId("settings-status").textContent = message;
+      showToast(message, true);
     }
   }
 
@@ -572,7 +696,11 @@
     const role = message.role === "user" ? "user" : message.role === "assistant" ? "assistant" : "system";
     const article = createElement("article", `message message-${role}${extraClass ? ` ${extraClass}` : ""}`);
     const header = createElement("div", "message-header");
-    header.appendChild(createElement("span", "message-author", role === "user" ? "Du" : role === "assistant" ? "Gemma" : "System"));
+    header.appendChild(createElement(
+      "span",
+      "message-author",
+      t(`chat.author.${role}`),
+    ));
     header.appendChild(createElement("time", "message-time", formatTime(message.created_at_unix_ms)));
     article.appendChild(header);
     article.appendChild(createElement("div", "message-body", safeText(message.content, "")));
@@ -595,10 +723,7 @@
             renderEvidence(safeObject(payload.turn), citationId);
           } catch (error) {
             showToast(
-              safeText(
-                error.message,
-                "Historisk evidens kunde inte hämtas.",
-              ),
+              localizedError(error, "chat.history_evidence_failed"),
               true,
             );
           }
@@ -613,10 +738,10 @@
   function renderPendingMessage() {
     const article = createElement("article", "message message-assistant is-pending");
     const header = createElement("div", "message-header");
-    header.appendChild(createElement("span", "message-author", "Gemma"));
+    header.appendChild(createElement("span", "message-author", t("chat.author.assistant")));
     header.appendChild(createElement("span", "message-mode", humanState(state.activeTurn && state.activeTurn.status)));
     article.appendChild(header);
-    const body = createElement("div", "message-body", "Arbetar");
+    const body = createElement("div", "message-body", t("chat.working"));
     const dots = createElement("span", "thinking-dots");
     for (let index = 0; index < 3; index += 1) {
       dots.appendChild(createElement("span"));
@@ -628,6 +753,7 @@
 
   function renderConversation() {
     const feed = byId("message-feed");
+    const previousScrollTop = feed.scrollTop;
     const keepAtBottom = (
       feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80
     );
@@ -650,7 +776,9 @@
       } else if (state.activeTurn && state.activeTurn.status === "failed") {
         feed.appendChild(renderMessage({
           role: "system",
-          content: `Episoden avbröts: ${safeText(state.activeTurn.error_code, "okänt fel")}`,
+          content: t("chat.episode_aborted", {
+            code: safeText(state.activeTurn.error_code, t("common.unknown")),
+          }),
           created_at_unix_ms: state.activeTurn.completed_at_unix_ms,
           citation_ids: [],
         }, "message-error"));
@@ -658,6 +786,8 @@
     }
     if (keepAtBottom) {
       feed.scrollTop = feed.scrollHeight;
+    } else {
+      feed.scrollTop = previousScrollTop;
     }
     renderContext();
   }
@@ -667,10 +797,21 @@
     details.replaceChildren();
     const conversation = safeObject(state.conversation);
     [
-      ["Conversation ID", safeText(conversation.conversation_id, "Inte skapad")],
-      ["Context version", safeInteger(conversation.version, "—")],
-      ["Kontextläge", safeText(conversation.context_mode, "typed_history")],
-      ["Antal turer", safeArray(conversation.messages).filter((message) => message.role === "user").length],
+      [
+        t("chat.context.conversation_id"),
+        safeText(conversation.conversation_id, t("chat.context.not_created")),
+      ],
+      [
+        t("chat.context.version"),
+        safeInteger(conversation.version, t("common.missing")),
+      ],
+      [t("chat.context.mode"), safeText(conversation.context_mode, "typed_history")],
+      [
+        t("chat.context.turn_count"),
+        i18n.number(
+          safeArray(conversation.messages).filter((message) => message.role === "user").length,
+        ),
+      ],
     ].forEach(([label, value]) => {
       const row = createElement("div");
       row.appendChild(createElement("dt", "", label));
@@ -688,7 +829,7 @@
     trace.replaceChildren();
     const status = turn ? safeText(turn.status, "queued") : "idle";
     const statusBadge = byId("episode-status");
-    statusBadge.textContent = turn ? humanState(status) : "Väntar";
+    statusBadge.textContent = turn ? humanState(status) : t("chat.activity.waiting");
     statusBadge.dataset.status = status === "answered"
       ? "completed"
       : status === "failed"
@@ -704,8 +845,16 @@
       item.dataset.state = status === "failed" ? "failed" : status === "answered" ? "complete" : status === "idle" ? "idle" : "active";
       item.appendChild(createElement("span", "trace-dot"));
       const copy = createElement("div");
-      copy.appendChild(createElement("strong", "", turn ? humanState(status) : "Ingen episod ännu"));
-      copy.appendChild(createElement("p", "", turn ? safeText(turn.turn_id) : "Typade beslut och verktygsanrop visas här."));
+      copy.appendChild(createElement(
+        "strong",
+        "",
+        turn ? humanState(status) : t("chat.activity.no_episode"),
+      ));
+      copy.appendChild(createElement(
+        "p",
+        "",
+        turn ? safeText(turn.turn_id) : t("chat.activity.note"),
+      ));
       item.appendChild(copy);
       trace.appendChild(item);
     } else {
@@ -729,11 +878,16 @@
     }
     const episode = safeObject(turn && turn.episode);
     const metricValues = turn ? [
-      safeInteger(episode.planner_turns, "—"),
-      safeInteger(episode.tool_calls, "—"),
-      safeInteger(episode.replans, "—"),
-      safeInteger(episode.final_context_version, "—"),
-    ] : ["—", "—", "—", "—"];
+      safeInteger(episode.planner_turns, t("common.missing")),
+      safeInteger(episode.tool_calls, t("common.missing")),
+      safeInteger(episode.replans, t("common.missing")),
+      safeInteger(episode.final_context_version, t("common.missing")),
+    ] : [
+      t("common.missing"),
+      t("common.missing"),
+      t("common.missing"),
+      t("common.missing"),
+    ];
     byId("episode-metrics").querySelectorAll("dd").forEach((node, index) => {
       node.textContent = String(metricValues[index]);
     });
@@ -750,8 +904,8 @@
       : allCitations;
     if (citations.length === 0) {
       list.className = "empty-compact";
-      list.appendChild(createElement("p", "", "Ingen extern evidens har hämtats."));
-      list.appendChild(createElement("small", "", "Researchresultat visas med hostmyntade evidence-ID:n."));
+      list.appendChild(createElement("p", "", t("chat.evidence.empty")));
+      list.appendChild(createElement("small", "", t("chat.evidence.empty_note")));
       return;
     }
     list.className = "";
@@ -773,19 +927,37 @@
         [location.name, location.country_name]
           .filter((value) => typeof value === "string" && value)
           .join(", ")
-          || "Verifierad citation från den skrivskyddade researchloopen.",
+          || t("chat.evidence.verified_fallback"),
       ));
       card.appendChild(createElement(
         "small",
         "",
         [
-          safeText(provenance.provider, safeText(envelope.tool_name, "read-only")),
-          `TTL till monotonic ${safeInteger(envelope.valid_until_monotonic_ms, "—")}`,
+          safeText(
+            provenance.provider,
+            safeText(envelope.tool_name, t("chat.evidence.read_only")),
+          ),
+          t("chat.evidence.validity"),
           safeText(provenance.raw_sha256, "").slice(0, 12),
         ].filter(Boolean).join(" · "),
       ));
       list.appendChild(card);
     });
+  }
+
+  function renderTurnAnnouncement() {
+    if (!state.activeTurn || !TERMINAL_TURN_STATES.has(state.activeTurn.status)) {
+      return;
+    }
+    byId("chat-announcer").textContent = state.activeTurn.status === "answered"
+      ? t("chat.announcer.answer", {
+        text: safeText(state.activeTurn.answer_text, ""),
+      })
+      : state.activeTurn.status === "clarification_required"
+        ? t("chat.announcer.clarification", {
+          text: safeText(state.activeTurn.clarification_question, ""),
+        })
+        : t("chat.announcer.stopped");
   }
 
   function renderTurn(turn) {
@@ -804,24 +976,35 @@
     if (TERMINAL_TURN_STATES.has(state.activeTurn.status)) {
       enforceCapabilities(safeObject(state.bootstrap));
       byId("composer-status").textContent = state.modelReady !== true
-        ? "LM Studio eller den konfigurerade modellen är inte redo"
+        ? t("capability.model_not_ready")
         : state.activeTurn.status === "answered"
-          ? "Svar verifierat · redo för nästa tur"
+          ? t("chat.answer_ready")
           : state.activeTurn.status === "clarification_required"
-            ? "Ett förtydligande behövs"
-            : `Episoden stoppades · ${safeText(state.activeTurn.error_code, "okänt fel")}`;
+            ? t("chat.clarification_needed")
+            : t("chat.episode_stopped", {
+              code: safeText(state.activeTurn.error_code, t("common.unknown")),
+            });
       if (visibleStateChanged) {
-        byId("chat-announcer").textContent = state.activeTurn.status === "answered"
-          ? `Gemma svarade: ${safeText(state.activeTurn.answer_text, "")}`
-          : state.activeTurn.status === "clarification_required"
-            ? `Gemma behöver ett förtydligande: ${safeText(state.activeTurn.clarification_question, "")}`
-            : "Agentepisoden stoppades utan svar.";
+        renderTurnAnnouncement();
       }
     } else {
       byId("send-button").disabled = true;
       byId("message-input").disabled = true;
-      byId("composer-status").textContent = `${humanState(state.activeTurn.status)} · ${safeText(state.activeTurn.turn_id)}`;
+      byId("composer-status").textContent = t("chat.turn_progress", {
+        state: humanState(state.activeTurn.status),
+        id: safeText(state.activeTurn.turn_id),
+      });
     }
+  }
+
+  function renderConversationSubtitle() {
+    if (!state.conversation) {
+      return;
+    }
+    byId("conversation-subtitle").textContent = t("chat.conversation_version", {
+      mode: safeText(state.conversation.context_mode, "typed_history"),
+      version: safeInteger(state.conversation.version, t("common.missing")),
+    });
   }
 
   async function createConversation() {
@@ -832,7 +1015,7 @@
     state.conversation = safeObject(payload.conversation);
     state.activeTurn = null;
     state.optimisticContent = null;
-    byId("conversation-subtitle").textContent = `typed_history · version ${safeInteger(state.conversation.version, 1)}`;
+    renderConversationSubtitle();
     renderConversation();
     renderActivity(null);
     renderEvidence(null);
@@ -846,22 +1029,22 @@
     const id = encodeURIComponent(state.conversation.conversation_id);
     const payload = await api(`/api/v1/conversations/${id}`);
     state.conversation = safeObject(payload.conversation);
-    byId("conversation-subtitle").textContent = `${safeText(state.conversation.context_mode, "typed_history")} · version ${safeInteger(state.conversation.version, "—")}`;
+    renderConversationSubtitle();
     renderConversation();
   }
 
   async function startNewConversation() {
     if (state.activeTurn && !TERMINAL_TURN_STATES.has(state.activeTurn.status)) {
-      showToast("Vänta tills den pågående episoden är terminal.", true);
+      showToast(t("chat.wait_for_terminal"), true);
       return;
     }
     byId("new-conversation-button").disabled = true;
     try {
       await createConversation();
       byId("message-input").focus();
-      showToast("Ny lokal konversation skapad.");
+      showToast(t("chat.created"));
     } catch (error) {
-      showToast(safeText(error.message, "Konversationen kunde inte skapas."), true);
+      showToast(localizedError(error, "chat.create_failed"), true);
     } finally {
       enforceCapabilities(safeObject(state.bootstrap));
     }
@@ -886,7 +1069,7 @@
       }
     } catch (error) {
       state.turnPollFailures += 1;
-      byId("composer-status").textContent = safeText(error.message, "Turn-polling misslyckades.");
+      byId("composer-status").textContent = localizedError(error, "chat.poll_failed");
       if (state.turnPollFailures >= 8) {
         state.turnPollGeneration += 1;
         renderTurn({
@@ -896,7 +1079,7 @@
           completed_at_unix_ms: Date.now(),
         });
         showToast(
-          "Turnstatus kunde inte återhämtas. Starta en ny konversation eller ladda om sidan.",
+          t("chat.poll_unrecoverable"),
           true,
         );
         return;
@@ -917,7 +1100,7 @@
       return;
     }
     if (state.activeTurn && !TERMINAL_TURN_STATES.has(state.activeTurn.status)) {
-      showToast("En episod pågår redan.", true);
+      showToast(t("chat.episode_in_progress"), true);
       return;
     }
     byId("send-button").disabled = true;
@@ -938,6 +1121,7 @@
           expected_conversation_version: state.conversation.version,
           content,
           mode: byId("turn-mode").value,
+          response_locale: i18n.locale,
         },
         timeout: 20000,
       });
@@ -952,7 +1136,7 @@
       state.optimisticContent = null;
       renderConversation();
       enforceCapabilities(safeObject(state.bootstrap));
-      showToast(safeText(error.message, "Meddelandet kunde inte skickas."), true);
+      showToast(localizedError(error, "chat.send_failed"), true);
     }
   }
 
@@ -963,7 +1147,7 @@
   function eventVisible(event) {
     const severity = byId("event-severity-filter").value;
     const category = byId("event-plane-filter").value;
-    const search = byId("event-search-input").value.trim().toLocaleLowerCase("sv-SE");
+    const search = byId("event-search-input").value.trim().toLocaleLowerCase(i18n.formatLocale);
     if (severity && event.level !== severity) {
       return false;
     }
@@ -979,29 +1163,38 @@
       event.message,
       safeObject(event.correlation).turn_id,
       safeObject(event.correlation).tool_call_id,
-    ].some((value) => typeof value === "string" && value.toLocaleLowerCase("sv-SE").includes(search));
+    ].some((value) => (
+      typeof value === "string"
+      && value.toLocaleLowerCase(i18n.formatLocale).includes(search)
+    ));
   }
 
-  function openEventDetail(event) {
+  function openEventDetail(event, focusClose = true) {
     state.selectedEvent = event;
     const source = safeObject(event.source);
     const correlation = safeObject(event.correlation);
-    byId("event-detail-heading").textContent = safeText(event.event_type, "Händelsedetaljer");
+    byId("event-detail-heading").textContent = safeText(
+      event.event_type,
+      t("events.detail_fallback"),
+    );
     const fields = byId("event-detail-fields");
     fields.replaceChildren();
     [
-      ["Event ID", safeText(event.event_id)],
-      ["Sekvens", safeInteger(event.sequence, "—")],
-      ["Tid", formatDateTime(eventTime(event))],
-      ["Nivå", safeText(event.level)],
-      ["Kategori", safeText(event.category)],
-      ["Source ID", safeText(source.source_id)],
-      ["Robot ID", safeText(source.robot_id)],
-      ["Node ID", safeText(source.node_id)],
-      ["Conversation ID", safeText(correlation.conversation_id)],
-      ["Turn ID", safeText(correlation.turn_id)],
-      ["Tool call ID", safeText(correlation.tool_call_id)],
-      ["Request ID", safeText(correlation.request_id)],
+      [t("events.field.event_id"), safeText(event.event_id)],
+      [
+        t("events.field.sequence"),
+        safeInteger(event.sequence, t("common.missing")),
+      ],
+      [t("events.field.time"), formatDateTime(eventTime(event))],
+      [t("events.field.level"), safeText(event.level)],
+      [t("events.field.category"), safeText(event.category)],
+      [t("events.field.source_id"), safeText(source.source_id)],
+      [t("events.field.robot_id"), safeText(source.robot_id)],
+      [t("events.field.node_id"), safeText(source.node_id)],
+      [t("events.field.conversation_id"), safeText(correlation.conversation_id)],
+      [t("events.field.turn_id"), safeText(correlation.turn_id)],
+      [t("events.field.tool_call_id"), safeText(correlation.tool_call_id)],
+      [t("events.field.request_id"), safeText(correlation.request_id)],
     ].forEach(([label, value]) => {
       const row = createElement("div");
       row.appendChild(createElement("dt", "", label));
@@ -1010,7 +1203,9 @@
     });
     byId("event-detail-json").textContent = JSON.stringify(event, null, 2);
     byId("event-detail").hidden = false;
-    byId("close-event-detail").focus();
+    if (focusClose) {
+      byId("close-event-detail").focus();
+    }
   }
 
   function renderEvents() {
@@ -1020,8 +1215,8 @@
     if (visible.length === 0) {
       const row = createElement("tr", "empty-row");
       const cell = createElement("td", "", state.events.length === 0
-        ? "Väntar på den första tekniska händelsen."
-        : "Inga händelser matchar filtret.");
+        ? t("events.empty")
+        : t("events.no_match"));
       cell.colSpan = 6;
       row.appendChild(cell);
       body.appendChild(row);
@@ -1041,7 +1236,9 @@
       const actionCell = createElement("td");
       const button = createElement("button", "event-row-button", "→");
       button.type = "button";
-      button.setAttribute("aria-label", `Visa ${safeText(event.event_type, "händelse")}`);
+      button.setAttribute("aria-label", t("events.show", {
+        type: safeText(event.event_type, t("events.event_fallback")),
+      }));
       button.addEventListener("click", () => openEventDetail(event));
       actionCell.appendChild(button);
       row.appendChild(actionCell);
@@ -1070,13 +1267,14 @@
     } else if (newest !== null && newest > state.afterSequence) {
       state.afterSequence = newest;
     }
-    const gapNotice = byId("event-gap-notice");
     if (payload.gap === true || safeInteger(payload.dropped_total, 0) > 0) {
-      gapNotice.hidden = false;
-      gapNotice.textContent = `Loggströmmen har ett gap. Totalt bortfall: ${safeInteger(payload.dropped_total, 0)}.`;
+      state.eventGapActive = true;
+      state.eventGapDroppedTotal = safeInteger(payload.dropped_total, 0);
     } else {
-      gapNotice.hidden = true;
+      state.eventGapActive = false;
+      state.eventGapDroppedTotal = 0;
     }
+    renderEventGap();
     renderEvents();
     if (state.activeTurn) {
       renderActivity(state.activeTurn);
@@ -1084,18 +1282,48 @@
     }
   }
 
+  function renderEventGap() {
+    const gapNotice = byId("event-gap-notice");
+    gapNotice.hidden = !state.eventGapActive;
+    if (!gapNotice.hidden) {
+      gapNotice.textContent = t("events.gap", {
+        count: i18n.number(state.eventGapDroppedTotal),
+      });
+    }
+  }
+
+  function renderEventStreamStatus() {
+    const label = byId("event-stream-label");
+    const parent = label.parentElement;
+    parent.classList.toggle("is-offline", state.eventStreamState === "offline");
+    parent.classList.toggle("is-paused", state.eventsPaused);
+    if (state.eventsPaused) {
+      label.textContent = t("events.paused");
+      return;
+    }
+    if (state.eventStreamState === "offline") {
+      label.textContent = t("events.offline");
+      return;
+    }
+    if (state.eventStreamState === "reconnecting") {
+      label.textContent = t("events.reconnecting");
+      return;
+    }
+    label.textContent = t("events.live", {
+      sequence: i18n.number(state.afterSequence),
+    });
+  }
+
   async function pollEvents() {
     if (!state.eventsPaused) {
       try {
         const payload = await api(`/api/v1/events?after_sequence=${state.afterSequence}&limit=${EVENT_LIMIT}`);
         ingestEvents(payload);
-        const label = byId("event-stream-label");
-        label.textContent = `Live · sekvens ${state.afterSequence}`;
-        label.parentElement.classList.remove("is-offline");
+        state.eventStreamState = "live";
+        renderEventStreamStatus();
       } catch (error) {
-        const label = byId("event-stream-label");
-        label.textContent = "Loggserver offline";
-        label.parentElement.classList.add("is-offline");
+        state.eventStreamState = "offline";
+        renderEventStreamStatus();
       }
     }
     window.setTimeout(pollEvents, document.hidden ? 5000 : 1500);
@@ -1105,15 +1333,16 @@
     state.eventsPaused = !state.eventsPaused;
     const button = byId("pause-events-button");
     button.setAttribute("aria-pressed", state.eventsPaused ? "true" : "false");
-    button.textContent = state.eventsPaused ? "Återuppta ström" : "Pausa ström";
-    const label = byId("event-stream-label");
-    label.textContent = state.eventsPaused ? "Pausad lokalt" : "Återansluter…";
-    label.parentElement.classList.toggle("is-paused", state.eventsPaused);
+    button.textContent = state.eventsPaused ? t("events.resume") : t("events.pause");
+    state.eventStreamState = state.eventsPaused
+      ? state.eventStreamState
+      : "reconnecting";
+    renderEventStreamStatus();
   }
 
   function exportEvents() {
     if (state.events.length === 0) {
-      showToast("Det finns inga lokala events att exportera.", true);
+      showToast(t("events.nothing_to_export"), true);
       return;
     }
     const jsonl = `${state.events.map((event) => JSON.stringify(event)).join("\n")}\n`;
@@ -1124,20 +1353,53 @@
     link.download = `robot-llm-events-${Date.now()}.jsonl`;
     link.click();
     URL.revokeObjectURL(url);
-    showToast("Den redigerade lokala eventbufferten exporterades.");
+    showToast(t("events.exported"));
   }
 
   function updateModeCopy() {
     const research = byId("turn-mode").value === "research_required";
     byId("mode-capability-note").textContent = research
-      ? "Aktuella väderkällor krävs · ingen robotstyrning"
-      : "Kan kolla upp väder vid behov · ingen robotstyrning";
+      ? t("mode.research_note")
+      : t("mode.conversation_note");
+  }
+
+  function renderProbeResult() {
+    const node = byId("probe-result");
+    const probe = safeObject(state.lmProbe);
+    if (probe.phase === "checking") {
+      node.dataset.status = "checking";
+      node.textContent = t("runtime.checking");
+      return;
+    }
+    if (probe.phase === "completed") {
+      const lmStudio = safeObject(probe.result);
+      node.dataset.status = safeText(lmStudio.state, "unknown");
+      node.textContent = lmStudio.configured_model_loaded === false
+        ? `${humanState(lmStudio.state)} · ${t("runtime.model_not_loaded")}`
+        : `${humanState(lmStudio.state)} · ${safeText(lmStudio.model, t("runtime.no_model"))}`;
+      return;
+    }
+    if (probe.phase === "failed") {
+      node.dataset.status = "offline";
+      node.textContent = localizedError(
+        { code: probe.errorCode },
+        "runtime.probe_failed",
+      );
+      return;
+    }
+    node.dataset.status = "idle";
+    node.textContent = t("settings.runtime.probe_idle");
   }
 
   async function probeLMStudio() {
     const button = byId("probe-lm-studio-button");
     button.disabled = true;
-    byId("probe-result").textContent = "Kontrollerar den lokala runtime-processen…";
+    state.lmProbe = {
+      phase: "checking",
+      result: null,
+      errorCode: null,
+    };
+    renderProbeResult();
     try {
       const payload = await api("/api/v1/runtime/lm-studio/probe", {
         method: "POST",
@@ -1149,10 +1411,12 @@
       state.bootstrap.runtime = runtime;
       renderRuntime(runtime);
       enforceCapabilities(state.bootstrap);
-      byId("probe-result").dataset.status = safeText(lmStudio.state, "unknown");
-      byId("probe-result").textContent = lmStudio.configured_model_loaded === false
-        ? `${humanState(lmStudio.state)} · konfigurerad modell ej laddad`
-        : `${humanState(lmStudio.state)} · ${safeText(lmStudio.model, "ingen modell")}`;
+      state.lmProbe = {
+        phase: "completed",
+        result: { ...lmStudio },
+        errorCode: null,
+      };
+      renderProbeResult();
     } catch (error) {
       const runtime = safeObject(state.bootstrap && state.bootstrap.runtime);
       runtime.lm_studio = {
@@ -1165,8 +1429,12 @@
       }
       renderRuntime(runtime);
       enforceCapabilities(safeObject(state.bootstrap));
-      byId("probe-result").dataset.status = "offline";
-      byId("probe-result").textContent = safeText(error.message, "Anslutningskontrollen misslyckades.");
+      state.lmProbe = {
+        phase: "failed",
+        result: null,
+        errorCode: safeText(error && error.code, "network_error"),
+      };
+      renderProbeResult();
     } finally {
       button.disabled = false;
     }
@@ -1181,12 +1449,101 @@
       const payload = await api("/api/v1/bootstrap");
       renderBootstrap(payload);
     } catch (error) {
-      setStatus("status-lm-studio", "offline", "dashboard offline");
+      setStatus("status-lm-studio", "offline", t("runtime.dashboard_offline"));
       if (!silent) {
-        showToast(safeText(error.message, "Dashboardservern kunde inte nås."), true);
+        showToast(localizedError(error, "server.unreachable"), true);
       }
     } finally {
       state.bootstrapBusy = false;
+    }
+  }
+
+  function renderLocalizedState() {
+    const activeElement = document.activeElement;
+    const activeId = activeElement && activeElement.id;
+    const scrollSnapshots = [
+      byId("agent-inspector"),
+      document.querySelector("[data-view-panel]:not([hidden])"),
+      document.querySelector(".event-table-wrap"),
+      byId("event-detail"),
+      byId("event-detail-json"),
+    ].filter(Boolean).map((node) => ({
+      node,
+      top: node.scrollTop,
+      left: node.scrollLeft,
+    }));
+    const viewportScroll = {
+      x: window.scrollX,
+      y: window.scrollY,
+    };
+    const selection = activeElement
+      && typeof activeElement.selectionStart === "number"
+      ? {
+        start: activeElement.selectionStart,
+        end: activeElement.selectionEnd,
+        direction: activeElement.selectionDirection,
+      }
+      : null;
+
+    applyStaticTranslations();
+    if (state.bootstrap) {
+      renderRuntime(state.bootstrap.runtime);
+      enforceCapabilities(state.bootstrap);
+      renderRegistry(state.bootstrap.registry);
+      renderExperiments(state.bootstrap.experiments);
+    }
+    renderProbeResult();
+    if (state.settings) {
+      byId("settings-revision").textContent = t("settings.revision", {
+        revision: safeInteger(state.settings.revision, t("common.missing")),
+      });
+      updateSettingsDirtyState();
+    }
+    renderConversationSubtitle();
+    renderConversation();
+    if (state.activeTurn) {
+      renderTurn(state.activeTurn);
+      renderTurnAnnouncement();
+    } else {
+      renderActivity(null);
+      renderEvidence(null);
+    }
+    renderEvents();
+    renderEventGap();
+    renderEventStreamStatus();
+    const pauseButton = byId("pause-events-button");
+    pauseButton.textContent = state.eventsPaused
+      ? t("events.resume")
+      : t("events.pause");
+    updateModeCopy();
+    if (state.selectedEvent && !byId("event-detail").hidden) {
+      openEventDetail(state.selectedEvent, false);
+    }
+
+    const focusTarget = activeId ? byId(activeId) : null;
+    if (focusTarget && document.activeElement !== focusTarget) {
+      focusTarget.focus({ preventScroll: true });
+    }
+    if (
+      selection
+      && focusTarget
+      && typeof focusTarget.setSelectionRange === "function"
+    ) {
+      focusTarget.setSelectionRange(
+        selection.start,
+        selection.end,
+        selection.direction,
+      );
+    }
+    scrollSnapshots.forEach(({ node, top, left }) => {
+      node.scrollTop = top;
+      node.scrollLeft = left;
+    });
+    if (
+      window.scrollX !== viewportScroll.x
+      || window.scrollY !== viewportScroll.y
+    ) {
+      window.scrollTo(viewportScroll.x, viewportScroll.y);
     }
   }
 
@@ -1218,6 +1575,9 @@
       }
     });
     byId("turn-mode").addEventListener("change", updateModeCopy);
+    byId("ui-language").addEventListener("change", (event) => {
+      i18n.setLocale(event.currentTarget.value);
+    });
     document.querySelectorAll("[data-prompt]").forEach((button) => {
       button.addEventListener("click", () => {
         byId("message-input").value = button.dataset.prompt;
@@ -1246,13 +1606,16 @@
       }
       try {
         await navigator.clipboard.writeText(JSON.stringify(state.selectedEvent, null, 2));
-        showToast("Händelsens JSON kopierades.");
+        showToast(t("events.json_copied"));
       } catch (_error) {
-        showToast("JSON kunde inte kopieras.", true);
+        showToast(t("events.json_copy_failed"), true);
       }
     });
     document.addEventListener("keydown", (event) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase("sv-SE") === "j") {
+      if (
+        (event.metaKey || event.ctrlKey)
+        && event.key.toLocaleLowerCase(i18n.formatLocale) === "j"
+      ) {
         event.preventDefault();
         activateView("events");
       }
@@ -1268,6 +1631,8 @@
   }
 
   async function initialize() {
+    applyStaticTranslations();
+    i18n.subscribe(renderLocalizedState);
     bindInteractions();
     try {
       const [bootstrapPayload, settingsPayload] = await Promise.all([
@@ -1278,8 +1643,8 @@
       renderSettings(settingsPayload.settings || bootstrapPayload.settings);
       probeLMStudio();
     } catch (error) {
-      byId("composer-status").textContent = "Dashboardservern kunde inte startas.";
-      showToast(safeText(error.message, "Dashboardservern kunde inte startas."), true);
+      byId("composer-status").textContent = t("server.start_failed");
+      showToast(localizedError(error, "server.start_failed"), true);
     }
     pollEvents();
     window.setInterval(() => refreshBootstrap(true), 10000);

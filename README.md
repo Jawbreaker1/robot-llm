@@ -1,7 +1,7 @@
 # Robot LLM Lab 🤖
 
 ![Status: physical PoC](https://img.shields.io/badge/status-physical%20PoC-2ea44f)
-![Tests: 429 passing](https://img.shields.io/badge/tests-429%20passing-2ea44f)
+![Tests: 448 passing](https://img.shields.io/badge/tests-448%20passing-2ea44f)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![Motion: manual only](https://img.shields.io/badge/motion-manual%20only-f59e0b)
 ![Navigation: simulator only](https://img.shields.io/badge/navigation-simulator%20only-2563eb)
@@ -93,6 +93,7 @@ drivmotorerna.
 | Autonom navigation | simulator-only waypoint, två förslagsproducenter, bounded inbox, versions-/TTL-grind, ensam MotionSupervisor, korta differentialpulser och swept collision oracle |
 | Read-only research | lokal Gemma väljer `weather.current`, Open-Meteo-evidens binds till request, plats, tid, hash och TTL, och svaret måste citera ett färskt evidence-ID |
 | Lokal Mac-dashboard | fempanels Lab Console med asynkron Gemma-chatt, `typed_history`, research/evidens, flerrobotsregister, sessionssettings och cursorbaserad eventlogg |
+| Internationalisering | komplett svensk och engelsk dashboard, standardsbaserat locale-val och typat `response_locale` genom hela agentturen utan språkdetektion |
 | Fysisk foreground-preflight | väntar på åtgärdat EV3-batteri; ännu inte deployad eller körd |
 
 Det här är alltså inte en simulering med en robotbild bredvid. Kod har kört
@@ -150,7 +151,7 @@ handling.
 
 | Mätning | Observerat resultat |
 |---|---:|
-| Hårdvarufria tester | `429 / 429` passerar |
+| Hårdvarufria tester | `448 / 448` passerar |
 | Fysisk supervisor-preflight | `completed`, `0` motorstartkommandon |
 | Rak fysisk drivpuls, B/C | `+175° / +175°` encoderrotation |
 | Fysisk svängpuls, B/C | `+172° / −170°` encoderrotation |
@@ -236,6 +237,13 @@ PYTHONPATH=src python3 -m robot_agent.dashboard_cli
 numerisk loopback, skapar en ny 256-bitars webbsession vid varje start och
 serverar inga externa assets. Den tokeniserade länken är en lokal
 bearer-hemlighet; en omstart gör länken ogiltig och skriver ut en ny.
+
+Språkväljaren i toppfältet byter hela gränssnittet mellan svenska och
+engelska utan omladdning. Vald locale skickas också som ett typat
+`response_locale` på varje tur, så Gemma instrueras uttryckligen vilket språk
+`ANSWER` och `CLARIFY` ska använda. Varken hosten eller säkerhetslagret
+försöker detektera språk med regexp, nyckelord eller specialfraser. Fler
+språk kan läggas till som kataloger bakom samma generiska kontrakt.
 
 Följande är separata, explicita lägen i chatten:
 

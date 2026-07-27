@@ -26,6 +26,32 @@ Porten kan ändras:
 PYTHONPATH=src python3 -m robot_agent.dashboard_cli --port 8877
 ```
 
+## Språk
+
+Språkväljaren i toppfältet byter hela dashboardens presentationsspråk utan
+omladdning eller ny nätverksbegäran. Svenska och engelska är kompletta
+kataloger i den första slicen. Det explicita valet sparas lokalt i browsern;
+utan ett sparat val används browserns standardsbaserade locale och därefter
+svenska som fallback.
+
+Valet skickas även som det typade fältet `response_locale` på varje agenttur.
+Fältet valideras genom en exakt allowlist och blir auktoritativt för
+`ANSWER`- och `CLARIFY`-texten. Modellen ska alltså inte gissa svarsspråk från
+användartext, historik, evidens eller verktygsresultat. Det gör språkbyte
+explicit och reproducerbart utan regexp, nyckelord eller språkheuristik.
+Hosten kompletterar modellkontexten med locale-namn och en explicit
+`response_language_instruction`, upprepar instruktionen på det genererade
+textfältets JSON-schema och placerar den sist i den strukturerade kontexten.
+Det behövdes i liveprov för att valt språk skulle vinna även över en prompt
+och konversationshistorik som uttryckligen begär motsatt språk.
+
+Tekniska identiteter som `weather.current`, eventtyper, ID:n, hashes,
+modellnamn och rå JSON översätts aldrig. Etiketter, statusförklaringar,
+tillgänglighetstext, placeholders, datum och tider följer däremot vald locale.
+Fler språk läggs till som kataloger och tas därefter upp i samma explicita
+locale-allowlist; agent- och säkerhetslogiken behöver inte förgrenas per
+språk.
+
 ## Fem ytor
 
 - **Arbetsbänk** visar en versionsmärkt konversation, pågående tur,

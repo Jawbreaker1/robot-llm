@@ -18,11 +18,36 @@ EVENT_PAGE_SCHEMA = "technical-event-page/v1"
 ROBOT_SCHEMA = "dashboard-robot/v1"
 NODE_SCHEMA = "dashboard-node/v1"
 REGISTRY_SCHEMA = "dashboard-registry/v1"
+EXPERIMENT_SCHEMA = "dashboard-experiment/v1"
 MESSAGE_SCHEMA = "chat-message/v1"
 CONVERSATION_SCHEMA = "conversation/v1"
 TURN_SCHEMA = "chat-turn/v1"
 
 CHAT_MODES = ("conversation", "research_required")
+RESPONSE_LOCALES = ("sv", "en")
+RESPONSE_LOCALE_NAMES = {
+    "sv": "Swedish",
+    "en": "English",
+}
+REGISTRY_DISPLAY_NAME_KEYS = (
+    "registry.names.composite_lab_robot",
+    "registry.names.front_camera",
+    "registry.names.microphone_array",
+    "registry.names.vision_node",
+    "registry.names.audio_node",
+    "registry.names.mac_host",
+)
+EXPERIMENT_TITLE_KEYS = (
+    "experiments.curated.dynamic_ir.title",
+    "experiments.curated.weather_tool.title",
+    "experiments.curated.ev3_preflight.title",
+)
+EXPERIMENT_SUMMARY_KEYS = (
+    "experiments.curated.dynamic_ir.summary",
+    "experiments.curated.weather_tool.summary",
+    "experiments.curated.ev3_preflight.summary",
+)
+EXPERIMENT_STATUSES = ("verified", "waiting")
 LOG_LEVELS = ("debug", "info", "warning", "error")
 ROBOT_LIFECYCLES = (
     "declared",
@@ -550,10 +575,58 @@ class EventPage:
 
 
 @dataclass(frozen=True)
+class ExperimentDescriptor:
+    experiment_id: str
+    title_key: str
+    summary_key: str
+    status: str
+    component_ids: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _identifier("experiment_id", self.experiment_id)
+        if self.title_key not in EXPERIMENT_TITLE_KEYS:
+            raise DashboardContractError(
+                "invalid_experiment_title_key",
+                "Experiment title catalog key is unsupported",
+            )
+        if self.summary_key not in EXPERIMENT_SUMMARY_KEYS:
+            raise DashboardContractError(
+                "invalid_experiment_summary_key",
+                "Experiment summary catalog key is unsupported",
+            )
+        if self.status not in EXPERIMENT_STATUSES:
+            raise DashboardContractError(
+                "invalid_experiment_status",
+                "Experiment status is unsupported",
+            )
+        if (
+            not isinstance(self.component_ids, tuple)
+            or len(set(self.component_ids)) != len(self.component_ids)
+        ):
+            raise DashboardContractError(
+                "invalid_experiment_component_ids",
+                "Experiment component IDs are invalid",
+            )
+        for component_id in self.component_ids:
+            _identifier("component_id", component_id)
+
+    def to_dict(self) -> Mapping[str, object]:
+        return {
+            "schema": EXPERIMENT_SCHEMA,
+            "experiment_id": self.experiment_id,
+            "title_key": self.title_key,
+            "summary_key": self.summary_key,
+            "status": self.status,
+            "component_ids": list(self.component_ids),
+        }
+
+
+@dataclass(frozen=True)
 class RobotDescriptor:
     robot_id: str
     display_name: str
     robot_kind: str
+    display_name_key: Optional[str] = None
     lifecycle: str = "declared"
     node_ids: Tuple[str, ...] = ()
 
@@ -561,6 +634,14 @@ class RobotDescriptor:
         _identifier("robot_id", self.robot_id)
         _text("display_name", self.display_name, 120)
         _identifier("robot_kind", self.robot_kind, 64)
+        if (
+            self.display_name_key is not None
+            and self.display_name_key not in REGISTRY_DISPLAY_NAME_KEYS
+        ):
+            raise DashboardContractError(
+                "invalid_registry_display_name_key",
+                "Robot display-name catalog key is unsupported",
+            )
         if self.lifecycle not in ROBOT_LIFECYCLES:
             raise DashboardContractError(
                 "invalid_robot_lifecycle",
@@ -582,6 +663,7 @@ class RobotDescriptor:
             "schema": ROBOT_SCHEMA,
             "robot_id": self.robot_id,
             "display_name": self.display_name,
+            "display_name_key": self.display_name_key,
             "robot_kind": self.robot_kind,
             "lifecycle": self.lifecycle,
             "node_ids": list(self.node_ids),
@@ -594,6 +676,7 @@ class NodeDescriptor:
     node_id: str
     display_name: str
     node_kind: str
+    display_name_key: Optional[str] = None
     lifecycle: str = "declared"
     robot_id: Optional[str] = None
     controller_id: Optional[str] = None
@@ -607,6 +690,14 @@ class NodeDescriptor:
     def __post_init__(self) -> None:
         _identifier("node_id", self.node_id)
         _text("display_name", self.display_name, 120)
+        if (
+            self.display_name_key is not None
+            and self.display_name_key not in REGISTRY_DISPLAY_NAME_KEYS
+        ):
+            raise DashboardContractError(
+                "invalid_registry_display_name_key",
+                "Node display-name catalog key is unsupported",
+            )
         if self.node_kind not in NODE_KINDS:
             raise DashboardContractError(
                 "invalid_node_kind",
@@ -668,6 +759,7 @@ class NodeDescriptor:
             "schema": NODE_SCHEMA,
             "node_id": self.node_id,
             "display_name": self.display_name,
+            "display_name_key": self.display_name_key,
             "node_kind": self.node_kind,
             "lifecycle": self.lifecycle,
             "robot_id": self.robot_id,
@@ -919,6 +1011,7 @@ class ChatTurn:
     conversation_id: str
     client_request_id: str
     mode: str
+    response_locale: str
     settings_revision: int
     status: str
     content: str
@@ -938,6 +1031,11 @@ class ChatTurn:
             raise DashboardContractError(
                 "invalid_chat_mode",
                 "Chat turn mode is unsupported",
+            )
+        if self.response_locale not in RESPONSE_LOCALES:
+            raise DashboardContractError(
+                "invalid_response_locale",
+                "Chat response locale is unsupported",
             )
         _integer(
             "settings_revision",
@@ -1056,6 +1154,7 @@ class ChatTurn:
             "conversation_id": self.conversation_id,
             "client_request_id": self.client_request_id,
             "mode": self.mode,
+            "response_locale": self.response_locale,
             "require_evidence": self.mode == "research_required",
             "settings_revision": self.settings_revision,
             "status": self.status,
