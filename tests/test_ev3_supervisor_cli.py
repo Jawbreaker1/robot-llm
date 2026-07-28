@@ -33,6 +33,8 @@ class SupervisorCLITests(unittest.TestCase):
         completed = subprocess.run(
             [
                 sys.executable,
+                "-W",
+                "error",
                 str(PROJECT_ROOT / "ev3" / "supervisor_cli.py"),
                 "--help",
             ],

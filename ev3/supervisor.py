@@ -18,7 +18,7 @@ import os
 import threading
 import time
 
-try:
+if __package__:
     from .robot_hal import (
         MotionVerificationError,
         RobotHAL,
@@ -26,7 +26,7 @@ try:
         read_text,
         write_text,
     )
-except (ImportError, ValueError, SystemError):
+else:
     from robot_hal import (
         MotionVerificationError,
         RobotHAL,

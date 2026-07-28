@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 
-try:
+if __package__:
     from .robot_hal import RobotHAL, SafetyError
     from .supervisor import (
         EV3Supervisor,
@@ -41,7 +41,7 @@ try:
         encode_response,
         error_response,
     )
-except (ImportError, ValueError, SystemError):
+else:
     from robot_hal import RobotHAL, SafetyError
     from supervisor import (
         EV3Supervisor,

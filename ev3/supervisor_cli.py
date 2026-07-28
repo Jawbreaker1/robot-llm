@@ -9,7 +9,7 @@ import os
 import sys
 import time
 
-try:
+if __package__:
     from .robot_hal import RobotHAL, SafetyError
     from .supervisor import (
         EV3Supervisor,
@@ -17,7 +17,7 @@ try:
         STATE_CLOSED,
         STATE_DISARMED,
     )
-except (ImportError, ValueError, SystemError):
+else:
     from robot_hal import RobotHAL, SafetyError
     from supervisor import (
         EV3Supervisor,

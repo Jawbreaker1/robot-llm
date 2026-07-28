@@ -2,6 +2,8 @@ import fcntl
 import json
 import os
 import queue
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -10,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import ev3.supervisor as supervisor_module
-from ev3.robot_hal import MotorBusyError, RobotHAL, read_text
+from ev3.robot_hal import MotorBusyError, RobotHAL, SafetyError, read_text
 from ev3.supervisor import (
     AuditBuffer,
     EV3Supervisor,
@@ -2017,6 +2019,23 @@ class EV3SupervisorTests(unittest.TestCase):
         }
         self.assertNotIn("--allow-one-drive-test", option_strings)
 
+    def test_direct_daemon_help_is_warning_clean(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-W",
+                "error",
+                str(PROJECT_ROOT / "ev3" / "supervisor_daemon.py"),
+                "--help",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("strict jsonl", completed.stdout.lower())
+
     def test_supervisor_loop_returns_fault_after_missed_deadline(self):
         session_id = self.claim_and_arm()
         self.start_drive(session_id, duration_ms=800)
@@ -2423,7 +2442,7 @@ class EV3SupervisorTests(unittest.TestCase):
         self.assertEqual(second["state"], STATE_CLOSED)
         self.assertFalse(second["audit_complete"])
 
-    def test_config_rejects_bool_as_supervisor_integer(self):
+    def test_hal_rejects_bool_as_supervisor_integer_before_startup(self):
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         config["limits"]["supervisor"]["poll_interval_ms"] = True
         self.supervisor.close()
@@ -2435,19 +2454,18 @@ class EV3SupervisorTests(unittest.TestCase):
         ) as handle:
             json.dump(config, handle)
             handle.flush()
-            invalid_hal = RobotHAL(
-                handle.name,
-                sysfs_root=str(self.sysfs.root),
-                lock_path=self.lock_path,
-                sleep_fn=self.clock.sleep,
-                monotonic_fn=self.clock.monotonic,
-            )
-            with self.assertRaises(SupervisorError) as context:
-                EV3Supervisor(invalid_hal)
+            with self.assertRaises(SafetyError) as context:
+                RobotHAL(
+                    handle.name,
+                    sysfs_root=str(self.sysfs.root),
+                    lock_path=self.lock_path,
+                    sleep_fn=self.clock.sleep,
+                    monotonic_fn=self.clock.monotonic,
+                )
 
-        self.assertEqual(
-            context.exception.code,
-            "invalid_poll_interval_ms",
+        self.assertIn(
+            "limits.supervisor.poll_interval_ms",
+            str(context.exception),
         )
 
 

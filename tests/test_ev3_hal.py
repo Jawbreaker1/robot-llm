@@ -1,5 +1,4 @@
 import fcntl
-import json
 import subprocess
 import tempfile
 import unittest
@@ -367,13 +366,232 @@ class RobotHALTests(unittest.TestCase):
         self.assertEqual(read_text(str(right_path / "command")), "")
 
     def test_stop_all_writes_stop_to_every_motor(self):
-        addresses = self.hal().stop_all()
+        result = self.hal().stop_all()
+        self.assertEqual(result["status"], "stopped")
+        self.assertTrue(result["stop_confirmed"])
         self.assertEqual(
-            addresses,
+            result["addresses"],
             ["ev3-ports:outA", "ev3-ports:outC", "ev3-ports:outB"],
+        )
+        self.assertEqual(result["motor_count"], 3)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["required_stable_intervals"], 5)
+        self.assertEqual(
+            len(result["stop_attempts"]),
+            3 * (result["required_stable_intervals"] + 1),
         )
         for motor_path in self.sysfs.motors.values():
             self.assertEqual(read_text(str(motor_path / "command")), "stop")
+            self.assertEqual(
+                read_text(str(motor_path / "stop_action")), "brake"
+            )
+
+    def test_stop_all_reports_partial_write_failure_and_continues(self):
+        failed_path = self.sysfs.motors["outB"]
+        other_paths = [
+            self.sysfs.motors["outA"],
+            self.sysfs.motors["outC"],
+        ]
+        original_write_text = robot_hal_module.write_text
+
+        def fail_one_motor(path, value):
+            if (
+                path == str(failed_path / "command")
+                and value == "stop"
+            ):
+                raise IOError("injected persistent stop failure")
+            original_write_text(path, value)
+
+        with patch.object(
+            robot_hal_module,
+            "write_text",
+            side_effect=fail_one_motor,
+        ):
+            result = self.hal().stop_all()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["stop_confirmed"])
+        self.assertTrue(
+            any("persistent stop failure" in item for item in result["errors"])
+        )
+        failed_attempts = [
+            item
+            for item in result["stop_attempts"]
+            if item["path"] == str(failed_path)
+        ]
+        self.assertTrue(failed_attempts)
+        self.assertTrue(
+            all(
+                not item["stop_command_written"]
+                for item in failed_attempts
+            )
+        )
+        for motor_path in other_paths:
+            self.assertEqual(
+                read_text(str(motor_path / "command")), "stop"
+            )
+
+    def test_stop_all_reports_verification_read_failure(self):
+        failed_path = self.sysfs.motors["outC"]
+        original_read_text = robot_hal_module.read_text
+
+        def fail_state_read(path):
+            if path == str(failed_path / "state"):
+                raise IOError("injected state read failure")
+            return original_read_text(path)
+
+        with patch.object(
+            robot_hal_module,
+            "read_text",
+            side_effect=fail_state_read,
+        ):
+            result = self.hal().stop_all()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["stop_confirmed"])
+        self.assertTrue(
+            any("state read failure" in item for item in result["errors"])
+        )
+        for motor_path in self.sysfs.motors.values():
+            self.assertEqual(
+                read_text(str(motor_path / "command")), "stop"
+            )
+
+    def test_stop_all_never_confirms_identity_read_failure(self):
+        failed_path = self.sysfs.motors["outB"]
+        original_read_text = robot_hal_module.read_text
+
+        def fail_address_read(path):
+            if path == str(failed_path / "address"):
+                raise IOError("injected address read failure")
+            return original_read_text(path)
+
+        with patch.object(
+            robot_hal_module,
+            "read_text",
+            side_effect=fail_address_read,
+        ):
+            result = self.hal().stop_all()
+
+        self.assertTrue(result["hardware_stop_verified"])
+        self.assertFalse(result["stop_confirmed"])
+        self.assertTrue(
+            any("address read failure" in item for item in result["errors"])
+        )
+
+    def test_stop_all_does_not_accept_zero_zero_one_coasting_pattern(self):
+        motor_path = self.sysfs.motors["outB"]
+        scripted_positions = iter(
+            [14, 14] + list(range(15, 40))
+        )
+        original_read_text = robot_hal_module.read_text
+        position_reads = []
+
+        def read_coasting_position(path):
+            if path == str(motor_path / "position"):
+                value = next(scripted_positions)
+                position_reads.append(value)
+                return str(value)
+            return original_read_text(path)
+
+        with patch.object(
+            robot_hal_module,
+            "read_text",
+            side_effect=read_coasting_position,
+        ):
+            result = self.hal().stop_all()
+
+        self.assertGreater(len(position_reads), 2)
+        self.assertEqual(position_reads[:3], [14, 14, 15])
+        self.assertFalse(result["hardware_stop_verified"])
+        self.assertFalse(result["stop_confirmed"])
+        self.assertEqual(result["observed_stable_intervals"], 0)
+
+    def test_stop_commands_precede_descriptive_topology_reads(self):
+        original_read_text = robot_hal_module.read_text
+        identity_reads = []
+
+        def require_stopped_before_identity(path):
+            if path.endswith("/address") or path.endswith("/driver_name"):
+                identity_reads.append(path)
+                for motor_path in self.sysfs.motors.values():
+                    self.assertEqual(
+                        original_read_text(str(motor_path / "command")),
+                        "stop",
+                    )
+            return original_read_text(path)
+
+        with patch.object(
+            robot_hal_module,
+            "read_text",
+            side_effect=require_stopped_before_identity,
+        ):
+            result = self.hal().stop_all()
+
+        self.assertTrue(result["stop_confirmed"])
+        self.assertEqual(len(identity_reads), 6)
+
+    def test_stop_all_does_not_confirm_active_or_faulted_motor(self):
+        motor_path = self.sysfs.motors["outC"]
+        write(motor_path / "state", "running stalled")
+
+        result = self.hal().stop_all()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["stop_confirmed"])
+        self.assertEqual(
+            result["fault_tokens"][str(motor_path)], ["stalled"]
+        )
+        self.assertTrue(
+            any(
+                "not verified before deadline" in item
+                for item in result["errors"]
+            )
+        )
+
+    def test_stop_all_does_not_confirm_missing_configured_motor(self):
+        missing_path = self.sysfs.motors["outA"]
+        for child in missing_path.iterdir():
+            child.unlink()
+        missing_path.rmdir()
+
+        result = self.hal().stop_all()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["stop_confirmed"])
+        self.assertTrue(
+            any(
+                "Configured motor arm on outA was not discovered" in item
+                for item in result["errors"]
+            )
+        )
+        for port in ("outB", "outC"):
+            self.assertEqual(
+                read_text(str(self.sysfs.motors[port] / "command")),
+                "stop",
+            )
+
+    def test_unconfigured_emergency_stop_attempt_is_never_fully_confirmed(self):
+        result = RobotHAL.emergency_stop_unconfigured(
+            "configuration contains duplicate keys",
+            sysfs_root=str(self.sysfs.root),
+            sleep_fn=lambda _seconds: None,
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["configuration_valid"])
+        self.assertTrue(result["hardware_stop_verified"])
+        self.assertFalse(result["stop_confirmed"])
+        self.assertTrue(
+            any(
+                "configuration contains duplicate keys" in item
+                for item in result["errors"]
+            )
+        )
+        for motor_path in self.sysfs.motors.values():
+            self.assertEqual(
+                read_text(str(motor_path / "command")), "stop"
+            )
 
     def _speech_processes(self):
         producer = unittest.mock.MagicMock()

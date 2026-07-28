@@ -161,6 +161,10 @@ def asset_directory():
         '"use strict";',
         encoding="utf-8",
     )
+    (root / "dashboard_logic.js").write_text(
+        '"use strict";\n/* dashboard logic fixture */',
+        encoding="utf-8",
+    )
     (root / "app.js").write_text(
         '"use strict";',
         encoding="utf-8",
@@ -291,6 +295,11 @@ class DashboardHTTPTests(unittest.TestCase):
             "/assets/i18n.js",
             self.headers(authenticated=False),
         )
+        old_logic_asset_path = self.router.handle(
+            "GET",
+            "/assets/dashboard_logic.js",
+            self.headers(authenticated=False),
+        )
         wrong_session = self.router.handle(
             "GET",
             "/session/{}/".format("b" * 64),
@@ -304,6 +313,11 @@ class DashboardHTTPTests(unittest.TestCase):
         i18n_asset = self.router.handle(
             "GET",
             self.router.session_path + "assets/i18n.js",
+            self.headers(authenticated=False),
+        )
+        logic_asset = self.router.handle(
+            "GET",
+            self.router.session_path + "assets/dashboard_logic.js",
             self.headers(authenticated=False),
         )
         mascot_asset = self.router.handle(
@@ -324,6 +338,7 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertEqual(public_root.status, 404)
         self.assertEqual(old_asset_path.status, 404)
         self.assertEqual(old_i18n_asset_path.status, 404)
+        self.assertEqual(old_logic_asset_path.status, 404)
         self.assertEqual(wrong_session.status, 403)
         self.assertEqual(session_asset.status, 200)
         self.assertEqual(
@@ -340,9 +355,26 @@ class DashboardHTTPTests(unittest.TestCase):
             "nosniff",
         )
         self.assertEqual(i18n_asset.body, b'"use strict";')
+        self.assertEqual(logic_asset.status, 200)
+        self.assertEqual(
+            dict(logic_asset.headers)["Content-Type"],
+            "text/javascript; charset=utf-8",
+        )
+        self.assertEqual(
+            dict(logic_asset.headers)["X-Content-Type-Options"],
+            "nosniff",
+        )
+        self.assertEqual(
+            logic_asset.body,
+            b'"use strict";\n/* dashboard logic fixture */',
+        )
         static_routes = tuple(DashboardRouter._STATIC_ROUTES)
         self.assertLess(
             static_routes.index("assets/i18n.js"),
+            static_routes.index("assets/dashboard_logic.js"),
+        )
+        self.assertLess(
+            static_routes.index("assets/dashboard_logic.js"),
             static_routes.index("assets/app.js"),
         )
         self.assertEqual(mascot_asset.status, 200)

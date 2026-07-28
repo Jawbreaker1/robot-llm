@@ -8,12 +8,20 @@ import json
 import os
 import sys
 
-from robot_hal import (
-    MotorBusyError,
-    RobotHAL,
-    SafetyError,
-    SpeechBusyError,
-)
+if __package__:
+    from .robot_hal import (
+        MotorBusyError,
+        RobotHAL,
+        SafetyError,
+        SpeechBusyError,
+    )
+else:
+    from robot_hal import (
+        MotorBusyError,
+        RobotHAL,
+        SafetyError,
+        SpeechBusyError,
+    )
 
 
 def default_config_path():
@@ -70,11 +78,28 @@ def main():
     if not args.command:
         parser.error("a command is required")
 
-    robot = RobotHAL(args.config)
+    try:
+        robot = RobotHAL(args.config)
+    except Exception as error:
+        if args.command != "stop":
+            raise
+        result = RobotHAL.emergency_stop_unconfigured(str(error))
+        print(
+            json.dumps(result, indent=2, sort_keys=True),
+            file=sys.stderr,
+        )
+        return 1
+
     if args.command == "inventory":
         result = robot.inventory()
     elif args.command == "stop":
-        result = {"status": "stopped", "motors": robot.stop_all()}
+        result = robot.stop_all()
+        if not result["stop_confirmed"]:
+            print(
+                json.dumps(result, indent=2, sort_keys=True),
+                file=sys.stderr,
+            )
+            return 1
     elif args.command == "read-sensor":
         result = robot.read_sensor(args.role)
     elif args.command == "motor-test":
@@ -101,11 +126,12 @@ def main():
         parser.error("unknown command")
 
     print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except SafetyError as error:
         print(
             json.dumps({"status": "rejected", "error": str(error)}),

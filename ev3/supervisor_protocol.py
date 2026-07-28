@@ -13,9 +13,9 @@ import json
 import binascii
 import os
 
-try:
+if __package__:
     from .supervisor import EV3Supervisor, SupervisorError
-except (ImportError, ValueError, SystemError):
+else:
     from supervisor import EV3Supervisor, SupervisorError
 
 

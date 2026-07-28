@@ -143,6 +143,10 @@ class DashboardRouter:
             "i18n.js",
             "text/javascript; charset=utf-8",
         ),
+        "assets/dashboard_logic.js": (
+            "dashboard_logic.js",
+            "text/javascript; charset=utf-8",
+        ),
         "assets/app.js": (
             "app.js",
             "text/javascript; charset=utf-8",

@@ -8,8 +8,14 @@
     "clarification_required",
     "failed",
   ]);
+  const {
+    TURN_POLL_POLICY,
+    replaceRenderedItems,
+    transitionTurnPoll,
+  } = window.RobotDashboardLogic;
   const EVENT_LIMIT = 100;
   const MAX_LOCAL_EVENTS = 500;
+
   const i18n = window.RobotI18n.createDefaultI18n();
   const t = (key, args) => i18n.t(key, args);
   const ERROR_MESSAGE_KEYS = Object.freeze({
@@ -65,6 +71,7 @@
     readOnlyInvariant: true,
     turnPollGeneration: 0,
     turnPollFailures: 0,
+    turnPollConnection: "connected",
     bootstrapBusy: false,
     settingsDirty: false,
     modelReady: null,
@@ -367,6 +374,19 @@
     );
   }
 
+  function activeTurnComposerStatus(turn) {
+    if (state.turnPollConnection === "unknown") {
+      return t("chat.poll_connection_unknown");
+    }
+    if (state.turnPollConnection === "retrying") {
+      return t("chat.poll_failed");
+    }
+    return t("chat.turn_progress", {
+      state: humanState(turn.status),
+      id: safeText(turn.turn_id),
+    });
+  }
+
   function enforceCapabilities(bootstrap) {
     const capabilities = safeObject(bootstrap.capabilities);
     state.readOnlyInvariant = (
@@ -398,11 +418,13 @@
       researchOption.disabled ? "idle" : "ready",
       researchOption.disabled ? t("capability.unavailable") : t("capability.weather_ready"),
     );
-    byId("composer-status").textContent = chatEnabled
-      ? t("capability.chat_ready")
-      : state.modelReady === false
-        ? t("capability.model_not_ready")
-        : t("capability.chat_unavailable");
+    byId("composer-status").textContent = turnActive
+      ? activeTurnComposerStatus(state.activeTurn)
+      : chatEnabled
+        ? t("capability.chat_ready")
+        : state.modelReady === false
+          ? t("capability.model_not_ready")
+          : t("capability.chat_unavailable");
     if (!state.readOnlyInvariant && !state.readOnlyViolationAnnounced) {
       state.readOnlyViolationAnnounced = true;
       showToast(t("capability.read_only_violation"), true);
@@ -517,13 +539,8 @@
   }
 
   function renderExperiments(experiments) {
-    state.experiments = safeArray(experiments);
-    if (state.experiments.length === 0) {
-      return;
-    }
     const list = byId("experiment-list");
-    list.replaceChildren();
-    state.experiments.forEach((experiment) => {
+    state.experiments = replaceRenderedItems(list, experiments, (experiment) => {
       const card = createElement("article", "experiment-card");
       card.appendChild(createElement(
         "div",
@@ -549,7 +566,7 @@
       ));
       card.appendChild(copy);
       card.appendChild(createElement("span", "state-chip state-idle", humanState(experiment.status)));
-      list.appendChild(card);
+      return card;
     });
   }
 
@@ -990,10 +1007,8 @@
     } else {
       byId("send-button").disabled = true;
       byId("message-input").disabled = true;
-      byId("composer-status").textContent = t("chat.turn_progress", {
-        state: humanState(state.activeTurn.status),
-        id: safeText(state.activeTurn.turn_id),
-      });
+      byId("new-conversation-button").disabled = true;
+      byId("composer-status").textContent = activeTurnComposerStatus(state.activeTurn);
     }
   }
 
@@ -1060,36 +1075,53 @@
         return;
       }
       const turn = safeObject(payload.turn);
-      state.turnPollFailures = 0;
+      const transition = transitionTurnPoll(
+        {
+          failures: state.turnPollFailures,
+          connection: state.turnPollConnection,
+        },
+        { type: "success", turn },
+      );
+      state.turnPollFailures = transition.failures;
+      state.turnPollConnection = transition.connection;
       renderTurn(turn);
-      if (TERMINAL_TURN_STATES.has(turn.status)) {
+      if (transition.recovered) {
+        showToast(t("chat.poll_recovered"));
+      }
+      if (transition.terminal) {
         await refreshConversation();
         renderTurn(turn);
         return;
       }
     } catch (error) {
-      state.turnPollFailures += 1;
-      byId("composer-status").textContent = localizedError(error, "chat.poll_failed");
-      if (state.turnPollFailures >= 8) {
-        state.turnPollGeneration += 1;
-        renderTurn({
-          ...safeObject(state.activeTurn),
-          status: "failed",
-          error_code: "turn_poll_failed",
-          completed_at_unix_ms: Date.now(),
-        });
-        showToast(
-          t("chat.poll_unrecoverable"),
-          true,
-        );
-        return;
+      const transition = transitionTurnPoll(
+        {
+          failures: state.turnPollFailures,
+          connection: state.turnPollConnection,
+        },
+        { type: "failure" },
+      );
+      state.turnPollFailures = transition.failures;
+      state.turnPollConnection = transition.connection;
+      byId("send-button").disabled = true;
+      byId("message-input").disabled = true;
+      byId("new-conversation-button").disabled = true;
+      byId("composer-status").textContent = transition.connection === "unknown"
+        ? t("chat.poll_connection_unknown")
+        : localizedError(error, "chat.poll_failed");
+      if (transition.becameUnknown) {
+        showToast(t("chat.poll_connection_unknown"), true);
       }
+      window.setTimeout(
+        () => pollTurn(turnId, generation),
+        transition.retryDelayMs,
+      );
+      return;
     }
-    const retryDelay = Math.min(
-      5000,
-      800 * Math.max(1, state.turnPollFailures),
+    window.setTimeout(
+      () => pollTurn(turnId, generation),
+      TURN_POLL_POLICY.baseDelayMs,
     );
-    window.setTimeout(() => pollTurn(turnId, generation), retryDelay);
   }
 
   async function submitTurn(event) {
@@ -1127,10 +1159,11 @@
       });
       input.value = "";
       state.optimisticContent = null;
+      state.turnPollFailures = 0;
+      state.turnPollConnection = "connected";
       renderTurn(payload.turn);
       await refreshConversation();
       state.turnPollGeneration += 1;
-      state.turnPollFailures = 0;
       pollTurn(payload.turn.turn_id, state.turnPollGeneration);
     } catch (error) {
       state.optimisticContent = null;

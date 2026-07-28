@@ -11,9 +11,17 @@ from statistics import median
 import sys
 import time
 
-try:
+if __package__:
+    from .robot_config import (
+        MAX_IR_CONSECUTIVE_DECISIONS,
+        MAX_IR_MEDIAN_WINDOW,
+    )
     from .robot_hal import RobotHAL, SafetyError, read_text
-except (ImportError, ValueError, SystemError):
+else:
+    from robot_config import (
+        MAX_IR_CONSECUTIVE_DECISIONS,
+        MAX_IR_MEDIAN_WINDOW,
+    )
     from robot_hal import RobotHAL, SafetyError, read_text
 
 
@@ -62,13 +70,24 @@ class GatePolicy(object):
             <= 100
         ):
             raise SafetyError("IR gate thresholds are invalid")
-        if median_window <= 0 or median_window % 2 == 0:
+        if (
+            median_window <= 0
+            or median_window > MAX_IR_MEDIAN_WINDOW
+            or median_window % 2 == 0
+        ):
             raise SafetyError(
-                "IR gate median window must be a positive odd integer"
+                "IR gate median window must be a positive odd integer "
+                "no greater than {0}".format(MAX_IR_MEDIAN_WINDOW)
             )
-        if enter_consecutive <= 0 or exit_consecutive <= 0:
+        if (
+            enter_consecutive <= 0
+            or enter_consecutive > MAX_IR_CONSECUTIVE_DECISIONS
+            or exit_consecutive <= 0
+            or exit_consecutive > MAX_IR_CONSECUTIVE_DECISIONS
+        ):
             raise SafetyError(
-                "IR gate consecutive counts must be positive"
+                "IR gate consecutive counts must be between 1 and "
+                "{0}".format(MAX_IR_CONSECUTIVE_DECISIONS)
             )
 
         self.immediate_enter_max = immediate_enter_max

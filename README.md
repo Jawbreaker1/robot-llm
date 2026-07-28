@@ -1,7 +1,7 @@
 # Robot LLM Lab 🤖
 
 ![Status: controlled experiment](https://img.shields.io/badge/status-controlled%20experiment-2ea44f)
-![Tests: 535 passing](https://img.shields.io/badge/tests-535%20passing-2ea44f)
+[![Quality](https://github.com/Jawbreaker1/robot-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/Jawbreaker1/robot-llm/actions/workflows/ci.yml)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![UI: English + Swedish](https://img.shields.io/badge/UI-English%20%2B%20Swedish-0ea5e9)
 ![Physical motion: manual only](https://img.shields.io/badge/physical%20motion-manual%20only-f59e0b)
@@ -211,8 +211,9 @@ physical IR observations are never allowed to claim an identity.
 
 ## Try it locally
 
-The host code and tests use Python's standard library. Python 3.9+ is
-recommended on macOS or Linux.
+The host code uses Python's standard library. Python 3.9+ is recommended on
+macOS or Linux. The complete quality gate also uses Node.js for executable
+tests of the dependency-free dashboard JavaScript; CI currently uses Node 22.
 
 ### Start the Lab Console
 
@@ -236,13 +237,15 @@ conversation state and form state survive the switch.
 ### Run the hardware-free tests
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 \
-  PYTHONPATH=src python3 -m unittest discover -s tests -q
+sh ./scripts/quality_check.sh
 ```
 
 The suite uses simulated sysfs and never activates physical hardware. It
 verifies contracts, budgets, process behavior, agent loops, and the
 accelerated synchronous simulator—not real stop latency or braking distance.
+The same dependency-free quality gate runs on Python 3.9 and 3.13 in GitHub
+Actions and also checks JavaScript syntax and the EV3 modules' Python 3.5
+grammar.
 
 ### Run autonomous navigation in the 2D simulator
 
@@ -328,6 +331,12 @@ python3 ev3/robot_cli.py stop
 python3 ev3/ir_gate_probe.py
 python3 ev3/supervisor_cli.py preflight
 ```
+
+`robot_cli.py stop` exits successfully only when every configured motor is
+inactive, fault-free, encoder-stable, and matched to the expected topology.
+An unreadable or invalid config does not prevent a best-effort emergency stop,
+but that configless attempt is reported on stderr with exit code 1 and can
+never claim `stop_confirmed: true`.
 
 Run one motion-free Gemma shadow cycle from the Mac:
 

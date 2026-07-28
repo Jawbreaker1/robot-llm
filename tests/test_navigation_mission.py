@@ -1,9 +1,13 @@
 from dataclasses import replace
 import itertools
 import json
+import subprocess
+import sys
 import threading
 import unittest
 
+import robot_agent.navigation_mission as navigation_mission
+import robot_agent.navigation_mission_contract as mission_contract
 from robot_agent.navigation_contract import (
     DriveCalibrationProfile,
     MotionAuthority,
@@ -172,6 +176,58 @@ def three_legs():
 
 
 class MissionContractTests(unittest.TestCase):
+    def test_contract_import_does_not_load_execution_layer(self):
+        code = (
+            "import sys;"
+            "import robot_agent.navigation_mission_contract;"
+            "assert 'robot_agent.navigation_episode' not in sys.modules;"
+            "assert 'robot_agent.navigation_simulator' not in sys.modules;"
+            "assert 'robot_agent.navigation_supervisor' not in sys.modules"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            check=False,
+            env={
+                "PYTHONPATH": "src",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr,
+        )
+
+    def test_legacy_mission_module_re_exports_contract_api(self):
+        names = (
+            "MAX_MISSION_LEGS",
+            "MAX_MISSION_PLAN_BYTES",
+            "MISSION_ABORTED",
+            "MISSION_BUDGET_EXHAUSTED",
+            "MISSION_COMPLETED",
+            "MISSION_LEG_FAILED",
+            "MISSION_PLAN_REJECTED",
+            "MISSION_PLAN_SCHEMA",
+            "MISSION_PLAN_STALE",
+            "MISSION_SAFETY_STOP",
+            "MissionLeg",
+            "MissionLegResult",
+            "MissionLimits",
+            "MissionPlan",
+            "MissionResult",
+            "decode_mission_plan",
+        )
+
+        for name in names:
+            with self.subTest(name=name):
+                self.assertIs(
+                    getattr(navigation_mission, name),
+                    getattr(mission_contract, name),
+                )
+
     def test_strict_plan_round_trip_and_duplicate_key_rejection(self):
         plant, _supervisor, _inbox = make_stack()
         plan = mission_plan(plant, three_legs())

@@ -6,11 +6,17 @@ from __future__ import print_function
 import fcntl
 import glob
 import io
-import json
 import os
 import subprocess
 import sys
 import time
+
+if __package__:
+    from .emergency_stop import verified_emergency_stop
+    from .robot_config import load_robot_config
+else:
+    from emergency_stop import verified_emergency_stop
+    from robot_config import load_robot_config
 
 
 class SafetyError(ValueError):
@@ -65,8 +71,12 @@ class RobotHAL(object):
         monotonic_fn=time.monotonic,
         speech_lock_path="/tmp/robot-llm-audio.lock",
     ):
-        with io.open(config_path, "r", encoding="utf-8") as handle:
-            self.config = json.load(handle)
+        try:
+            self.config = load_robot_config(config_path)
+        except (TypeError, ValueError) as error:
+            raise SafetyError(
+                "Invalid robot configuration: {}".format(error)
+            )
         self.sysfs_root = sysfs_root
         self.lock_path = lock_path
         self.speech_lock_path = speech_lock_path
@@ -119,10 +129,11 @@ class RobotHAL(object):
         return sensor_path
 
     def _limit_for_role(self, role):
-        if role not in self.config["motors"]:
+        try:
+            limit_name = self.config["motors"][role]["limit_profile"]
+            return self.config["limits"][limit_name]
+        except KeyError:
             raise SafetyError("Unknown motor role {!r}".format(role))
-        limit_name = "drive" if role.startswith("drive_") else "arm"
-        return self.config["limits"][limit_name]
 
     def _drive_roles(self):
         try:
@@ -139,7 +150,11 @@ class RobotHAL(object):
             raise SafetyError("Left and right drive roles must be different")
 
         for role in (left_role, right_role):
-            if role not in self.config["motors"] or not role.startswith("drive_"):
+            if (
+                role not in self.config["motors"]
+                or self.config["motors"][role].get("limit_profile")
+                != "drive"
+            ):
                 raise SafetyError(
                     "Drive geometry contains invalid role {!r}".format(role)
                 )
@@ -420,15 +435,41 @@ class RobotHAL(object):
         return result
 
     def stop_all(self):
-        stopped = []
-        pattern = os.path.join(self.sysfs_root, "tacho-motor", "*")
-        for motor_path in sorted(glob.glob(pattern)):
-            try:
-                write_text(os.path.join(motor_path, "command"), "stop")
-                stopped.append(read_text(os.path.join(motor_path, "address")))
-            except (IOError, OSError):
-                continue
-        return stopped
+        """Stop all tacho motors and return conservative verification."""
+        expected_by_port = {}
+        for role, configured in self.config["motors"].items():
+            expected_by_port[configured["port"]] = {
+                "role": role,
+                "driver": configured["driver"],
+            }
+        limits = self.config["limits"]["supervisor"]
+        return verified_emergency_stop(
+            sysfs_root=self.sysfs_root,
+            sleep_fn=self.sleep_fn,
+            read_fn=read_text,
+            write_fn=write_text,
+            expected_motors=expected_by_port,
+            timeout_ms=limits["stop_verify_timeout_ms"],
+            poll_ms=limits["stop_poll_interval_ms"],
+            glob_fn=glob.glob,
+        )
+
+    @staticmethod
+    def emergency_stop_unconfigured(
+        configuration_error,
+        sysfs_root="/sys/class",
+        sleep_fn=time.sleep,
+    ):
+        """Attempt a stop without trusting or requiring robot config."""
+        return verified_emergency_stop(
+            sysfs_root=sysfs_root,
+            sleep_fn=sleep_fn,
+            read_fn=read_text,
+            write_fn=write_text,
+            expected_motors=None,
+            configuration_error=configuration_error,
+            glob_fn=glob.glob,
+        )
 
     def inventory(self):
         motors = {}

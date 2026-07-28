@@ -88,6 +88,8 @@ class IRGateProbeTests(unittest.TestCase):
         completed = subprocess.run(
             [
                 sys.executable,
+                "-W",
+                "error",
                 str(PROJECT_ROOT / "ev3" / "ir_gate_probe.py"),
                 "--help",
             ],
@@ -219,6 +221,46 @@ class IRGateProbeTests(unittest.TestCase):
                 median_window=4,
                 enter_consecutive=2,
                 exit_consecutive=3,
+            ),
+        ]
+        for values in invalid_values:
+            with self.subTest(values=values):
+                with self.assertRaises(SafetyError):
+                    GatePolicy(**values)
+
+    def test_policy_enforces_absolute_count_ceilings(self):
+        GatePolicy(
+            immediate_enter_max=16,
+            enter_max=35,
+            exit_min=40,
+            median_window=31,
+            enter_consecutive=20,
+            exit_consecutive=20,
+        )
+        invalid_values = [
+            dict(
+                immediate_enter_max=16,
+                enter_max=35,
+                exit_min=40,
+                median_window=33,
+                enter_consecutive=2,
+                exit_consecutive=3,
+            ),
+            dict(
+                immediate_enter_max=16,
+                enter_max=35,
+                exit_min=40,
+                median_window=3,
+                enter_consecutive=21,
+                exit_consecutive=3,
+            ),
+            dict(
+                immediate_enter_max=16,
+                enter_max=35,
+                exit_min=40,
+                median_window=3,
+                enter_consecutive=2,
+                exit_consecutive=21,
             ),
         ]
         for values in invalid_values:

@@ -61,8 +61,13 @@ class DashboardWebContractTests(unittest.TestCase):
         cls.html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
         cls.css = (WEB_ROOT / "styles.css").read_text(encoding="utf-8")
         cls.i18n = (WEB_ROOT / "i18n.js").read_text(encoding="utf-8")
+        cls.dashboard_logic = (
+            WEB_ROOT / "dashboard_logic.js"
+        ).read_text(encoding="utf-8")
         cls.javascript = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
-        cls.javascript_assets = cls.i18n + "\n" + cls.javascript
+        cls.javascript_assets = "\n".join(
+            (cls.i18n, cls.dashboard_logic, cls.javascript)
+        )
         cls.parser = AssetParser()
         cls.parser.feed(cls.html)
         cls.i18n_contract = cls._inspect_i18n_contract()
@@ -287,7 +292,11 @@ process.stdout.write(JSON.stringify({
         )
         self.assertEqual(
             self.parser.scripts,
-            ["assets/i18n.js", "assets/app.js"],
+            [
+                "assets/i18n.js",
+                "assets/dashboard_logic.js",
+                "assets/app.js",
+            ],
         )
         self.assertTrue(
             all(
@@ -892,6 +901,7 @@ process.stdout.write(JSON.stringify({
         )
         for filename, source in (
             ("i18n.js", self.i18n),
+            ("dashboard_logic.js", self.dashboard_logic),
             ("app.js", self.javascript),
         ):
             for token in forbidden:
@@ -969,17 +979,6 @@ process.stdout.write(JSON.stringify({
         self.assertLess(
             self.javascript.index(comparison),
             self.javascript.index(reload_page),
-        )
-
-    def test_turn_polling_has_bounded_failure_budget_and_terminal_fallback(self):
-        self.assertIn("turnPollFailures: 0", self.javascript)
-        self.assertIn("state.turnPollFailures += 1", self.javascript)
-        self.assertIn("state.turnPollFailures >= 8", self.javascript)
-        self.assertIn('error_code: "turn_poll_failed"', self.javascript)
-        self.assertIn("Math.min(", self.javascript)
-        self.assertIn(
-            "window.setTimeout(() => pollTurn(turnId, generation), retryDelay)",
-            self.javascript,
         )
 
     def test_historical_citations_fetch_their_own_turn_evidence(self):
