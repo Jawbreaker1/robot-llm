@@ -1249,6 +1249,21 @@ class ExclusiveArmTests(unittest.TestCase):
         self.assertEqual(result.metrics.navigation_pause_requests, 1)
         self.assertEqual(result.metrics.navigation_pause_acks, 1)
         self.assertEqual(result.metrics.gestures_completed, 1)
+        refresh_stops = [
+            pulse
+            for pulse in plant.applied_pulses
+            if pulse.reason_code == "post_pause_observation_refresh"
+        ]
+        self.assertEqual(len(refresh_stops), 1)
+        first_drive_index = next(
+            index
+            for index, pulse in enumerate(plant.applied_pulses)
+            if pulse.kind == "DRIVE"
+        )
+        self.assertLess(
+            plant.applied_pulses.index(refresh_stops[0]),
+            first_drive_index,
+        )
         event_kinds = [event.kind for event in result.events]
         self.assertLess(
             event_kinds.index("navigation_pause_ack"),
@@ -1257,6 +1272,12 @@ class ExclusiveArmTests(unittest.TestCase):
         self.assertLess(
             event_kinds.index("gesture_completed"),
             event_kinds.index("navigation_pause_released"),
+        )
+        self.assertLess(
+            event_kinds.index("navigation_pause_released"),
+            event_kinds.index(
+                "post_pause_observation_refresh_requested"
+            ),
         )
 
     def test_cancel_wakes_active_pause_and_navigation_terminal_stops(self):

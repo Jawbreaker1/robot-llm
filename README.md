@@ -1,7 +1,7 @@
 # Robot LLM Lab 🤖
 
 ![Status: controlled experiment](https://img.shields.io/badge/status-controlled%20experiment-2ea44f)
-![Tests: 521 passing](https://img.shields.io/badge/tests-521%20passing-2ea44f)
+![Tests: 535 passing](https://img.shields.io/badge/tests-535%20passing-2ea44f)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![UI: English + Swedish](https://img.shields.io/badge/UI-English%20%2B%20Swedish-0ea5e9)
 ![Physical motion: manual only](https://img.shields.io/badge/physical%20motion-manual%20only-f59e0b)
@@ -75,7 +75,7 @@ permission to execute motion.
 
 ## What works today
 
-Status snapshot: **2026-07-27**.
+Status snapshot: **2026-07-28**.
 
 | Area | Verified now | Important boundary |
 |---|---|---|
@@ -84,7 +84,7 @@ Status snapshot: **2026-07-27**.
 | EV3 supervisor | Motion-free `brake`/`stop`/inventory/touch preflight passed on the real robot with zero motor starts | The newer foreground daemon has only been verified against fake sysfs |
 | Lab Console | Local Gemma chat, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | No motor, SSH, TTS, or stop routes exist in the dashboard |
 | RobotAPI loop | Typed, snapshot-bound arm API and a closed `observe → plan → act → verify → replan` loop | Simulator-only and currently driven by a scripted fake planner |
-| Navigation | Waypoint following, obstacle avoidance, proposal inbox, one MotionSupervisor, and an independent collision oracle | 2D simulator only; no physical navigation adapter |
+| Navigation | Waypoint following, obstacle avoidance, version-bound multi-waypoint missions, one MotionSupervisor, and an independent collision oracle | 2D simulator only; no physical navigation adapter or model-authored mission planner |
 | Concurrent interaction | Independent bounded workers plus one live local-Gemma simulator run where model speech overlapped a later navigation tick | Virtual callbacks only; no physical drive, speaker, or arm adapter |
 | Physical autonomy | Not enabled | Waiting for reliable EV3 power, physical transport validation, calibration, stop-latency evidence, and fault injection |
 
@@ -138,6 +138,21 @@ fixed host-owned alternating segments, and releases navigation. Speech-only
 reactions never pause the wheels. A slow or failed model/audio callback is
 isolated from navigation. A per-object cooldown and total planner budget stop
 repeated sensor reacquisition from turning into model or speech spam.
+
+Above a single waypoint episode, the simulator now accepts a strict,
+version-bound mission plan containing up to eight semantic waypoint legs.
+Each leg receives a newer goal epoch and shares global time, action, motion,
+proposal, and replan budgets. The next leg starts only after the previous
+episode has reached its waypoint and verified a terminal STOP. A changed
+world model invalidates the remaining plan at that stopped boundary, and a
+failed leg never starts later legs. This is the deterministic plan-execution
+seam; Gemma does not author these mission plans yet.
+
+If geometry changes after observation but before dispatch, the stale pulse is
+rejected, the episode re-observes, and the retry consumes the existing replan
+budget. Repeated invalidation ends in a STOP bound to the newest state.
+Likewise, release from an exclusive propeller pause forces a new stopped
+observation boundary before any later DRIVE.
 
 Touch stop, distance gates, heartbeat, timeout, speed limits, stall checks,
 and emergency stop are deterministic. They do not wait for an LLM response.
@@ -350,7 +365,7 @@ This is a manual hardware test, not autonomous navigation. Read the full
 
 | Measurement | Result |
 |---|---:|
-| Hardware-free test suite | `521 / 521` passing |
+| Hardware-free test suite | `535 / 535` passing |
 | Physical supervisor preflight | `completed`, `0` motor-start commands |
 | Straight physical B/C pulse | `+175° / +175°` |
 | Physical B/C turn pulse | `+172° / −170°` |
@@ -378,6 +393,8 @@ Protocols, limitations, and raw data are in the
 - [x] Typed RobotAPI and closed arm loop in simulation
 - [x] Simulator-first waypoint navigation with parallelizable proposals and
   serialized supervision
+- [x] Strict multi-waypoint mission execution with shared budgets, verified
+  inter-leg stops, and world-version invalidation
 - [x] Concurrent simulator runtime: asynchronous navigation/expression/speech,
   optional propeller reaction, and serialized wheel ownership
 - [ ] Reliable EV3 power and physical motion-free foreground handshake

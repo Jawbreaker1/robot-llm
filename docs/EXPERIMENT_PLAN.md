@@ -923,6 +923,44 @@ Liveprov mot lokala `google/gemma-4-26b-a4b`:
 - speech-callbacken var fortfarande virtuell. Provet aktiverade varken
   högtalare, arm, EV3 eller annan fysisk hårdvara.
 
+### EXP-F5-MISSION-SIM-004 – versionsbunden flerstegsplan
+
+Hypotes: roboten kan exekvera en agentiskt användbar plan med flera delmål
+utan att ge planbyggaren motorbehörighet eller låta ett delmål
+förhandsauktorisera senare fysisk motion.
+
+Implementation och acceptans:
+
+- strikt `robot-navigation-mission-plan/v1` med 1–8 typade waypointben,
+  unika leg-ID:n och exakt bindning till robot, controllerinstans,
+  state-version, world-model-version och planrevision,
+- varje ben får ett nytt monotont goal epoch och kör samma befintliga
+  `NavigationEpisode` samt samma ensamma `MotionSupervisor`,
+- missionens globala tick-, tids-, proposal-, replan-, action- och
+  motionbudget klipps in i varje ben och kan inte återställas mellan ben,
+- nästa ben får inte starta förrän föregående waypoint har nåtts och ett
+  terminalt STOP har verifierats,
+- ett misslyckat ben, cancellation eller budgetstopp förhindrar alla senare
+  ben,
+- en ändrad world-model-version gör återstående plan stale vid stoppgränsen
+  och ger ett nytt versionsbundet STOP,
+- ett världsbyte mellan observation och dispatch kasserar den gamla pulsen,
+  gör en ny observation och förbrukar befintlig replanbudget; upprepade
+  invalidationer slutar bounded med verifierat STOP,
+- efter pausgrindad propellergest krävs en ny STOP/observationsgräns innan
+  senare DRIVE.
+
+Det deterministiska trebenstestet når samtliga waypointmål utan kollision och
+verifierar ett terminalt STOP för varje ben. Negativtest täcker strikt JSON,
+duplicerade ben, stale aktivering, världsbyte, stall, global actionbudget,
+pre-cancellation och single-use-runner. Hela den hårdvarufria reposviten
+passerar därefter `535 / 535`.
+
+Grind: godkänd som simulatorbevis för planexekvering, delmålsverifiering och
+bounded failure propagation. Gemma bygger ännu inte missionsplanen,
+missionsben kör ännu inte `ConcurrentBehaviorRuntime`, och ingen fysisk
+adapter eller hårdvara aktiverades.
+
 ## Fas 6 – Parallella snurror
 
 Simulator-slicen bevisar nu en avgränsad del av

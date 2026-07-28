@@ -209,6 +209,27 @@ backend för en pollande flerpulsloop. En fysisk adapter kräver därför en
 senare protokollgrind med batterier, persistent heartbeat/preemption,
 kalibrering, stopplatens och felinjektion – inte en SSH-session per tick.
 
+### Versionsbundet missionslager
+
+`MissionRunner` ligger ovanför den oförändrade waypointloopen och exekverar
+ett strikt `robot-navigation-mission-plan/v1` med högst åtta semantiska
+waypointben. Planen binds vid aktivering till robot, controllerinstans,
+state-version och world-model-version. Den innehåller inga motorportar,
+hjulhastigheter, motion authority eller TTL.
+
+Varje ben får ett monotont nytt `goal_epoch`, nya instanser av de
+deterministiska referensbeteendena och en del av missionens kvarvarande
+globala budget för ticks, tid, förslag, omplaneringar, handlingar och
+motionstid. Nästa ben startar endast om föregående waypoint nåddes och dess
+terminala STOP verifierades. Fel, cancellation eller budgetstopp avbryter
+alla senare ben. Ett ändrat world model gör återstående plan stale vid den
+närmsta verifierade stoppgränsen.
+
+Detta är en exekverings- och verifieringssöm för framtida agentisk planering,
+inte ännu en LM Studio-planner. En långsam modell ska framåt föreslå sådana
+högre delmål vid stoppgränser, inte försöka mikroplanera varje 120 ms-puls.
+MotionSupervisor och den lokala hinderundvikningen förblir deterministiska.
+
 ### Parallell interaktion ovanpå serialiserad navigation
 
 Den körbara concurrent-slicen lägger uttryck och objektreaktioner bredvid

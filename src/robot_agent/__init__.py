@@ -38,6 +38,11 @@ _EXPORTS = {
     ),
     "LoopLimits": (".agent_loop", "LoopLimits"),
     "ModelCandidate": (".lm_studio", "ModelCandidate"),
+    "MissionLeg": (".navigation_mission", "MissionLeg"),
+    "MissionLimits": (".navigation_mission", "MissionLimits"),
+    "MissionPlan": (".navigation_mission", "MissionPlan"),
+    "MissionResult": (".navigation_mission", "MissionResult"),
+    "MissionRunner": (".navigation_mission", "MissionRunner"),
     "MotionCommand": (".contract", "MotionCommand"),
     "MotionRequest": (".robot_api", "MotionRequest"),
     "MotorCapability": (".robot_api", "MotorCapability"),
@@ -144,6 +149,10 @@ _EXPORTS = {
     "decode_decision_proposal": (
         ".agent_loop",
         "decode_decision_proposal",
+    ),
+    "decode_mission_plan": (
+        ".navigation_mission",
+        "decode_mission_plan",
     ),
     "decode_research_decision": (
         ".research_loop",

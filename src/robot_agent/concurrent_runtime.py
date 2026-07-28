@@ -46,6 +46,7 @@ from .navigation_contract import (
 )
 from .navigation_episode import (
     GoalSeekingBehavior,
+    NAVIGATION_REFRESH_REQUIRED,
     NavigationEpisode,
     NavigationLimits,
     NavigationResult,
@@ -1388,6 +1389,13 @@ class ConcurrentBehaviorRuntime:
                 str(snapshot.state_version),
             )
             self.cancel()
+            return None
+        self._events.append(
+            "motion",
+            "post_pause_observation_refresh_requested",
+            str(snapshot.state_version),
+        )
+        return NAVIGATION_REFRESH_REQUIRED
 
     def _start_worker(
         self,

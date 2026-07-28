@@ -31,6 +31,8 @@ NAVIGATION_SAFETY_STOP = "NAVIGATION_SAFETY_STOP"
 NAVIGATION_PROGRESS_FAILED = "NAVIGATION_PROGRESS_FAILED"
 NAVIGATION_BUDGET_EXHAUSTED = "NAVIGATION_BUDGET_EXHAUSTED"
 NAVIGATION_EXECUTION_FAILED = "NAVIGATION_EXECUTION_FAILED"
+NAVIGATION_PLAN_STALE = "NAVIGATION_PLAN_STALE"
+NAVIGATION_REFRESH_REQUIRED = "NAVIGATION_REFRESH_REQUIRED"
 
 
 def distance_to_goal_mm(
@@ -414,6 +416,7 @@ class NavigationEpisode:
             Callable[[NavigationSnapshot], None]
         ] = None,
         cancel_event=None,
+        required_world_model_version: Optional[int] = None,
     ):
         if not isinstance(plant, DifferentialDriveSimulator):
             raise NavigationContractError(
@@ -470,6 +473,13 @@ class NavigationEpisode:
                 "invalid_cancel_event",
                 "Cancel event must expose is_set()",
             )
+        if required_world_model_version is not None:
+            integer(
+                "required_world_model_version",
+                required_world_model_version,
+                1,
+                2**63 - 1,
+            )
         self.plant = plant
         self.supervisor = supervisor
         self.inbox = inbox
@@ -478,6 +488,9 @@ class NavigationEpisode:
         self.observation_sink = observation_sink
         self.before_arbitration = before_arbitration
         self.cancel_event = cancel_event
+        self.required_world_model_version = (
+            required_world_model_version
+        )
 
     def _cancelled(self) -> bool:
         return (
@@ -491,6 +504,9 @@ class NavigationEpisode:
     ) -> None:
         if self.observation_sink is not None:
             self.observation_sink(snapshot)
+
+    def _terminal_stop_cost_ms(self) -> int:
+        return self.plant.settings.idle_tick_ms
 
     def _publish_local(
         self,
@@ -662,6 +678,8 @@ class NavigationEpisode:
         }
         best_distance = distance_to_goal_mm(snapshot, goal)
         no_progress_ticks = 0
+        stale_dispatch_replans = 0
+        stale_retry_granted = False
 
         try:
             self._publish_observation(snapshot)
@@ -679,6 +697,8 @@ class NavigationEpisode:
         while True:
             snapshot = reducer.snapshot()
             current_distance = distance_to_goal_mm(snapshot, goal)
+            retrying_stale_dispatch = stale_retry_granted
+            stale_retry_granted = False
             if self._cancelled():
                 trace.append("CANCELLED")
                 return self._finish(
@@ -705,12 +725,29 @@ class NavigationEpisode:
                     already_stopped=False,
                 )
             if (
+                self.required_world_model_version is not None
+                and snapshot.world_model_version
+                != self.required_world_model_version
+            ):
+                return self._finish(
+                    goal,
+                    NAVIGATION_PLAN_STALE,
+                    counters,
+                    trace,
+                    steps,
+                    snapshot,
+                    already_stopped=False,
+                )
+            if (
                 counters["ticks"] >= self.limits.max_ticks
                 or self.plant.clock_ms() < started_at_ms
                 or self.plant.clock_ms() - started_at_ms
                 >= self.limits.max_elapsed_ms
                 or counters["proposals"] >= self.limits.max_proposals
-                or counters["replans"] >= self.limits.max_replans
+                or (
+                    counters["replans"] >= self.limits.max_replans
+                    and not retrying_stale_dispatch
+                )
                 or counters["actions"] >= self.limits.max_actions
                 or counters["total_motion_ms"]
                 >= self.limits.max_total_motion_ms
@@ -725,9 +762,16 @@ class NavigationEpisode:
                     already_stopped=False,
                 )
             if current_distance <= goal.tolerance_mm:
+                elapsed_ms = self.plant.clock_ms() - started_at_ms
+                termination = NAVIGATION_GOAL_REACHED
+                if (
+                    elapsed_ms + self._terminal_stop_cost_ms()
+                    > self.limits.max_elapsed_ms
+                ):
+                    termination = NAVIGATION_BUDGET_EXHAUSTED
                 return self._finish(
                     goal,
-                    NAVIGATION_GOAL_REACHED,
+                    termination,
                     counters,
                     trace,
                     steps,
@@ -738,8 +782,9 @@ class NavigationEpisode:
             trace.append("PUBLISHING")
             try:
                 self._publish_local(goal, snapshot)
+                tick_directive = None
                 if self.before_arbitration is not None:
-                    self.before_arbitration(snapshot)
+                    tick_directive = self.before_arbitration(snapshot)
             except Exception:
                 return self._finish(
                     goal,
@@ -775,11 +820,17 @@ class NavigationEpisode:
                 )
 
             trace.append("ARBITRATING")
-            pulse = self.supervisor.decide(
-                snapshot,
-                goal,
-                proposals,
-            )
+            if tick_directive == NAVIGATION_REFRESH_REQUIRED:
+                pulse = self.supervisor.force_stop(
+                    snapshot,
+                    reason_code="post_pause_observation_refresh",
+                )
+            else:
+                pulse = self.supervisor.decide(
+                    snapshot,
+                    goal,
+                    proposals,
+                )
             if (
                 pulse.kind == "DRIVE"
                 and (
@@ -802,12 +853,103 @@ class NavigationEpisode:
                     snapshot,
                     already_stopped=False,
                 )
+            elapsed_ms = self.plant.clock_ms() - started_at_ms
+            dispatch_cost_ms = (
+                pulse.duration_ms
+                if pulse.kind == "DRIVE"
+                else self._terminal_stop_cost_ms()
+            )
+            terminal_stop_reserve_ms = (
+                self._terminal_stop_cost_ms()
+                if pulse.kind == "DRIVE"
+                else 0
+            )
+            if (
+                elapsed_ms
+                + dispatch_cost_ms
+                + terminal_stop_reserve_ms
+                > self.limits.max_elapsed_ms
+            ):
+                try:
+                    self.supervisor.cancel(pulse)
+                    termination = NAVIGATION_BUDGET_EXHAUSTED
+                except Exception:
+                    termination = NAVIGATION_EXECUTION_FAILED
+                return self._finish(
+                    goal,
+                    termination,
+                    counters,
+                    trace,
+                    steps,
+                    snapshot,
+                    already_stopped=False,
+                )
 
             trace.append("EXECUTING")
             before = snapshot
             try:
                 after = self.plant.apply(pulse, goal)
                 reducer.commit(after)
+            except NavigationContractError as error:
+                if error.code != "stale_drive_pulse":
+                    return self._finish(
+                        goal,
+                        NAVIGATION_EXECUTION_FAILED,
+                        counters,
+                        trace,
+                        steps,
+                        snapshot,
+                        already_stopped=False,
+                    )
+                trace.append("STALE_DISPATCH")
+                fresh = None
+                try:
+                    fresh = self.plant.observe(goal)
+                    reducer.commit(fresh)
+                    if (
+                        self.required_world_model_version is not None
+                        and fresh.world_model_version
+                        != self.required_world_model_version
+                    ):
+                        return self._finish(
+                            goal,
+                            NAVIGATION_PLAN_STALE,
+                            counters,
+                            trace,
+                            steps,
+                            fresh,
+                            already_stopped=False,
+                        )
+                    self._publish_observation(fresh)
+                except Exception:
+                    return self._finish(
+                        goal,
+                        NAVIGATION_ABORTED,
+                        counters,
+                        trace,
+                        steps,
+                        fresh if fresh is not None else snapshot,
+                        already_stopped=False,
+                    )
+                trace.append("STALE_DISPATCH_REOBSERVED")
+                if counters["replans"] >= self.limits.max_replans:
+                    return self._finish(
+                        goal,
+                        NAVIGATION_BUDGET_EXHAUSTED,
+                        counters,
+                        trace,
+                        steps,
+                        fresh,
+                        already_stopped=False,
+                    )
+                stale_dispatch_replans += 1
+                counters["replans"] = (
+                    stale_dispatch_replans
+                    + max(0, counters["ticks"] - 1)
+                )
+                stale_retry_granted = True
+                trace.append("REPLANNING")
+                continue
             except Exception:
                 return self._finish(
                     goal,
@@ -820,7 +962,10 @@ class NavigationEpisode:
                 )
 
             counters["ticks"] += 1
-            counters["replans"] = max(0, counters["ticks"] - 1)
+            counters["replans"] = (
+                stale_dispatch_replans
+                + max(0, counters["ticks"] - 1)
+            )
             if pulse.kind == "DRIVE":
                 counters["actions"] += 1
                 counters["total_motion_ms"] += pulse.duration_ms
@@ -901,7 +1046,11 @@ class NavigationEpisode:
                         after,
                         already_stopped=True,
                     )
-                no_progress_ticks += 1
+                if (
+                    pulse.reason_code
+                    != "post_pause_observation_refresh"
+                ):
+                    no_progress_ticks += 1
             elif (
                 after_distance
                 <= best_distance - self.limits.minimum_progress_mm

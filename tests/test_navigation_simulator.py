@@ -559,6 +559,154 @@ class NavigationSimulatorTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "stale_drive_pulse")
 
+    def test_stale_dispatch_reobserves_and_routes_around_new_obstacle(self):
+        plant, supervisor, inbox, _authority = make_stack()
+        observations = []
+        updates = []
+
+        def add_obstacle_once(snapshot):
+            if updates:
+                return
+            updates.append(snapshot.state_version)
+            plant.update_world(
+                SimulationWorld(
+                    width_mm=1_300,
+                    height_mm=700,
+                    obstacles=(
+                        CircleObstacle(
+                            obstacle_id="appeared-box",
+                            x_mm=600,
+                            y_mm=300,
+                            radius_mm=70,
+                        ),
+                    ),
+                )
+            )
+
+        episode = NavigationEpisode(
+            plant,
+            supervisor,
+            inbox,
+            (
+                GoalSeekingBehavior(),
+                ObstacleAvoidanceBehavior(),
+            ),
+            limits=NavigationLimits(
+                max_ticks=500,
+                max_elapsed_ms=60_000,
+                max_proposals=1_000,
+                max_replans=500,
+                max_actions=480,
+                max_total_motion_ms=55_000,
+                max_no_progress_ticks=120,
+            ),
+            observation_sink=observations.append,
+            before_arbitration=add_obstacle_once,
+        )
+
+        result = episode.run(waypoint())
+
+        self.assertTrue(result.completed, result.to_dict())
+        self.assertEqual(result.termination, NAVIGATION_GOAL_REACHED)
+        self.assertTrue(result.terminal_stop_verified)
+        self.assertEqual(plant.collision_count, 0)
+        self.assertEqual(updates, [1])
+        self.assertEqual(
+            [
+                (
+                    value.state_version,
+                    value.world_model_version,
+                )
+                for value in observations[:2]
+            ],
+            [(1, 1), (2, 2)],
+        )
+        self.assertIn("STALE_DISPATCH", result.trace)
+        self.assertIn("STALE_DISPATCH_REOBSERVED", result.trace)
+        self.assertTrue(
+            all(
+                pulse.based_on_world_model_version == 2
+                for pulse in plant.applied_pulses
+            )
+        )
+        self.assertEqual(
+            plant.applied_pulses[0].based_on_state_version,
+            2,
+        )
+        self.assertEqual(plant.applied_pulses[-1].kind, "STOP")
+
+    def test_repeated_stale_dispatches_exhaust_replans_with_verified_stop(
+        self,
+    ):
+        plant, supervisor, inbox, _authority = make_stack()
+        observed_versions = []
+        update_count = [0]
+
+        def invalidate_every_dispatch(_snapshot):
+            update_count[0] += 1
+            plant.update_world(
+                SimulationWorld(
+                    width_mm=1_300,
+                    height_mm=700,
+                    obstacles=(),
+                )
+            )
+
+        episode = NavigationEpisode(
+            plant,
+            supervisor,
+            inbox,
+            (GoalSeekingBehavior(),),
+            limits=NavigationLimits(
+                max_ticks=10,
+                max_elapsed_ms=10_000,
+                max_proposals=10,
+                max_replans=2,
+                max_actions=10,
+                max_total_motion_ms=1_000,
+                max_no_progress_ticks=10,
+            ),
+            observation_sink=lambda value: (
+                observed_versions.append(value.state_version)
+            ),
+            before_arbitration=invalidate_every_dispatch,
+        )
+
+        result = episode.run(waypoint())
+
+        self.assertFalse(result.completed)
+        self.assertEqual(
+            result.termination,
+            NAVIGATION_BUDGET_EXHAUSTED,
+        )
+        self.assertTrue(result.terminal_stop_verified)
+        self.assertEqual(result.ticks, 0)
+        self.assertEqual(result.actions, 0)
+        self.assertEqual(result.replans, 2)
+        self.assertEqual(update_count[0], 3)
+        self.assertEqual(observed_versions, [1, 2, 3, 4])
+        self.assertEqual(plant.collision_count, 0)
+        self.assertEqual(
+            result.trace.count("STALE_DISPATCH"),
+            3,
+        )
+        self.assertEqual(
+            result.trace.count("STALE_DISPATCH_REOBSERVED"),
+            3,
+        )
+        self.assertEqual(
+            [pulse.kind for pulse in plant.applied_pulses],
+            ["STOP"],
+        )
+        self.assertEqual(
+            plant.applied_pulses[-1].based_on_state_version,
+            4,
+        )
+        self.assertEqual(
+            result.final_snapshot.state_version,
+            5,
+        )
+
     def test_stall_is_detected_on_first_motion_segment(self):
         plant, supervisor, inbox, _authority = make_stack(
             plant_class=StallingSimulator
@@ -921,6 +1069,7 @@ class NavigationSimulatorTests(unittest.TestCase):
         code = (
             "import sys;"
             "import robot_agent.navigation_episode;"
+            "import robot_agent.navigation_mission;"
             "assert 'robot_agent.supervisor_transport' not in sys.modules;"
             "assert 'robot_agent.robot_api' not in sys.modules"
         )
