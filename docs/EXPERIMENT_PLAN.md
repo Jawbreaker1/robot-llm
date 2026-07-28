@@ -860,12 +860,18 @@ Implementation och acceptans:
   hostattribuerad evidens. Expression-resultat binds till robot,
   controllerinstans, mål, planrevision, world model, response locale,
   obstruction epoch och evidence-ID samt får en hostägd TTL.
+- Reducern skapar dessutom en separat hostägd talkontext-generation.
+  Identifierade objekt behåller samma talkontext över kort sensor-occlusion
+  och nya fysiska obstruction epochs, medan andra objekt och oidentifierade
+  nya hinder byter talkontext.
 - Hosten härleder ett unikt expression-`proposal_id` från varje exakt
   snapshot, låser structured-output-schemat till detta konstanta värde och
   förbrukar ID:t exakt en gång per episod. Modellen kan därför inte svälta
   senare giltiga events genom att återanvända ett generiskt ID. Replay nekas
-  och auditloggas; ett nytt obstruction epoch gör väntande expression- och
-  taljobb stale, medan enbart fri väg inte skapar ett nytt epoch.
+  och auditloggas. Tal kan accepteras efter ett nytt obstruction epoch endast
+  om hostens talkontext fortfarande bevisar samma identifierade objekt och
+  övriga robot-, controller-, mål-, plan-, world-, locale- och TTL-bindningar
+  fortfarande gäller. Propellergesten återanvänds aldrig på detta sätt.
 - Expression-anrop har både en total episodbudget och en cooldown per stabilt
   objekt-ID; oidentifierade hinder delar en konservativ unknown-nyckel.
   Upprepade återträffar på samma låda auditloggas men skapar inte en
@@ -917,6 +923,23 @@ Liveprov mot lokala `google/gemma-4-26b-a4b`:
   låsta schemat, men resultatet hann passera in i ett nytt obstruction epoch
   och släpptes därför som stale; navigationen fortsatte och stoppade
   verifierat,
+- traceanalys visade att samma `demo-box` lämnade och återkom i den momentana
+  sensorstrålen tre gånger medan roboten svängde; TTL hade inte löpt ut,
+- efter införandet av separat talkontext accepterade motsvarande `50 ms`-
+  scenario den svenska Gemma-repliken, gav noll stale expression- och
+  speech-drops, överlappade en senare navigationstick och nådde målet efter
+  `98` handlingar med verifierat terminalstopp,
+- ett synkroniserat regressionstest visar samtidigt att en propellergest från
+  den äldre snapshoten nekas efter epochskiftet: pause/STOP-kvittens och
+  revalidering sker, men inga armsegment körs,
+- upprepade engelska liveförsök isolerade ett separat kontraktsfel: ett
+  instrumenterat Gemma-svar innehöll en replik på `170` tecken trots
+  JSON-schemats `maxLength: 160`, varpå hostens strikta decoder nekade
+  resultatet och navigationen fortsatte säkert,
+- modellkontraktet gjordes därefter explicit kortare med högst `120` tecken
+  både i prompt och schema. Nya svenska och engelska `50 ms`-försök gav
+  giltiga egna repliker, tal/navigation-overlap, noll planner- och stale-fel
+  samt verifierat terminalstopp,
 - navigationen nådde waypointen efter `98` korta handlingar, terminalt stopp
   verifierades, inga workers levde kvar och modellen begärde ingen
   propellergest,
@@ -954,7 +977,7 @@ Det deterministiska trebenstestet når samtliga waypointmål utan kollision och
 verifierar ett terminalt STOP för varje ben. Negativtest täcker strikt JSON,
 duplicerade ben, stale aktivering, världsbyte, stall, global actionbudget,
 pre-cancellation och single-use-runner. Hela den hårdvarufria reposviten
-passerar därefter `535 / 535`.
+passerar nu `574 / 574`.
 
 Grind: godkänd som simulatorbevis för planexekvering, delmålsverifiering och
 bounded failure propagation. Gemma bygger ännu inte missionsplanen,

@@ -40,6 +40,7 @@ EXPRESSION_REQUEST_TIMEOUT_SECONDS = 10.0
 MAX_EXPRESSION_RESPONSE_BYTES = 64 * 1024
 MAX_EXPRESSION_PROPOSAL_BYTES = 16 * 1024
 MAX_EXPRESSION_OUTPUT_TOKENS = 512
+MAX_MODEL_UTTERANCE_CHARS = 120
 _TRIMMED_NO_CONTROL_PATTERN = (
     r"^[^\u0000-\u0020\u0085\u00A0\u1680\u2000-\u200A"
     r"\u2028\u2029\u202F\u205F\u3000]"
@@ -65,9 +66,10 @@ _SYSTEM_PROMPT = (
     "field is authoritative: write the utterance naturally in exactly that "
     "locale and do not infer its language from any other input. If "
     "interaction_snapshot.evidence.object_id is null, never claim to know "
-    "the obstruction's identity. Be amusingly grumpy without threats, abuse, "
-    "or unsafe language. Return JSON only, with no markdown."
-)
+    "the obstruction's identity. Keep the utterance concise and no longer "
+    "than {} characters. Be amusingly grumpy without threats, abuse, or "
+    "unsafe language. Return JSON only, with no markdown."
+).format(MAX_MODEL_UTTERANCE_CHARS)
 
 
 def _strict_object(pairs):
@@ -240,12 +242,16 @@ def _proposal_schema(
                     "utterance": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 160,
+                        "maxLength": MAX_MODEL_UTTERANCE_CHARS,
                         "pattern": _TRIMMED_NO_CONTROL_PATTERN,
                         "description": (
-                            "Write naturally in exactly response_locale {!r}; "
-                            "that host-authored locale is authoritative."
-                        ).format(response_locale),
+                            "Write one concise utterance in exactly "
+                            "response_locale {!r}; that host-authored locale "
+                            "is authoritative. Use at most {} characters."
+                        ).format(
+                            response_locale,
+                            MAX_MODEL_UTTERANCE_CHARS,
+                        ),
                     },
                 },
                 (

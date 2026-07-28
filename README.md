@@ -136,8 +136,14 @@ wave may not overlap wheel motion: it requests a pause, waits for a verified
 stopped-boundary acknowledgement, revalidates the current obstruction, runs
 fixed host-owned alternating segments, and releases navigation. Speech-only
 reactions never pause the wheels. A slow or failed model/audio callback is
-isolated from navigation. A per-object cooldown and total planner budget stop
-repeated sensor reacquisition from turning into model or speech spam.
+isolated from navigation. Host-tracked object identity gives speech a separate
+short-lived semantic context, so briefly losing and reacquiring the same
+identified object while turning does not discard a still-relevant model
+response. A different object, world, goal, expired lifetime, or a newly
+reacquired unknown obstruction still invalidates it. Physical gestures retain
+the stricter exact-snapshot check. A per-object cooldown and total planner
+budget stop repeated sensor reacquisition from turning into model or speech
+spam.
 
 Above a single waypoint episode, the simulator now accepts a strict,
 version-bound mission plan containing up to eight semantic waypoint legs.
@@ -374,7 +380,7 @@ This is a manual hardware test, not autonomous navigation. Read the full
 
 | Measurement | Result |
 |---|---:|
-| Hardware-free test suite | `535 / 535` passing |
+| Hardware-free test suite | `574 / 574` passing |
 | Physical supervisor preflight | `completed`, `0` motor-start commands |
 | Straight physical B/C pulse | `+175° / +175°` |
 | Physical B/C turn pulse | `+172° / −170°` |

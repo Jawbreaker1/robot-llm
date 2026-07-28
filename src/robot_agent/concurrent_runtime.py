@@ -400,6 +400,7 @@ class _PlannerRequest:
     proposal_id: str
     submitted_at_ms: int
     valid_until_ms: int
+    speech_context_epoch: int
 
 
 @dataclass(frozen=True)
@@ -408,6 +409,7 @@ class _ExpressionJob:
     basis_snapshot: InteractionSnapshot
     accepted_at_ms: int
     valid_until_ms: int
+    speech_context_epoch: int
 
 
 _STOP = object()
@@ -426,19 +428,30 @@ class _InteractionReducer:
         self._current: Optional[InteractionSnapshot] = None
         self._blocked = False
         self._object_id: Optional[str] = None
+        self._evidence_source: Optional[str] = None
         self._world_model_version: Optional[int] = None
         self._interaction_state_version = 0
         self._obstruction_epoch = 0
+        self._speech_context_epoch = 0
+        self._speech_context_key = None
         self._lock = threading.Lock()
 
     def current(self) -> Optional[InteractionSnapshot]:
         with self._lock:
             return self._current
 
+    def current_with_speech_context(
+        self,
+    ) -> Tuple[Optional[InteractionSnapshot], int]:
+        """Return one atomic view for asynchronous speech revalidation."""
+
+        with self._lock:
+            return self._current, self._speech_context_epoch
+
     def reduce(
         self,
         snapshot: NavigationSnapshot,
-    ) -> Tuple[InteractionSnapshot, bool]:
+    ) -> Tuple[InteractionSnapshot, bool, int]:
         clearance = snapshot.clearance
         blocked = bool(
             clearance.near_obstacle_latched
@@ -454,6 +467,10 @@ class _InteractionReducer:
                 first
                 or blocked != self._blocked
                 or object_id != self._object_id
+                or (
+                    blocked
+                    and clearance.source != self._evidence_source
+                )
                 or snapshot.world_model_version
                 != self._world_model_version
             )
@@ -463,10 +480,34 @@ class _InteractionReducer:
                     first
                     or not self._blocked
                     or object_id != self._object_id
+                    or clearance.source != self._evidence_source
                     or snapshot.world_model_version
                     != self._world_model_version
                 ):
                     self._obstruction_epoch += 1
+            if blocked:
+                # A host-tracked object ID is the semantic identity boundary
+                # for speech.  It survives brief sensor occlusion while the
+                # robot turns around the same object.  Unknown obstructions
+                # cannot be correlated safely, so every physical obstruction
+                # epoch becomes a new speech context.
+                if object_id is None:
+                    speech_context_key = (
+                        "unknown-obstruction",
+                        clearance.source,
+                        "BLOCKING_PATH",
+                        self._obstruction_epoch,
+                    )
+                else:
+                    speech_context_key = (
+                        "identified-object",
+                        clearance.source,
+                        "BLOCKING_PATH",
+                        object_id,
+                    )
+                if speech_context_key != self._speech_context_key:
+                    self._speech_context_epoch += 1
+                    self._speech_context_key = speech_context_key
             evidence = None
             if blocked:
                 evidence = ObjectEvidence(
@@ -505,8 +546,10 @@ class _InteractionReducer:
             self._current = value
             self._blocked = blocked
             self._object_id = object_id
+            if blocked:
+                self._evidence_source = clearance.source
             self._world_model_version = snapshot.world_model_version
-            return value, changed
+            return value, changed, self._speech_context_epoch
 
 
 class _CallbackCancelEvent:
@@ -806,14 +849,20 @@ class ConcurrentBehaviorRuntime:
         for source_id, target in self._behavior_queues.items():
             self._put_latest(target, snapshot, source_id)
 
-        interaction, changed = self._interaction.reduce(snapshot)
+        interaction, changed, speech_context_epoch = (
+            self._interaction.reduce(snapshot)
+        )
         self._events.append(
             "motion",
             "navigation_observation",
-            "state={} interaction={} obstruction={}".format(
+            (
+                "state={} interaction={} obstruction={} "
+                "speech_context={}"
+            ).format(
                 snapshot.state_version,
                 interaction.interaction_state_version,
                 interaction.obstruction_epoch,
+                speech_context_epoch,
             ),
         )
         if (
@@ -880,6 +929,7 @@ class ConcurrentBehaviorRuntime:
                 valid_until_ms=(
                     now_ms + self.policy.expression_ttl_ms
                 ),
+                speech_context_epoch=speech_context_epoch,
             )
             queued = self._put_bounded(
                 self._planner_queue,
@@ -935,12 +985,22 @@ class ConcurrentBehaviorRuntime:
                 )
         self._events.append(source_id, "worker_stopped")
 
-    def _event_is_current(
+    def _speech_event_is_current(
         self,
         proposal: ExpressionProposal,
         basis_snapshot: InteractionSnapshot,
         valid_until_ms: int,
+        basis_speech_context_epoch: int,
     ) -> bool:
+        """Revalidate semantic speech without relaxing physical gestures.
+
+        The proposal must still match its immutable basis exactly.  Only the
+        later current-state comparison uses the host-owned semantic context,
+        allowing one identified object to survive brief sensor occlusion.
+        ``_arm_revalidation`` deliberately keeps exact current-snapshot
+        matching.
+        """
+
         if self._now_ms() > valid_until_ms:
             return False
         try:
@@ -953,7 +1013,9 @@ class ConcurrentBehaviorRuntime:
             != basis_snapshot.response_locale
         ):
             return False
-        current = self._interaction.current()
+        current, current_speech_context_epoch = (
+            self._interaction.current_with_speech_context()
+        )
         if current is None:
             return False
         return (
@@ -965,8 +1027,8 @@ class ConcurrentBehaviorRuntime:
             and current.plan_revision == basis_snapshot.plan_revision
             and current.world_model_version
             == basis_snapshot.world_model_version
-            and current.obstruction_epoch
-            == basis_snapshot.obstruction_epoch
+            and current_speech_context_epoch
+            == basis_speech_context_epoch
             and current.response_locale
             == basis_snapshot.response_locale
         )
@@ -1023,10 +1085,11 @@ class ConcurrentBehaviorRuntime:
                 )
                 continue
             self._expression_proposal_ids.add(proposal.proposal_id)
-            if not self._event_is_current(
+            if not self._speech_event_is_current(
                 proposal,
                 item.snapshot,
                 item.valid_until_ms,
+                item.speech_context_epoch,
             ):
                 self._metrics.add("stale_expression_drops")
                 self._events.append(
@@ -1049,6 +1112,7 @@ class ConcurrentBehaviorRuntime:
                 basis_snapshot=item.snapshot,
                 accepted_at_ms=self._now_ms(),
                 valid_until_ms=item.valid_until_ms,
+                speech_context_epoch=item.speech_context_epoch,
             )
             self._events.append(
                 "expression-planner",
@@ -1111,10 +1175,11 @@ class ConcurrentBehaviorRuntime:
                     item.proposal.proposal_id,
                 )
                 continue
-            if not self._event_is_current(
+            if not self._speech_event_is_current(
                 item.proposal,
                 item.basis_snapshot,
                 item.valid_until_ms,
+                item.speech_context_epoch,
             ):
                 self._metrics.add("stale_speech_drops")
                 self._events.append(

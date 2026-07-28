@@ -13,6 +13,7 @@ from robot_agent.concurrent_runtime import (
 from robot_agent.interaction_contract import (
     ExpressionIntent,
     ExpressionProposal,
+    InteractionContractError,
     expression_proposal_id_for_snapshot,
 )
 from robot_agent.navigation_contract import (
@@ -436,19 +437,23 @@ class PlannerAdmissionPolicyTests(unittest.TestCase):
         self.assertEqual(request.submitted_at_ms, 0)
         self.assertEqual(request.valid_until_ms, 5_000)
         host_now[0] = 5_000
-        self.assertTrue(runtime._event_is_current(
+        self.assertTrue(runtime._speech_event_is_current(
             proposal,
             request.snapshot,
             request.valid_until_ms,
+            request.speech_context_epoch,
         ))
         host_now[0] = 5_001
-        self.assertFalse(runtime._event_is_current(
+        self.assertFalse(runtime._speech_event_is_current(
             proposal,
             request.snapshot,
             request.valid_until_ms,
+            request.speech_context_epoch,
         ))
 
-    def test_new_obstruction_epoch_invalidates_pending_expression(self):
+    def test_different_obstruction_context_invalidates_pending_expression(
+        self,
+    ):
         runtime, original = self.make_runtime(
             expression_cooldown_ms=0,
         )
@@ -467,10 +472,11 @@ class PlannerAdmissionPolicyTests(unittest.TestCase):
         runtime._observation_sink(
             self.clear_snapshot(first, state_version=2)
         )
-        self.assertTrue(runtime._event_is_current(
+        self.assertTrue(runtime._speech_event_is_current(
             proposal,
             request.snapshot,
             request.valid_until_ms,
+            request.speech_context_epoch,
         ))
 
         runtime._observation_sink(self.blocked_snapshot(
@@ -483,10 +489,142 @@ class PlannerAdmissionPolicyTests(unittest.TestCase):
             current.obstruction_epoch,
             request.snapshot.obstruction_epoch,
         )
-        self.assertFalse(runtime._event_is_current(
+        self.assertFalse(runtime._speech_event_is_current(
             proposal,
             request.snapshot,
             request.valid_until_ms,
+            request.speech_context_epoch,
+        ))
+
+    def test_same_identified_object_survives_obstruction_epoch_churn(
+        self,
+    ):
+        runtime, original = self.make_runtime(
+            expression_cooldown_ms=0,
+        )
+        first = self.blocked_snapshot(
+            original,
+            state_version=1,
+            object_id="same-box",
+        )
+        runtime._observation_sink(first)
+        request = runtime._planner_queue.get_nowait()
+        proposal = expression_for(
+            request.snapshot,
+            gesture_kind=None,
+        )
+
+        runtime._observation_sink(
+            self.clear_snapshot(first, state_version=2)
+        )
+        runtime._observation_sink(self.blocked_snapshot(
+            first,
+            state_version=3,
+            object_id="same-box",
+        ))
+        current = runtime._interaction.current()
+
+        self.assertGreater(
+            current.obstruction_epoch,
+            request.snapshot.obstruction_epoch,
+        )
+        self.assertTrue(runtime._speech_event_is_current(
+            proposal,
+            request.snapshot,
+            request.valid_until_ms,
+            request.speech_context_epoch,
+        ))
+        with self.assertRaises(InteractionContractError):
+            proposal.assert_matches_snapshot(current)
+
+    def test_unknown_obstruction_does_not_bridge_epoch_churn(self):
+        runtime, original = self.make_runtime(
+            expression_cooldown_ms=0,
+        )
+        first = self.blocked_snapshot(
+            original,
+            state_version=1,
+            object_id=None,
+        )
+        runtime._observation_sink(first)
+        request = runtime._planner_queue.get_nowait()
+        proposal = expression_for(
+            request.snapshot,
+            gesture_kind=None,
+        )
+
+        runtime._observation_sink(
+            self.clear_snapshot(first, state_version=2)
+        )
+        runtime._observation_sink(self.blocked_snapshot(
+            first,
+            state_version=3,
+            object_id=None,
+        ))
+
+        self.assertFalse(runtime._speech_event_is_current(
+            proposal,
+            request.snapshot,
+            request.valid_until_ms,
+            request.speech_context_epoch,
+        ))
+
+    def test_evidence_source_change_replans_and_invalidates_speech(
+        self,
+    ):
+        runtime, original = self.make_runtime(
+            expression_cooldown_ms=0,
+        )
+        first = replace(
+            original,
+            state_version=1,
+            clearance=replace(
+                original.clearance,
+                source="physical_ir_reflection",
+                near_obstacle_latched=True,
+                forward_mm=None,
+                left_mm=None,
+                right_mm=None,
+                raw_ir_proximity=10,
+                forward_object_id=None,
+            ),
+        )
+        runtime._observation_sink(first)
+        request = runtime._planner_queue.get_nowait()
+        proposal = expression_for(
+            request.snapshot,
+            gesture_kind=None,
+        )
+        changed_source = replace(
+            first,
+            state_version=2,
+            clearance=replace(
+                first.clearance,
+                source="none",
+                raw_ir_proximity=None,
+            ),
+        )
+
+        runtime._observation_sink(changed_source)
+        current = runtime._interaction.current()
+        metrics = self.metrics(runtime)
+
+        self.assertGreater(
+            current.interaction_state_version,
+            request.snapshot.interaction_state_version,
+        )
+        self.assertGreater(
+            current.obstruction_epoch,
+            request.snapshot.obstruction_epoch,
+        )
+        self.assertEqual(metrics.planner_requests, 2)
+        self.assertEqual(metrics.planner_cooldown_drops, 0)
+        self.assertEqual(runtime._planner_queue.qsize(), 1)
+        self.assertFalse(runtime._speech_event_is_current(
+            proposal,
+            request.snapshot,
+            request.valid_until_ms,
+            request.speech_context_epoch,
         ))
 
     def test_duplicate_expression_proposal_id_is_rejected(self):
@@ -809,6 +947,90 @@ class ExpressionIsolationTests(unittest.TestCase):
         self.assertEqual(result.metrics.speech_started, 1)
         self.assertFalse(arm_called.is_set())
         self.assertEqual(result.metrics.navigation_pause_requests, 0)
+
+    def test_slow_same_object_speaks_but_old_gesture_is_dropped(self):
+        plant, supervisor, inbox, published = make_stack()
+        planner_entered = threading.Event()
+        release_planner = threading.Event()
+        speech_called = threading.Event()
+        arm_called = threading.Event()
+        runtime_holder = []
+
+        def planner(snapshot):
+            planner_entered.set()
+            self.assertTrue(release_planner.wait(2))
+            return expression_for(snapshot)
+
+        def tick(cancel_event, _interval):
+            current = runtime_holder[0]._interaction.current()
+            if (
+                current is not None
+                and current.obstruction_epoch >= 2
+            ):
+                release_planner.set()
+            if cancel_event.is_set():
+                return
+            self.assertTrue(published.wait(1))
+            published.clear()
+
+        runtime = ConcurrentBehaviorRuntime(
+            plant,
+            supervisor,
+            inbox,
+            waypoint(),
+            response_locale="en",
+            expression_planner=planner,
+            speaker=lambda *_args: speech_called.set(),
+            arm_segment_executor=lambda *_args: arm_called.set(),
+            behaviors=(GoalSeekingBehavior(), ObstacleAvoidanceBehavior()),
+            navigation_limits=short_limits(40),
+            tick_hook=tick,
+        )
+        runtime_holder.append(runtime)
+
+        result = runtime.run()
+
+        self.assertTrue(planner_entered.is_set())
+        self.assertTrue(release_planner.is_set())
+        self.assertTrue(speech_called.is_set())
+        self.assertFalse(arm_called.is_set())
+        self.assertEqual(result.metrics.expressions_accepted, 1)
+        self.assertEqual(result.metrics.stale_expression_drops, 0)
+        self.assertEqual(result.metrics.speech_started, 1)
+        self.assertEqual(result.metrics.speech_completed, 1)
+        self.assertEqual(result.metrics.stale_speech_drops, 0)
+        self.assertEqual(result.metrics.gestures_started, 0)
+        self.assertEqual(result.metrics.gestures_completed, 0)
+        self.assertEqual(result.metrics.arm_segments, 0)
+        self.assertEqual(result.metrics.gesture_drops, 1)
+        self.assertTrue(result.navigation.terminal_stop_verified)
+
+        ordered = {
+            event.kind: event.sequence
+            for event in result.events
+            if event.kind in {
+                "navigation_pause_requested",
+                "navigation_pause_ack",
+                "stale_gesture_drop",
+                "navigation_pause_released",
+            }
+        }
+        self.assertLess(
+            ordered["navigation_pause_requested"],
+            ordered["navigation_pause_ack"],
+        )
+        self.assertLess(
+            ordered["navigation_pause_ack"],
+            ordered["stale_gesture_drop"],
+        )
+        self.assertLess(
+            ordered["stale_gesture_drop"],
+            ordered["navigation_pause_released"],
+        )
+        self.assertFalse(any(
+            event.kind == "arm_segment_started"
+            for event in result.events
+        ))
 
     def test_stale_expression_is_dropped_after_obstruction_changes(self):
         plant, supervisor, inbox, published = make_stack()

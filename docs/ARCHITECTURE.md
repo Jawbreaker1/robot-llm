@@ -243,7 +243,7 @@ flowchart LR
     N2 --> I
     I --> M["MotionSupervisor<br/>ett hjulbeslut per tick"]
 
-    O --> R["InteractionReducer<br/>obstruction epoch + evidens"]
+    O --> R["InteractionReducer<br/>obstruction epoch + talkontext"]
     R --> Q["Bounded expression queue"]
     Q --> L["LM/typad expression planner"]
     L --> S["Speech queue + worker"]
@@ -269,11 +269,15 @@ alltså varken välja eller återanvända det. Navigation, expression planning,
 tal och propeller kör i separata workers. En blockerad eller felande modell- eller
 talcallback hindrar därför inte senare motionstick. Tal är en kortlivad
 reaktion på ett versionsbundet hinder-event och kan fortsätta medan roboten
-navigerar vidare, så länge robot-, controller-, mål-, plan-, world-model- och
-obstruction-epoch-bindningar samt hostens TTL fortfarande gäller. Att vägen
-blir fri ändrar inte epoken, men ett nytt hinder gör ett väntande taljobb
-stale. Callback-cancellation är kooperativ: callbacken får ett Event och ska
-lämna snabbt.
+navigerar vidare. Förslaget måste alltid exakt matcha sitt ursprungliga
+snapshot. Vid senare talacceptans krävs dessutom samma robot, controller, mål,
+plan, world model och locale samt hostens TTL. En separat hostägd
+talkontext-generation gör att samma betrodda `object_id` kan överleva kort
+sensor-occlusion och ett nytt fysiskt obstruction epoch när roboten svänger.
+Ett annat objekt eller evidenssource byter talkontext. För oidentifierade
+hinder skapar varje nytt obstruction epoch konservativt en ny talkontext.
+Callback-cancellation är kooperativ: callbacken får ett Event och ska lämna
+snabbt.
 Armgrindens host-watchdog avbryter hela episoden och framtvingar terminalt
 hjulstopp om den exklusiva pausen inte släpps, men kan inte själv stoppa en
 godtycklig callbacktråd eller fysisk motor. Den fysiska adaptern behöver därför
@@ -298,11 +302,12 @@ ett syntetiskt cirkelhinder. Fysisk IR-reflektion får aldrig bära eller
 härleda objektidentitet, och modellen instrueras att inte namnge objektet när
 identity-evidens saknas.
 
-Ett liveprov med lokala Gemma accepterade en svensk speech-only-expression
-efter ungefär `3,7 s`. Tal-workern startade, navigationen genomförde ytterligare
-en tick innan talet avslutades och episoden nådde waypointen med verifierat
-terminalstopp. Det är evidens för asynkron modell-/talorkestrering med virtuellt
-ljud, inte för fysisk TTS.
+Ett liveprov med lokala Gemma och `50 ms` navigationstick accepterade en
+svensk speech-only-expression efter att samma syntetiska låda kort hade
+försvunnit ur och återkommit i sensorns stråle. Tal-workern startade,
+navigationen genomförde en senare tick innan talet avslutades och episoden
+nådde waypointen med verifierat terminalstopp. Det är evidens för asynkron
+modell-/talorkestrering med virtuellt ljud, inte för fysisk TTS.
 
 Detta bevisar en bounded trådad schemaläggningsmodell, inte en fullt
 paralleliserad fysisk robot. Tal- och armcallbacks är simulatoriska

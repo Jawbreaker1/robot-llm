@@ -234,6 +234,7 @@ class LMStudioExpressionRequestTests(unittest.TestCase):
         self.assertIn("authoritative", prompt_lower)
         self.assertIn("speech-only", prompt_lower)
         self.assertIn("genuinely strongly upset", prompt_lower)
+        self.assertIn("no longer than 120 characters", prompt_lower)
         self.assertIn("no markdown", prompt_lower)
         user_payload = json.loads(request["messages"][1]["content"])
         self.assertEqual(user_payload["response_locale"], "en-GB")
@@ -318,6 +319,10 @@ class LMStudioExpressionRequestTests(unittest.TestCase):
             2,
         )
         pattern = by_gesture[None]["utterance"]["pattern"]
+        self.assertEqual(
+            by_gesture[None]["utterance"]["maxLength"],
+            120,
+        )
         self.assertIsNotNone(re.search(pattern, "Valid utterance"))
         for invalid in (" leading", "trailing ", "line\nbreak"):
             with self.subTest(invalid=invalid):
