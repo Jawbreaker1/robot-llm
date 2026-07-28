@@ -265,7 +265,12 @@ def decode_research_decision(raw: bytes) -> ResearchDecision:
             object_pairs_hook=_strict_object,
             parse_constant=_reject_constant,
         )
-    except (RecursionError, UnicodeDecodeError, TypeError, ValueError):
+    except RecursionError:
+        raise ResearchLoopError(
+            "json_complexity_limit",
+            "Planner decision exceeded the JSON complexity limit",
+        ) from None
+    except (UnicodeDecodeError, TypeError, ValueError):
         raise ResearchLoopError(
             "invalid_decision_json",
             "Planner returned invalid JSON",

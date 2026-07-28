@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 from robot_agent.research import (
@@ -968,6 +969,14 @@ class DecisionCodecTests(unittest.TestCase):
         ).encode("utf-8")
         with self.assertRaises(ResearchLoopError) as raised:
             decode_research_decision(raw)
+        self.assertEqual(raised.exception.code, "json_complexity_limit")
+
+        with patch(
+            "robot_agent.research_loop.json.loads",
+            side_effect=RecursionError("decoder recursion limit"),
+        ):
+            with self.assertRaises(ResearchLoopError) as raised:
+                decode_research_decision(b"{}")
         self.assertEqual(raised.exception.code, "json_complexity_limit")
 
     def test_goal_requires_exact_boolean_evidence_policy(self):
