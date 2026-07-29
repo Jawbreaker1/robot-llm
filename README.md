@@ -16,7 +16,7 @@ bounded, and interruptible control of every physical action.
 
 > **Research question:** Can asynchronous LLM reasoning, dialogue, and
 > perception produce useful closed-loop robot behavior while a deterministic
-> real-time layer remains the sole authority over motion?
+> safety and control layer remains the sole authority over motion?
 
 This is **not primarily a general-purpose chatbot**. The chat is the
 human-facing workbench for the future robot agent: it lets us test context,
@@ -89,11 +89,14 @@ choose motor ports, raw wheel speeds, safety timeouts, authority, or its own
 proposal lifetime. Parallel perception and reasoning are welcome; physical
 execution remains serialized and deterministic.
 
-The project deliberately avoids phrase menus, regular-expression intent
-matching, and language-specific keyword heuristics. The model classifies
-natural language and proposes typed actions; strict host policy either accepts
-that proposal as written, rejects it, or asks for clarification. It never
-reinterprets the user's sentence into a motor command.
+The design deliberately rules out phrase menus, regular-expression intent
+matching, and language-specific keyword heuristics. In the implemented seams
+today, natural language is used for dialogue and read-only tool selection,
+while simulator autonomy gives the model opaque, host-generated structured
+choices. Model outputs are schema-validated typed proposals.
+Natural-language robot-action classification is not connected yet; when it
+is, strict host policy will accept, reject, or request clarification without
+reinterpreting the user's sentence into a motor command.
 
 > **Semantic invariant:** the LLM may propose intent and express personality,
 > but it never owns a motor.
@@ -108,12 +111,12 @@ Status snapshot: **2026-07-29**.
 | Area | Verified now | Important boundary |
 |---|---|---|
 | Physical EV3 baseline | ev3dev boot, USB/SSH, motors A/B/C, bounded manual drive/turn pulses, encoders, touch, relative IR, reflected-light sensing, and Swedish eSpeak TTS | This verifies the assembled EV3RSTORM, not autonomous motion |
-| Physical LLM path | One complete motion-free shadow cycle: IR readings → deterministic zone → Gemma comment as audit data → deterministic Swedish TTS | Gemma had no tools or motor access |
+| Physical LLM path | One complete motion-free shadow cycle: IR readings → deterministic zone; Gemma generated an audit-only comment, while a separate deterministic Swedish fallback was sent to TTS | Gemma output was not spoken and had no tools or motor access |
 | EV3 supervisor | Motion-free `brake`/`stop`/inventory/touch preflight passed on the real robot with zero motor starts | The newer foreground daemon has only been verified against fake sysfs |
 | Lab Console | Local Gemma chat, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | No motor, SSH, TTS, or stop routes exist in the dashboard |
 | RobotAPI loop | Typed, snapshot-bound arm API and a closed `observe → plan → act → verify → replan` loop | Simulator-only and currently driven by a scripted fake planner |
 | Navigation | Waypoint following, obstacle avoidance, version-bound multi-waypoint missions, self-directed idle exploration, one MotionSupervisor, and an independent collision oracle | 2D simulator only; Gemma selects opaque host-created opportunities, not arbitrary coordinates or physical commands |
-| Spatial map | Continuous bounded occupancy fusion, robot pose, fresh sensor rays, and persistent opaque object hypotheses in a read-only Lab Console map | Simulator metric ranges only; physical EV3 IR remains non-metric, provisional evidence rather than a claim about distance or free space |
+| Spatial map | Continuous bounded occupancy fusion, robot pose, fresh sensor rays, and persistent opaque object hypotheses in a read-only Lab Console map | Current map input is simulator-only. The contract can later retain physical EV3 IR as low-confidence qualitative evidence without inventing metric distance or free space |
 | Concurrent interaction | Independent bounded workers plus one live local-Gemma simulator run where model speech overlapped a later navigation tick | Virtual callbacks only; no physical drive, speaker, or arm adapter |
 | Physical autonomy | Not enabled | Waiting for reliable EV3 power, physical transport validation, calibration, stop-latency evidence, and fault injection |
 
