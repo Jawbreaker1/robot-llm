@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
@@ -7,12 +8,41 @@ import unittest
 from robot_agent.dashboard_http import (
     DashboardRouter,
     MAX_REQUEST_BYTES,
+    STT_LANGUAGE_HEADER,
+    STT_REQUEST_ID_HEADER,
+    STT_REQUESTS_PATH,
+    STT_TRANSCRIPTIONS_PATH,
 )
+from robot_agent.stt_contract import MAX_STT_AUDIO_BYTES
 
 
 TOKEN = "a" * 64
 HOST = "127.0.0.1:8765"
 ORIGIN = "http://" + HOST
+
+
+def canonical_wav(duration_ms=250):
+    sample_count = 16_000 * duration_ms // 1_000
+    data = struct.pack("<h", 0) * sample_count
+    return (
+        b"RIFF"
+        + struct.pack("<I", 36 + len(data))
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack(
+            "<IHHIIHH",
+            16,
+            1,
+            1,
+            16_000,
+            32_000,
+            2,
+            16,
+        )
+        + b"data"
+        + struct.pack("<I", len(data))
+        + data
+    )
 
 
 class ServiceFailure(RuntimeError):
@@ -155,6 +185,90 @@ class FakeDashboardService:
             "base_url": "http://127.0.0.1:1234",
         }
 
+    def submit_transcription(
+        self,
+        request_id,
+        language_hint,
+        wav_bytes,
+    ):
+        self.calls.append(
+            (
+                "submit_transcription",
+                request_id,
+                language_hint,
+                wav_bytes,
+            )
+        )
+        return {
+            "schema": "speech-transcription/v1",
+            "transcription_id": "stt-1",
+            "request_id": request_id,
+            "status": "queued",
+        }
+
+    def get_transcription(self, transcription_id):
+        self.calls.append(("get_transcription", transcription_id))
+        if transcription_id == "missing":
+            raise ServiceFailure(
+                404,
+                "stt_not_found",
+                "Speech transcription was not found",
+            )
+        if transcription_id == "expired":
+            raise ServiceFailure(
+                410,
+                "stt_expired",
+                "Speech transcription result has expired",
+            )
+        return {
+            "schema": "speech-transcription/v1",
+            "transcription_id": transcription_id,
+            "request_id": "voice-1",
+            "status": "completed",
+            "text": "Vinka med höger arm.",
+        }
+
+    def cancel_transcription(self, transcription_id):
+        self.calls.append(("cancel_transcription", transcription_id))
+        if transcription_id == "missing":
+            raise ServiceFailure(
+                404,
+                "stt_not_found",
+                "Speech transcription was not found",
+            )
+        if transcription_id == "expired":
+            raise ServiceFailure(
+                410,
+                "stt_expired",
+                "Speech transcription result has expired",
+            )
+        return {
+            "schema": "speech-transcription/v1",
+            "transcription_id": transcription_id,
+            "request_id": "voice-1",
+            "status": "cancelled",
+            "error_code": "stt_cancelled",
+            "audio": {"duration_ms": 250, "retained": False},
+        }
+
+    def cancel_transcription_request(self, request_id):
+        self.calls.append(("cancel_transcription_request", request_id))
+        return {
+            "schema": "speech-transcription-cancellation/v1",
+            "request_id": request_id,
+            "transcription_id": None,
+            "status": "cancelled",
+        }
+
+    def probe_speech_transcriber(self):
+        self.calls.append(("probe_speech_transcriber",))
+        return {
+            "schema": "speech-to-text-runtime/v1",
+            "state": "online",
+            "provider_id": "whisper.cpp",
+            "model_id": "ggml-small",
+        }
+
 
 def asset_directory():
     temporary = tempfile.TemporaryDirectory()
@@ -178,6 +292,18 @@ def asset_directory():
     )
     (root / "spatial_map_presenter.js").write_text(
         '"use strict";\n/* spatial map presenter fixture */',
+        encoding="utf-8",
+    )
+    (root / "speech_input_logic.js").write_text(
+        '"use strict";\n/* speech input logic fixture */',
+        encoding="utf-8",
+    )
+    (root / "microphone_input.js").write_text(
+        '"use strict";\n/* microphone input fixture */',
+        encoding="utf-8",
+    )
+    (root / "pcm_capture_worklet.js").write_text(
+        '"use strict";\n/* pcm capture worklet fixture */',
         encoding="utf-8",
     )
     (root / "app.js").write_text(
@@ -242,6 +368,11 @@ class DashboardHTTPTests(unittest.TestCase):
         headers = dict(response.headers)
         self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+        self.assertIn("worker-src 'self'", headers["Content-Security-Policy"])
+        self.assertEqual(
+            headers["Permissions-Policy"],
+            "microphone=(self), camera=()",
+        )
         self.assertEqual(headers["Cache-Control"], "no-store, max-age=0")
         self.assertEqual(headers["X-Frame-Options"], "DENY")
 
@@ -382,6 +513,24 @@ class DashboardHTTPTests(unittest.TestCase):
             + "assets/spatial_map_presenter.js",
             self.headers(authenticated=False),
         )
+        speech_logic_asset = self.router.handle(
+            "GET",
+            self.router.session_path
+            + "assets/speech_input_logic.js",
+            self.headers(authenticated=False),
+        )
+        microphone_asset = self.router.handle(
+            "GET",
+            self.router.session_path
+            + "assets/microphone_input.js",
+            self.headers(authenticated=False),
+        )
+        worklet_asset = self.router.handle(
+            "GET",
+            self.router.session_path
+            + "assets/pcm_capture_worklet.js",
+            self.headers(authenticated=False),
+        )
         mascot_asset = self.router.handle(
             "GET",
             self.router.session_path
@@ -440,6 +589,13 @@ class DashboardHTTPTests(unittest.TestCase):
             presenter_asset.body,
             b'"use strict";\n/* spatial map presenter fixture */',
         )
+        self.assertEqual(speech_logic_asset.status, 200)
+        self.assertEqual(microphone_asset.status, 200)
+        self.assertEqual(worklet_asset.status, 200)
+        self.assertEqual(
+            dict(worklet_asset.headers)["Content-Type"],
+            "text/javascript; charset=utf-8",
+        )
         static_routes = tuple(DashboardRouter._STATIC_ROUTES)
         self.assertLess(
             static_routes.index("assets/i18n.js"),
@@ -451,6 +607,18 @@ class DashboardHTTPTests(unittest.TestCase):
         )
         self.assertLess(
             static_routes.index("assets/spatial_map_presenter.js"),
+            static_routes.index("assets/speech_input_logic.js"),
+        )
+        self.assertLess(
+            static_routes.index("assets/speech_input_logic.js"),
+            static_routes.index("assets/microphone_input.js"),
+        )
+        self.assertLess(
+            static_routes.index("assets/microphone_input.js"),
+            static_routes.index("assets/pcm_capture_worklet.js"),
+        )
+        self.assertLess(
+            static_routes.index("assets/pcm_capture_worklet.js"),
             static_routes.index("assets/app.js"),
         )
         self.assertEqual(mascot_asset.status, 200)
@@ -671,6 +839,235 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertEqual(compressed.status, 415)
         self.assertEqual(chunked.status, 400)
 
+    def test_speech_audio_route_is_bounded_and_provider_neutral(self):
+        wav = canonical_wav()
+        headers = self.headers(
+            mutation=True,
+            **{
+                "Content-Type": "audio/wav",
+                STT_REQUEST_ID_HEADER: "voice-1",
+                STT_LANGUAGE_HEADER: "sv",
+            },
+        )
+
+        submitted = self.router.handle(
+            "POST",
+            STT_TRANSCRIPTIONS_PATH,
+            headers,
+            wav,
+        )
+        fetched = self.router.handle(
+            "GET",
+            STT_TRANSCRIPTIONS_PATH + "/stt-1",
+            self.headers(),
+        )
+
+        self.assertEqual(submitted.status, 202)
+        self.assertEqual(
+            self.decoded(submitted)["transcription"]["status"],
+            "queued",
+        )
+        self.assertEqual(fetched.status, 200)
+        self.assertEqual(
+            self.decoded(fetched)["transcription"]["text"],
+            "Vinka med höger arm.",
+        )
+        self.assertEqual(
+            self.service.calls[-2],
+            ("submit_transcription", "voice-1", "sv", wav),
+        )
+        self.assertEqual(
+            self.service.calls[-1],
+            ("get_transcription", "stt-1"),
+        )
+
+    def test_authenticated_delete_cancels_exact_transcription(self):
+        cancelled = self.router.handle(
+            "DELETE",
+            STT_TRANSCRIPTIONS_PATH + "/stt-1",
+            self.headers(),
+        )
+
+        self.assertEqual(cancelled.status, 200)
+        self.assertEqual(
+            self.decoded(cancelled)["transcription"]["status"],
+            "cancelled",
+        )
+        self.assertEqual(
+            self.service.calls[-1],
+            ("cancel_transcription", "stt-1"),
+        )
+
+        missing = self.router.handle(
+            "DELETE",
+            STT_TRANSCRIPTIONS_PATH + "/missing",
+            self.headers(),
+        )
+        expired = self.router.handle(
+            "DELETE",
+            STT_TRANSCRIPTIONS_PATH + "/expired",
+            self.headers(),
+        )
+        expired_get = self.router.handle(
+            "GET",
+            STT_TRANSCRIPTIONS_PATH + "/expired",
+            self.headers(),
+        )
+        self.assertEqual(missing.status, 404)
+        self.assertEqual(
+            self.decoded(missing)["error"]["code"],
+            "stt_not_found",
+        )
+        self.assertEqual(expired.status, 410)
+        self.assertEqual(
+            self.decoded(expired)["error"]["code"],
+            "stt_expired",
+        )
+        self.assertEqual(expired_get.status, 410)
+        self.assertEqual(
+            self.decoded(expired_get)["error"]["code"],
+            "stt_expired",
+        )
+
+    def test_speech_delete_rejects_bad_auth_query_and_body(self):
+        path = STT_TRANSCRIPTIONS_PATH + "/stt-1"
+
+        unauthorized = self.router.handle(
+            "DELETE",
+            path,
+            self.headers(authenticated=False),
+        )
+        queried = self.router.handle(
+            "DELETE",
+            path + "?force=true",
+            self.headers(),
+        )
+        with_body = self.router.handle(
+            "DELETE",
+            path,
+            self.headers(),
+            b"{}",
+        )
+        wrong_route = self.router.handle(
+            "DELETE",
+            "/api/v1/settings",
+            self.headers(),
+        )
+
+        self.assertEqual(unauthorized.status, 403)
+        self.assertEqual(queried.status, 400)
+        self.assertEqual(with_body.status, 400)
+        self.assertEqual(wrong_route.status, 405)
+        self.assertNotIn(
+            ("cancel_transcription", "stt-1"),
+            self.service.calls,
+        )
+
+    def test_authenticated_delete_can_cancel_before_submit_returns(self):
+        path = STT_REQUESTS_PATH + "/voice-race-1"
+        cancelled = self.router.handle(
+            "DELETE",
+            path,
+            self.headers(),
+        )
+
+        self.assertEqual(cancelled.status, 200)
+        self.assertEqual(
+            self.decoded(cancelled)["cancellation"]["status"],
+            "cancelled",
+        )
+        self.assertEqual(
+            self.service.calls[-1],
+            ("cancel_transcription_request", "voice-race-1"),
+        )
+
+        for target, body, expected in (
+            (path + "?force=true", b"", 400),
+            (path, b"{}", 400),
+        ):
+            with self.subTest(target=target, body=body):
+                response = self.router.handle(
+                    "DELETE",
+                    target,
+                    self.headers(),
+                    body,
+                )
+                self.assertEqual(response.status, expected)
+
+    def test_speech_route_requires_exact_mime_headers_and_query(self):
+        wav = canonical_wav()
+        base_headers = {
+            STT_REQUEST_ID_HEADER: "voice-1",
+            STT_LANGUAGE_HEADER: "auto",
+        }
+        wrong_mime = self.router.handle(
+            "POST",
+            STT_TRANSCRIPTIONS_PATH,
+            self.headers(mutation=True, **base_headers),
+            wav,
+        )
+        missing_headers = self.router.handle(
+            "POST",
+            STT_TRANSCRIPTIONS_PATH,
+            self.headers(
+                mutation=True,
+                **{"Content-Type": "audio/wav"},
+            ),
+            wav,
+        )
+        queried = self.router.handle(
+            "POST",
+            STT_TRANSCRIPTIONS_PATH + "?language=sv",
+            self.headers(
+                mutation=True,
+                **{
+                    "Content-Type": "audio/wav",
+                    **base_headers,
+                },
+            ),
+            wav,
+        )
+
+        self.assertEqual(wrong_mime.status, 415)
+        self.assertEqual(missing_headers.status, 400)
+        self.assertEqual(queried.status, 400)
+        self.assertEqual(self.service.calls, [])
+
+    def test_only_exact_speech_route_receives_the_audio_body_limit(self):
+        self.assertEqual(
+            self.router.request_body_limit(
+                "POST",
+                STT_TRANSCRIPTIONS_PATH,
+            ),
+            MAX_STT_AUDIO_BYTES,
+        )
+        for method, target in (
+            ("GET", STT_TRANSCRIPTIONS_PATH),
+            ("POST", STT_TRANSCRIPTIONS_PATH + "?debug=1"),
+            ("POST", "/api/v1/conversations"),
+            ("PUT", "/api/v1/settings"),
+        ):
+            with self.subTest(method=method, target=target):
+                self.assertEqual(
+                    self.router.request_body_limit(method, target),
+                    MAX_REQUEST_BYTES,
+                )
+
+        too_large = self.router.handle(
+            "POST",
+            STT_TRANSCRIPTIONS_PATH,
+            self.headers(
+                mutation=True,
+                **{
+                    "Content-Type": "audio/wav",
+                    STT_REQUEST_ID_HEADER: "voice-large",
+                    STT_LANGUAGE_HEADER: "auto",
+                },
+            ),
+            b"\x00" * (MAX_STT_AUDIO_BYTES + 1),
+        )
+        self.assertEqual(too_large.status, 413)
+
     def test_event_cursor_is_bounded_and_unknown_query_is_rejected(self):
         response = self.router.handle(
             "GET",
@@ -714,6 +1111,31 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertEqual(
             self.service.calls[-1],
             ("probe_lm_studio",),
+        )
+
+    def test_speech_probe_is_explicit_and_accepts_no_fields(self):
+        response = self.router.handle(
+            "POST",
+            "/api/v1/runtime/stt/probe",
+            self.headers(mutation=True),
+            b"{}",
+        )
+        extra = self.router.handle(
+            "POST",
+            "/api/v1/runtime/stt/probe",
+            self.headers(mutation=True),
+            b'{"url":"http://example.com"}',
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(extra.status, 400)
+        self.assertEqual(
+            self.decoded(response)["speech_to_text"]["state"],
+            "online",
+        )
+        self.assertEqual(
+            self.service.calls[-1],
+            ("probe_speech_transcriber",),
         )
 
     def test_physical_ssh_tts_and_event_injection_routes_do_not_exist(self):

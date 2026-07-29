@@ -6,6 +6,7 @@ import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import signal
 import socket
 import sys
 import threading
@@ -14,7 +15,6 @@ from typing import Optional, Sequence
 from .dashboard_http import (
     DashboardHTTPResponse,
     DashboardRouter,
-    MAX_REQUEST_BYTES,
     new_session_token,
 )
 from .dashboard_service import DashboardService
@@ -113,7 +113,7 @@ def _handler_class(router: DashboardRouter):
             if self.command != "HEAD":
                 self.wfile.write(response.body)
 
-        def _request_body(self) -> bytes:
+        def _request_body(self, max_bytes: int) -> bytes:
             raw_length = self.headers.get("Content-Length")
             if raw_length is None:
                 return b""
@@ -124,7 +124,7 @@ def _handler_class(router: DashboardRouter):
             ):
                 raise ValueError("invalid content length")
             length = int(raw_length)
-            if length > MAX_REQUEST_BYTES:
+            if length > max_bytes:
                 raise OverflowError("request body too large")
             body = self.rfile.read(length)
             if len(body) != length:
@@ -164,7 +164,12 @@ def _handler_class(router: DashboardRouter):
                 self._send(preflight)
                 return
             try:
-                body = self._request_body()
+                body = self._request_body(
+                    router.request_body_limit(
+                        self.command,
+                        self.path,
+                    )
+                )
             except OverflowError:
                 self._send(
                     router._response(
@@ -290,12 +295,87 @@ def _parser() -> argparse.ArgumentParser:
             "och visa den skrivskyddat i GUI:t"
         ),
     )
+    stt_source = parser.add_mutually_exclusive_group()
+    stt_source.add_argument(
+        "--stt-model",
+        help=(
+            "Sökväg till en flerspråkig whisper.cpp-modell; "
+            "dashboarden startar då en varm lokal server"
+        ),
+    )
+    stt_source.add_argument(
+        "--stt-url",
+        help=(
+            "Loopback-bas-URL till en redan startad whisper.cpp-server"
+        ),
+    )
+    parser.add_argument(
+        "--stt-model-id",
+        default="whisper-multilingual",
+        help=(
+            "Säkert visnings-ID för modellen vid --stt-url "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--stt-whisper-binary",
+        default="whisper-server",
+        help="whisper-server-binär (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--stt-port",
+        type=int,
+        default=8178,
+        help="Loopback-port för hanterad whisper-server (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--stt-threads",
+        type=int,
+        default=4,
+        help="Whisper-trådar för hanterad server (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--stt-cpu",
+        action="store_true",
+        help=(
+            "Kör hanterad whisper-server på CPU om Metal/GPU redan används"
+        ),
+    )
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def _close_resources(
+    server,
+    service,
+    map_runtime,
+    whisper_runtime,
+    *,
+    drain_map: bool,
+) -> None:
+    """Attempt every owned cleanup even if an earlier one is interrupted."""
+
+    try:
+        if server is not None:
+            server.server_close()
+    finally:
+        try:
+            if service is not None:
+                service.shutdown()
+        finally:
+            try:
+                if map_runtime is not None:
+                    map_runtime.close(drain=drain_map)
+            finally:
+                if whisper_runtime is not None:
+                    whisper_runtime.stop()
+
+
+def _run(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     map_runtime = None
+    whisper_runtime = None
+    service = None
+    server = None
     try:
         if args.simulation_map_demo:
             from .spatial_mapping_demo import (
@@ -313,17 +393,68 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise RuntimeError(
                     "Simulator map demo did not complete safely"
                 )
+        speech_transcriber = None
+        if args.stt_model:
+            from .stt_whisper_cpp import WhisperCppTranscriber
+            from .stt_whisper_server import WhisperCppServer
+
+            whisper_runtime = WhisperCppServer(
+                args.stt_model,
+                binary=args.stt_whisper_binary,
+                port=args.stt_port,
+                threads=args.stt_threads,
+                use_gpu=not args.stt_cpu,
+            )
+            whisper_runtime.start()
+            speech_transcriber = WhisperCppTranscriber(
+                base_url=whisper_runtime.base_url,
+                model_id=whisper_runtime.model_id,
+                require_opaque_path=True,
+            )
+        elif args.stt_url:
+            from .stt_whisper_cpp import WhisperCppTranscriber
+
+            speech_transcriber = WhisperCppTranscriber(
+                base_url=args.stt_url,
+                model_id=args.stt_model_id,
+                require_opaque_path=True,
+            )
         service = DashboardService(
             base_url=args.lm_studio_url,
             model=args.model,
             spatial_map_provider=map_runtime,
+            speech_transcriber=speech_transcriber,
         )
         server, _router = build_server(service, args.port)
+
+        address = "http://{}:{}{}".format(
+            LOOPBACK_HOST,
+            args.port,
+            _router.session_path,
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "url": address,
+                    "physical_control_enabled": False,
+                    "speech_to_text_enabled": (
+                        speech_transcriber is not None
+                    ),
+                    "spatial_map_mode": (
+                        "simulation_demo"
+                        if map_runtime is not None
+                        else "unavailable"
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        server.serve_forever(poll_interval=0.25)
+    except KeyboardInterrupt:
+        pass
     except (OSError, RuntimeError, ValueError) as error:
-        if "service" in locals():
-            service.shutdown()
-        if map_runtime is not None:
-            map_runtime.close(drain=False)
         print(
             json.dumps(
                 {
@@ -335,38 +466,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             file=sys.stderr,
         )
         return 2
-
-    address = "http://{}:{}{}".format(
-        LOOPBACK_HOST,
-        args.port,
-        _router.session_path,
-    )
-    print(
-        json.dumps(
-            {
-                "status": "ready",
-                "url": address,
-                "physical_control_enabled": False,
-                "spatial_map_mode": (
-                    "simulation_demo"
-                    if map_runtime is not None
-                    else "unavailable"
-                ),
-            },
-            ensure_ascii=False,
-        ),
-        flush=True,
-    )
-    try:
-        server.serve_forever(poll_interval=0.25)
-    except KeyboardInterrupt:
-        pass
     finally:
-        server.server_close()
-        service.shutdown()
-        if map_runtime is not None:
-            map_runtime.close()
+        _close_resources(
+            server,
+            service,
+            map_runtime,
+            whisper_runtime,
+            drain_map=server is not None,
+        )
     return 0
+
+
+def _raise_termination_interrupt(_signum, _frame) -> None:
+    """Route normal service-manager termination through runtime cleanup."""
+
+    raise KeyboardInterrupt
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    previous_sigterm = None
+    if threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.signal(
+            signal.SIGTERM,
+            _raise_termination_interrupt,
+        )
+    try:
+        return _run(argv)
+    finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

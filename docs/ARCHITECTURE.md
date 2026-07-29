@@ -646,16 +646,27 @@ locale-instruktion. Svenska och engelska är första kompletta katalogparet;
 fler språk är en katalog-, språkmetadata- och allowlistutökning, inte nya
 språkberoende beslutskodvägar.
 
-En transportoberoende, bounded och kooperativt cancellable speech-worker finns nu i
-concurrent-simulatorn, och tester visar att både blockerad och felande
-uppspelning isoleras från navigationen. Den är ännu inte kopplad till EV3-TTS
-och verifierar inte en fysisk röst. Framtida STT får publicera transkript med
-ett separat, tidsstämplat `detected_locale` och confidence som observation;
-det får inte tyst skriva över användarens valda `response_locale`. Den fysiska
-TTS-adaptern får i sin tur ett explicit `voice_locale` och ett allowlistat
-voice-ID. Om en passande röst saknas ska anropet neka eller kräva ett synligt
-val, aldrig råka falla tillbaka till svenska. Engelskt STT/TTS är därför en
-egen YouTube-demo-grind även om engelsk textdialog redan fungerar.
+Två separata bounded speech-flöden finns nu. Concurrent-simulatorns
+uppspelningsworker isolerar blockerad eller felande TTS från navigationen.
+Dashboardens STT-worker tar korta 16 kHz mono PCM16-yttranden från Macens
+browserstandardiserade mikrofonflöde och publicerar ett tidsbegränsat
+transkript till exakt samma agent-submit som text. Ingen av dem har motor-,
+SSH- eller supervisorcapability.
+
+STT-providergränsen är transportoberoende; första adaptern använder en varm,
+lokal `whisper.cpp`. Jobbkö, ljudstorlek, taltid, providerdeadline,
+resultatlagring och leverans-TTL är hårt begränsade. Cancel och shutdown
+raderar köat ljud och gör sena providerresultat ogiltiga. Råljud, ljudhash och
+transkript får aldrig kopieras till eventloggen. Ett `detected_language` är
+metadata och får inte tyst skriva över användarens valda `response_locale`.
+
+Flödet är ännu inte kopplat till EV3-TTS eller den fysiska
+språk-till-handling-grinden. Den fysiska TTS-adaptern får i sin tur ett
+explicit `voice_locale` och ett allowlistat voice-ID. Om en passande röst
+saknas ska anropet neka eller kräva ett synligt val, aldrig råka falla
+tillbaka till svenska. Engelskt och svenskt mikrofon-STT samt engelskt
+EV3-TTS är därför separata YouTube-demo-grindar även om textdialogen redan
+fungerar.
 
 Det beskrivande registryt stöder redan flera `robot_id`, controllers,
 kameror, mikrofoner, compute-noder och providers. Varje nod har

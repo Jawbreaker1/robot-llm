@@ -1,9 +1,9 @@
 # Lokal Mac-dashboard
 
 Dashboarden är en rörelsefri arbetsbänk för Robot LLM Lab. Den fungerar utan
-EV3-batterier och samlar lokal dialog, read-only research, tekniska händelser,
-agentbudgetar och ett beskrivande register över nuvarande och framtida
-robotkomponenter.
+EV3-batterier och samlar lokal textdialog och en lokal röstinmatningspipeline,
+read-only research, tekniska händelser, agentbudgetar och ett beskrivande
+register över nuvarande och framtida robotkomponenter.
 
 ## Starta
 
@@ -37,6 +37,32 @@ PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
 Flaggan kontaktar ingen EV3. Utan flaggan visar kartytan ärligt att ingen
 kartprovider är ansluten.
 
+### Starta med lokal taligenkänning
+
+STT är ett explicit opt-in. På Mac:
+
+```sh
+brew install whisper-cpp
+sh scripts/download_whisper_model.sh small
+PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
+  --stt-model models/ggml-small.bin
+```
+
+Modellen ligger i den git-ignorerade katalogen `models/`. Nedladdningsscriptet
+accepterar `small` och `base` och verifierar den officiella filens SHA-256
+innan den aktiveras. `small` är kvalitetsvalet för svensk/engelsk demo;
+`base` är ett snabbare och mindre jämförelsealternativ.
+Hanterad STT föredrar GPU/Metal för låg latens. Om en annan lokal modell redan
+använder GPU-minnet kan `--stt-cpu` väljas explicit som en långsammare men
+isolerad fallback.
+
+Dashboarden startar modellen en gång och håller den varm. Ett redan startat,
+betrott `whisper.cpp` kan i stället anges med en explicit loopback-URL via
+`--stt-url`; externa nätverksadresser accepteras inte. URL:en måste innehålla
+en lång, opak `--request-path` som konfigurerats på servern. En oskyddad
+standardserver på rot-URL nekas eftersom dess CORS-ytor annars kan anropas av
+en fientlig webbsida.
+
 ## Språk
 
 Språkväljaren i toppfältet byter hela dashboardens presentationsspråk utan
@@ -63,6 +89,49 @@ Fler språk läggs till som kataloger och tas därefter upp i samma explicita
 locale-allowlist; agent- och säkerhetslogiken behöver inte förgrenas per
 språk.
 
+## Mikrofon och STT
+
+Talk-knappen är byggd på browserstandarderna `getUserMedia`, Web Audio och
+`AudioWorklet`. Den använder inte `SpeechRecognition`, en Safari-specifik
+implementation, user-agent-detektering eller någon molnbaserad fallback.
+
+Flödet är:
+
+```text
+Talk → nivå/VAD → tystnadsstopp → PCM16-WAV → lokal STT
+     → färskt transkript → samma versionskontrollerade agentformulär som text
+```
+
+Mikrofoninställningarna ligger separat och sparas endast i browserns lokala
+lagring:
+
+- fysisk mikrofon eller systemets standard,
+- `auto`, svenska eller engelska som första explicita språkval,
+- känslighet med levande nivåmätare och synlig signaltröskel,
+- tystnadstid före automatiskt stopp och maximal taltid,
+- echo cancellation, noise suppression och automatisk gain,
+- automatiskt skicka eller lämna transkriptet redigerbart.
+
+Känsligheten är en deterministisk signaltröskel, inte en semantisk
+klassificerare och inte hårdvaruförstärkning. En kort pre-roll behålls när tal
+upptäcks; väntetystnad trimmas och mycket korta segment fylls till backendens
+minsta säkra WAV-längd. Det minskar onödig inferenstid utan att klippa första
+ordet.
+
+Råljud finns bara i minnet medan ett bounded jobb väntar eller ett lokalt
+provideranrop kör. Det persisteras inte och eventloggen får varken ljud,
+ljudhash eller transkript. Transkript har en hostägd leverans-TTL; gamla
+resultat får inte auto-skickas. Cancel rensar köat ljud direkt. Ett redan
+påbörjat provideranrop kan behålla sin lokala request tills dess deadline,
+vilket redovisas som `audio.retained`; dess sena resultat kastas.
+Browsern skapar request-ID:t före uppladdningen och kan därför avbryta även
+om POST-svaret ännu inte har kommit; en kortlivad, bounded tombstone gör att
+en samtidigt anländande uppladdning nekas.
+
+STT-workern är fristående från researchworkern och från robotens framtida
+MotionSupervisor. En långsam eller felande transkribering får därför inte
+blockera dialog, navigation eller den deterministiska säkerhetsloopen.
+
 ## Sex ytor
 
 - **Arbetsbänk** visar en versionsmärkt konversation, pågående tur,
@@ -78,8 +147,9 @@ språk.
   loggas inte.
 - **Experiment** reserverar en read-only yta för reproducerbara episoder och
   befintliga experimentartefakter.
-- **Inställningar** ändrar sessionsbundna agentbudgetar. Inställningarna
-  versionskontrolleras och återställs när servern startas om.
+- **Inställningar** ändrar sessionsbundna agentbudgetar och browserlokala
+  mikrofonval. Agentinställningarna versionskontrolleras och återställs när
+  servern startas om; mikrofoninställningarna lämnar aldrig browsern.
 
 ## Dialog och kontext
 
@@ -152,7 +222,7 @@ Webbgränsen använder dessutom:
 - en explicit asset- och route-allowlist
 - en strikt Content Security Policy utan externa assets
 - socket-timeout och ett fast tak för samtidiga HTTP-handlers
-- en begränsad jobbkö med en enda researchworker
+- separata begränsade jobbköer för research och STT
 
 Frontend anropar endast hostservern. Den kontaktar aldrig LM Studio,
 Open-Meteo eller EV3 direkt.

@@ -10,6 +10,8 @@
   <link rel="icon" type="image/png" href="assets/robot-llm-head.png">
   <script src="assets/i18n.js" defer></script>
   <script src="assets/dashboard_logic.js" defer></script>
+  <script src="assets/speech_input_logic.js" defer></script>
+  <script src="assets/microphone_input.js" defer></script>
   <script src="assets/spatial_map_presenter.js" defer></script>
   <script src="assets/app.js" defer></script>
 </head>
@@ -168,7 +170,21 @@
               <span class="capability-note" id="mode-capability-note" data-i18n="workbench.mode.capability">Ingen robotstyrning</span>
             </div>
             <label class="sr-only" for="message-input" data-i18n="workbench.composer.message_label">Meddelande till Gemma</label>
-            <textarea id="message-input" name="message" rows="3" maxlength="4000" placeholder="Prata med Gemma eller be den undersöka något…" data-i18n-placeholder="workbench.composer.placeholder" disabled></textarea>
+            <div class="composer-input-shell">
+              <textarea id="message-input" name="message" rows="3" maxlength="4000" placeholder="Prata med Gemma eller be den undersöka något…" data-i18n-placeholder="workbench.composer.placeholder" disabled></textarea>
+              <button class="microphone-button" type="button" id="microphone-button" aria-label="Prata med roboten" data-i18n-aria-label="microphone.button.start" aria-describedby="microphone-status" aria-pressed="false" disabled>
+                <span class="microphone-glyph" aria-hidden="true"></span>
+                <span class="microphone-button-label" data-i18n="microphone.button.label">Prata</span>
+              </button>
+            </div>
+            <div class="microphone-feedback" id="microphone-feedback">
+              <div class="microphone-meter" id="microphone-meter" role="meter" aria-label="Mikrofonnivå" data-i18n-aria-label="microphone.meter.aria_label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="Nivå 0 %, aktiveringströskel 33 %">
+                <span class="microphone-meter-fill" id="microphone-meter-fill" aria-hidden="true"></span>
+                <span class="microphone-meter-threshold" id="microphone-meter-threshold" aria-hidden="true"></span>
+              </div>
+              <span id="microphone-status" role="status" aria-live="polite" data-i18n="microphone.status.starting">Startar mikrofonen…</span>
+              <button class="text-button microphone-cancel" type="button" id="cancel-transcription-button" data-i18n="microphone.button.cancel" hidden>Avbryt</button>
+            </div>
             <div class="composer-footer">
               <span id="composer-status" role="status" data-i18n="workbench.composer.starting">Startar den lokala arbetsbänken…</span>
               <button class="button button-primary" type="submit" id="send-button" disabled>
@@ -551,11 +567,70 @@
           <span class="settings-revision" id="settings-revision" data-i18n="settings.revision.empty">Revision —</span>
         </header>
 
+        <form id="microphone-settings-form" class="microphone-settings-form">
+          <section class="settings-section" aria-labelledby="settings-microphone-heading">
+            <header>
+              <div>
+                <span class="section-number" aria-hidden="true">01</span>
+                <div>
+                  <h3 id="settings-microphone-heading" data-i18n="settings.microphone.title">Mikrofon och taligenkänning</h3>
+                  <p data-i18n="settings.microphone.description">Spela in på datorn och transkribera lokalt. Inställningarna sparas bara i den här webbläsaren.</p>
+                </div>
+              </div>
+              <span class="state-chip state-idle" id="microphone-settings-state" role="status" data-i18n="settings.microphone.saved">Sparas automatiskt</span>
+            </header>
+            <div class="form-grid microphone-form-grid">
+              <label class="field field-wide">
+                <span data-i18n="settings.microphone.device">Mikrofon</span>
+                <select id="microphone-device" name="microphone-device">
+                  <option value="default" data-i18n="settings.microphone.default_device">Systemets standardmikrofon</option>
+                </select>
+                <small data-i18n="settings.microphone.device_help">Webbläsaren visar enhetsnamn efter att mikrofonåtkomst har tillåtits.</small>
+              </label>
+              <label class="field">
+                <span data-i18n="settings.microphone.language">Talat språk</span>
+                <select id="speech-input-language" name="speech-input-language">
+                  <option value="auto" data-i18n="settings.microphone.language_auto">Identifiera automatiskt</option>
+                  <option value="sv" data-i18n="settings.microphone.language_swedish">Svenska</option>
+                  <option value="en" data-i18n="settings.microphone.language_english">English</option>
+                </select>
+              </label>
+              <label class="field microphone-range-field">
+                <span><span data-i18n="settings.microphone.sensitivity">Känslighet</span> <output id="microphone-sensitivity-output" for="microphone-sensitivity">65 %</output></span>
+                <input id="microphone-sensitivity" name="microphone-sensitivity" type="range" min="0" max="100" step="1" value="65">
+                <small data-i18n="settings.microphone.sensitivity_help">Höj om tal inte upptäcks; sänk om bakgrundsljud aktiverar inspelningen.</small>
+              </label>
+              <label class="field">
+                <span data-i18n="settings.microphone.silence">Tystnad före automatiskt stopp, ms</span>
+                <input id="microphone-silence-ms" name="microphone-silence-ms" type="number" min="400" max="3000" step="100" value="800">
+              </label>
+              <label class="field">
+                <span data-i18n="settings.microphone.maximum">Maximal taltid, ms</span>
+                <input id="microphone-max-utterance-ms" name="microphone-max-utterance-ms" type="number" min="3000" max="30000" step="1000" value="12000">
+              </label>
+            </div>
+            <fieldset class="microphone-processing">
+              <legend data-i18n="settings.microphone.processing">Ljudbehandling</legend>
+              <label><input id="microphone-echo-cancellation" name="microphone-echo-cancellation" type="checkbox" checked> <span data-i18n="settings.microphone.echo_cancellation">Ekoreducering</span></label>
+              <label><input id="microphone-noise-suppression" name="microphone-noise-suppression" type="checkbox" checked> <span data-i18n="settings.microphone.noise_suppression">Brusreducering</span></label>
+              <label><input id="microphone-auto-gain" name="microphone-auto-gain" type="checkbox" checked> <span data-i18n="settings.microphone.auto_gain">Automatisk nivå</span></label>
+              <label><input id="microphone-auto-send" name="microphone-auto-send" type="checkbox" checked> <span data-i18n="settings.microphone.auto_send">Skicka transkript automatiskt</span></label>
+            </fieldset>
+            <div class="microphone-settings-footer">
+              <div class="microphone-meter is-settings" id="microphone-settings-meter" role="meter" aria-label="Mikrofonnivå i inställningar" data-i18n-aria-label="settings.microphone.meter_aria_label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="Nivå 0 %, aktiveringströskel 33 %">
+                <span class="microphone-meter-fill" id="microphone-settings-meter-fill" aria-hidden="true"></span>
+                <span class="microphone-meter-threshold" id="microphone-settings-meter-threshold" aria-hidden="true"></span>
+              </div>
+              <button class="button button-secondary" type="button" id="refresh-microphones-button" data-i18n="settings.microphone.refresh">Uppdatera mikrofoner</button>
+            </div>
+          </section>
+        </form>
+
         <form id="settings-form">
           <section class="settings-section" aria-labelledby="settings-runtime-heading">
             <header>
               <div>
-                <span class="section-number" aria-hidden="true">01</span>
+                <span class="section-number" aria-hidden="true">02</span>
                 <div>
                   <h3 id="settings-runtime-heading">LM Studio</h3>
                   <p data-i18n="settings.runtime.description">Endast en lokal loopback-slutpunkt accepteras.</p>
@@ -584,7 +659,7 @@
           <section class="settings-section" aria-labelledby="settings-agent-heading">
             <header>
               <div>
-                <span class="section-number" aria-hidden="true">02</span>
+                <span class="section-number" aria-hidden="true">03</span>
                 <div>
                   <h3 id="settings-agent-heading" data-i18n="settings.budgets.title">Agentbudgetar</h3>
                   <p data-i18n="settings.budgets.description">Hårda tak för varje lokal episod.</p>
@@ -642,7 +717,7 @@
           <section class="settings-section" aria-labelledby="settings-tools-heading">
             <header>
               <div>
-                <span class="section-number" aria-hidden="true">03</span>
+                <span class="section-number" aria-hidden="true">04</span>
                 <div>
                   <h3 id="settings-tools-heading" data-i18n="settings.tools.title">Verktyg</h3>
                   <p data-i18n="settings.tools.description">Exakt tillåtelselista. Verktyg får endast producera passiv evidens.</p>
@@ -672,7 +747,7 @@
           <section class="settings-section safety-section" aria-labelledby="settings-safety-heading">
             <header>
               <div>
-                <span class="section-number" aria-hidden="true">04</span>
+                <span class="section-number" aria-hidden="true">05</span>
                 <div>
                   <h3 id="settings-safety-heading" data-i18n="settings.safety.title">Fysisk säkerhet</h3>
                   <p data-i18n="settings.safety.description">Informationsyta, inte en kontroll.</p>
