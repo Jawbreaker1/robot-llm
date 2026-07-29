@@ -7,20 +7,87 @@
 ![Physical motion: manual only](https://img.shields.io/badge/physical%20motion-manual%20only-f59e0b)
 ![Navigation: simulator only](https://img.shields.io/badge/navigation-simulator%20only-2563eb)
 
+**Give a local LLM goals—not motor access.**
+
+Robot LLM Lab is an embodied-agent research project. It explores how a local
+LLM can become the conversational, planning, and reasoning layer for a LEGO
+EV3 robot while deterministic software—not the model—retains exclusive,
+bounded, and interruptible control of every physical action.
+
+> **Research question:** Can asynchronous LLM reasoning, dialogue, and
+> perception produce useful closed-loop robot behavior while a deterministic
+> real-time layer remains the sole authority over motion?
+
+This is **not primarily a general-purpose chatbot**. The chat is the
+human-facing workbench for the future robot agent: it lets us test context,
+tool selection, evidence, personality, and model behavior before connecting
+natural-language goals to physical execution. The physical language-to-motion
+path is intentionally still locked.
+
 <p align="center">
   <img src="src/robot_agent/dashboard_web/robot-llm-mascot.png" alt="Robot LLM Lab's mildly grumpy modular mascot waving" width="280">
 </p>
 
 <p align="center"><em>Mildly grumpy by design. Personality lives in the language layer; safety does not.</em></p>
 
-**A local LLM gets a real LEGO body—without getting direct access to the
-motors.**
+## The short answer
 
-Robot LLM Lab is a controlled experiment built around a physical LEGO
-MINDSTORMS EV3RSTORM, ev3dev, and a local Gemma model served by LM Studio. It
-explores conversation, context, planning, perception, and closed agentic loops
-while deterministic code remains solely responsible for authorization and
-physical execution.
+| Question | Answer |
+|---|---|
+| What is this for? | Building and evaluating a local, agentic intelligence for a physical LEGO robot that can understand goals, form plans, observe, act, verify, speak, and replan |
+| Is it a chat where I can ask anything? | Gemma can hold a conversation, but general chat is a test harness—not the purpose of the project |
+| Can I give the EV3 natural-language instructions today? | Not physically yet. Model-driven goal selection and closed loops run in the 2D simulator; physical EV3 motion remains manual and explicitly acknowledged |
+| What does the Lab Console do? | It is an operator and observability workbench for dialogue, agent traces, evidence, experiments, component state, and the simulator-generated spatial map; it has no robot-control routes |
+| Why is there a weather demo? | Weather is a deliberately low-risk proof of semantic tool choice, fresh external information, provenance, and citations. The same pattern can later let the robot research something identified by perception; weather itself is not the product |
+
+The intended interaction is a **goal**, not a low-level motor script:
+
+```text
+Human: "Explore the room. If something blocks you, investigate it and tell me what you think it is."
+
+local LLM        → interprets the goal, proposes a plan, comments, replans
+host policy      → validates typed proposals, versions, freshness, and budgets
+MotionSupervisor → chooses exactly one bounded physical decision per tick
+robot            → acts briefly, observes again, and reports new evidence
+```
+
+Today the motion, observation, arbitration, and verification parts of that
+loop are exercised against a synthetic robot and world. Live Gemma has made
+bounded exploration and expression decisions in simulator runs, but arbitrary
+human-language missions are not yet wired end-to-end. The real EV3RSTORM has
+verified motors, sensors, speech, and manual bounded movement; autonomous
+physical motion remains gated until the power, transport, calibration,
+braking, and fault-injection evidence is strong enough.
+
+## Core architecture
+
+```mermaid
+flowchart LR
+    U["Target interface<br/>human goal"] --> L["Local LLM<br/>interpret · plan · explain"]
+    O["Sensors · pose · map<br/>time-stamped observations"] --> L
+    L --> P["Typed proposals<br/>no motor access"]
+
+    subgraph HOST["Mac · deterministic policy and orchestration"]
+        P --> V["Schema · identity · state version<br/>freshness · TTL · budgets"]
+        V --> M["MotionSupervisor<br/>one decision per tick"]
+    end
+
+    M -->|"verified now"| X["2D simulator<br/>synthetic robot · sensors · world"]
+    X --> O
+    M -.->|"target physical path · gated"| S["EV3 safety supervisor<br/>sole local motor owner"]
+    S --> R["EV3RSTORM<br/>motors · sensors · speaker"]
+    R -.-> O
+```
+
+The solid `MotionSupervisor → 2D simulator → observations` control path is
+implemented today. Individual Gemma seams are verified for bounded selection
+and expression, but the arbitrary human-goal interface and dashed EV3 path
+remain target architecture—not end-to-end physical capability claims.
+
+The LLM can propose intent, dialogue, and higher-level actions. It cannot
+choose motor ports, raw wheel speeds, safety timeouts, authority, or its own
+proposal lifetime. Parallel perception and reasoning are welcome; physical
+execution remains serialized and deterministic.
 
 The project deliberately avoids phrase menus, regular-expression intent
 matching, and language-specific keyword heuristics. The model classifies
@@ -33,45 +100,6 @@ reinterprets the user's sentence into a motor command.
 
 > **Execution invariant:** parallel perception and reasoning are welcome;
 > physical execution is serialized, bounded, interruptible, and deterministic.
-
-## See it in action
-
-### The English Lab Console
-
-![English Robot LLM Lab workbench with the mascot, local Gemma, and motion visibly locked](docs/images/dashboard-workbench-en.jpg)
-
-The Mac workbench provides local Gemma chat, session context, agent traces,
-evidence, settings, experiment history, and technical events. The dashboard
-cannot control the robot yet, and says so visibly.
-
-### A live read-only agent episode
-
-![A completed English weather episode with the typed activity trace visible](docs/images/dashboard-weather-en.jpg)
-
-In this captured run, Gemma selected the single allowlisted
-`weather.current` tool, the host fetched Open-Meteo data, bound it as fresh
-evidence, and required the final answer to cite that evidence. The model and
-agent run locally; only the explicit, allowlisted weather request leaves the
-Mac.
-
-### Honest experiment status
-
-![The experiment register separating verified results from a waiting physical preflight](docs/images/dashboard-experiments-en.jpg)
-
-The experiment register keeps verified evidence separate from work that is
-still waiting on a physical gate.
-
-<details>
-<summary><strong>Component registry</strong></summary>
-
-![The declarative Bodies registry for robot controllers, cameras, and microphones](docs/images/dashboard-bodies-en.jpg)
-
-This is a declarative inventory, not a control surface. The future camera,
-microphone, Robot Inventor, and BOOST nodes are currently offline declarations
-with no exposed control path. Seeing a controller in the registry never grants
-permission to execute motion.
-
-</details>
 
 ## What works today
 
@@ -89,10 +117,15 @@ Status snapshot: **2026-07-29**.
 | Concurrent interaction | Independent bounded workers plus one live local-Gemma simulator run where model speech overlapped a later navigation tick | Virtual callbacks only; no physical drive, speaker, or arm adapter |
 | Physical autonomy | Not enabled | Waiting for reliable EV3 power, physical transport validation, calibration, stop-latency evidence, and fault injection |
 
+<details>
+<summary><strong>Why physical autonomy remains locked</strong></summary>
+
 The latest EV3 power check measured **5.889 V**. Physical deployment of the
 foreground daemon was intentionally stopped before file transfer to avoid a
 brownout and unnecessary SD-card risk. Physical testing remains paused until
 reliable battery power is available.
+
+</details>
 
 English and Swedish are verified for the dashboard and model text responses.
 English STT, English EV3 speech, multilingual robot personality, camera
@@ -100,29 +133,73 @@ vision, and physical language-to-action classification are not yet verified.
 The locale contract is generic so more languages can be added without
 language detection in the safety layer.
 
-## How it works
+## Fastest robot-focused demo
 
-```mermaid
-flowchart LR
-    U["User goal"] --> A["Main agent / dialogue"]
-    A <--> L["LM Studio · local Gemma"]
-    A --> P["Typed proposal"]
-    W["Allowlisted read-only research"] --> E["Bound evidence"]
-    E --> A
+This runs the implemented autonomous navigation stack in the 2D simulator,
+builds its spatial map, and then opens the read-only Lab Console:
 
-    subgraph HOST["Mac · policy and orchestration"]
-        P --> H["Schema, capability, freshness,<br/>state version, TTL, and budget checks"]
-        O["Parallel observation / validation<br/>producers"] --> I["Versioned proposal inbox"]
-        H --> I
-        I --> M["MotionSupervisor<br/>exactly one decision per tick"]
-    end
-
-    subgraph EV3["EV3 · deterministic execution"]
-        M -.->|"physical adapter pending"| S["Local safety supervisor<br/>sole motor owner"]
-        R["IR · touch · encoders"] --> S
-        S --> B["Motors A / B / C"]
-    end
+```sh
+PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
+  --simulation-map-demo
 ```
+
+Choose **Map** in the session URL printed by the server. The episode is
+simulator-only and cannot contact or move the EV3.
+Its navigation uses deterministic reference behaviors, so this command
+validates the control, verification, and mapping stack—not LLM planning.
+
+To evaluate live Gemma making one bounded exploration choice from
+host-generated opportunities:
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.autonomy_demo \
+  --lm-studio --scenario range-change
+```
+
+Gemma sees opaque candidate IDs rather than coordinates or motor parameters;
+this still is not arbitrary natural-language mission planning.
+
+## The Lab Console
+
+![English Robot LLM Lab workbench with the mascot, local Gemma, and motion visibly locked](docs/images/dashboard-workbench-en.jpg)
+
+The Mac workbench is the human-facing console for the experiment. It provides
+local Gemma dialogue, context, agent traces, evidence, the spatial map,
+settings, experiment history, component state, and technical events. It is
+currently an **observability and dialogue surface**, not a robot remote:
+there are no motor, stop, SSH, or TTS routes.
+
+![The experiment register separating verified results from a waiting physical preflight](docs/images/dashboard-experiments-en.jpg)
+
+The experiment register separates measured evidence from capabilities that
+are still waiting on a physical gate.
+
+<details>
+<summary><strong>Secondary proof: typed read-only tool use</strong></summary>
+
+![A completed English weather episode with the typed activity trace visible](docs/images/dashboard-weather-en.jpg)
+
+Weather is intentionally narrow and motion-free. In this run, Gemma selected
+the single allowlisted `weather.current` tool, the host fetched Open-Meteo
+data, bound it as fresh evidence, and required the answer to cite that
+evidence. This validates semantic tool selection and provenance for future
+robot perception; it does **not** make weather chat the purpose of the
+project.
+
+</details>
+
+<details>
+<summary><strong>Declarative component registry</strong></summary>
+
+![The declarative Bodies registry for robot controllers, cameras, and microphones](docs/images/dashboard-bodies-en.jpg)
+
+This is an inventory, not a control surface. The future camera, microphone,
+Robot Inventor, and BOOST nodes are offline declarations with no exposed
+control path.
+
+</details>
+
+## Architecture in detail
 
 The concurrent simulator runtime now uses independent bounded workers and
 latest-snapshot mailboxes for its navigation behaviors. Obstruction-triggered
