@@ -30,6 +30,8 @@ const logic = context.RobotDashboardLogic;
 if (
   !logic
   || !logic.TURN_POLL_POLICY
+  || logic.SPATIAL_MAP_SCHEMA !== "robot-spatial-map/v1"
+  || typeof logic.normalizeSpatialMap !== "function"
   || typeof logic.replaceRenderedItems !== "function"
   || typeof logic.transitionTurnPoll !== "function"
 ) {
@@ -97,6 +99,121 @@ try {
   invalidEventRejected = Boolean(error && error.name === "TypeError");
 }
 
+const spatialNow = 2000;
+const normalizedMap = logic.normalizeSpatialMap({
+  schema: "robot-spatial-map/v1",
+  read_only: true,
+  status: "available",
+  robot_id: "ev3rstorm-01",
+  frame_id: "SIM_WORLD",
+  map_version: 7,
+  based_on_state_version: 19,
+  based_on_world_model_version: 4,
+  captured_at_unix_ms: 1800,
+  source_id: "simulator",
+  provenance: "SIMULATION",
+  resolution_mm: 50,
+  bounds: {
+    min_x_mm: 0,
+    min_y_mm: 0,
+    max_x_mm: 1000,
+    max_y_mm: 800,
+    future_field: "ignored",
+  },
+  robot_pose: {
+    x_mm: 100,
+    y_mm: 200,
+    heading_mdeg: 90000,
+  },
+  cells: [
+    {
+      x_mm: 150,
+      y_mm: 250,
+      state: "FREE",
+      source_id: "occupancy",
+      provenance: "PROVISIONAL_IR",
+      observed_at_unix_ms: 1900,
+    },
+    { x_mm: 300, y_mm: 400, state: "future-state" },
+    { x_mm: "bad", y_mm: 400, state: "OCCUPIED" },
+  ],
+  sensor_rays: [
+    {
+      origin_x_mm: 100,
+      origin_y_mm: 200,
+      end_x_mm: 500,
+      end_y_mm: 200,
+      observed_at_unix_ms: 1950,
+      valid_until_unix_ms: 2100,
+      provenance: "PROVISIONAL_IR",
+    },
+    {
+      origin_x_mm: 100,
+      origin_y_mm: 200,
+      end_x_mm: 100,
+      end_y_mm: 500,
+      valid_until_unix_ms: 2000,
+    },
+  ],
+  qualitative_observations: [
+    {
+      bearing: "FORWARD",
+      relation: "NEAR_OBSTACLE",
+      raw_ir_proximity: 81,
+      confidence_milli: 250,
+      source_id: "physical_ir_reflection",
+      provenance: "PROVISIONAL_IR",
+      provisional: true,
+      observed_at_unix_ms: 1875,
+      age_ms: 42,
+    },
+    {
+      bearing: "FORWARD",
+      raw_ir_proximity: 40,
+    },
+  ],
+  object_hypotheses: [
+    {
+      hypothesis_id: "object-1",
+      label: "box",
+      x_mm: 500,
+      y_mm: 300,
+      observed_at_unix_ms: 1750,
+      confidence_milli: 850,
+      source_id: "vision",
+      provenance: "SIMULATION",
+    },
+    {
+      hypothesis_id: "stale",
+      x_mm: 700,
+      y_mm: 300,
+      valid_until_unix_ms: 1999,
+    },
+  ],
+  future_top_level: { ignored: true },
+}, spatialNow);
+const emptyMap = logic.normalizeSpatialMap(null, spatialNow);
+const wrongSchemaMap = logic.normalizeSpatialMap({
+  schema: "future-map/v9",
+  read_only: true,
+  cells: [{ x_mm: 1, y_mm: 2, state: "FREE" }],
+}, spatialNow);
+const qualitativeOnlyMap = logic.normalizeSpatialMap({
+  schema: "robot-spatial-map/v1",
+  read_only: true,
+  status: "qualitative_only",
+  frame_id: "ROBOT_BASE",
+  bounds: null,
+  qualitative_observations: [{
+    bearing: "FORWARD",
+    relation: "NO_NEAR_REFLECTION",
+    raw_ir_proximity: 12,
+    confidence_milli: 200,
+    provisional: true,
+    age_ms: 90,
+  }],
+}, spatialNow);
+
 process.stdout.write(JSON.stringify({
   exports: Object.keys(logic).sort(),
   frozen: Object.isFrozen(logic),
@@ -126,6 +243,17 @@ process.stdout.write(JSON.stringify({
     recoveredActive,
     recoveredTerminal,
     invalidEventRejected,
+  },
+  spatial: {
+    normalizedMap,
+    normalizedFrozen: Object.isFrozen(normalizedMap),
+    cellsFrozen: Object.isFrozen(normalizedMap.cells),
+    qualitativeFrozen: Object.isFrozen(
+      normalizedMap.qualitativeObservations,
+    ),
+    emptyMap,
+    wrongSchemaMap,
+    qualitativeOnlyMap,
   },
 }));
 """
@@ -183,7 +311,9 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(
             self.runtime["exports"],
             [
+                "SPATIAL_MAP_SCHEMA",
                 "TURN_POLL_POLICY",
+                "normalizeSpatialMap",
                 "replaceRenderedItems",
                 "transitionTurnPoll",
             ],
@@ -246,6 +376,84 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(polling["recoveredTerminal"]["terminal"])
         self.assertFalse(polling["recoveredTerminal"]["retry"])
         self.assertTrue(polling["invalidEventRejected"])
+
+    def test_spatial_map_normalization_is_bounded_fresh_and_defensive(self):
+        spatial = self.runtime["spatial"]
+        normalized = spatial["normalizedMap"]
+
+        self.assertTrue(spatial["normalizedFrozen"])
+        self.assertTrue(spatial["cellsFrozen"])
+        self.assertTrue(spatial["qualitativeFrozen"])
+        self.assertTrue(normalized["contractValid"])
+        self.assertEqual(normalized["schema"], "robot-spatial-map/v1")
+        self.assertEqual(normalized["ageMs"], 200)
+        self.assertEqual(normalized["basedOnStateVersion"], 19)
+        self.assertEqual(normalized["basedOnWorldModelVersion"], 4)
+        self.assertEqual(normalized["provenance"], "SIMULATION")
+        self.assertEqual(
+            normalized["bounds"],
+            {
+                "minX": 0,
+                "minY": 0,
+                "maxX": 1000,
+                "maxY": 800,
+            },
+        )
+        self.assertEqual(len(normalized["cells"]), 2)
+        self.assertEqual(normalized["cells"][0]["state"], "FREE")
+        self.assertEqual(
+            normalized["cells"][0]["provenance"],
+            "PROVISIONAL IR",
+        )
+        self.assertEqual(normalized["cells"][0]["ageMs"], 100)
+        self.assertEqual(normalized["cells"][1]["state"], "UNKNOWN")
+        self.assertEqual(len(normalized["sensorRays"]), 1)
+        self.assertEqual(
+            normalized["sensorRays"][0]["validUntilUnixMs"],
+            2100,
+        )
+        self.assertEqual(len(normalized["objectHypotheses"]), 1)
+        self.assertEqual(
+            normalized["objectHypotheses"][0]["hypothesisId"],
+            "object-1",
+        )
+        self.assertEqual(normalized["robotPose"]["ageMs"], 200)
+        self.assertEqual(len(normalized["qualitativeObservations"]), 1)
+        self.assertEqual(
+            normalized["qualitativeObservations"][0],
+            {
+                "bearing": "FORWARD",
+                "relation": "NEAR_OBSTACLE",
+                "rawIrProximity": 81,
+                "confidenceMilli": 250,
+                "sourceId": "physical_ir_reflection",
+                "provenance": "PROVISIONAL IR",
+                "provisional": True,
+                "ageMs": 125,
+            },
+        )
+
+        empty = spatial["emptyMap"]
+        self.assertFalse(empty["contractValid"])
+        self.assertEqual(empty["cells"], [])
+        self.assertEqual(empty["sensorRays"], [])
+        self.assertEqual(empty["objectHypotheses"], [])
+        self.assertEqual(empty["qualitativeObservations"], [])
+
+        wrong = spatial["wrongSchemaMap"]
+        self.assertFalse(wrong["contractValid"])
+        self.assertEqual(wrong["cells"], [])
+        self.assertEqual(wrong["qualitativeObservations"], [])
+
+        qualitative = spatial["qualitativeOnlyMap"]
+        self.assertTrue(qualitative["contractValid"])
+        self.assertEqual(qualitative["status"], "qualitative_only")
+        self.assertIsNone(qualitative["bounds"])
+        self.assertEqual(len(qualitative["qualitativeObservations"]), 1)
+        self.assertEqual(
+            qualitative["qualitativeObservations"][0]["ageMs"],
+            90,
+        )
 
 
 if __name__ == "__main__":

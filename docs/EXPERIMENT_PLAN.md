@@ -1068,16 +1068,88 @@ modellbaserad intresseklassificering och säker målpreemption. Inte godkänd f�
 fysisk idle-körning. Tal, gest, dashboardmål, kamera, mikrofon och flera
 controllers är ännu inte integrerade med denna lease.
 
+### EXP-F5-SPATIAL-SIM-006 – kontinuerligt spatialt världsminne
+
+Hypotes: robotens versionsbundna navigationsobservationer kan kontinuerligt
+bygga en osäker, begränsad omgivningskarta utan att raycasting,
+occupancy-fusion, objektsamling eller GUI-serialisering flyttas in i
+motionsticken, och utan att fysisk IR felaktigt behandlas som centimeter.
+
+Implementation och acceptans:
+
+- `NavigationSnapshot` publiceras genom en O(1), bounded, drop-oldest
+  `offer_nowait`-relay till exakt en separat mapping-worker;
+- navigation, mission, idle och concurrent runtime isolerar sinkfel och
+  publicerar dessutom sin slutliga verifierade STOP-snapshot;
+- workern äger en trådsäker LRU-grid med fast celltak, egen monoton
+  kartrevision och immutable snapshots;
+- robot/controller/frame, state-version, world-model-version och tidsordning
+  valideras före varje atomisk ingest; stale eller duplicerad evidens muterar
+  inte kartan;
+- simulatorns tre strålar vid `0°` och `±45°` fusionerar fri respektive
+  upptagen evidens genom ett explicit `UNKNOWN`-intervall; korrelerade
+  strålar reduceras till en uppdatering per cell och en occupied endpoint
+  dominerar samtidig free-evidens i samma grova cell;
+- samma sensor-timestamp återfusioneras inte från ett nyare robot-state,
+  medan en högre `world_model_version` atomiskt nollställer den gamla
+  evidensgenerationen och får ta in sitt första prov även vid samma
+  simulatortid;
+- simulatorprovenance heter
+  `SIMULATION_CONFIGURATION_SPACE:*`, eftersom avståndet gäller
+  robotradie-inflated kollisionsgeometri och inte exakt fysisk objektyta;
+- fysisk `IR-PROX` skapar endast bounded, lågkonfidens,
+  `PROVISIONAL_QUALITATIVE` evidens utan millimeter, metrisk endpoint,
+  objektnamn eller positiv clear-path;
+- connected occupied cells skapar persistenta, opaka `UNKNOWN`-hypoteser med
+  bounds, centroid, ålder, confidence och evidenslinje som senare
+  kamera-/LLM-klassificering kan referera till;
+- relaydrop eller mapperfel ger synlig `degraded` status men kan inte stoppa
+  eller auktorisera motion;
+- dashboarden får endast en read-only snapshot-provider och exponerar en
+  autentiserad `GET /api/v1/map` med strikt JSON- och 2 MiB-responsgräns;
+- GUI:t visar fri/upptagen/osäker grid, robotpose, färska strålar,
+  objekthypoteser, källa, provenance, ålder och simulator/provisional-status
+  på svenska och engelska.
+
+Det deterministiska end-to-end-scenariot kör den befintliga
+hinder-navigationen och bygger kartan asynkront. Resultat:
+
+- `98` korta DRIVE-handlingar, noll kollisioner och verifierat terminalt
+  STOP;
+- `100` snapshots applicerade utan relaydrop eller mapperfel;
+- `193` gridceller kvar efter fusion och `9` opaka connected-component-
+  hypoteser, varav minst en bär det betrodda simulator-ID:t `demo-box`;
+- den verkliga runtime-snapshoten passerar dashboardens JavaScript-
+  normalisering med robotpose, tre sensorstrålar, celler och hypoteser;
+- en startad loopback-dashboard gav autentiserad HTTP `200` för samma
+  faktiska karta medan `physical_control_enabled` förblev false;
+- hela den hårdvarufria reposviten passerar `700 / 700`.
+
+Negativtest täcker stale/duplicerade snapshots, robot/controller-mismatch,
+återanvänt sensorprov, generationsbyte, överlappande rays, motstridig evidens
+som går via `UNKNOWN`, fysisk IR-isolering, bounded
+cell-/evidensminne, blocked mapper med queue overflow, drop-oldest-semantik,
+mapperfel, flush/close, invalid eller sen publication, providerfel,
+oversize/malformad dashboarddata, route-auth och sinkfel som inte får påverka
+mission eller terminalt stopp.
+
+Grind: godkänd som simulatorbevis för asynkron kontinuerlig mapping och
+read-only visualisering. Inte godkänd för fysisk metrisk mapping, SLAM,
+loop closure, kartbaserad path planning, frontier exploration eller semantisk
+objektklassificering. Kartan är ännu observationsdata och återkopplas inte
+till `MotionSupervisor`. Ingen EV3 eller annan fysisk hårdvara kontaktades.
+
 ## Fas 6 – Parallella snurror
 
 Simulator-slicen bevisar nu en avgränsad del av
 schemaläggningsmönstret: synkrona sensorobservationer matar parallella workers
-för navigation proposals, expression planning och tal, medan ett enda
-motionplan serialiserar hjulen och pausgrindar propellern. Den fysiska
-målarkitekturen är fortfarande att även sensorpollning, perception, planering
-och validering arbetar parallellt, en host-side decision arbiter serialiserar
-semantiska beslutsförslag och varje lokal LEGO-supervisor ensam serialiserar
-och övervakar redan auktoriserade motorprimitiver.
+för navigation proposals, expression planning och tal samt en separat
+asynkron spatial-map-worker, medan ett enda motionplan serialiserar hjulen och
+pausgrindar propellern. Den fysiska målarkitekturen är fortfarande att även
+sensorpollning, generell perception, planering och validering arbetar
+parallellt, en host-side decision arbiter serialiserar semantiska
+beslutsförslag och varje lokal LEGO-supervisor ensam serialiserar och
+övervakar redan auktoriserade motorprimitiver.
 
 En logisk robot kan bestå av flera exekveringsnoder. Varje EV3-, Robot
 Inventor- eller BOOST-controller får exakt en lokal motorägare. En gemensam

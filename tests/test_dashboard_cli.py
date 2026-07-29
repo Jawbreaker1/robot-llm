@@ -9,6 +9,7 @@ from http.server import ThreadingHTTPServer
 from robot_agent.dashboard_cli import (
     _LoopbackThreadingHTTPServer,
     _handler_class,
+    _parser,
 )
 from robot_agent.dashboard_http import DashboardHTTPResponse
 
@@ -172,6 +173,13 @@ class DashboardCLITests(unittest.TestCase):
         logged = output.getvalue()
         self.assertEqual(logged, "[dashboard] HTTP error status 403\n")
         self.assertNotIn("SECRET", logged)
+
+    def test_simulation_map_demo_is_explicit_opt_in(self):
+        defaults = _parser().parse_args([])
+        enabled = _parser().parse_args(["--simulation-map-demo"])
+
+        self.assertFalse(defaults.simulation_map_demo)
+        self.assertTrue(enabled.simulation_map_demo)
 
 
 if __name__ == "__main__":

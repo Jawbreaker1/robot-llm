@@ -10,6 +10,7 @@
   <link rel="icon" type="image/png" href="assets/robot-llm-head.png">
   <script src="assets/i18n.js" defer></script>
   <script src="assets/dashboard_logic.js" defer></script>
+  <script src="assets/spatial_map_presenter.js" defer></script>
   <script src="assets/app.js" defer></script>
 </head>
 <body>
@@ -82,22 +83,29 @@
             <small data-i18n="nav.bodies.subtitle">Noder och status</small>
           </span>
         </button>
-        <button class="nav-item" type="button" data-view="events">
+        <button class="nav-item" type="button" data-view="map">
           <span class="nav-index" aria-hidden="true">03</span>
+          <span>
+            <strong data-i18n="nav.map.title">Karta</strong>
+            <small data-i18n="nav.map.subtitle">Rumslig lägesbild</small>
+          </span>
+        </button>
+        <button class="nav-item" type="button" data-view="events">
+          <span class="nav-index" aria-hidden="true">04</span>
           <span>
             <strong data-i18n="nav.events.title">Händelser</strong>
             <small data-i18n="nav.events.subtitle">Teknisk logg</small>
           </span>
         </button>
         <button class="nav-item" type="button" data-view="experiments">
-          <span class="nav-index" aria-hidden="true">04</span>
+          <span class="nav-index" aria-hidden="true">05</span>
           <span>
             <strong data-i18n="nav.experiments.title">Experiment</strong>
             <small data-i18n="nav.experiments.subtitle">Evidens och historik</small>
           </span>
         </button>
         <button class="nav-item" type="button" data-view="settings">
-          <span class="nav-index" aria-hidden="true">05</span>
+          <span class="nav-index" aria-hidden="true">06</span>
           <span>
             <strong data-i18n="nav.settings.title">Inställningar</strong>
             <small data-i18n="nav.settings.subtitle">Runtime och budgetar</small>
@@ -316,6 +324,108 @@
               </div>
             </div>
           </section>
+        </div>
+      </section>
+
+      <section class="view-panel standard-view map-view" id="view-map" data-view-panel="map" aria-labelledby="map-heading" hidden>
+        <header class="page-header">
+          <div>
+            <p class="eyebrow" data-i18n="map.eyebrow">Gemensam rumslig lägesbild</p>
+            <h2 id="map-heading" data-i18n="map.title">Karta</h2>
+            <p data-i18n="map.description">En skrivskyddad vy av versionsmärkta kartfakta. Den skickar aldrig rörelsekommandon.</p>
+          </div>
+          <div class="map-header-status">
+            <span class="read-only-seal" data-i18n="map.read_only">Endast observation</span>
+            <span class="state-chip state-idle" id="map-connection-status" role="status" data-i18n="map.status.waiting">Väntar på karta</span>
+          </div>
+        </header>
+
+        <div class="map-layout">
+          <section class="spatial-map-panel" aria-labelledby="spatial-map-panel-heading">
+            <header class="instrument-header">
+              <div>
+                <p class="eyebrow" data-i18n="map.canvas.eyebrow">Robotens koordinatram</p>
+                <h3 id="spatial-map-panel-heading" data-i18n="map.canvas.title">Rumslig karta</h3>
+              </div>
+              <span class="map-frame-label" id="map-frame-label">—</span>
+            </header>
+            <div class="spatial-map-stage">
+              <svg id="spatial-map-canvas" class="spatial-map-canvas" viewBox="0 0 1000 620" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="spatial-map-title spatial-map-description">
+                <title id="spatial-map-title" data-i18n="map.canvas.svg_title">Skrivskyddad rumslig karta</title>
+                <desc id="spatial-map-description" data-i18n="map.canvas.svg_description">Rutnät med robotpose, beläggningsceller, färska sensorstrålar och objekthypoteser när sådana fakta finns.</desc>
+                <defs>
+                  <pattern id="spatial-map-grid-pattern" width="50" height="50" patternUnits="userSpaceOnUse">
+                    <path class="map-grid-line" d="M 50 0 L 0 0 0 50"></path>
+                  </pattern>
+                </defs>
+                <rect class="map-grid-background" x="0" y="0" width="1000" height="620" fill="url(#spatial-map-grid-pattern)"></rect>
+                <g id="map-cell-layer" aria-hidden="true"></g>
+                <g id="map-ray-layer" aria-hidden="true"></g>
+                <g id="map-object-layer" aria-hidden="true"></g>
+                <g id="map-robot-layer" aria-hidden="true"></g>
+              </svg>
+              <div class="map-empty-state" id="map-empty-state">
+                <strong id="map-empty-title" data-i18n="map.empty.title">Ingen karta ännu</strong>
+                <span id="map-empty-body" data-i18n="map.empty.body">En tom snapshot visas tills en simulator eller perceptionskälla publicerar riktiga kartfakta.</span>
+              </div>
+            </div>
+            <div class="map-legend" aria-label="Kartförklaring" data-i18n-aria-label="map.legend.aria_label">
+              <span><i class="legend-swatch is-free" aria-hidden="true"></i><span data-i18n="map.legend.free">Fri</span></span>
+              <span><i class="legend-swatch is-occupied" aria-hidden="true"></i><span data-i18n="map.legend.occupied">Upptagen</span></span>
+              <span><i class="legend-swatch is-uncertain" aria-hidden="true"></i><span data-i18n="map.legend.uncertain">Osäker</span></span>
+              <span><i class="legend-line" aria-hidden="true"></i><span data-i18n="map.legend.sensor_ray">Färsk sensorstråle</span></span>
+              <span><i class="legend-robot" aria-hidden="true"></i><span data-i18n="map.legend.robot">Robot och riktning</span></span>
+            </div>
+          </section>
+
+          <aside class="map-detail-column" aria-label="Kartmetadata" data-i18n-aria-label="map.details.aria_label">
+            <section class="instrument-panel map-metadata-panel">
+              <header class="instrument-header">
+                <div>
+                  <p class="eyebrow" data-i18n="map.details.eyebrow">Snapshot</p>
+                  <h3 data-i18n="map.details.title">Ursprung och färskhet</h3>
+                </div>
+              </header>
+              <dl class="telemetry-list" id="map-metadata">
+                <div><dt data-i18n="map.details.source">Källa</dt><dd>—</dd></div>
+                <div><dt data-i18n="map.details.age">Ålder</dt><dd>—</dd></div>
+                <div><dt data-i18n="map.details.provenance">Märkning</dt><dd>—</dd></div>
+                <div><dt data-i18n="map.details.version">Kartversion</dt><dd>—</dd></div>
+                <div><dt data-i18n="map.details.robot">Robot</dt><dd>—</dd></div>
+              </dl>
+            </section>
+
+            <section class="instrument-panel map-qualitative-panel">
+              <header class="instrument-header">
+                <div>
+                  <p class="eyebrow" data-i18n="map.qualitative.eyebrow">Icke-metrisk perception</p>
+                  <h3 data-i18n="map.qualitative.title">Kvalitativa observationer</h3>
+                </div>
+                <span class="map-observation-count" id="map-qualitative-count">0</span>
+              </header>
+              <div class="map-qualitative-list" id="map-qualitative-list">
+                <p class="map-qualitative-empty" data-i18n="map.qualitative.empty">Inga kvalitativa observationer i snapshoten.</p>
+              </div>
+            </section>
+
+            <section class="instrument-panel map-objects-panel">
+              <header class="instrument-header">
+                <div>
+                  <p class="eyebrow" data-i18n="map.objects.eyebrow">Aktuella hypoteser</p>
+                  <h3 data-i18n="map.objects.title">Objekt</h3>
+                </div>
+                <span class="map-object-count" id="map-object-count">0</span>
+              </header>
+              <div class="map-object-list" id="map-object-list">
+                <p class="map-object-empty" data-i18n="map.objects.empty">Inga objekthypoteser i snapshoten.</p>
+              </div>
+            </section>
+
+            <div class="map-provenance-note">
+              <strong data-i18n="map.provenance.title">Tolka märkningen</strong>
+              <p data-i18n="map.provenance.body">SIMULATION är genererad geometri. PROVISIONAL IR är ännu inte en verifierad metrisk avståndsmätning.</p>
+            </div>
+          </aside>
         </div>
       </section>
 
@@ -597,9 +707,10 @@
     <footer class="mobile-nav" aria-label="Mobil navigation" data-i18n-aria-label="footer.mobile_nav.aria_label">
       <button type="button" data-view="workbench" class="is-active" aria-current="page"><span aria-hidden="true">01</span><span data-i18n="footer.workbench">Arbetsbänk</span></button>
       <button type="button" data-view="bodies"><span aria-hidden="true">02</span><span data-i18n="footer.bodies">Kroppar</span></button>
-      <button type="button" data-view="events"><span aria-hidden="true">03</span><span data-i18n="footer.events">Händelser</span></button>
-      <button type="button" data-view="experiments"><span aria-hidden="true">04</span><span data-i18n="footer.experiments">Experiment</span></button>
-      <button type="button" data-view="settings"><span aria-hidden="true">05</span><span data-i18n="footer.settings">Inställningar</span></button>
+      <button type="button" data-view="map"><span aria-hidden="true">03</span><span data-i18n="footer.map">Karta</span></button>
+      <button type="button" data-view="events"><span aria-hidden="true">04</span><span data-i18n="footer.events">Händelser</span></button>
+      <button type="button" data-view="experiments"><span aria-hidden="true">05</span><span data-i18n="footer.experiments">Experiment</span></button>
+      <button type="button" data-view="settings"><span aria-hidden="true">06</span><span data-i18n="footer.settings">Inställningar</span></button>
     </footer>
   </div>
 

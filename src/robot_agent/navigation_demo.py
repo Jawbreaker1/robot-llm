@@ -200,7 +200,7 @@ def load_demo_config(path: Path):
     }
 
 
-def run_demo(
+def _build_demo_stack(
     config_path: Path = DEFAULT_CONFIG_PATH,
     with_obstacle: bool = True,
 ):
@@ -249,6 +249,34 @@ def run_demo(
         ),
         plant.clock_ms,
     )
+    return config, plant, supervisor, inbox
+
+
+def run_demo(
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    with_obstacle: bool = True,
+    observation_sink=None,
+):
+    config, plant, supervisor, inbox = _build_demo_stack(
+        config_path,
+        with_obstacle,
+    )
+    return _run_demo_stack(
+        config,
+        plant,
+        supervisor,
+        inbox,
+        observation_sink,
+    )
+
+
+def _run_demo_stack(
+    config,
+    plant,
+    supervisor,
+    inbox,
+    observation_sink=None,
+):
     episode = NavigationEpisode(
         plant,
         supervisor,
@@ -266,8 +294,17 @@ def run_demo(
             max_total_motion_ms=55_000,
             max_no_progress_ticks=120,
         ),
+        observation_sink=observation_sink,
     )
-    return episode.run(config["goal"])
+    result = episode.run(config["goal"])
+    if observation_sink is not None:
+        try:
+            observation_sink(result.final_snapshot)
+        except Exception:
+            # This demo hook is observability only. The terminal STOP has
+            # already been applied and verified by NavigationEpisode.
+            pass
+    return result
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

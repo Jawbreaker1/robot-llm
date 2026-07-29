@@ -9,12 +9,14 @@
     "failed",
   ]);
   const {
+    normalizeSpatialMap,
     TURN_POLL_POLICY,
     replaceRenderedItems,
     transitionTurnPoll,
   } = window.RobotDashboardLogic;
   const EVENT_LIMIT = 100;
   const MAX_LOCAL_EVENTS = 500;
+  const MAP_POLL_INTERVAL_MS = 2000;
 
   const i18n = window.RobotI18n.createDefaultI18n();
   const t = (key, args) => i18n.t(key, args);
@@ -52,6 +54,7 @@
     runtime_unavailable: "errors.runtime_unavailable",
     lm_studio_unreachable: "errors.runtime_unavailable",
     model_not_ready: "errors.model_not_ready",
+    spatial_map_unavailable: "errors.spatial_map_unavailable",
   });
 
   const state = {
@@ -59,6 +62,9 @@
     settings: null,
     originalSettings: null,
     registry: null,
+    spatialMap: null,
+    mapBusy: false,
+    mapConnection: "waiting",
     experiments: [],
     conversation: null,
     activeTurn: null,
@@ -159,6 +165,13 @@
     const translated = t(key);
     return translated === key ? fallback : translated;
   }
+
+  const spatialMapPresenter = window.RobotSpatialMapPresenter.create({
+    document,
+    normalizeSpatialMap,
+    translate: t,
+    formatNumber: (value, options) => i18n.number(value, options),
+  });
 
   function requestError(code, status = null, cause = null) {
     const error = new Error(code);
@@ -536,6 +549,12 @@
       state.readOnlyInvariant = false;
       setStatus("status-motion", "fault", t("capability.rejected"));
     }
+  }
+
+  function renderSpatialMap(spatialMap, connection = "connected") {
+    state.spatialMap = safeObject(spatialMap);
+    state.mapConnection = connection;
+    spatialMapPresenter.render(state.spatialMap, connection);
   }
 
   function renderExperiments(experiments) {
@@ -1491,6 +1510,29 @@
     }
   }
 
+  async function refreshSpatialMap(silent = true) {
+    if (state.mapBusy) {
+      return;
+    }
+    state.mapBusy = true;
+    try {
+      const payload = await api("/api/v1/map", {
+        timeout: 5000,
+      });
+      renderSpatialMap(payload.map, "connected");
+    } catch (error) {
+      renderSpatialMap(state.spatialMap, "offline");
+      if (!silent) {
+        showToast(
+          localizedError(error, "errors.spatial_map_unavailable"),
+          true,
+        );
+      }
+    } finally {
+      state.mapBusy = false;
+    }
+  }
+
   function renderLocalizedState() {
     const activeElement = document.activeElement;
     const activeId = activeElement && activeElement.id;
@@ -1525,6 +1567,7 @@
       renderRegistry(state.bootstrap.registry);
       renderExperiments(state.bootstrap.experiments);
     }
+    renderSpatialMap(state.spatialMap, state.mapConnection);
     renderProbeResult();
     if (state.settings) {
       byId("settings-revision").textContent = t("settings.revision", {
@@ -1675,12 +1718,17 @@
       renderBootstrap(bootstrapPayload);
       renderSettings(settingsPayload.settings || bootstrapPayload.settings);
       probeLMStudio();
+      refreshSpatialMap(true);
     } catch (error) {
       byId("composer-status").textContent = t("server.start_failed");
       showToast(localizedError(error, "server.start_failed"), true);
     }
     pollEvents();
     window.setInterval(() => refreshBootstrap(true), 10000);
+    window.setInterval(
+      () => refreshSpatialMap(true),
+      MAP_POLL_INTERVAL_MS,
+    );
   }
 
   initialize();

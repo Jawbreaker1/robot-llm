@@ -321,6 +321,47 @@ class MissionRunnerTests(unittest.TestCase):
             self.assertEqual(matching[-1].kind, "STOP")
             self.assertTrue(leg.navigation.terminal_stop_verified)
 
+    def test_observation_sink_receives_final_stop_and_cannot_break_motion(self):
+        plant, supervisor, inbox = make_stack()
+        plan = mission_plan(
+            plant,
+            (MissionLeg("observed-leg", 320, 300, 25),),
+        )
+        observations = []
+
+        result = MissionRunner(
+            plant,
+            supervisor,
+            inbox,
+            STARTING_EPOCH,
+            observation_sink=observations.append,
+        ).run(plan)
+
+        self.assertTrue(result.completed)
+        self.assertTrue(observations)
+        self.assertEqual(observations[-1], result.final_snapshot)
+        self.assertFalse(observations[-1].motors_running)
+
+        second_plant, second_supervisor, second_inbox = make_stack()
+        second_plan = mission_plan(
+            second_plant,
+            (MissionLeg("isolated-leg", 320, 300, 25),),
+        )
+
+        def failing_sink(_snapshot):
+            raise RuntimeError("fixture telemetry failure")
+
+        isolated = MissionRunner(
+            second_plant,
+            second_supervisor,
+            second_inbox,
+            STARTING_EPOCH,
+            observation_sink=failing_sink,
+        ).run(second_plan)
+
+        self.assertTrue(isolated.completed)
+        self.assertTrue(isolated.terminal_stop_verified)
+
     def test_stale_activation_is_rejected_without_drive_and_still_stops(self):
         plant, supervisor, inbox = make_stack()
         plan = mission_plan(plant, three_legs())

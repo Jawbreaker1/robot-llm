@@ -282,20 +282,48 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_MODEL,
         help="Exakt modell-ID som LM Studio ska använda",
     )
+    parser.add_argument(
+        "--simulation-map-demo",
+        action="store_true",
+        help=(
+            "Bygg en riktig simulatorisk navigationskarta före start "
+            "och visa den skrivskyddat i GUI:t"
+        ),
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
+    map_runtime = None
     try:
+        if args.simulation_map_demo:
+            from .spatial_mapping_demo import (
+                build_simulation_map_demo,
+            )
+
+            navigation, plant, map_runtime = (
+                build_simulation_map_demo()
+            )
+            if (
+                not navigation.completed
+                or not navigation.terminal_stop_verified
+                or plant.collision_count
+            ):
+                raise RuntimeError(
+                    "Simulator map demo did not complete safely"
+                )
         service = DashboardService(
             base_url=args.lm_studio_url,
             model=args.model,
+            spatial_map_provider=map_runtime,
         )
         server, _router = build_server(service, args.port)
     except (OSError, RuntimeError, ValueError) as error:
         if "service" in locals():
             service.shutdown()
+        if map_runtime is not None:
+            map_runtime.close(drain=False)
         print(
             json.dumps(
                 {
@@ -319,6 +347,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "status": "ready",
                 "url": address,
                 "physical_control_enabled": False,
+                "spatial_map_mode": (
+                    "simulation_demo"
+                    if map_runtime is not None
+                    else "unavailable"
+                ),
             },
             ensure_ascii=False,
         ),
@@ -331,6 +364,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     finally:
         server.server_close()
         service.shutdown()
+        if map_runtime is not None:
+            map_runtime.close()
     return 0
 
 

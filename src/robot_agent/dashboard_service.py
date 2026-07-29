@@ -9,6 +9,7 @@ or any motor-capable module.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import math
 import queue
 import secrets
@@ -63,8 +64,10 @@ from .research_loop import (
 
 SERVICE_SCHEMA = "dashboard-bootstrap/v1"
 RUNTIME_SCHEMA = "dashboard-runtime/v1"
+SPATIAL_MAP_SCHEMA = "robot-spatial-map/v1"
 MAX_CHAT_JOBS = 8
 MAX_HISTORY_MESSAGES = 20
+MAX_SPATIAL_MAP_BYTES = 2 * 1024 * 1024
 LM_PROBE_TIMEOUT_SECONDS = 2.0
 LM_PROBE_MAX_BYTES = 64 * 1024
 _LEVEL_ORDER = {
@@ -79,6 +82,7 @@ EpisodeRunner = Callable[
     ResearchEpisodeResult,
 ]
 ProbeTransport = Callable[..., object]
+SpatialMapProvider = Callable[[], object]
 
 
 class DashboardServiceError(RuntimeError):
@@ -323,6 +327,32 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
     )
 
 
+def _empty_spatial_map() -> Mapping[str, object]:
+    """Return an honest snapshot until a spatial store is connected."""
+
+    return {
+        "schema": SPATIAL_MAP_SCHEMA,
+        "status": "unavailable",
+        "reason_code": "no_spatial_map_provider",
+        "read_only": True,
+        "robot_id": None,
+        "frame_id": None,
+        "map_version": None,
+        "based_on_state_version": None,
+        "based_on_world_model_version": None,
+        "captured_at_unix_ms": None,
+        "source_id": None,
+        "provenance": None,
+        "bounds": None,
+        "resolution_mm": None,
+        "robot_pose": None,
+        "cells": [],
+        "sensor_rays": [],
+        "qualitative_observations": [],
+        "object_hypotheses": [],
+    }
+
+
 def _service_status_for(code: str) -> int:
     if code in (
         "conversation_not_found",
@@ -356,7 +386,23 @@ class DashboardService:
         weather_factory=OpenMeteoWeatherTool,
         probe_transport: ProbeTransport = direct_http_request,
         server_instance_id: Optional[str] = None,
+        spatial_map_provider: Optional[SpatialMapProvider] = None,
     ):
+        spatial_snapshot = getattr(
+            spatial_map_provider,
+            "snapshot",
+            None,
+        )
+        if (
+            spatial_map_provider is not None
+            and not callable(spatial_map_provider)
+            and not callable(spatial_snapshot)
+        ):
+            raise DashboardServiceError(
+                500,
+                "invalid_service_configuration",
+                "Dashboard service configuration is invalid",
+            )
         if (
             isinstance(queue_capacity, bool)
             or not isinstance(queue_capacity, int)
@@ -387,6 +433,12 @@ class DashboardService:
         self._planner_factory = planner_factory
         self._weather_factory = weather_factory
         self._probe_transport = probe_transport
+        if spatial_map_provider is None:
+            self._spatial_map_provider = _empty_spatial_map
+        elif callable(spatial_snapshot):
+            self._spatial_map_provider = spatial_snapshot
+        else:
+            self._spatial_map_provider = spatial_map_provider
         self._jobs = queue.Queue(maxsize=queue_capacity)
         self._job_slots = threading.BoundedSemaphore(queue_capacity)
         self._stop_requested = threading.Event()
@@ -495,6 +547,7 @@ class DashboardService:
             "capabilities": {
                 "chat": True,
                 "research": ["weather.current"],
+                "spatial_map": "read_only",
                 "physical_control": False,
                 "ssh": False,
                 "tts": False,
@@ -510,6 +563,43 @@ class DashboardService:
                 },
             },
         }
+
+    def spatial_map(self):
+        """Return one detached, finite JSON map snapshot.
+
+        The provider is observation-only.  Its result is copied through strict
+        JSON so callers cannot mutate provider state through the dashboard.
+        """
+
+        try:
+            supplied = self._spatial_map_provider()
+            to_dict = getattr(supplied, "to_dict", None)
+            if callable(to_dict):
+                supplied = to_dict()
+            encoded = json.dumps(
+                supplied,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            if len(encoded) > MAX_SPATIAL_MAP_BYTES:
+                raise ValueError("map snapshot is too large")
+            snapshot = strict_json_object(encoded)
+            if (
+                snapshot.get("schema") != SPATIAL_MAP_SCHEMA
+                or snapshot.get("read_only") is not True
+            ):
+                raise ValueError("map snapshot contract mismatch")
+        except DashboardServiceError:
+            raise
+        except Exception:
+            raise DashboardServiceError(
+                503,
+                "spatial_map_unavailable",
+                "Spatial map snapshot is unavailable",
+            ) from None
+        return snapshot
 
     @staticmethod
     def experiments():

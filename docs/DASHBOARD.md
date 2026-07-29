@@ -26,6 +26,17 @@ Porten kan ändras:
 PYTHONPATH=src python3 -m robot_agent.dashboard_cli --port 8877
 ```
 
+För att först köra den riktiga 2D-simulatornavigationen och därefter visa dess
+ackumulerade karta i dashboarden:
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
+  --simulation-map-demo
+```
+
+Flaggan kontaktar ingen EV3. Utan flaggan visar kartytan ärligt att ingen
+kartprovider är ansluten.
+
 ## Språk
 
 Språkväljaren i toppfältet byter hela dashboardens presentationsspråk utan
@@ -52,10 +63,13 @@ Fler språk läggs till som kataloger och tas därefter upp i samma explicita
 locale-allowlist; agent- och säkerhetslogiken behöver inte förgrenas per
 språk.
 
-## Fem ytor
+## Sex ytor
 
 - **Arbetsbänk** visar en versionsmärkt konversation, pågående tur,
   verifierat slutsvar, typad aktivitet och eventuell evidens.
+- **Karta** visar en skrivskyddad snapshot av robotens osäkra lokala
+  världsminne: robotpose, färska sensorstrålar, `FREE`/`UNKNOWN`/`OCCUPIED`
+  rutor och opaka objekthypoteser med källa, ålder och confidence.
 - **Kroppar** visar logiska robotar med controllers och perceptionskällor.
   EV3RSTORM är deklarerad men inte observerad när ingen fysisk probe har
   körts.
@@ -85,6 +99,34 @@ Dialoghistoriken är ett konversationsminne, inte robotens framtida
 världsmodell. Fysiska följdreferenser som “två gånger till” måste senare
 bindas till en separat, explicit action-/state-kontext innan någon exekvering
 kan bli aktuell.
+
+## Kartvyn
+
+Dashboarden pollar den autentiserade, read-only routen `GET /api/v1/map`.
+Resultatet är en frikopplad JSON-snapshot med fast storleksgräns; browsern
+får varken kartans skrivcapability eller någon motorcapability.
+
+Den aktuella simulatorn publicerar tre strålar per snapshot, framåt och
+`±45°`. Avstånden beskriver robotradie-inflated configuration space och ska
+inte tolkas som exakta fysiska objektytor. Kartan fusionerar upprepad positiv
+och negativ evidens genom `UNKNOWN`, så en motstridig mätning vänder inte
+omedelbart en ruta från upptagen till fri eller tvärtom. Sammanhängande
+upptagna rutor blir persistenta, semantiskt opaka `UNKNOWN`-hypoteser. Det
+ger en tydlig framtida söm där kamera-, ljud- eller LLM-klassificering kan
+lägga till en etikett och evidens utan att ändra den geometriska kartan.
+
+Fysisk EV3 `IR-PROX` är en reflektionssignal och får därför bara visas som
+provisorisk kvalitativ evidens. Systemet hittar inte på millimeter, en metrisk
+endpoint, objektidentitet eller positivt fri väg. Gamla strålar försvinner ur
+livevyn medan kartceller och fortfarande stödda objekthypoteser ligger kvar.
+Om den bounded mapping-kön tappar snapshots eller workern får fel markeras
+kartan `degraded`; navigationsloopen fortsätter oberoende.
+
+Detta är ännu inte SLAM, global lokalisering, A*, frontier exploration eller
+ett navigationsfacit. Kartan är inte återkopplad som motorunderlag i denna
+slice. Framtida kameror och flera LEGO-controllers måste publicera explicita
+koordinatramar och kalibrerade transformeringar; observationer från olika
+ramar får inte slås ihop bara för att de tillhör samma logiska robot.
 
 ## Säkerhetsgräns
 

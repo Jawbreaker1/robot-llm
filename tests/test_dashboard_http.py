@@ -72,6 +72,17 @@ class FakeDashboardService:
             "robots": [],
         }
 
+    def spatial_map(self):
+        self.calls.append(("spatial_map",))
+        return {
+            "schema": "robot-spatial-map/v1",
+            "status": "unavailable",
+            "read_only": True,
+            "cells": [],
+            "sensor_rays": [],
+            "object_hypotheses": [],
+        }
+
     def create_conversation(self, title=None):
         self.calls.append(("create_conversation", title))
         return {
@@ -163,6 +174,10 @@ def asset_directory():
     )
     (root / "dashboard_logic.js").write_text(
         '"use strict";\n/* dashboard logic fixture */',
+        encoding="utf-8",
+    )
+    (root / "spatial_map_presenter.js").write_text(
+        '"use strict";\n/* spatial map presenter fixture */',
         encoding="utf-8",
     )
     (root / "app.js").write_text(
@@ -267,6 +282,42 @@ class DashboardHTTPTests(unittest.TestCase):
             [("bootstrap",), ("registry",)],
         )
 
+    def test_spatial_map_is_authenticated_read_only_and_query_free(self):
+        response = self.router.handle(
+            "GET",
+            "/api/v1/map",
+            self.headers(),
+        )
+
+        self.assertEqual(response.status, 200)
+        snapshot = self.decoded(response)["map"]
+        self.assertEqual(snapshot["schema"], "robot-spatial-map/v1")
+        self.assertIs(snapshot["read_only"], True)
+        self.assertEqual(snapshot["cells"], [])
+        self.assertEqual(self.service.calls, [("spatial_map",)])
+
+        unauthenticated = self.router.handle(
+            "GET",
+            "/api/v1/map",
+            self.headers(authenticated=False),
+        )
+        queried = self.router.handle(
+            "GET",
+            "/api/v1/map?robot_id=ev3rstorm-01",
+            self.headers(),
+        )
+        mutation = self.router.handle(
+            "POST",
+            "/api/v1/map",
+            self.headers(mutation=True),
+            b"{}",
+        )
+
+        self.assertEqual(unauthenticated.status, 403)
+        self.assertEqual(queried.status, 400)
+        self.assertEqual(mutation.status, 404)
+        self.assertEqual(self.service.calls, [("spatial_map",)])
+
     def test_every_api_read_and_static_bootstrap_require_session(self):
         unauthenticated_api = self.router.handle(
             "GET",
@@ -300,6 +351,11 @@ class DashboardHTTPTests(unittest.TestCase):
             "/assets/dashboard_logic.js",
             self.headers(authenticated=False),
         )
+        old_presenter_asset_path = self.router.handle(
+            "GET",
+            "/assets/spatial_map_presenter.js",
+            self.headers(authenticated=False),
+        )
         wrong_session = self.router.handle(
             "GET",
             "/session/{}/".format("b" * 64),
@@ -318,6 +374,12 @@ class DashboardHTTPTests(unittest.TestCase):
         logic_asset = self.router.handle(
             "GET",
             self.router.session_path + "assets/dashboard_logic.js",
+            self.headers(authenticated=False),
+        )
+        presenter_asset = self.router.handle(
+            "GET",
+            self.router.session_path
+            + "assets/spatial_map_presenter.js",
             self.headers(authenticated=False),
         )
         mascot_asset = self.router.handle(
@@ -339,6 +401,7 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertEqual(old_asset_path.status, 404)
         self.assertEqual(old_i18n_asset_path.status, 404)
         self.assertEqual(old_logic_asset_path.status, 404)
+        self.assertEqual(old_presenter_asset_path.status, 404)
         self.assertEqual(wrong_session.status, 403)
         self.assertEqual(session_asset.status, 200)
         self.assertEqual(
@@ -368,6 +431,15 @@ class DashboardHTTPTests(unittest.TestCase):
             logic_asset.body,
             b'"use strict";\n/* dashboard logic fixture */',
         )
+        self.assertEqual(presenter_asset.status, 200)
+        self.assertEqual(
+            dict(presenter_asset.headers)["Content-Type"],
+            "text/javascript; charset=utf-8",
+        )
+        self.assertEqual(
+            presenter_asset.body,
+            b'"use strict";\n/* spatial map presenter fixture */',
+        )
         static_routes = tuple(DashboardRouter._STATIC_ROUTES)
         self.assertLess(
             static_routes.index("assets/i18n.js"),
@@ -375,6 +447,10 @@ class DashboardHTTPTests(unittest.TestCase):
         )
         self.assertLess(
             static_routes.index("assets/dashboard_logic.js"),
+            static_routes.index("assets/spatial_map_presenter.js"),
+        )
+        self.assertLess(
+            static_routes.index("assets/spatial_map_presenter.js"),
             static_routes.index("assets/app.js"),
         )
         self.assertEqual(mascot_asset.status, 200)

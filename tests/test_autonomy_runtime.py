@@ -344,6 +344,26 @@ class IdleExplorationRuntimeTests(unittest.TestCase):
         self.assertEqual(plant.applied_pulses[-1].kind, "STOP")
         self.assertIsNone(authority.state.active_owner)
 
+    def test_idle_autonomy_propagates_mapping_observations_through_stop(self):
+        plant, supervisor, inbox, authority = _stack()
+        observations = []
+        service = IdleExplorationService(
+            plant,
+            supervisor,
+            inbox,
+            authority,
+            selector=_selection,
+            clock_ms=plant.clock_ms,
+            observation_sink=observations.append,
+        )
+
+        result = service.run_once()
+
+        self.assertTrue(result.completed)
+        self.assertTrue(observations)
+        self.assertEqual(observations[-1], result.final_snapshot)
+        self.assertFalse(observations[-1].motors_running)
+
     def test_hold_releases_safely_without_driving(self):
         plant, supervisor, inbox, authority = _stack()
         selector = RecordingSelector("HOLD")

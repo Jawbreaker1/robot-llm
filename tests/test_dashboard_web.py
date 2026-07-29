@@ -64,9 +64,17 @@ class DashboardWebContractTests(unittest.TestCase):
         cls.dashboard_logic = (
             WEB_ROOT / "dashboard_logic.js"
         ).read_text(encoding="utf-8")
+        cls.spatial_map_presenter = (
+            WEB_ROOT / "spatial_map_presenter.js"
+        ).read_text(encoding="utf-8")
         cls.javascript = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
         cls.javascript_assets = "\n".join(
-            (cls.i18n, cls.dashboard_logic, cls.javascript)
+            (
+                cls.i18n,
+                cls.dashboard_logic,
+                cls.spatial_map_presenter,
+                cls.javascript,
+            )
         )
         cls.parser = AssetParser()
         cls.parser.feed(cls.html)
@@ -295,6 +303,7 @@ process.stdout.write(JSON.stringify({
             [
                 "assets/i18n.js",
                 "assets/dashboard_logic.js",
+                "assets/spatial_map_presenter.js",
                 "assets/app.js",
             ],
         )
@@ -378,12 +387,21 @@ process.stdout.write(JSON.stringify({
         required = {
             "view-workbench",
             "view-bodies",
+            "view-map",
             "view-events",
             "view-experiments",
             "view-settings",
             "message-feed",
             "composer-form",
             "registry-tree",
+            "spatial-map-canvas",
+            "map-empty-state",
+            "map-empty-title",
+            "map-empty-body",
+            "map-metadata",
+            "map-qualitative-list",
+            "map-qualitative-count",
+            "map-object-list",
             "event-table-body",
             "settings-form",
             "status-motion",
@@ -421,6 +439,57 @@ process.stdout.write(JSON.stringify({
         ):
             with self.subTest(raw_value=raw_value):
                 self.assertIn(">{}<".format(raw_value), self.html)
+
+    def test_spatial_map_surface_is_read_only_empty_and_provenance_aware(self):
+        svg_elements = [
+            attributes
+            for tag, attributes in self.parser.elements
+            if tag == "svg"
+            and attributes.get("id") == "spatial-map-canvas"
+        ]
+
+        self.assertEqual(len(svg_elements), 1)
+        self.assertEqual(svg_elements[0].get("role"), "img")
+        self.assertIn("robot-spatial-map/v1", self.dashboard_logic)
+        self.assertIn("normalizeSpatialMap", self.dashboard_logic)
+        self.assertIn('api("/api/v1/map"', self.javascript)
+        self.assertIn(
+            "RobotSpatialMapPresenter.create",
+            self.javascript,
+        )
+        self.assertIn(
+            "map.sensorRays.forEach",
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            "map.objectHypotheses.forEach",
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            "map.robotPose.headingMdeg",
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            'map.status === "degraded"',
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            "map.qualitativeObservations",
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            'map.status === "qualitative_only"',
+            self.spatial_map_presenter,
+        )
+        self.assertLess(len(self.javascript.splitlines()), 1800)
+        self.assertNotIn("function mapProjection", self.javascript)
+        self.assertIn("map.reason.observation_gap", self.i18n)
+        self.assertIn("SIMULATION", self.i18n)
+        self.assertIn("PROVISIONAL IR", self.i18n)
+        self.assertIn("Ingen karta ännu", self.html)
+        self.assertNotIn("map-drive", self.html)
+        self.assertNotIn("map-waypoint", self.html)
+        self.assertNotIn("map-stop", self.html)
 
     def test_i18n_catalogs_have_the_exact_same_nonempty_keyset(self):
         self.assertTrue(
@@ -864,7 +933,7 @@ process.stdout.write(JSON.stringify({
         static_calls = set(
             re.findall(
                 r"""\b(?:i18n\.)?t\(\s*["']([a-z0-9_.-]+)["']""",
-                self.javascript,
+                self.javascript_assets,
             )
         )
         self.assertTrue(static_calls)
@@ -902,6 +971,10 @@ process.stdout.write(JSON.stringify({
         for filename, source in (
             ("i18n.js", self.i18n),
             ("dashboard_logic.js", self.dashboard_logic),
+            (
+                "spatial_map_presenter.js",
+                self.spatial_map_presenter,
+            ),
             ("app.js", self.javascript),
         ):
             for token in forbidden:
@@ -909,6 +982,7 @@ process.stdout.write(JSON.stringify({
                     self.assertNotIn(token, source)
         self.assertIn("textContent", self.javascript_assets)
         self.assertIn("replaceChildren", self.javascript)
+        self.assertIn("replaceChildren", self.spatial_map_presenter)
         self.assertNotIn("error.message", self.javascript)
         self.assertIn("ERROR_MESSAGE_KEYS", self.javascript)
         self.assertIn("localizedError(", self.javascript)
@@ -920,6 +994,7 @@ process.stdout.write(JSON.stringify({
             "/api/v1/runtime/lm-studio/probe",
             self.javascript,
         )
+        self.assertIn("/api/v1/map", self.javascript)
         for forbidden_route in (
             "/move",
             "/drive",
@@ -955,6 +1030,12 @@ process.stdout.write(JSON.stringify({
         self.assertNotIn("translate(-27px", self.css)
         self.assertNotIn("linear-gradient(", self.css)
         self.assertNotIn("@import", self.css)
+        self.assertIn(".map-layout {", self.css)
+        self.assertIn(".spatial-map-canvas {", self.css)
+        self.assertIn(
+            "grid-template-columns: repeat(6, minmax(0, 1fr))",
+            self.css,
+        )
         composer_meta = self.css[
             self.css.index(".composer-meta {"):
             self.css.index(".composer-meta label")

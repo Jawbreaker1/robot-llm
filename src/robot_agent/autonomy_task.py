@@ -128,6 +128,20 @@ class _IdleTaskExecutorMixin:
             tolerance_mm=1,
         )
 
+    def _offer_observation(
+        self,
+        snapshot: NavigationSnapshot,
+    ) -> None:
+        """Publish telemetry without letting it affect goal ownership."""
+
+        sink = getattr(self, "observation_sink", None)
+        if sink is None:
+            return
+        try:
+            sink(snapshot)
+        except Exception:
+            return
+
     def _verified_stop(
         self,
         goal: WaypointGoal,
@@ -140,6 +154,7 @@ class _IdleTaskExecutorMixin:
                 reason_code="idle_terminal_stop",
             )
             after = self.plant.apply(stop, goal)
+            self._offer_observation(after)
             return (
                 after,
                 (
@@ -234,6 +249,7 @@ class _IdleTaskExecutorMixin:
             snapshot = self.plant.observe(boundary_goal)
         except Exception:
             return None
+        self._offer_observation(snapshot)
         if (
             snapshot.state_version != context.state_version
             or snapshot.world_model_version
@@ -288,6 +304,7 @@ class _IdleTaskExecutorMixin:
     ) -> Union[InterestSelectionContext, IdleTaskResult]:
         try:
             state.snapshot = self.plant.observe(state.boundary_goal)
+            self._offer_observation(state.snapshot)
             if (
                 state.snapshot.motors_running
                 or state.snapshot.touch_pressed
@@ -587,6 +604,7 @@ class _IdleTaskExecutorMixin:
                     self._now_ms,
                     mission_deadline_ms,
                 ),
+                observation_sink=self._offer_observation,
             )
             state.trace.append("MISSION_STARTED")
             mission = runner.run(plan)

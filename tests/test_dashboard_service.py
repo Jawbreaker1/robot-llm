@@ -535,6 +535,154 @@ class DashboardServiceTests(unittest.TestCase):
             all(not node["control_exposed"] for node in registry["nodes"])
         )
         self.assertFalse(bootstrap["capabilities"]["ssh"])
+        self.assertEqual(
+            bootstrap["capabilities"]["spatial_map"],
+            "read_only",
+        )
+
+    def test_spatial_map_defaults_to_an_honest_empty_snapshot(self):
+        service = self.make_service(
+            episode_runner=ScriptedRunner()
+        )
+
+        snapshot = service.spatial_map()
+
+        self.assertEqual(snapshot["schema"], "robot-spatial-map/v1")
+        self.assertEqual(snapshot["status"], "unavailable")
+        self.assertEqual(
+            snapshot["reason_code"],
+            "no_spatial_map_provider",
+        )
+        self.assertIs(snapshot["read_only"], True)
+        self.assertIsNone(snapshot["robot_pose"])
+        self.assertEqual(snapshot["cells"], [])
+        self.assertEqual(snapshot["sensor_rays"], [])
+        self.assertEqual(snapshot["object_hypotheses"], [])
+        self.assertIsNone(snapshot["source_id"])
+        self.assertIsNone(snapshot["provenance"])
+
+    def test_spatial_map_store_is_injected_and_snapshot_is_detached(self):
+        supplied = {
+            "schema": "robot-spatial-map/v1",
+            "status": "available",
+            "read_only": True,
+            "robot_id": "ev3rstorm-01",
+            "frame_id": "SIM_WORLD",
+            "source_id": "navigation-simulator",
+            "provenance": "SIMULATION",
+            "captured_at_unix_ms": 1_785_251_200_000,
+            "bounds": {
+                "min_x_mm": 0,
+                "min_y_mm": 0,
+                "max_x_mm": 2_000,
+                "max_y_mm": 1_200,
+            },
+            "robot_pose": {
+                "x_mm": 500,
+                "y_mm": 400,
+                "heading_mdeg": 90_000,
+            },
+            "cells": [
+                {
+                    "x_mm": 700,
+                    "y_mm": 400,
+                    "state": "FREE",
+                }
+            ],
+            "sensor_rays": [],
+            "object_hypotheses": [],
+        }
+
+        class MapStore:
+            def __init__(self):
+                self.calls = 0
+
+            def snapshot(self):
+                self.calls += 1
+                return supplied
+
+        store = MapStore()
+        service = self.make_service(
+            episode_runner=ScriptedRunner(),
+            spatial_map_provider=store,
+        )
+
+        first = service.spatial_map()
+        first["cells"].append({"state": "OCCUPIED"})
+        second = service.spatial_map()
+
+        self.assertEqual(store.calls, 2)
+        self.assertEqual(second["cells"], supplied["cells"])
+        self.assertIsNot(second, supplied)
+        self.assertIsNot(second["bounds"], supplied["bounds"])
+
+    def test_spatial_map_store_prefers_read_capability_over_call(self):
+        class CapabilitySeparatedStore:
+            def __init__(self):
+                self.reads = 0
+                self.write_calls = 0
+
+            def __call__(self, _observation=None):
+                self.write_calls += 1
+                raise AssertionError("write capability was invoked")
+
+            def snapshot(self):
+                self.reads += 1
+                return {
+                    "schema": "robot-spatial-map/v1",
+                    "status": "unavailable",
+                    "reason_code": "no_observations",
+                    "read_only": True,
+                    "cells": [],
+                    "sensor_rays": [],
+                    "object_hypotheses": [],
+                }
+
+        store = CapabilitySeparatedStore()
+        service = self.make_service(
+            episode_runner=ScriptedRunner(),
+            spatial_map_provider=store,
+        )
+
+        snapshot = service.spatial_map()
+
+        self.assertEqual(snapshot["reason_code"], "no_observations")
+        self.assertEqual(store.reads, 1)
+        self.assertEqual(store.write_calls, 0)
+
+    def test_spatial_map_provider_fails_closed_without_leaking_errors(self):
+        secret = "MAP-PROVIDER-SECRET"
+
+        def broken():
+            raise RuntimeError(secret)
+
+        service = self.make_service(
+            episode_runner=ScriptedRunner(),
+            spatial_map_provider=broken,
+        )
+        with self.assertRaises(DashboardServiceError) as raised:
+            service.spatial_map()
+
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(
+            raised.exception.code,
+            "spatial_map_unavailable",
+        )
+        self.assertNotIn(secret, str(raised.exception))
+
+        invalid = self.make_service(
+            episode_runner=ScriptedRunner(),
+            spatial_map_provider=lambda: {
+                "schema": "wrong/v1",
+                "read_only": True,
+            },
+        )
+        with self.assertRaises(DashboardServiceError) as mismatch:
+            invalid.spatial_map()
+        self.assertEqual(
+            mismatch.exception.code,
+            "spatial_map_unavailable",
+        )
 
     def test_bootstrap_uses_typed_catalog_keys_for_curated_copy(self):
         service = self.make_service(

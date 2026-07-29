@@ -679,6 +679,33 @@ class PlannerAdmissionPolicyTests(unittest.TestCase):
 
 
 class ConcurrentNavigationTests(unittest.TestCase):
+    def test_external_mapping_sink_is_isolated_and_receives_final_stop(self):
+        plant, supervisor, inbox, published = make_stack(
+            obstacle=False
+        )
+        observations = []
+        runtime = ConcurrentBehaviorRuntime(
+            plant,
+            supervisor,
+            inbox,
+            waypoint(x_mm=260),
+            response_locale="en",
+            behaviors=(GoalSeekingBehavior(),),
+            navigation_limits=short_limits(20),
+            tick_hook=waiting_tick(published),
+            navigation_observation_sink=observations.append,
+        )
+
+        result = runtime.run()
+
+        self.assertTrue(result.navigation.completed)
+        self.assertTrue(observations)
+        self.assertEqual(
+            observations[-1],
+            result.navigation.final_snapshot,
+        )
+        self.assertFalse(observations[-1].motors_running)
+
     def test_blocked_expression_planner_does_not_block_navigation(self):
         plant, supervisor, inbox, published = make_stack()
         planner_entered = threading.Event()

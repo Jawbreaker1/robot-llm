@@ -209,6 +209,92 @@ backend för en pollande flerpulsloop. En fysisk adapter kräver därför en
 senare protokollgrind med batterier, persistent heartbeat/preemption,
 kalibrering, stopplatens och felinjektion – inte en SSH-session per tick.
 
+### Asynkront spatialt världsminne
+
+Navigationens immutabla snapshots kan nu förgrenas till en separat
+mapping-pipeline utan att göra perception till en del av motorbeslutet:
+
+```mermaid
+flowchart LR
+    N["NavigationSnapshot<br/>pose · state/world version · rays"]
+    Q["Bounded drop-oldest relay<br/>offer_nowait"]
+    W["SpatialMap worker<br/>raycast · occupancy fusion · clustering"]
+    M["Immutable bounded map<br/>revision · frame · provenance"]
+    D["Read-only dashboard snapshot"]
+    C["Framtida vision/LLM classifier"]
+    S["MotionSupervisor"]
+
+    N --> Q
+    Q --> W
+    W --> M
+    M --> D
+    M -.->|"opaka hypoteser + evidens"| C
+    N --> S
+    M -.->|"ingen kontrollkoppling i denna slice"| S
+```
+
+`offer_nowait` gör endast typkontroll, hoststämpling och en O(1)-köoperation.
+Rayprojektion, griduppdatering, connected-components, immutable snapshot och
+dashboardserialisering körs på mapping-workern eller lästråden, aldrig i
+motionsticken. När kön är full kastas den äldsta ännu obehandlade
+observationen. Ett sådant gap, eller ett mapperfel, gör kartan explicit
+`degraded`; det får varken blockera, stoppa eller auktorisera hjulen.
+Slutlig verifierad STOP-snapshot publiceras även från mission-, idle- och
+concurrent-sömmarna. Kartans läs- och skrivcapabilities är separata:
+dashboarden får endast en snapshot-provider och mappingkärnan har ingen
+referens till `ProposalInbox`, `MotionAuthority`, motorbuss eller fysisk
+adapter.
+
+Kartan är en identitets- och rambunden, trådsäker LRU-grid med fast celltak.
+Varje accepterad snapshot måste vara nyare i state-version, world-model-
+version och tidsordning. Simulatorstrålar vid `0°`, `+45°` och `−45°`
+markerar passerade celler som fri evidens och en träff före maxrange som
+upptagen evidens. Motstridig evidens går genom `UNKNOWN`; en enda ny mätning
+byter därför inte tvärt mellan `FREE` och `OCCUPIED`. Kartan behåller
+provenance, evidensräknare, ålder, senaste pose och en egen monoton
+`map_version`.
+
+De tre strålarna i samma snapshot betraktas som korrelerade och reduceras
+först till högst en uppdatering per cell. En explicit occupied endpoint
+dominerar att en annan samtidig stråle passerar samma grova cell. Ett nyare
+robot-state med exakt samma sensor-timestamp uppdaterar pose och
+`map_version`, men fuserar eller reprojicerar inte samma sensorprov igen.
+Vid en högre auktoritativ `world_model_version` invalidieras däremot all
+gammal geometrisk och kvalitativ evidens innan den nya generationens prov
+tas in, även om simulatorklockan inte hunnit ticka. Den första säkra slicen
+väljer alltså ett ärligt generationsreset framför att presentera ett borttaget
+objekt som aktuellt; partiell dynamisk kartassociation kommer senare.
+
+Simulatorns avstånd och endpoints beskriver robotradie-inflated
+configuration space från dess kollisionsmodell, inte ett exakt fysiskt
+objekts yta. Ett betrott simulator-ID får följa träffevidensen men rensas när
+senare positiv fri-evidens motbevisar cellen. Fysisk `IR-PROX` korsar aldrig
+den metriska gränsen: den lagras endast som lågkonfidens,
+`PROVISIONAL_QUALITATIVE` evidens i robotens lokala basram, utan uppfunnet
+millimeteravstånd, endpoint eller objektidentitet.
+
+Sammanhängande upptagna celler ger persistenta, opaka objekthypoteser med
+centroid, bounds, första/senaste observation, confidence och evidenslinje.
+Den enda semantiska etiketten är än så länge `UNKNOWN`. Det är avsiktligt:
+en framtida kamera-, ljud- eller LLM-klassificerare ska föreslå en separat,
+tidsstämplad semantisk hypotes mot detta ID och denna kartrevision, inte
+skriva om geometrin eller direkt skapa motorhandling. Hypotesen kan ligga
+kvar när objektet lämnar senaste sensorstrålen så länge dess occupied-celler
+fortfarande stöds.
+Ett unikt betrott simulatorobjekt ger ett geometriskt stabilt hashat
+hypotes-ID. En okänd komponent ankras i sin äldsta fortfarande stödda
+occupied-evidens, så tillväxt åt valfri riktning inte byter ID. Rensas eller
+evikteras ankaret, eller splittras/mergeas komponenter, måste en framtida
+klassificerare ändå revalidera mot aktuell `map_version`; full multi-object
+tracking ingår inte ännu.
+
+Detta är ett osäkert lokalt världsminne, inte SLAM, loop closure, global
+lokalisering, frontier planner, A* eller bevis för att osedd yta är fri.
+Navigationen konsumerar ännu inte kartan. När kameror, mikrofoner och flera
+LEGO-controllers ansluts måste varje observation bära explicit frame och
+kalibrerad transform; kartor från olika controllers får inte fusioneras utan
+en verifierad gemensam ram.
+
 ### Versionsbundet missionslager
 
 `MissionRunner` ligger ovanför den oförändrade waypointloopen och exekverar

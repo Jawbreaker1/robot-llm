@@ -147,6 +147,10 @@ class DashboardRouter:
             "dashboard_logic.js",
             "text/javascript; charset=utf-8",
         ),
+        "assets/spatial_map_presenter.js": (
+            "spatial_map_presenter.js",
+            "text/javascript; charset=utf-8",
+        ),
         "assets/app.js": (
             "app.js",
             "text/javascript; charset=utf-8",
@@ -534,6 +538,16 @@ class DashboardRouter:
                 )
             value = self._service_call(self._service.registry)
             return self._response(200, {"registry": value})
+
+        if method == "GET" and path == "/api/v1/map":
+            if parsed.query:
+                raise DashboardHTTPError(
+                    400,
+                    "invalid_query",
+                    "Map endpoint accepts no query",
+                )
+            value = self._service_call(self._service.spatial_map)
+            return self._response(200, {"map": value})
 
         if method == "POST" and path == "/api/v1/conversations":
             if parsed.query:

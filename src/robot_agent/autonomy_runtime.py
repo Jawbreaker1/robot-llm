@@ -49,7 +49,7 @@ from .navigation_contract import (
 from .navigation_episode import NavigationLimits
 from .navigation_mission_contract import MissionLimits
 from .navigation_simulator import DifferentialDriveSimulator
-from .navigation_state import ProposalInbox
+from .navigation_state import NavigationSnapshot, ProposalInbox
 from .navigation_supervisor import MotionSupervisor
 
 
@@ -78,6 +78,9 @@ class IdleExplorationService(_IdleTaskExecutorMixin):
         memory: Optional[ExplorationMemory] = None,
         range_tracker: Optional[RangeObservationTracker] = None,
         duty_cycle_limits: IdleDutyCycleLimits = IdleDutyCycleLimits(),
+        observation_sink: Optional[
+            Callable[[NavigationSnapshot], None]
+        ] = None,
     ):
         if not isinstance(plant, DifferentialDriveSimulator):
             raise NavigationContractError(
@@ -143,10 +146,13 @@ class IdleExplorationService(_IdleTaskExecutorMixin):
         )
         if not callable(clock_ms) or (
             id_factory is not None and not callable(id_factory)
+        ) or (
+            observation_sink is not None
+            and not callable(observation_sink)
         ):
             raise NavigationContractError(
                 "invalid_idle_dependency",
-                "Idle clock or ID factory is invalid",
+                "Idle clock, ID factory, or observation sink is invalid",
             )
         if memory is None:
             memory = ExplorationMemory(
@@ -190,6 +196,7 @@ class IdleExplorationService(_IdleTaskExecutorMixin):
         self.memory = memory
         self.range_tracker = range_tracker
         self.duty_cycle_limits = duty_cycle_limits
+        self.observation_sink = observation_sink
         self.candidate_generator = SimulatorCandidateGenerator(
             plant,
             memory,

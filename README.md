@@ -85,6 +85,7 @@ Status snapshot: **2026-07-29**.
 | Lab Console | Local Gemma chat, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | No motor, SSH, TTS, or stop routes exist in the dashboard |
 | RobotAPI loop | Typed, snapshot-bound arm API and a closed `observe → plan → act → verify → replan` loop | Simulator-only and currently driven by a scripted fake planner |
 | Navigation | Waypoint following, obstacle avoidance, version-bound multi-waypoint missions, self-directed idle exploration, one MotionSupervisor, and an independent collision oracle | 2D simulator only; Gemma selects opaque host-created opportunities, not arbitrary coordinates or physical commands |
+| Spatial map | Continuous bounded occupancy fusion, robot pose, fresh sensor rays, and persistent opaque object hypotheses in a read-only Lab Console map | Simulator metric ranges only; physical EV3 IR remains non-metric, provisional evidence rather than a claim about distance or free space |
 | Concurrent interaction | Independent bounded workers plus one live local-Gemma simulator run where model speech overlapped a later navigation tick | Virtual callbacks only; no physical drive, speaker, or arm adapter |
 | Physical autonomy | Not enabled | Waiting for reliable EV3 power, physical transport validation, calibration, stop-latency evidence, and fault injection |
 
@@ -144,6 +145,22 @@ reacquired unknown obstruction still invalidates it. Physical gestures retain
 the stricter exact-snapshot check. A per-object cooldown and total planner
 budget stop repeated sensor reacquisition from turning into model or speech
 spam.
+
+Navigation snapshots can also feed a separate spatial-map worker through a
+bounded, non-blocking, drop-oldest relay. Ray projection, occupancy fusion,
+object clustering, and dashboard serialization never run on the motion tick.
+The map keeps explicit `FREE`, `UNKNOWN`, and `OCCUPIED` evidence, the latest
+robot pose and sensor rays, and opaque persistent `UNKNOWN` object hypotheses
+that a later vision or language classifier can enrich without rewriting the
+geometric safety layer. Relay gaps and mapping failures make the map visibly
+degraded; they never stop or authorize motion.
+
+The current metric map is deliberately simulator-only. Its ranges describe
+robot-radius-inflated configuration space used by the collision simulator,
+not exact physical object surfaces. EV3 `IR-PROX` is stored only as
+low-confidence qualitative evidence with no invented millimetres or occupied
+endpoint. This is an uncertain local world memory—not SLAM, global
+localization, a path planner, or proof that an unseen area is clear.
 
 Above a single waypoint episode, the simulator now accepts a strict,
 version-bound mission plan containing up to eight semantic waypoint legs.
@@ -237,7 +254,10 @@ Verified or enforced today:
 - simulator-only self-directed exploration with an exclusive goal lease,
   opaque model-selected opportunities, persistent wandering budgets, bounded
   ordered user preemption, stale-world replanning, and verified terminal
-  stops.
+  stops;
+- a bounded asynchronous spatial-map worker and authenticated read-only map
+  endpoint; mapping has no reference to the proposal inbox, motion authority,
+  motor bus, or physical adapter.
 
 Still required before autonomous physical motion:
 
@@ -303,6 +323,29 @@ Use `--scenario clear` for a direct waypoint and `--full` for the reproducible
 tick trace. Every measurement in `config/navigation_simulation.json` is
 labelled `simulation_only`. The command cannot import RobotAPI, SSH transport,
 or the EV3 HAL.
+
+### Build and inspect the spatial map
+
+Run the same bounded obstacle-navigation episode while accumulating an
+occupancy map:
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.spatial_mapping_demo
+```
+
+To inspect that completed simulator map in the Lab Console:
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
+  --simulation-map-demo
+```
+
+Open the session URL and choose **Map**. The view is read-only and shows
+uncertain/free/occupied cells, the final robot pose, fresh sensor rays,
+source and age metadata, and opaque object hypotheses. The flag runs a real
+simulator episode before the dashboard starts; without it the map honestly
+reports that no provider is connected. Neither command contacts EV3
+hardware.
 
 ### Run self-directed idle exploration
 
@@ -451,7 +494,7 @@ This is a manual hardware test, not autonomous navigation. Read the full
 
 | Measurement | Result |
 |---|---:|
-| Hardware-free test suite | `656 / 656` passing |
+| Hardware-free test suite | `700 / 700` passing |
 | Physical supervisor preflight | `completed`, `0` motor-start commands |
 | Straight physical B/C pulse | `+175° / +175°` |
 | Physical B/C turn pulse | `+172° / −170°` |
@@ -462,6 +505,7 @@ This is a manual hardware test, not autonomous navigation. Read the full
 | Gemma proposal in one physical shadow run | `417 ms` |
 | Live concurrent Gemma simulator run | `1` accepted expression; speech/navigation interleaving observed; `98` actions; verified stop |
 | Live idle Gemma range-change run | `2 / 2` self-selected tasks; same box `207 → 357 mm`; `22` actions; `0` collisions; verified stop |
+| Spatial-map simulator run | `100` fused snapshots; `193` retained cells; `9` opaque hypotheses; `98` actions; `0` collisions; verified stop |
 
 The IR figures verify filtering and hysteresis in stationary tests. They are
 not motor stop time, braking distance, a real-time guarantee, or a benchmark.
@@ -488,10 +532,14 @@ Protocols, limitations, and raw data are in the
   Gemma-selected waypoint opportunities, cancelable single-flight selection,
   goal leases, bounded user preemption, retry memory, and persistent wandering
   budgets
+- [x] Asynchronous simulator spatial map with bounded occupancy evidence,
+  persistent unknown-object hypotheses, and a read-only live GUI view
 - [ ] Reliable EV3 power and physical motion-free foreground handshake
 - [ ] Physical RobotAPI adapter, semantic tools, calibration, and safety
   evidence
 - [ ] Gemma-driven physical `ACT`/`ABORT` loop behind a separate motion gate
+- [ ] Map-informed frontier planning and semantic classification of persistent
+  hypotheses, with confidence and evidence lineage
 - [ ] Push-to-talk STT through the Mac microphone
 - [ ] Wi-Fi, camera, microphones, vision, and sound-source localization
 - [ ] Multi-controller orchestration across EV3, Robot Inventor, and BOOST

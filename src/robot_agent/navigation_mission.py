@@ -11,7 +11,7 @@ EV3 HAL, or any physical transport.
 """
 
 import threading
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from .navigation_contract import (
     NavigationContractError,
@@ -66,6 +66,9 @@ class MissionRunner:
         per_leg_limits: NavigationLimits = NavigationLimits(),
         mission_limits: MissionLimits = MissionLimits(),
         cancel_event=None,
+        observation_sink: Optional[
+            Callable[[NavigationSnapshot], None]
+        ] = None,
     ):
         if not isinstance(plant, DifferentialDriveSimulator):
             raise NavigationContractError(
@@ -105,6 +108,13 @@ class MissionRunner:
                 "invalid_cancel_event",
                 "Cancel event must expose is_set()",
             )
+        if observation_sink is not None and not callable(
+            observation_sink
+        ):
+            raise NavigationContractError(
+                "invalid_observation_sink",
+                "Mission observation sink must be callable",
+            )
         self.plant = plant
         self.supervisor = supervisor
         self.inbox = inbox
@@ -112,8 +122,23 @@ class MissionRunner:
         self.per_leg_limits = per_leg_limits
         self.mission_limits = mission_limits
         self.cancel_event = cancel_event
+        self.observation_sink = observation_sink
         self._run_lock = threading.Lock()
         self._has_run = False
+
+    def _offer_observation(
+        self,
+        snapshot: NavigationSnapshot,
+    ) -> None:
+        """Keep optional telemetry isolated from physical decisions."""
+
+        if self.observation_sink is None:
+            return
+        try:
+            self.observation_sink(snapshot)
+        except Exception:
+            # A map consumer is observability, never motion authority.
+            return
 
     def _goal(self, plan: MissionPlan, index: int) -> WaypointGoal:
         leg = plan.legs[index]
@@ -238,7 +263,7 @@ class MissionRunner:
             and not final_snapshot.active_faults
             and elapsed_ms <= self.mission_limits.max_elapsed_ms
         )
-        return MissionResult(
+        result = MissionResult(
             plan_id=plan.plan_id,
             completed=completed,
             termination=termination,
@@ -255,6 +280,8 @@ class MissionRunner:
             terminal_stop_verified=terminal_stop_verified,
             leg_results=values,
         )
+        self._offer_observation(final_snapshot)
+        return result
 
     def _verified_stop(
         self,
@@ -369,6 +396,7 @@ class MissionRunner:
                     ObstacleAvoidanceBehavior(),
                 ),
                 limits=limits,
+                observation_sink=self._offer_observation,
                 cancel_event=self.cancel_event,
                 required_world_model_version=(
                     plan.based_on_world_model_version

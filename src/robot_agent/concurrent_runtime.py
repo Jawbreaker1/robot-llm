@@ -609,6 +609,9 @@ class ConcurrentBehaviorRuntime:
             lambda: int(time.monotonic() * 1_000)
         ),
         tick_hook: Optional[TickHook] = None,
+        navigation_observation_sink: Optional[
+            Callable[[NavigationSnapshot], None]
+        ] = None,
     ):
         if not isinstance(plant, DifferentialDriveSimulator):
             raise NavigationContractError(
@@ -655,6 +658,10 @@ class ConcurrentBehaviorRuntime:
             ("speaker", speaker),
             ("arm_segment_executor", arm_segment_executor),
             ("tick_hook", tick_hook),
+            (
+                "navigation_observation_sink",
+                navigation_observation_sink,
+            ),
         ):
             if callback is not None and not callable(callback):
                 raise ValueError("{} must be callable".format(name))
@@ -705,6 +712,9 @@ class ConcurrentBehaviorRuntime:
         self._host_clock_ms = host_clock_ms
         self._tick_hook = (
             self._default_tick_hook if tick_hook is None else tick_hook
+        )
+        self._navigation_observation_sink = (
+            navigation_observation_sink
         )
 
         self._cancel_event = threading.Event()
@@ -844,7 +854,24 @@ class ConcurrentBehaviorRuntime:
             )
             return False
 
+    def _offer_navigation_observation(
+        self,
+        snapshot: NavigationSnapshot,
+    ) -> None:
+        sink = self._navigation_observation_sink
+        if sink is None:
+            return
+        try:
+            sink(snapshot)
+        except Exception as error:
+            self._events.append(
+                "spatial-map",
+                "observation_sink_failure",
+                type(error).__name__,
+            )
+
     def _observation_sink(self, snapshot: NavigationSnapshot) -> None:
+        self._offer_navigation_observation(snapshot)
         self._metrics.add("navigation_snapshots")
         for source_id, target in self._behavior_queues.items():
             self._put_latest(target, snapshot, source_id)
@@ -1540,6 +1567,9 @@ class ConcurrentBehaviorRuntime:
         )
         try:
             navigation = episode.run(self.goal)
+            self._offer_navigation_observation(
+                navigation.final_snapshot
+            )
         finally:
             self._cancel_event.set()
             self._pause_acknowledged.set()
