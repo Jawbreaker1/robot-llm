@@ -7,12 +7,13 @@
 ![Physical motion: manual only](https://img.shields.io/badge/physical%20motion-manual%20only-f59e0b)
 ![Navigation: simulator only](https://img.shields.io/badge/navigation-simulator%20only-2563eb)
 
-**Give a local LLM goals—not motor access.**
+**Building a physical LEGO robot with a local LLM as its brain.**
 
-Robot LLM Lab is an embodied-agent research project. It explores how a local
-LLM can become the conversational, planning, and reasoning layer for a LEGO
-EV3 robot while deterministic software—not the model—retains exclusive,
-bounded, and interruptible control of every physical action.
+Robot LLM Lab is an embodied-agent research project built around a LEGO
+EV3RSTORM. The goal is for a local LLM to understand instructions, form
+plans, converse, choose high-level actions, observe the results, and replan.
+In that architecture, the model decides what the robot should try to do;
+deterministic software decides whether and how the motors may carry it out.
 
 > **Research question:** Can asynchronous LLM reasoning, dialogue, and
 > perception produce useful closed-loop robot behavior while a deterministic
