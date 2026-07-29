@@ -852,6 +852,13 @@ textarea:focus-visible,
   white-space: normal;
 }
 
+.composer-input-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px;
+  gap: 9px;
+  align-items: stretch;
+}
+
 .composer textarea {
   display: block;
   width: 100%;
@@ -873,6 +880,119 @@ textarea:focus-visible,
 
 .composer textarea:focus {
   border-color: rgb(110 214 196 / 55%);
+}
+
+.microphone-button {
+  display: grid;
+  min-height: 74px;
+  place-items: center;
+  align-content: center;
+  gap: 7px;
+  padding: 9px;
+  color: var(--text-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #11181b;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.microphone-button:hover:not(:disabled) {
+  color: var(--ready);
+  border-color: rgb(110 214 196 / 48%);
+}
+
+.microphone-button[aria-pressed="true"] {
+  color: var(--danger);
+  border-color: rgb(255 107 98 / 48%);
+  background: rgb(255 107 98 / 7%);
+}
+
+.microphone-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.microphone-glyph {
+  position: relative;
+  width: 17px;
+  height: 23px;
+  border: 2px solid currentcolor;
+  border-radius: 9px;
+}
+
+.microphone-glyph::before {
+  position: absolute;
+  right: -6px;
+  bottom: -6px;
+  left: -6px;
+  height: 11px;
+  content: "";
+  border: 2px solid currentcolor;
+  border-top: 0;
+  border-radius: 0 0 10px 10px;
+}
+
+.microphone-glyph::after {
+  position: absolute;
+  bottom: -10px;
+  left: 6px;
+  width: 2px;
+  height: 5px;
+  content: "";
+  background: currentcolor;
+}
+
+.microphone-feedback {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.35fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 24px;
+  margin-top: 7px;
+}
+
+.microphone-feedback > span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--faint);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.microphone-meter {
+  position: relative;
+  height: 6px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--panel-deep);
+}
+
+.microphone-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: var(--ready);
+  transition: width 70ms linear;
+}
+
+.microphone-meter-threshold {
+  position: absolute;
+  z-index: 1;
+  top: -2px;
+  bottom: -2px;
+  left: 50%;
+  width: 1px;
+  background: var(--warning);
+}
+
+.microphone-cancel {
+  padding: 2px 0;
+  color: var(--danger);
+  font-size: 9px;
 }
 
 .composer-footer {
@@ -2084,6 +2204,10 @@ textarea:focus-visible,
   margin: 0 auto;
 }
 
+.microphone-settings-form {
+  margin-bottom: 13px !important;
+}
+
 .settings-view .page-header {
   max-width: 1080px;
 }
@@ -2166,6 +2290,77 @@ textarea:focus-visible,
 
 .field input:invalid {
   border-color: var(--danger);
+}
+
+.microphone-range-field > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.microphone-range-field output {
+  color: var(--ready);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.microphone-range-field input[type="range"] {
+  min-height: 37px;
+  padding: 0;
+  accent-color: var(--ready);
+}
+
+.microphone-processing {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0 17px 17px;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: var(--line-soft);
+}
+
+.microphone-processing legend {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.microphone-processing label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 9px 10px;
+  color: var(--muted);
+  background: var(--panel-deep);
+  font-size: 9px;
+}
+
+.microphone-processing input {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--ready);
+}
+
+.microphone-settings-footer {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  margin: 0 17px 17px;
+}
+
+.microphone-meter.is-settings {
+  height: 8px;
 }
 
 .inline-result {
@@ -2627,6 +2822,10 @@ textarea:focus-visible,
     grid-template-columns: 1fr;
   }
 
+  .microphone-processing {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .capability-matrix {
     grid-template-columns: repeat(2, 1fr);
   }
@@ -2691,6 +2890,14 @@ textarea:focus-visible,
     width: 100%;
   }
 
+  .composer-input-shell {
+    grid-template-columns: minmax(0, 1fr) 64px;
+  }
+
+  .microphone-feedback {
+    grid-template-columns: minmax(80px, 0.3fr) minmax(0, 1fr) auto;
+  }
+
   .composer-footer > span {
     max-width: 58%;
   }
@@ -2744,6 +2951,11 @@ textarea:focus-visible,
   }
 
   .capability-matrix {
+    grid-template-columns: 1fr;
+  }
+
+  .microphone-processing,
+  .microphone-settings-footer {
     grid-template-columns: 1fr;
   }
 }

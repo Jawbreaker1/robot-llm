@@ -1,5 +1,6 @@
 import json
 import os
+import struct
 import subprocess
 import sys
 import threading
@@ -24,6 +25,7 @@ from robot_agent.research_loop import (
     ResearchEvidenceEnvelope,
     ResearchEpisodeResult,
 )
+from robot_agent.stt_contract import ProviderTranscription
 
 
 def episode(
@@ -99,6 +101,76 @@ class BlockingRunner:
         return self.result
 
 
+class ScriptedSpeechProvider:
+    provider_id = "fixture-stt"
+    model_id = "fixture-multilingual-v1"
+
+    def __init__(self, text="Vinka med höger arm."):
+        self.text = text
+        self.calls = []
+        self.probe_calls = 0
+
+    def transcribe(self, request):
+        self.calls.append(request)
+        return ProviderTranscription(
+            text=self.text,
+            provider_id=self.provider_id,
+            model_id=self.model_id,
+            detected_language="sv",
+        )
+
+    def probe(self):
+        self.probe_calls += 1
+        return {
+            "state": "online",
+            "provider_id": self.provider_id,
+            "model_id": self.model_id,
+        }
+
+
+class BlockingSpeechProvider(ScriptedSpeechProvider):
+    def __init__(self, text="Vinka med höger arm."):
+        super().__init__(text)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def transcribe(self, request):
+        self.calls.append(request)
+        self.started.set()
+        if not self.release.wait(5):
+            raise RuntimeError("test speech provider timed out")
+        return ProviderTranscription(
+            text=self.text,
+            provider_id=self.provider_id,
+            model_id=self.model_id,
+            detected_language="sv",
+        )
+
+
+def canonical_wav(duration_ms=250, sample=0):
+    sample_count = 16_000 * duration_ms // 1_000
+    data = struct.pack("<h", sample) * sample_count
+    return (
+        b"RIFF"
+        + struct.pack("<I", 36 + len(data))
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack(
+            "<IHHIIHH",
+            16,
+            1,
+            1,
+            16_000,
+            32_000,
+            2,
+            16,
+        )
+        + b"data"
+        + struct.pack("<I", len(data))
+        + data
+    )
+
+
 def wait_for_terminal(service, turn_id, timeout=5):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -111,6 +183,16 @@ def wait_for_terminal(service, turn_id, timeout=5):
             return value
         time.sleep(0.005)
     raise AssertionError("turn did not become terminal")
+
+
+def wait_for_transcription(service, transcription_id, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = service.get_transcription(transcription_id)
+        if value["status"] in ("completed", "failed", "cancelled"):
+            return value
+        time.sleep(0.005)
+    raise AssertionError("transcription did not become terminal")
 
 
 class DashboardServiceTests(unittest.TestCase):
@@ -392,6 +474,123 @@ class DashboardServiceTests(unittest.TestCase):
         self.assertNotIn(user_secret, encoded)
         self.assertNotIn(exception_secret, encoded)
 
+    def test_speech_runs_independently_and_event_log_stays_private(self):
+        blocker = BlockingRunner(
+            episode(ANSWERED, answer_text="Chatten är klar.")
+        )
+        transcript_secret = "HEMLIG TRANSKRIBERING 817"
+        provider = ScriptedSpeechProvider(transcript_secret)
+        service = self.make_service(
+            episode_runner=blocker,
+            speech_transcriber=provider,
+        )
+        conversation = service.create_conversation()
+        chat_turn = self.submit(
+            service,
+            conversation,
+            "parallel-chat",
+            "Blockera forskningsarbetaren",
+            "conversation",
+        )
+        self.assertTrue(blocker.started.wait(1))
+        wav = canonical_wav(sample=317)
+
+        submitted = service.submit_transcription(
+            "parallel-voice",
+            "sv-SE",
+            wav,
+        )
+        transcribed = wait_for_transcription(
+            service,
+            submitted["transcription_id"],
+        )
+
+        self.assertEqual(transcribed["status"], "completed")
+        self.assertEqual(transcribed["text"], transcript_secret)
+        self.assertEqual(transcribed["detected_language"], "sv")
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(provider.calls[0].language_hint, "sv")
+        self.assertEqual(
+            service.get_turn(chat_turn["turn_id"])["status"],
+            "running",
+        )
+
+        encoded_events = json.dumps(
+            service.events(0, 1_000),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertNotIn(transcript_secret, encoded_events)
+        self.assertNotIn(provider.calls[0].audio.sha256, encoded_events)
+        self.assertNotIn("wav_bytes", encoded_events)
+        self.assertNotIn("audio_sha256", encoded_events)
+
+        blocker.release.set()
+        self.assertEqual(
+            wait_for_terminal(service, chat_turn["turn_id"])["status"],
+            "answered",
+        )
+
+    def test_speech_cancellation_discards_late_result_and_stays_private(self):
+        transcript_secret = "CANCELLED TRANSCRIPT MUST NOT LEAK 991"
+        provider = BlockingSpeechProvider(transcript_secret)
+        service = self.make_service(speech_transcriber=provider)
+        submitted = service.submit_transcription(
+            "cancel-service-voice",
+            "sv",
+            canonical_wav(sample=913),
+        )
+        self.assertTrue(provider.started.wait(1))
+
+        cancelled = service.cancel_transcription(
+            submitted["transcription_id"]
+        )
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["error_code"], "stt_cancelled")
+        self.assertTrue(cancelled["provider_work_pending"])
+        self.assertTrue(cancelled["audio"]["retained"])
+        self.assertNotIn("text", cancelled)
+
+        provider.release.set()
+        deadline = time.monotonic() + 1
+        while True:
+            final = service.get_transcription(
+                submitted["transcription_id"]
+            )
+            if final["late_provider_result_discarded"]:
+                break
+            if time.monotonic() >= deadline:
+                self.fail("late speech result was not discarded")
+            time.sleep(0.001)
+        self.assertEqual(final["status"], "cancelled")
+        self.assertFalse(final["provider_work_pending"])
+        self.assertFalse(final["audio"]["retained"])
+        self.assertNotIn("text", final)
+
+        deadline = time.monotonic() + 1
+        while True:
+            event_page = service.events(0, 1_000)
+            event_types = [
+                event["event_type"]
+                for event in event_page["events"]
+            ]
+            if "stt.transcription_late_result_discarded" in event_types:
+                break
+            if time.monotonic() >= deadline:
+                self.fail("speech cancellation events were not recorded")
+            time.sleep(0.001)
+        encoded_events = json.dumps(
+            event_page,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertIn("stt.transcription_cancelled", event_types)
+        self.assertNotIn(transcript_secret, encoded_events)
+        self.assertNotIn(provider.calls[0].audio.sha256, encoded_events)
+        self.assertNotIn("wav_bytes", encoded_events)
+        self.assertNotIn("audio_sha256", encoded_events)
+
     def test_episode_result_for_another_turn_fails_closed(self):
         stale = replace(
             episode(ANSWERED, answer_text="Fel tur"),
@@ -539,6 +738,38 @@ class DashboardServiceTests(unittest.TestCase):
             bootstrap["capabilities"]["spatial_map"],
             "read_only",
         )
+        self.assertFalse(
+            bootstrap["capabilities"]["speech_to_text"]["enabled"]
+        )
+        self.assertEqual(
+            bootstrap["runtime"]["speech_to_text"]["state"],
+            "disabled",
+        )
+
+    def test_bootstrap_and_probe_describe_local_speech_runtime(self):
+        provider = ScriptedSpeechProvider()
+        service = self.make_service(
+            episode_runner=ScriptedRunner(),
+            speech_transcriber=provider,
+        )
+
+        bootstrap = service.bootstrap()
+        capability = bootstrap["capabilities"]["speech_to_text"]
+        probed = service.probe_speech_transcriber()
+
+        self.assertTrue(capability["enabled"])
+        self.assertEqual(capability["input_format"], "audio/wav")
+        self.assertEqual(capability["encoding"], "pcm_s16le")
+        self.assertEqual(capability["sample_rate_hz"], 16_000)
+        self.assertEqual(capability["channels"], 1)
+        self.assertFalse(capability["audio_persisted"])
+        self.assertEqual(
+            bootstrap["runtime"]["speech_to_text"]["state"],
+            "configured",
+        )
+        self.assertEqual(probed["state"], "online")
+        self.assertEqual(provider.probe_calls, 1)
+
 
     def test_spatial_map_defaults_to_an_honest_empty_snapshot(self):
         service = self.make_service(

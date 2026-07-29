@@ -2,8 +2,9 @@
 
 The router is deliberately independent from sockets so its complete security
 surface can be exercised in unit tests.  The thin ``BaseHTTPRequestHandler``
-adapter owns framing only; it never interprets natural language and it exposes
-no route for robot motion, SSH, speech, or supervisor control.
+adapter owns framing only; it never interprets natural language and exposes
+bounded speech transcription, but no route for robot motion, SSH, TTS, or
+supervisor control.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from typing import Dict, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from .dashboard_contract import DashboardContractError, strict_json_loads
+from .stt_contract import MAX_STT_AUDIO_BYTES
 
 
 API_VERSION = "robot-dashboard/v1"
@@ -23,6 +25,10 @@ MAX_REQUEST_BYTES = 16 * 1024
 MAX_EVENT_LIMIT = 500
 TOKEN_HEADER = "x-robot-dashboard-token"
 TOKEN_PLACEHOLDER = b"__ROBOT_DASHBOARD_TOKEN__"
+STT_REQUEST_ID_HEADER = "x-robot-stt-request-id"
+STT_LANGUAGE_HEADER = "x-robot-stt-language"
+STT_TRANSCRIPTIONS_PATH = "/api/v1/stt/transcriptions"
+STT_REQUESTS_PATH = "/api/v1/stt/requests"
 
 
 class DashboardHTTPError(RuntimeError):
@@ -151,6 +157,18 @@ class DashboardRouter:
             "spatial_map_presenter.js",
             "text/javascript; charset=utf-8",
         ),
+        "assets/speech_input_logic.js": (
+            "speech_input_logic.js",
+            "text/javascript; charset=utf-8",
+        ),
+        "assets/microphone_input.js": (
+            "microphone_input.js",
+            "text/javascript; charset=utf-8",
+        ),
+        "assets/pcm_capture_worklet.js": (
+            "pcm_capture_worklet.js",
+            "text/javascript; charset=utf-8",
+        ),
         "assets/app.js": (
             "app.js",
             "text/javascript; charset=utf-8",
@@ -241,12 +259,14 @@ class DashboardRouter:
                 "style-src 'self'; "
                 "img-src 'self' data:; "
                 "connect-src 'self'; "
+                "worker-src 'self'; "
                 "object-src 'none'; "
                 "base-uri 'none'; "
                 "frame-ancestors 'none'; "
                 "form-action 'self'",
             ),
             ("Cross-Origin-Resource-Policy", "same-origin"),
+            ("Permissions-Policy", "microphone=(self), camera=()"),
         )
 
     def _response(
@@ -353,15 +373,19 @@ class DashboardRouter:
                 "content_encoding_rejected",
                 "Content-Encoding is not accepted",
             )
-        if (
-            method in ("POST", "PUT")
-            and headers.get("content-type") != "application/json"
-        ):
-            raise DashboardHTTPError(
-                415,
-                "content_type_rejected",
-                "Content-Type must be application/json",
+        if method in ("POST", "PUT"):
+            expected_content_type = (
+                "audio/wav"
+                if method == "POST"
+                and path == STT_TRANSCRIPTIONS_PATH
+                else "application/json"
             )
+            if headers.get("content-type") != expected_content_type:
+                raise DashboardHTTPError(
+                    415,
+                    "content_type_rejected",
+                    "Content-Type is not accepted for this route",
+                )
 
     def _body_object(self, body: bytes):
         if not isinstance(body, bytes) or len(body) > MAX_REQUEST_BYTES:
@@ -419,7 +443,7 @@ class DashboardRouter:
         target: str,
         headers: Mapping[str, str],
     ):
-        if method not in ("GET", "POST", "PUT"):
+        if method not in ("GET", "POST", "PUT", "DELETE"):
             raise DashboardHTTPError(
                 405,
                 "method_not_allowed",
@@ -427,6 +451,21 @@ class DashboardRouter:
             )
         request_headers = _lower_headers(headers)
         parsed = self._parsed_target(target)
+        if method == "DELETE":
+            segments = self._path_segments(parsed.path)
+            if (
+                len(segments) != 5
+                or segments[:4]
+                not in (
+                    ("api", "v1", "stt", "transcriptions"),
+                    ("api", "v1", "stt", "requests"),
+                )
+            ):
+                raise DashboardHTTPError(
+                    405,
+                    "method_not_allowed",
+                    "HTTP method is not allowed",
+                )
         self._authorize(method, parsed.path, request_headers)
         return parsed
 
@@ -443,6 +482,18 @@ class DashboardRouter:
         except DashboardHTTPError as error:
             return self._error(error)
         return None
+
+    def request_body_limit(self, method: str, target: str) -> int:
+        """Return the exact post-preflight body cap for one route."""
+
+        parsed = self._parsed_target(target)
+        if (
+            method == "POST"
+            and parsed.path == STT_TRANSCRIPTIONS_PATH
+            and not parsed.query
+        ):
+            return MAX_STT_AUDIO_BYTES
+        return MAX_REQUEST_BYTES
 
     def handle(
         self,
@@ -548,6 +599,130 @@ class DashboardRouter:
                 )
             value = self._service_call(self._service.spatial_map)
             return self._response(200, {"map": value})
+
+        if method == "POST" and path == STT_TRANSCRIPTIONS_PATH:
+            if parsed.query:
+                raise DashboardHTTPError(
+                    400,
+                    "invalid_query",
+                    "Speech transcription endpoint accepts no query",
+                )
+            request_headers = _lower_headers(headers)
+            request_id = request_headers.get(STT_REQUEST_ID_HEADER)
+            language_hint = request_headers.get(STT_LANGUAGE_HEADER)
+            if request_id is None or language_hint is None:
+                raise DashboardHTTPError(
+                    400,
+                    "invalid_request_headers",
+                    "Speech transcription headers are incomplete",
+                )
+            if len(body) > MAX_STT_AUDIO_BYTES:
+                raise DashboardHTTPError(
+                    413,
+                    "request_too_large",
+                    "Speech audio is too large",
+                )
+            value = self._service_call(
+                lambda: self._service.submit_transcription(
+                    request_id,
+                    language_hint,
+                    body,
+                )
+            )
+            return self._response(
+                202,
+                {"transcription": value},
+            )
+
+        if (
+            method == "GET"
+            and len(segments) == 5
+            and segments[:4] == (
+                "api",
+                "v1",
+                "stt",
+                "transcriptions",
+            )
+        ):
+            if parsed.query:
+                raise DashboardHTTPError(
+                    400,
+                    "invalid_query",
+                    "Speech transcription endpoint accepts no query",
+                )
+            value = self._service_call(
+                lambda: self._service.get_transcription(
+                    segments[4]
+                )
+            )
+            return self._response(
+                200,
+                {"transcription": value},
+            )
+
+        if (
+            method == "DELETE"
+            and len(segments) == 5
+            and segments[:4] == (
+                "api",
+                "v1",
+                "stt",
+                "transcriptions",
+            )
+        ):
+            if parsed.query:
+                raise DashboardHTTPError(
+                    400,
+                    "invalid_query",
+                    "Speech transcription endpoint accepts no query",
+                )
+            if body:
+                raise DashboardHTTPError(
+                    400,
+                    "invalid_request",
+                    "Speech cancellation accepts no request body",
+                )
+            value = self._service_call(
+                lambda: self._service.cancel_transcription(
+                    segments[4]
+                )
+            )
+            return self._response(
+                200,
+                {"transcription": value},
+            )
+
+        if (
+            method == "DELETE"
+            and len(segments) == 5
+            and segments[:4] == (
+                "api",
+                "v1",
+                "stt",
+                "requests",
+            )
+        ):
+            if parsed.query:
+                raise DashboardHTTPError(
+                    400,
+                    "invalid_query",
+                    "Speech cancellation endpoint accepts no query",
+                )
+            if body:
+                raise DashboardHTTPError(
+                    400,
+                    "invalid_request",
+                    "Speech cancellation accepts no request body",
+                )
+            value = self._service_call(
+                lambda: self._service.cancel_transcription_request(
+                    segments[4]
+                )
+            )
+            return self._response(
+                200,
+                {"cancellation": value},
+            )
 
         if method == "POST" and path == "/api/v1/conversations":
             if parsed.query:
@@ -695,6 +870,25 @@ class DashboardRouter:
             _exact_object(self._body_object(body), ())
             value = self._service_call(self._service.probe_lm_studio)
             return self._response(200, {"lm_studio": value})
+
+        if (
+            method == "POST"
+            and path == "/api/v1/runtime/stt/probe"
+        ):
+            if parsed.query:
+                raise DashboardHTTPError(
+                    400,
+                    "invalid_query",
+                    "Probe endpoint accepts no query",
+                )
+            _exact_object(self._body_object(body), ())
+            value = self._service_call(
+                self._service.probe_speech_transcriber
+            )
+            return self._response(
+                200,
+                {"speech_to_text": value},
+            )
 
         raise DashboardHTTPError(
             404,

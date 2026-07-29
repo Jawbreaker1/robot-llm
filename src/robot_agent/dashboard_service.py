@@ -36,6 +36,7 @@ from .dashboard_state import (
     NodeRegistry,
     SettingsStore,
 )
+from .dashboard_stt import DashboardSTT
 from .http_transport import direct_http_request
 from .lm_studio import (
     DEFAULT_BASE_URL,
@@ -387,6 +388,7 @@ class DashboardService:
         probe_transport: ProbeTransport = direct_http_request,
         server_instance_id: Optional[str] = None,
         spatial_map_provider: Optional[SpatialMapProvider] = None,
+        speech_transcriber=None,
     ):
         spatial_snapshot = getattr(
             spatial_map_provider,
@@ -427,6 +429,10 @@ class DashboardService:
         )
         self._settings_store = SettingsStore()
         self._events = EventLog(self._server_instance_id)
+        self._stt = DashboardSTT(
+            speech_transcriber,
+            event_sink=self._stt_event,
+        )
         self._registry = _default_registry(self._server_instance_id)
         self._conversations = ConversationStore()
         self._episode_runner = episode_runner
@@ -493,6 +499,76 @@ class DashboardService:
             return None
         return self._events.append(**values)
 
+    def _stt_event(
+        self,
+        event_type: str,
+        data: Mapping[str, object],
+    ) -> None:
+        """Record bounded STT metadata without audio or transcript text."""
+
+        safe_data = {
+            key: value
+            for key, value in data.items()
+            if key
+            in {
+                "transcription_id",
+                "language_hint",
+                "audio_duration_ms",
+                "provider_id",
+                "status",
+                "error_code",
+                "provider_latency_ms",
+                "previous_status",
+                "reason_code",
+                "provider_work_pending",
+                "late_result_discarded",
+                "cancelled_total",
+            }
+        }
+        request_id = data.get("request_id")
+        self._event(
+            level=(
+                "warning"
+                if event_type == "stt.transcription_failed"
+                else "info"
+            ),
+            category="perception",
+            event_type=event_type,
+            source_id="dashboard.microphone",
+            message={
+                "stt.transcription_queued": (
+                    "Speech transcription queued"
+                ),
+                "stt.transcription_started": (
+                    "Local speech transcription started"
+                ),
+                "stt.transcription_completed": (
+                    "Local speech transcription completed"
+                ),
+                "stt.transcription_failed": (
+                    "Local speech transcription failed"
+                ),
+                "stt.transcription_cancelled": (
+                    "Speech transcription cancelled"
+                ),
+                "stt.transcription_expired": (
+                    "Speech transcription result expired"
+                ),
+                "stt.transcription_late_result_discarded": (
+                    "Late speech provider result discarded"
+                ),
+                "stt.runtime_shutdown": (
+                    "Speech transcription runtime stopping"
+                ),
+            }.get(event_type, "Speech transcription state changed"),
+            request_id=(
+                request_id
+                if isinstance(request_id, str)
+                else None
+            ),
+            data=safe_data,
+        )
+
     def _translate(self, error: Exception):
         if isinstance(error, DashboardServiceError):
             raise error
@@ -548,6 +624,7 @@ class DashboardService:
                 "chat": True,
                 "research": ["weather.current"],
                 "spatial_map": "read_only",
+                "speech_to_text": self._stt.capability(),
                 "physical_control": False,
                 "ssh": False,
                 "tts": False,
@@ -557,12 +634,37 @@ class DashboardService:
             "experiments": self.experiments(),
             "runtime": {
                 "lm_studio": runtime,
+                "speech_to_text": self._stt.runtime_view(),
                 "ev3": {
                     "state": "unobserved",
                     "reason_code": "physical_probe_not_run",
                 },
             },
         }
+
+    def submit_transcription(
+        self,
+        request_id: str,
+        language_hint: str,
+        wav_bytes: bytes,
+    ):
+        return self._stt.submit(
+            request_id,
+            language_hint,
+            wav_bytes,
+        )
+
+    def get_transcription(self, transcription_id: str):
+        return self._stt.get(transcription_id)
+
+    def cancel_transcription(self, transcription_id: str):
+        return self._stt.cancel(transcription_id)
+
+    def cancel_transcription_request(self, request_id: str):
+        return self._stt.cancel_request(request_id)
+
+    def probe_speech_transcriber(self):
+        return self._stt.probe()
 
     def spatial_map(self):
         """Return one detached, finite JSON map snapshot.
@@ -1310,11 +1412,21 @@ class DashboardService:
                 self._stop_requested.set()
             deadline = time.monotonic() + float(timeout_seconds)
             self._drain_queued_jobs()
+            stt_shutdown = self._stt.shutdown(
+                timeout_seconds=max(
+                    0.0,
+                    deadline - time.monotonic(),
+                )
+            )
             if self._worker is not threading.current_thread():
                 self._worker.join(
                     timeout=max(0.0, deadline - time.monotonic())
                 )
             worker_alive = self._worker.is_alive()
+            stt_worker_alive = stt_shutdown["worker_alive"]
+            stt_event_worker_alive = stt_shutdown[
+                "event_worker_alive"
+            ]
             with self._cancelled_lock:
                 cancelled_total = self._queued_cancelled_total
             return {
@@ -1322,7 +1434,20 @@ class DashboardService:
                 "accepting": False,
                 "stop_requested": True,
                 "worker_alive": worker_alive,
-                "timed_out": worker_alive,
+                "stt_worker_alive": stt_worker_alive,
+                "stt_event_worker_alive": stt_event_worker_alive,
+                "timed_out": (
+                    worker_alive or stt_shutdown["timed_out"]
+                ),
                 "queued_cancelled_total": cancelled_total,
                 "queued_remaining": self._jobs.qsize(),
+                "stt_queued_remaining": stt_shutdown[
+                    "queued_remaining"
+                ],
+                "stt_provider_work_pending": stt_shutdown[
+                    "provider_work_pending"
+                ],
+                "stt_event_dropped_total": stt_shutdown[
+                    "event_dropped_total"
+                ],
             }

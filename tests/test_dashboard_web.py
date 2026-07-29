@@ -64,6 +64,15 @@ class DashboardWebContractTests(unittest.TestCase):
         cls.dashboard_logic = (
             WEB_ROOT / "dashboard_logic.js"
         ).read_text(encoding="utf-8")
+        cls.speech_input_logic = (
+            WEB_ROOT / "speech_input_logic.js"
+        ).read_text(encoding="utf-8")
+        cls.microphone_input = (
+            WEB_ROOT / "microphone_input.js"
+        ).read_text(encoding="utf-8")
+        cls.pcm_capture_worklet = (
+            WEB_ROOT / "pcm_capture_worklet.js"
+        ).read_text(encoding="utf-8")
         cls.spatial_map_presenter = (
             WEB_ROOT / "spatial_map_presenter.js"
         ).read_text(encoding="utf-8")
@@ -72,6 +81,9 @@ class DashboardWebContractTests(unittest.TestCase):
             (
                 cls.i18n,
                 cls.dashboard_logic,
+                cls.speech_input_logic,
+                cls.microphone_input,
+                cls.pcm_capture_worklet,
                 cls.spatial_map_presenter,
                 cls.javascript,
             )
@@ -79,6 +91,7 @@ class DashboardWebContractTests(unittest.TestCase):
         cls.parser = AssetParser()
         cls.parser.feed(cls.html)
         cls.i18n_contract = cls._inspect_i18n_contract()
+        cls.speech_input_contract = cls._inspect_speech_input_contract()
 
     @classmethod
     def _inspect_i18n_contract(cls):
@@ -293,6 +306,142 @@ process.stdout.write(JSON.stringify({
             raise AssertionError(completed.stderr)
         return json.loads(completed.stdout)
 
+    @classmethod
+    def _inspect_speech_input_contract(cls):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const context = {};
+vm.runInNewContext(source, context, { filename: process.argv[1] });
+const logic = context.RobotSpeechInputLogic;
+if (
+  !logic
+  || typeof logic.normalizeSettings !== "function"
+  || typeof logic.advanceVad !== "function"
+  || typeof logic.resampleMono !== "function"
+  || typeof logic.speechWindow !== "function"
+  || typeof logic.encodePCM16Wav !== "function"
+) {
+  throw new Error("speech_input_logic.js did not expose its runtime contract");
+}
+
+const defaults = logic.normalizeSettings(null);
+const bounded = logic.normalizeSettings({
+  deviceId: "",
+  language: "fr",
+  sensitivity: 999,
+  silenceMs: 1,
+  maxUtteranceMs: 999999,
+  echoCancellation: false,
+  noiseSuppression: "yes",
+  autoGainControl: false,
+  autoSend: false,
+});
+const sourcePcm = Float32Array.from([
+  0, 0.25, 0.5, 0.75,
+  1, 0.75, 0.5, 0.25,
+  0, -0.25, -0.5, -0.75,
+]);
+const downsampled = logic.resampleMono(sourcePcm, 48000, 16000);
+const windowed = logic.speechWindow(
+  Float32Array.from({ length: 16000 }, (_value, index) => index),
+  16000,
+  { startedAtMs: 1000, speechStartedAtMs: 1800 },
+);
+const paddedWindow = logic.speechWindow(
+  Float32Array.from([0.5, -0.5]),
+  16000,
+  { startedAtMs: 1000, speechStartedAtMs: 1000 },
+);
+const wav = logic.encodePCM16Wav(downsampled, 16000);
+const wavView = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+const ascii = (offset, length) => Array.from(
+  wav.slice(offset, offset + length),
+  (value) => String.fromCharCode(value),
+).join("");
+
+let vad = logic.createVadState(1000);
+const vadActions = [];
+[
+  [1050, -64],
+  [1250, -20],
+  [1300, -20],
+  [1500, -65],
+  [2200, -65],
+].forEach(([nowMs, sampleLevelDb]) => {
+  const transition = logic.advanceVad(
+    vad,
+    { nowMs, levelDb: sampleLevelDb },
+    { ...defaults, silenceMs: 600 },
+  );
+  vad = transition.state;
+  vadActions.push(transition.action);
+});
+let quiet = logic.createVadState(0);
+let quietAction = null;
+for (const nowMs of [250, 1000, 3000, 5000]) {
+  const transition = logic.advanceVad(
+    quiet,
+    { nowMs, levelDb: -70 },
+    defaults,
+  );
+  quiet = transition.state;
+  quietAction = transition.action;
+}
+
+process.stdout.write(JSON.stringify({
+  exports: Object.keys(logic).sort(),
+  frozen: Object.isFrozen(logic),
+  defaults,
+  defaultsFrozen: Object.isFrozen(defaults),
+  bounded,
+  resampling: {
+    length: downsampled.length,
+    samples: Array.from(downsampled),
+  },
+  speechWindow: {
+    length: windowed.length,
+    first: windowed[0],
+    paddedLength: paddedWindow.length,
+    paddedFirst: paddedWindow[0],
+    paddedSecond: paddedWindow[1],
+    paddedLast: paddedWindow[paddedWindow.length - 1],
+  },
+  wav: {
+    length: wav.length,
+    riff: ascii(0, 4),
+    wave: ascii(8, 4),
+    format: wavView.getUint16(20, true),
+    channels: wavView.getUint16(22, true),
+    sampleRate: wavView.getUint32(24, true),
+    bitsPerSample: wavView.getUint16(34, true),
+    dataBytes: wavView.getUint32(40, true),
+  },
+  vadActions,
+  vadPhase: vad.phase,
+  quietAction,
+  quietPhase: quiet.phase,
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(WEB_ROOT / "speech_input_logic.js"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr)
+        return json.loads(completed.stdout)
+
     def test_html_has_one_token_placeholder_and_external_assets_only(self):
         self.assertEqual(
             self.html.count("__ROBOT_DASHBOARD_TOKEN__"),
@@ -303,6 +452,8 @@ process.stdout.write(JSON.stringify({
             [
                 "assets/i18n.js",
                 "assets/dashboard_logic.js",
+                "assets/speech_input_logic.js",
+                "assets/microphone_input.js",
                 "assets/spatial_map_presenter.js",
                 "assets/app.js",
             ],
@@ -490,6 +641,432 @@ process.stdout.write(JSON.stringify({
         self.assertNotIn("map-drive", self.html)
         self.assertNotIn("map-waypoint", self.html)
         self.assertNotIn("map-stop", self.html)
+
+    def test_speech_input_logic_is_bounded_and_emits_pcm16_wav(self):
+        contract = self.speech_input_contract
+        self.assertTrue(contract["frozen"])
+        self.assertTrue(contract["defaultsFrozen"])
+        self.assertEqual(
+            set(contract["exports"]),
+            {
+                "DEFAULT_SETTINGS",
+                "SETTINGS_STORAGE_KEY",
+                "TARGET_SAMPLE_RATE_HZ",
+                "VAD_ACTION",
+                "advanceVad",
+                "concatenateSamples",
+                "createVadState",
+                "encodePCM16Wav",
+                "levelDb",
+                "meterPercent",
+                "normalizeSettings",
+                "resampleMono",
+                "speechWindow",
+                "thresholdDb",
+            },
+        )
+        self.assertEqual(
+            contract["defaults"],
+            {
+                "deviceId": "default",
+                "language": "auto",
+                "sensitivity": 65,
+                "silenceMs": 800,
+                "maxUtteranceMs": 12000,
+                "echoCancellation": True,
+                "noiseSuppression": True,
+                "autoGainControl": True,
+                "autoSend": True,
+            },
+        )
+        self.assertEqual(
+            contract["bounded"],
+            {
+                "deviceId": "default",
+                "language": "auto",
+                "sensitivity": 100,
+                "silenceMs": 400,
+                "maxUtteranceMs": 30000,
+                "echoCancellation": False,
+                "noiseSuppression": True,
+                "autoGainControl": False,
+                "autoSend": False,
+            },
+        )
+        self.assertEqual(contract["resampling"]["length"], 4)
+        self.assertAlmostEqual(
+            contract["resampling"]["samples"][0],
+            0.25,
+            places=5,
+        )
+        self.assertAlmostEqual(
+            contract["resampling"]["samples"][-1],
+            -0.5,
+            places=5,
+        )
+        self.assertEqual(
+            contract["speechWindow"],
+            {
+                "length": 7200,
+                "first": 8800,
+                "paddedLength": 4000,
+                "paddedFirst": 0.5,
+                "paddedSecond": -0.5,
+                "paddedLast": 0,
+            },
+        )
+        self.assertEqual(
+            contract["wav"],
+            {
+                "length": 52,
+                "riff": "RIFF",
+                "wave": "WAVE",
+                "format": 1,
+                "channels": 1,
+                "sampleRate": 16000,
+                "bitsPerSample": 16,
+                "dataBytes": 8,
+            },
+        )
+
+    def test_speech_vad_requires_voice_then_stops_after_silence(self):
+        contract = self.speech_input_contract
+        self.assertEqual(
+            contract["vadActions"],
+            [
+                "none",
+                "none",
+                "speech_started",
+                "none",
+                "stop_silence",
+            ],
+        )
+        self.assertEqual(contract["vadPhase"], "speech")
+        self.assertEqual(contract["quietAction"], "stop_no_speech")
+        self.assertEqual(contract["quietPhase"], "waiting")
+
+    def test_microphone_ui_is_accessible_explicit_and_browser_local(self):
+        elements_by_id = {
+            attrs["id"]: (tag, attrs)
+            for tag, attrs in self.parser.elements
+            if "id" in attrs
+        }
+        required = {
+            "microphone-button",
+            "microphone-status",
+            "microphone-meter",
+            "cancel-transcription-button",
+            "microphone-settings-form",
+            "microphone-device",
+            "speech-input-language",
+            "microphone-sensitivity",
+            "microphone-silence-ms",
+            "microphone-max-utterance-ms",
+            "microphone-echo-cancellation",
+            "microphone-noise-suppression",
+            "microphone-auto-gain",
+            "microphone-auto-send",
+            "microphone-settings-meter",
+        }
+        self.assertTrue(required <= set(elements_by_id))
+        _, button = elements_by_id["microphone-button"]
+        self.assertEqual(button.get("type"), "button")
+        self.assertEqual(button.get("aria-pressed"), "false")
+        self.assertEqual(
+            button.get("aria-describedby"),
+            "microphone-status",
+        )
+        _, status = elements_by_id["microphone-status"]
+        self.assertEqual(status.get("role"), "status")
+        self.assertEqual(status.get("aria-live"), "polite")
+        for meter_id in ("microphone-meter", "microphone-settings-meter"):
+            _, meter = elements_by_id[meter_id]
+            self.assertEqual(meter.get("role"), "meter")
+            self.assertEqual(
+                (
+                    meter.get("aria-valuemin"),
+                    meter.get("aria-valuemax"),
+                    meter.get("aria-valuenow"),
+                ),
+                ("0", "100", "0"),
+            )
+            self.assertIn("aria-valuetext", meter)
+        _, auto_send = elements_by_id["microphone-auto-send"]
+        self.assertEqual(auto_send.get("type"), "checkbox")
+        self.assertIn("checked", auto_send)
+        self.assertIn(
+            "robot-dashboard-microphone-v1",
+            self.speech_input_logic,
+        )
+        self.assertNotIn(
+            "microphone-device",
+            self.javascript[
+                self.javascript.index("  function settingsFromForm()"):
+                self.javascript.index("\n  function settingsChanges()")
+            ],
+        )
+
+    def test_microphone_capture_is_generic_pcm_and_uses_the_stt_contract(self):
+        combined = "\n".join(
+            (
+                self.speech_input_logic,
+                self.microphone_input,
+                self.pcm_capture_worklet,
+                self.javascript,
+            )
+        )
+        for forbidden in (
+            "SpeechRecognition",
+            "webkitSpeechRecognition",
+            "MediaRecorder",
+            "navigator.userAgent",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, combined)
+        for required in (
+            "getUserMedia",
+            "enumerateDevices",
+            "AudioWorkletNode",
+            "audio/wav",
+            "X-Robot-STT-Request-ID",
+            "X-Robot-STT-Language",
+            "/api/v1/stt/transcriptions",
+            "/api/v1/stt/requests/",
+            "pcm_capture_worklet.js",
+            "requestSubmit()",
+            'method: "DELETE"',
+            '"stt_expired"',
+            "valid_until_unix_ms",
+            "speechWindow(",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, combined)
+        self.assertIn(
+            "safeObject(capabilities.speech_to_text)",
+            self.javascript,
+        )
+        self.assertIn(
+            "generation !== this.generation",
+            self.microphone_input,
+        )
+        self.assertIn("requestController.abort()", self.microphone_input)
+        self.assertIn("getTracks().forEach", self.microphone_input)
+        self.assertIn("await context.close()", self.microphone_input)
+        self.assertNotIn("innerHTML", self.microphone_input)
+        self.assertIn(
+            'meter.setAttribute(\n          "aria-valuetext"',
+            self.microphone_input,
+        )
+        self.assertIn(
+            '"microphone.meter.value"',
+            self.microphone_input,
+        )
+
+    def test_cancel_before_post_response_uses_request_id_and_drops_late_result(
+        self,
+    ):
+        harness = (
+            Path(__file__).resolve().parent
+            / "browser_microphone_cancel_harness.js"
+        )
+        completed = subprocess.run(
+            [
+                "node",
+                str(harness),
+                str(WEB_ROOT / "speech_input_logic.js"),
+                str(WEB_ROOT / "microphone_input.js"),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        result = json.loads(completed.stdout)
+
+        self.assertEqual(
+            result["beforeCancel"],
+            [
+                {
+                    "method": "POST",
+                    "path": "/api/v1/stt/transcriptions",
+                }
+            ],
+        )
+        self.assertEqual(
+            result["callSequence"],
+            [
+                {
+                    "method": "POST",
+                    "path": "/api/v1/stt/transcriptions",
+                },
+                {
+                    "method": "DELETE",
+                    "path": (
+                        "/api/v1/stt/requests/"
+                        "stt-fixed-request"
+                    ),
+                },
+            ],
+        )
+        self.assertTrue(result["cancelledSignal"])
+        self.assertEqual(
+            result["postRequestId"],
+            "stt-fixed-request",
+        )
+        self.assertEqual(
+            result["cancellationPath"],
+            "/api/v1/stt/requests/stt-fixed-request",
+        )
+        self.assertEqual(result["transcriptCount"], 0)
+        self.assertEqual(result["finalPhase"], "cancelled")
+
+    def test_microphone_vad_clock_starts_after_permission_and_audio_setup(self):
+        start_source = self.microphone_input[
+            self.microphone_input.index("    async start() {"):
+            self.microphone_input.index(
+                "\n    _receiveSamples(",
+                self.microphone_input.index("    async start() {"),
+            )
+        ]
+        self.assertLess(
+            start_source.index("await this._openStream()"),
+            start_source.index(
+                "this.vad = this.logic.createVadState(this._now())"
+            ),
+        )
+        self.assertIn("void this.refreshDevices(false)", start_source)
+        self.assertNotIn(
+            "await this.refreshDevices(false)",
+            start_source,
+        )
+        self.assertLess(
+            start_source.index("await context.audioWorklet.addModule"),
+            start_source.index(
+                "this.vad = this.logic.createVadState(this._now())"
+            ),
+        )
+        self.assertLess(
+            start_source.index(
+                "this.vad = this.logic.createVadState(this._now())"
+            ),
+            start_source.index("this.source.connect(this.worklet)"),
+        )
+
+    def test_microphone_number_fields_commit_without_fighting_keyboard_input(self):
+        settings_source = self.microphone_input[
+            self.microphone_input.index("    _settingsFromForm() {"):
+            self.microphone_input.index(
+                "\n    async initialize()",
+                self.microphone_input.index("    _settingsFromForm() {"),
+            )
+        ]
+        self.assertIn('silenceMs === ""', settings_source)
+        self.assertIn('maxUtteranceMs === ""', settings_source)
+        self.assertIn(
+            "event.target === this.elements.sensitivity",
+            settings_source,
+        )
+        input_listener = settings_source[
+            settings_source.index(
+                'this.elements.settingsForm.addEventListener(\n        "input"'
+            ):
+            settings_source.index(
+                'this.elements.settingsForm.addEventListener(\n        "change"'
+            )
+        ]
+        self.assertNotIn("this.elements.silenceMs", input_listener)
+        self.assertNotIn("this.elements.maxUtteranceMs", input_listener)
+
+    def test_active_agent_turn_cancels_and_disables_microphone(self):
+        render_turn = self.javascript[
+            self.javascript.index("  function renderTurn(turn) {"):
+            self.javascript.index(
+                "\n  function renderConversationSubtitle()",
+                self.javascript.index("  function renderTurn(turn) {"),
+            )
+        ]
+        submit_turn = self.javascript[
+            self.javascript.index("  async function submitTurn(event) {"):
+            self.javascript.index(
+                "\n  function eventTime(",
+                self.javascript.index("  async function submitTurn(event) {"),
+            )
+        ]
+        self.assertGreaterEqual(
+            render_turn.count(
+                "enforceCapabilities(safeObject(state.bootstrap))"
+            ),
+            2,
+        )
+        self.assertIn("microphoneInput.cancel()", submit_turn)
+
+    def test_device_refresh_cannot_replace_an_active_capture_phase(self):
+        render_devices = self.microphone_input[
+            self.microphone_input.index("    _renderDeviceOptions() {"):
+            self.microphone_input.index(
+                "\n    async refreshDevices(",
+                self.microphone_input.index("    _renderDeviceOptions() {"),
+            )
+        ]
+        self.assertIn(
+            "if (!ACTIVE_PHASES.has(this.phase))",
+            render_devices,
+        )
+        self.assertIn(
+            'this._setPhase("device_fallback")',
+            render_devices,
+        )
+        refresh_devices = self.microphone_input[
+            self.microphone_input.index("    async refreshDevices("):
+            self.microphone_input.index(
+                "\n    _supportedAudioConstraints()",
+                self.microphone_input.index("    async refreshDevices("),
+            )
+        ]
+        self.assertIn(
+            "if (ACTIVE_PHASES.has(this.phase))",
+            refresh_devices,
+        )
+        self.assertIn(
+            "this.onError(this.translate(STATUS_KEYS.device_missing))",
+            refresh_devices,
+        )
+
+    def test_device_fallback_keeps_requesting_phase_until_stream_opens(self):
+        open_stream = self.microphone_input[
+            self.microphone_input.index("    async _openStream() {"):
+            self.microphone_input.index(
+                "\n    _effectiveSettings()",
+                self.microphone_input.index("    async _openStream() {"),
+            )
+        ]
+        self.assertIn(
+            "return mediaDevices.getUserMedia(",
+            open_stream,
+        )
+        self.assertNotIn(
+            'this._setPhase("device_fallback")',
+            open_stream,
+        )
+
+    def test_unsupported_browser_without_media_devices_initializes_safely(self):
+        bind_source = self.microphone_input[
+            self.microphone_input.index("    _bind() {"):
+            self.microphone_input.index(
+                "\n    async initialize()",
+                self.microphone_input.index("    _bind() {"),
+            )
+        ]
+        self.assertIn(
+            "this.environment.navigator\n        "
+            "&& this.environment.navigator.mediaDevices",
+            bind_source,
+        )
+        self.assertIn(
+            "mediaDevices\n        "
+            '&& typeof mediaDevices.addEventListener === "function"',
+            bind_source,
+        )
 
     def test_i18n_catalogs_have_the_exact_same_nonempty_keyset(self):
         self.assertTrue(
@@ -971,6 +1548,9 @@ process.stdout.write(JSON.stringify({
         for filename, source in (
             ("i18n.js", self.i18n),
             ("dashboard_logic.js", self.dashboard_logic),
+            ("speech_input_logic.js", self.speech_input_logic),
+            ("microphone_input.js", self.microphone_input),
+            ("pcm_capture_worklet.js", self.pcm_capture_worklet),
             (
                 "spatial_map_presenter.js",
                 self.spatial_map_presenter,

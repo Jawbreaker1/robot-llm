@@ -522,14 +522,22 @@ keyword-fallback.
 Den första mikrofonen sitter i Macen och är en inmatningskanal till samma
 chattkontext:
 
-`push-to-talk → lokal STT → synligt transkript → agent → robotverktyg → EV3-TTS`
+`Talk/click-to-talk → lokal STT → synligt transkript → agent → robotverktyg → EV3-TTS`
+
+Den nu implementerade slicen slutar vid det versionskontrollerade
+agentformuläret. Ett verkligt Mac-mikrofonprov återstår, och robotverktyg,
+färsk fysisk observation samt EV3-TTS i steg 3–6 nedan är framtida fysisk
+acceptance.
 
 Första versionens regler:
 
-- push-to-talk i stället för ständig avlyssning,
+- en explicit Talk-knapp med automatisk tystnadsstopp i stället för ständig
+  avlyssning,
 - STT-körning bakom ett transportoberoende gränssnitt så motor eller modell
   kan bytas utan att agenten ändras,
-- transkript, konfidens och tidsstämpel loggas som en observation,
+- färdigt transkript levereras med hostägd timestamp och TTL till samma
+  agentformulär som text; eventloggen behåller endast bounded metadata och
+  aldrig transkript, råljud eller ljudhash,
 - låg konfidens eller tvetydig instruktion leder till en kontrollfråga och
   aldrig till rörelse,
 - samtalssvar får talas automatiskt men rörelse går alltid genom samma
@@ -537,11 +545,13 @@ Första versionens regler:
 - fysisk nödstopp får aldrig vara beroende av STT eller LLM,
 - mikrofonen spärras eller ekoreduceras under EV3-TTS så att roboten inte
   transkriberar sitt eget tal och börjar prata med sig själv,
-- varje inspelning och modellbegäran har timeout, avbrytning och episodbudget.
+- varje inspelning och modellbegäran har timeout, avbrytning och episodbudget;
+  en redan påbörjad lokal provideroperation får avslutas men dess sena resultat
+  måste kastas efter Cancel eller shutdown.
 
 Första acceptanstest:
 
-1. Användaren håller push-to-talk och säger "Vad ser du framför dig?"
+1. Användaren trycker på Talk och säger "Vad ser du framför dig?"
 2. Transkriptet visas i applikationen.
 3. Agenten begär en färsk IR-observation.
 4. Gemma formulerar en kort kommentar i vald personlighet.
@@ -1123,7 +1133,7 @@ hinder-navigationen och bygger kartan asynkront. Resultat:
   normalisering med robotpose, tre sensorstrålar, celler och hypoteser;
 - en startad loopback-dashboard gav autentiserad HTTP `200` för samma
   faktiska karta medan `physical_control_enabled` förblev false;
-- hela den hårdvarufria reposviten passerar `700 / 700`.
+- hela den hårdvarufria reposviten passerar `scripts/quality_check.sh`.
 
 Negativtest täcker stale/duplicerade snapshots, robot/controller-mismatch,
 återanvänt sensorprov, generationsbyte, överlappande rays, motstridig evidens

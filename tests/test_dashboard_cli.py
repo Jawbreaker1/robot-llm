@@ -1,4 +1,5 @@
 import io
+import json
 import socket
 import threading
 import unittest
@@ -10,6 +11,8 @@ from robot_agent.dashboard_cli import (
     _LoopbackThreadingHTTPServer,
     _handler_class,
     _parser,
+    _raise_termination_interrupt,
+    main,
 )
 from robot_agent.dashboard_http import DashboardHTTPResponse
 
@@ -73,7 +76,33 @@ class RejectingRouter:
         raise AssertionError("rejected request reached router.handle")
 
 
+class AcceptingRouter:
+    def __init__(self, body_limit):
+        self.body_limit = body_limit
+        self.limit_calls = []
+        self.handle_calls = []
+
+    def preflight(self, _method, _path, _headers):
+        return None
+
+    def request_body_limit(self, method, path):
+        self.limit_calls.append((method, path))
+        return self.body_limit
+
+    def handle(self, method, path, headers, body):
+        self.handle_calls.append((method, path, headers, body))
+        return DashboardHTTPResponse(
+            status=202,
+            headers=(("Content-Type", "application/json"),),
+            body=b"{}",
+        )
+
+
 class DashboardCLITests(unittest.TestCase):
+    def test_sigterm_handler_routes_through_keyboard_interrupt_cleanup(self):
+        with self.assertRaises(KeyboardInterrupt):
+            _raise_termination_interrupt(15, None)
+
     @staticmethod
     def bare_server(slots=1):
         server = object.__new__(_LoopbackThreadingHTTPServer)
@@ -160,6 +189,31 @@ class DashboardCLITests(unittest.TestCase):
         self.assertEqual(len(router.preflight_calls), 1)
         self.assertEqual(router.handle_calls, [])
 
+    def test_authenticated_route_selects_body_limit_before_read(self):
+        router = AcceptingRouter(body_limit=800_000)
+        handler_class = _handler_class(router)
+        handler = object.__new__(handler_class)
+        handler.command = "POST"
+        handler.path = "/api/v1/stt/transcriptions"
+        handler.headers = FakeHeaders(
+            (
+                ("Host", "127.0.0.1:8765"),
+                ("Content-Length", "4"),
+            )
+        )
+        handler.rfile = io.BytesIO(b"WAVE")
+        sent = []
+        handler._send = sent.append
+
+        handler._dispatch()
+
+        self.assertEqual(
+            router.limit_calls,
+            [("POST", "/api/v1/stt/transcriptions")],
+        )
+        self.assertEqual(router.handle_calls[0][3], b"WAVE")
+        self.assertEqual(sent[0].status, 202)
+
     def test_access_log_is_quiet_and_never_copies_session_path(self):
         handler_class = _handler_class(RejectingRouter())
         handler = object.__new__(handler_class)
@@ -180,6 +234,218 @@ class DashboardCLITests(unittest.TestCase):
 
         self.assertFalse(defaults.simulation_map_demo)
         self.assertTrue(enabled.simulation_map_demo)
+
+    def test_speech_source_is_explicit_and_mutually_exclusive(self):
+        defaults = _parser().parse_args([])
+        managed = _parser().parse_args(
+            [
+                "--stt-model",
+                "models/ggml-base.bin",
+                "--stt-port",
+                "8123",
+                "--stt-threads",
+                "6",
+            ]
+        )
+        external = _parser().parse_args(
+            [
+                "--stt-url",
+                "http://127.0.0.1:8178",
+                "--stt-model-id",
+                "ggml-small",
+            ]
+        )
+
+        self.assertIsNone(defaults.stt_model)
+        self.assertIsNone(defaults.stt_url)
+        self.assertEqual(managed.stt_model, "models/ggml-base.bin")
+        self.assertEqual(managed.stt_port, 8123)
+        self.assertEqual(managed.stt_threads, 6)
+        self.assertFalse(managed.stt_cpu)
+        self.assertEqual(
+            external.stt_url,
+            "http://127.0.0.1:8178",
+        )
+        self.assertEqual(external.stt_model_id, "ggml-small")
+        with (
+            self.assertRaises(SystemExit),
+            mock.patch("sys.stderr", new_callable=io.StringIO),
+        ):
+            _parser().parse_args(
+                [
+                    "--stt-model",
+                    "models/ggml-base.bin",
+                    "--stt-url",
+                    "http://127.0.0.1:8178",
+                ]
+            )
+
+    def test_main_wires_and_stops_managed_speech_server(self):
+        speech_server = mock.Mock()
+        private_prefix = "/stt-" + "a" * 48
+        speech_server.base_url = (
+            "http://127.0.0.1:8178" + private_prefix
+        )
+        speech_server.model_id = "ggml-base"
+        transcriber = object()
+        service = mock.Mock()
+        http_server = mock.Mock()
+        router = mock.Mock()
+        router.session_path = "/session/token/"
+
+        with (
+            mock.patch(
+                "robot_agent.stt_whisper_server.WhisperCppServer",
+                return_value=speech_server,
+            ) as server_factory,
+            mock.patch(
+                "robot_agent.stt_whisper_cpp.WhisperCppTranscriber",
+                return_value=transcriber,
+            ) as transcriber_factory,
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+                return_value=service,
+            ) as service_factory,
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+                return_value=(http_server, router),
+            ),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            result = main(
+                [
+                    "--port",
+                    "8765",
+                    "--stt-model",
+                    "models/ggml-base.bin",
+                    "--stt-port",
+                    "8178",
+                    "--stt-threads",
+                    "6",
+                    "--stt-cpu",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        server_factory.assert_called_once_with(
+            "models/ggml-base.bin",
+            binary="whisper-server",
+            port=8178,
+            threads=6,
+            use_gpu=False,
+        )
+        speech_server.start.assert_called_once_with()
+        transcriber_factory.assert_called_once_with(
+            base_url="http://127.0.0.1:8178" + private_prefix,
+            model_id="ggml-base",
+            require_opaque_path=True,
+        )
+        self.assertIs(
+            service_factory.call_args.kwargs["speech_transcriber"],
+            transcriber,
+        )
+        http_server.serve_forever.assert_called_once_with(
+            poll_interval=0.25
+        )
+        http_server.server_close.assert_called_once_with()
+        service.shutdown.assert_called_once_with()
+        speech_server.stop.assert_called_once_with()
+        ready_output = stdout.getvalue()
+        self.assertNotIn(private_prefix, ready_output)
+        ready = json.loads(ready_output)
+        self.assertTrue(ready["speech_to_text_enabled"])
+
+    def test_ready_interrupt_still_closes_every_owned_resource(self):
+        speech_server = mock.Mock()
+        speech_server.base_url = (
+            "http://127.0.0.1:8178/stt-" + "a" * 48
+        )
+        speech_server.model_id = "ggml-base"
+        service = mock.Mock()
+        http_server = mock.Mock()
+        router = mock.Mock()
+        router.session_path = "/session/token/"
+
+        with (
+            mock.patch(
+                "robot_agent.stt_whisper_server.WhisperCppServer",
+                return_value=speech_server,
+            ),
+            mock.patch(
+                "robot_agent.stt_whisper_cpp.WhisperCppTranscriber",
+                return_value=object(),
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+                return_value=service,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+                return_value=(http_server, router),
+            ),
+            mock.patch(
+                "builtins.print",
+                side_effect=KeyboardInterrupt,
+            ),
+        ):
+            result = main(
+                [
+                    "--stt-model",
+                    "models/ggml-base.bin",
+                    "--stt-cpu",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        http_server.serve_forever.assert_not_called()
+        http_server.server_close.assert_called_once_with()
+        service.shutdown.assert_called_once_with()
+        speech_server.stop.assert_called_once_with()
+
+    def test_cleanup_failure_does_not_skip_managed_speech_stop(self):
+        speech_server = mock.Mock()
+        speech_server.base_url = (
+            "http://127.0.0.1:8178/stt-" + "a" * 48
+        )
+        speech_server.model_id = "ggml-base"
+        service = mock.Mock()
+        service.shutdown.side_effect = RuntimeError("shutdown failed")
+        http_server = mock.Mock()
+        router = mock.Mock()
+        router.session_path = "/session/token/"
+
+        with (
+            mock.patch(
+                "robot_agent.stt_whisper_server.WhisperCppServer",
+                return_value=speech_server,
+            ),
+            mock.patch(
+                "robot_agent.stt_whisper_cpp.WhisperCppTranscriber",
+                return_value=object(),
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+                return_value=service,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+                return_value=(http_server, router),
+            ),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "shutdown failed",
+            ):
+                main(
+                [
+                    "--stt-model",
+                    "models/ggml-base.bin",
+                    "--stt-cpu",
+                ]
+                )
+
+        speech_server.stop.assert_called_once_with()
 
 
 if __name__ == "__main__":

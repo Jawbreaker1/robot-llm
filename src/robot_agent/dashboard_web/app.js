@@ -1,6 +1,5 @@
 (() => {
   "use strict";
-
   const TOKEN_META = document.querySelector('meta[name="robot-dashboard-token"]');
   const SESSION_TOKEN = TOKEN_META ? TOKEN_META.content : "";
   const TERMINAL_TURN_STATES = new Set([
@@ -17,7 +16,7 @@
   const EVENT_LIMIT = 100;
   const MAX_LOCAL_EVENTS = 500;
   const MAP_POLL_INTERVAL_MS = 2000;
-
+  let microphoneInput = null;
   const i18n = window.RobotI18n.createDefaultI18n();
   const t = (key, args) => i18n.t(key, args);
   const ERROR_MESSAGE_KEYS = Object.freeze({
@@ -199,10 +198,23 @@
       headers["X-Robot-Dashboard-Token"] = SESSION_TOKEN;
     }
     if (method === "POST" || method === "PUT") {
-      headers["Content-Type"] = "application/json";
-      request.body = JSON.stringify(options.body || {});
+      if (Object.hasOwn(options, "rawBody")) {
+        Object.assign(headers, options.headers || {});
+        request.body = options.rawBody;
+      } else {
+        headers["Content-Type"] = "application/json";
+        request.body = JSON.stringify(options.body || {});
+      }
     }
     const controller = new AbortController();
+    const parentAbort = () => controller.abort();
+    if (options.signal) {
+      if (options.signal.aborted) {
+        controller.abort();
+      } else {
+        options.signal.addEventListener("abort", parentAbort, { once: true });
+      }
+    }
     const timer = window.setTimeout(() => controller.abort(), options.timeout || 15000);
     request.signal = controller.signal;
     try {
@@ -234,6 +246,9 @@
       throw requestError("network_error", null, error);
     } finally {
       window.clearTimeout(timer);
+      if (options.signal) {
+        options.signal.removeEventListener("abort", parentAbort);
+      }
     }
   }
 
@@ -438,6 +453,12 @@
         : state.modelReady === false
           ? t("capability.model_not_ready")
           : t("capability.chat_unavailable");
+    if (microphoneInput) {
+      microphoneInput.setAvailability(
+        safeObject(capabilities.speech_to_text),
+        chatEnabled,
+      );
+    }
     if (!state.readOnlyInvariant && !state.readOnlyViolationAnnounced) {
       state.readOnlyViolationAnnounced = true;
       showToast(t("capability.read_only_violation"), true);
@@ -1024,9 +1045,7 @@
         renderTurnAnnouncement();
       }
     } else {
-      byId("send-button").disabled = true;
-      byId("message-input").disabled = true;
-      byId("new-conversation-button").disabled = true;
+      enforceCapabilities(safeObject(state.bootstrap));
       byId("composer-status").textContent = activeTurnComposerStatus(state.activeTurn);
     }
   }
@@ -1071,6 +1090,9 @@
     if (state.activeTurn && !TERMINAL_TURN_STATES.has(state.activeTurn.status)) {
       showToast(t("chat.wait_for_terminal"), true);
       return;
+    }
+    if (microphoneInput) {
+      microphoneInput.cancel();
     }
     byId("new-conversation-button").disabled = true;
     try {
@@ -1153,6 +1175,9 @@
     if (state.activeTurn && !TERMINAL_TURN_STATES.has(state.activeTurn.status)) {
       showToast(t("chat.episode_in_progress"), true);
       return;
+    }
+    if (microphoneInput) {
+      microphoneInput.cancel();
     }
     byId("send-button").disabled = true;
     input.disabled = true;
@@ -1592,6 +1617,9 @@
       ? t("events.resume")
       : t("events.pause");
     updateModeCopy();
+    if (microphoneInput) {
+      microphoneInput.renderLocale();
+    }
     if (state.selectedEvent && !byId("event-detail").hidden) {
       openEventDetail(state.selectedEvent, false);
     }
@@ -1696,6 +1724,9 @@
         activateView("events");
       }
       if (event.key === "Escape") {
+        if (microphoneInput) {
+          microphoneInput.cancel();
+        }
         if (!byId("event-detail").hidden) {
           byId("event-detail").hidden = true;
         }
@@ -1705,11 +1736,28 @@
       }
     });
   }
-
   async function initialize() {
     applyStaticTranslations();
     i18n.subscribe(renderLocalizedState);
     bindInteractions();
+    microphoneInput = window.RobotMicrophoneInput.create({
+      document,
+      logic: window.RobotSpeechInputLogic,
+      translate: t,
+      randomId,
+      request: api,
+      onTranscript: (text, metadata) => {
+        const input = byId("message-input");
+        input.value = text;
+        input.focus();
+        if (metadata.autoSend && !input.disabled) {
+          byId("composer-form").requestSubmit();
+        }
+      },
+      onError: (message) => showToast(message, true),
+      workletUrl: "assets/pcm_capture_worklet.js",
+    });
+    microphoneInput.initialize();
     try {
       const [bootstrapPayload, settingsPayload] = await Promise.all([
         api("/api/v1/bootstrap"),

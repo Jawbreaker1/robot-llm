@@ -3,6 +3,7 @@
 ![Status: controlled experiment](https://img.shields.io/badge/status-controlled%20experiment-2ea44f)
 [![Quality](https://github.com/Jawbreaker1/robot-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/Jawbreaker1/robot-llm/actions/workflows/ci.yml)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
+![STT: local](https://img.shields.io/badge/STT-local%20whisper.cpp-14b8a6)
 ![UI: English + Swedish](https://img.shields.io/badge/UI-English%20%2B%20Swedish-0ea5e9)
 ![Physical motion: manual only](https://img.shields.io/badge/physical%20motion-manual%20only-f59e0b)
 ![Navigation: simulator only](https://img.shields.io/badge/navigation-simulator%20only-2563eb)
@@ -20,9 +21,10 @@ deterministic software decides whether and how the motors may carry it out.
 > safety and control layer remains the sole authority over motion?
 
 The Lab Console is the human-facing workbench for developing and observing
-the agent. Today it exercises dialogue, context, read-only tool use, evidence,
-personality, and model behavior while the physical language-to-motion path
-remains intentionally locked.
+the agent. Today it exercises typed dialogue and a local speech-input
+pipeline, context, read-only tool use, evidence, personality, and model
+behavior while the physical language-to-motion path remains intentionally
+locked.
 
 <p align="center">
   <img src="src/robot_agent/dashboard_web/robot-llm-mascot.png" alt="Robot LLM Lab's mildly grumpy modular mascot waving" width="280">
@@ -105,7 +107,7 @@ Status snapshot: **2026-07-29**.
 | Physical EV3 baseline | ev3dev boot, USB/SSH, motors A/B/C, bounded manual drive/turn pulses, encoders, touch, relative IR, reflected-light sensing, and Swedish eSpeak TTS | This verifies the assembled EV3RSTORM, not autonomous motion |
 | Physical LLM path | One complete motion-free shadow cycle: IR readings → deterministic zone; Gemma generated an audit-only comment, while a separate deterministic Swedish fallback was sent to TTS | Gemma output was not spoken and had no tools or motor access |
 | EV3 supervisor | Motion-free `brake`/`stop`/inventory/touch preflight passed on the real robot with zero motor starts | The newer foreground daemon has only been verified against fake sysfs |
-| Lab Console | Local Gemma chat, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | No motor, SSH, TTS, or stop routes exist in the dashboard |
+| Lab Console | Local Gemma chat, standards-based microphone UI, local whisper.cpp STT, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | Swedish/English synthetic WAV passed the full local STT API; a real Mac-microphone utterance remains a gate. Speech becomes agent text—no motor, SSH, TTS, or stop routes exist here |
 | RobotAPI loop | Typed, snapshot-bound arm API and a closed `observe → plan → act → verify → replan` loop | Simulator-only and currently driven by a scripted fake planner |
 | Navigation | Waypoint following, obstacle avoidance, version-bound multi-waypoint missions, self-directed idle exploration, one MotionSupervisor, and an independent collision oracle | 2D simulator only; Gemma selects opaque host-created opportunities, not arbitrary coordinates or physical commands |
 | Spatial map | Continuous bounded occupancy fusion, robot pose, fresh sensor rays, and persistent opaque object hypotheses in a read-only Lab Console map | Current map input is simulator-only. The contract can later retain physical EV3 IR as low-confidence qualitative evidence without inventing metric distance or free space |
@@ -123,10 +125,12 @@ reliable battery power is available.
 </details>
 
 English and Swedish are verified for the dashboard and model text responses.
-English STT, English EV3 speech, multilingual robot personality, camera
-vision, and physical language-to-action classification are not yet verified.
-The locale contract is generic so more languages can be added without
-language detection in the safety layer.
+The local STT path is provider-neutral and accepts explicit language hints;
+English and Swedish microphone quality remain separately measured demo gates.
+English EV3 speech, multilingual robot personality, camera vision, and
+physical language-to-action classification are not yet verified. The locale
+contract is generic so more languages can be added without language detection
+in the safety layer.
 
 ## Fastest robot-focused demo
 
@@ -156,13 +160,11 @@ this still is not arbitrary natural-language mission planning.
 
 ## The Lab Console
 
-![English Robot LLM Lab workbench with the mascot, local Gemma, and motion visibly locked](docs/images/dashboard-workbench-en.jpg)
-
 The Mac workbench is the human-facing console for the experiment. It provides
-local Gemma dialogue, context, agent traces, evidence, the spatial map,
-settings, experiment history, component state, and technical events. It is
-currently an **observability and dialogue surface**, not a robot remote:
-there are no motor, stop, SSH, or TTS routes.
+local Gemma dialogue, local speech-to-text, context, agent traces, evidence,
+the spatial map, settings, experiment history, component state, and technical
+events. It is currently an **observability and dialogue surface**, not a robot
+remote: there are no motor, stop, SSH, or TTS routes.
 
 ![The experiment register separating verified results from a waiting physical preflight](docs/images/dashboard-experiments-en.jpg)
 
@@ -372,6 +374,41 @@ Restarting the server invalidates the token. The language selector switches
 the complete UI and sends a typed `response_locale` with every model turn;
 conversation state and form state survive the switch.
 
+To talk through the Mac microphone, install `whisper.cpp`, download a
+checksum-verified multilingual model, and opt in when starting the console:
+
+```sh
+brew install whisper-cpp
+sh scripts/download_whisper_model.sh small
+PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
+  --stt-model models/ggml-small.bin
+```
+
+`small` is the quality-first default for Swedish/English demonstrations.
+`base` is a smaller, faster comparison:
+
+```sh
+sh scripts/download_whisper_model.sh base
+```
+
+Managed STT prefers GPU/Metal for latency. If another local model already
+occupies the available GPU memory, add `--stt-cpu` for a slower but isolated
+CPU fallback.
+
+The **Talk** button uses standards-based `getUserMedia` and `AudioWorklet`,
+not a browser-vendor speech service. The settings view exposes microphone
+selection, live signal level and threshold, sensitivity, silence auto-stop,
+maximum utterance length, browser audio processing, spoken-language hint, and
+whether a fresh transcript is sent automatically or left editable.
+
+Audio is converted in the browser to bounded 16 kHz mono PCM16 WAV and sent
+only to the loopback dashboard. It is held in memory while queued or while the
+local provider call is running, and never written to the event log. Queued
+audio is cleared immediately on cancellation; an in-flight provider may retain
+its request until its bounded call returns, after which the result is
+discarded. STT has its own bounded worker, so it does not serialize Gemma
+dialogue, navigation, speech playback, or motor supervision.
+
 ### Run the hardware-free tests
 
 ```sh
@@ -566,7 +603,8 @@ This is a manual hardware test, not autonomous navigation. Read the full
 
 | Measurement | Result |
 |---|---:|
-| Hardware-free test suite | `700 / 700` passing |
+| Hardware-free test suite | `scripts/quality_check.sh` passing |
+| Local `small` STT synthetic acceptance | exact Swedish + English transcripts; `495 ms` first inference / `120 ms` warm follow-up |
 | Physical supervisor preflight | `completed`, `0` motor-start commands |
 | Straight physical B/C pulse | `+175° / +175°` |
 | Physical B/C turn pulse | `+172° / −170°` |
@@ -581,6 +619,9 @@ This is a manual hardware test, not autonomous navigation. Read the full
 
 The IR figures verify filtering and hysteresis in stationary tests. They are
 not motor stop time, braking distance, a real-time guarantee, or a benchmark.
+The STT figures use locally synthesized canonical WAV fixtures, not a physical
+microphone recording, and therefore verify the managed server and API path
+rather than room-noise robustness.
 Protocols, limitations, and raw data are in the
 [experiment plan](docs/EXPERIMENT_PLAN.md) and
 [EXP-F1-IR-DYN-002.json](docs/data/EXP-F1-IR-DYN-002.json).
@@ -612,7 +653,11 @@ Protocols, limitations, and raw data are in the
 - [ ] Gemma-driven physical `ACT`/`ABORT` loop behind a separate motion gate
 - [ ] Map-informed frontier planning and semantic classification of persistent
   hypotheses, with confidence and evidence lineage
-- [ ] Push-to-talk STT through the Mac microphone
+- [x] Bounded local talk-to-agent STT pipeline, with standards-based capture,
+  local whisper.cpp, live level/VAD controls, explicit language hint,
+  cancellation, and the normal versioned agent-submit path
+- [ ] Real browser-permission + Mac-microphone acceptance runs in Swedish and
+  English
 - [ ] Wi-Fi, camera, microphones, vision, and sound-source localization
 - [ ] Multi-controller orchestration across EV3, Robot Inventor, and BOOST
 
