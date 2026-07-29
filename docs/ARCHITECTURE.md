@@ -226,9 +226,119 @@ alla senare ben. Ett ändrat world model gör återstående plan stale vid den
 närmsta verifierade stoppgränsen.
 
 Detta är en exekverings- och verifieringssöm för framtida agentisk planering,
-inte ännu en LM Studio-planner. En långsam modell ska framåt föreslå sådana
-högre delmål vid stoppgränser, inte försöka mikroplanera varje 120 ms-puls.
+inte en modellstyrd pulsgenerator. En långsam modell ska föreslå högre delmål
+vid stoppgränser, inte försöka mikroplanera varje 120 ms-puls.
 MotionSupervisor och den lokala hinderundvikningen förblir deterministiska.
+
+### Självvalda idle-mål och exklusiv målauktoritet
+
+Den första körbara idle-slicen låter nu Gemma välja vad roboten ska undersöka
+när inget användarmål finns. Den ligger ovanför både missionslagret och
+`ProposalInbox`:
+
+```mermaid
+flowchart LR
+    O["Typade observationer<br/>range nu · vision/audio senare"]
+    C["Hostägd kandidatgenerator<br/>säker lokal geometri"]
+    L["Gemma interest selector<br/>SELECT · HOLD · ABORT"]
+    R["Privat kandidatregister<br/>ID → waypoint"]
+    G["GoalLeaseCoordinator<br/>USER_PENDING > IDLE"]
+    M["Enbens MissionPlan"]
+    S["MotionSupervisor"]
+
+    O --> C
+    C -->|"opaka ID:n + fakta"| L
+    L -->|"exakt ett erbjudet ID"| R
+    G -->|"giltig idle-lease"| R
+    R -->|"hosten löser koordinat"| M
+    M --> S
+```
+
+Målauktoritet och pulsmakt är två olika saker. `MotionSupervisor` fortsätter
+äga varje kort motorbeslut. En separat `GoalLeaseCoordinator` avgör atomiskt
+om det över huvud taget är en användare eller idle-autonomin som får skapa
+det aktiva högre målet. Idle är opt-in och avstängt som standard.
+`try_acquire_idle()` lyckas bara när det varken finns en aktiv ägare eller en
+väntande användare.
+
+En användarinstruktion reserverar först `USER_PENDING`. Reservationen blockerar
+omedelbart ny idle-planering och sätter cancellation på en eventuell aktiv
+idle-lease. Den får inte aktiveras som användarmål förrän idle-resultatet har
+bekräftat terminalt STOP, inaktiva motorer och frånvaro av touch/fault. Först
+då tilldelas användaren ett strikt nyare `goal_epoch` och en ny planrevision.
+Ett sent modellresultat kan alltså inte vinna ett race mot användaren. Ett
+`SingleFlightSelector` väntar avbrytbart på högst ett modelljobb. En
+användarreservation kan därför släppa idle-leasen och aktiveras efter
+verifierat STOP även om själva modelltråden aldrig återkommer; sena resultat
+kasseras och ingen ny selectortråd startas medan den gamla lever.
+
+Cancellation som observeras före dispatch återkallar pulsen. Om reservationen
+inträffar inne i den sista simulatoriska `plant.apply`-skarven kan däremot
+högst den enda redan dispatchade, kalibreringsbegränsade pulsen hinna
+exekveras. Ingen efterföljande DRIVE tillåts, terminalt STOP verifieras och
+först därefter får användarens strikt nyare epoch aktiveras. Preemption är
+alltså ordnad och hårt begränsad, inte fysiskt momentan.
+
+Modellen ser aldrig kandidatens koordinater. Hosten skapar högst tre lokala
+simulatoriska kandidater från positiv metric clearance i riktningarna fram,
+vänsterstråle och högerstråle. Modellvyn innehåller endast ett opakt
+`candidate_id`, typad uppgift, relativ riktning, uppskattad färdsträcka,
+antal försök, antal verifierat slutförda besök och länkar till typade
+observationer.
+Strikt strukturerad output låser `selected_candidate_id` till en enum av
+exakt dessa ID:n. Modellen kan inte returnera waypoint, heading, path,
+goal epoch, motor, hastighet, duration, verktyg, TTL, priority eller authority.
+
+Varje modellresultat binds till:
+
+- robot och controllerinstans,
+- autonomisession och lease-generation,
+- kandidatset och hosttilldelat proposal-ID,
+- state- och world-model-version,
+- observationens producer, robot, controller och koordinatram,
+- separat källdomän för sensortid samt hostens receive/deadline.
+
+Efter modellsvaret läser hosten ett nytt stoppat snapshot och jämför allt igen.
+En state- eller världsförändring kasserar svaret och förbrukar en explicit
+replanbudget. TTL-gränsen är exklusiv och kontrolleras både när modellsvaret
+tas emot och omedelbart före plan/dispatch; samma deadline avbryter även en
+påbörjad mission. Ett världsbyte under första DRIVE gör missionen stale,
+verifierar STOP och kan starta ett nytt idle-försök med ny lease och nytt
+epoch.
+
+`RangeObservationTracker` jämför endast exakta simulatoriska mätvärden från
+samma pose och heading. Den kan publicera tidigare/aktuellt millimetervärde
+och tidigare/aktuellt betrott simulatorobjekt-ID, men ger aldrig förändringen
+ett språkligt intressevärde. Kandidater kan märkas som kopplade till denna
+faktiska övergång; Gemma avgör om den är värd att undersöka. Rörelse mellan
+två olika robotposer förväxlas inte med att världen rört sig. Fysisk
+`IR-PROX` producerar varken metric observation eller positiv idle-kandidat.
+
+Ett hostägt rutminne kvantiserar waypointceller och räknar slutförda besök.
+Ett besök commit:as först efter nått mål och verifierat STOP; stale,
+avbrutna och misslyckade försök räknas endast som attempts. Efter ett
+deterministiskt retrytak döljs cellen tills en exakt ny observation gör den
+relevant igen. En omgivande idle-session begränsar kumulativt antal uppgifter,
+planneranrop, stale-replans, hosttid, handlingar och total motionstid. Ovanpå
+sessionen finns en beständig duty-cycle som överlever nya `run_once`- och
+`run_session`-anrop. Den kan bara återställas explicit när idle är avstängt,
+ingen ägare eller användarreservation finns, roboten står säkert och ingen
+selectortråd lever. En atomisk maintenance-guard i `GoalLeaseCoordinator`
+blockerar samtidigt idle-enable, idle-acquisition och nya user-claims tills
+snapshotkontroll och räknarnollning är färdiga. Varken nya missioner, nya
+scheduleranrop eller ett rearm-race kan därför nollställa vandringsbudgeten.
+
+Den körbara `autonomy_demo` har både ett deterministiskt test-orakel och den
+strikta `LMStudioInterestSelector`. Ett liveprov med
+`google/gemma-4-26b-a4b` slutförde först utforskning, flyttade därefter samma
+syntetiska låda från den stoppade robotens perspektiv (`207 → 357 mm`) och
+lät Gemma välja en `INVESTIGATE_OBSERVATION`-kandidat. Två delmål gav totalt
+22 korta DRIVE-pulser, noll kollisioner och verifierat slutstopp.
+
+Detta är ännu simulatorisk, wake-driven idle-autonomi. Den är inte inkopplad
+till fysisk EV3-motion, dashboardens användarmål eller concurrent-tal/gest.
+När dessa kopplas ihop ska tal vara en separat eventdriven producent som kan
+överlappa hjulnavigation, medan samma goal lease och enda motorägare behålls.
 
 ### Parallell interaktion ovanpå serialiserad navigation
 

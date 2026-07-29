@@ -980,9 +980,93 @@ pre-cancellation och single-use-runner. Hela den hårdvarufria reposviten
 passerar nu `574 / 574`.
 
 Grind: godkänd som simulatorbevis för planexekvering, delmålsverifiering och
-bounded failure propagation. Gemma bygger ännu inte missionsplanen,
-missionsben kör ännu inte `ConcurrentBehaviorRuntime`, och ingen fysisk
-adapter eller hårdvara aktiverades.
+bounded failure propagation. Gemma bygger ännu inte godtyckliga
+flerbensmissioner, missionsben kör ännu inte `ConcurrentBehaviorRuntime`, och
+ingen fysisk adapter eller hårdvara aktiverades.
+
+### EXP-F5-IDLE-SIM-005 – självvalda uppgifter och intresseklassificering
+
+Hypotes: när inget användarmål finns kan en lokal modell välja ett eget
+begränsat undersökningsmål från typade observationer utan att få koordinater,
+motorbehörighet eller möjlighet att fördröja användarpreemption.
+
+Implementation och acceptans:
+
+- idle måste uttryckligen aktiveras och får endast starta med en exklusiv
+  hostägd `IDLE_EXPLORATION`-lease,
+- en väntande användare reserverar `USER_PENDING`, blockerar ny idle,
+  cancellerar aktiv lease och får inte ett nytt mål förrän terminalt STOP
+  verifierats,
+- en separat state/world-versionerad observation beskriver exakt
+  rangevärde och simulatoriskt objekt-ID från samma stoppade pose; hosten
+  avgör inte språkligt vad som är intressant,
+- hosten genererar endast geometriskt genomförbara lokala kandidater och
+  håller koordinaterna i ett privat register,
+- modellens strikta output är endast `SELECT | HOLD | ABORT`; `SELECT` låses
+  i schemat till ett av de erbjudna opaka kandidat-ID:na,
+- modellen får inte returnera waypoint, heading, path, goal epoch,
+  motoruppgifter, speed, duration, tool call, TTL, source, priority eller
+  authority,
+- modellresultatet revalideras mot lease-generation, proposal-ID,
+  kandidatset, exklusiv deadline, state-version, world-model-version,
+  observationens robot/controller/frame samt host-receive/TTL och ett nytt
+  säkert stoppat snapshot,
+- en förändring under modellsvaret kasserar svaret och konsumerar
+  replanbudget; en förändring under första DRIVE gör missionen stale,
+  verifierar STOP och kräver en ny lease/epoch,
+- modellvalet körs single-flight och väntan avbryts direkt av user
+  reservation eller deadline; ett sent/hängt jobb får aldrig fler
+  parallella selectortrådar,
+- cancellation före dispatch återkallar pulsen; en reservation inne i den
+  sista `plant.apply`-skarven tillåter högst den enda redan dispatchade,
+  tidsbegränsade pulsen, därefter inga fler DRIVE och verifierat STOP,
+- slutförda waypointceller sparas först efter nått mål och verifierat STOP,
+  medan misslyckade attempts når ett deterministiskt retrytak om inte exakt
+  ny observation återöppnar cellen,
+- planneranrop, tasks, stale-replans, hosttid, actions och total motion har
+  både kumulativa sessionsbudgetar och en beständig duty-cycle över nya
+  scheduleranrop; re-arm kräver avstängd och säkert stoppad idle och hålls
+  atomisk mot samtidiga idle-enable/user-claim via en authority-guard,
+- fysisk `IR-PROX` får varken skapa metric observation eller positiv
+  idle-kandidat.
+
+Deterministiska simulatorresultat:
+
+- tre självvalda uppgifter slutfördes med `34` korta DRIVE-pulser,
+  noll kollisioner och terminalt STOP efter varje uppgift,
+- ett range-change-scenario flyttade samma syntetiska låda mellan två
+  stoppgränser; den andra observationen var exakt `207 → 357 mm` och
+  kandidaterna bar `INVESTIGATE_OBSERVATION`,
+- race-testet blockerar användaraktivering medan idle fortfarande äger
+  målet, avbryter väntan även på ett selectorjobb som inte återkommer,
+  kasserar det sena svaret, verifierar STOP och tilldelar därefter användaren
+  ett strikt nyare goal epoch,
+- negativa test täcker `HOLD`, tom kandidatmeny, malformed/okänt ID,
+  state- och world-staleness, deadline exakt på gränsen och efter selection,
+  världsbyte före första DRIVE, bounded apply-race, attempts/retrytak,
+  user-reservation-cancel, minnescommit samt sessions- och duty-cyclebudgetar,
+- ett långt clear-world-regressionstest slutför `12 / 12` självvalda mål
+  inklusive gränsnära kandidater utan kollision eller fastnad
+  obstacle-avoidance; ett separat CLI-stresstest slutförde `20 / 20` mål med
+  `269` korta pulser och noll kollisioner.
+
+Liveprov med lokala `google/gemma-4-26b-a4b`:
+
+- vanlig idle-session: `2 / 2` modellvalda uppgifter, `27` actions,
+  noll kollisioner och verifierat STOP,
+- range-change-session: `2 / 2` modellvalda uppgifter, den andra vald som
+  `INVESTIGATE_OBSERVATION`, totalt `22` actions, noll kollisioner och
+  verifierat STOP,
+- modellen valde endast schemaerbjudna opaka ID:n; hosten löste därefter
+  koordinaterna och den befintliga deterministiska navigationen utförde
+  uppgiften.
+
+Hela den hårdvarufria reposviten passerar `656 / 656`.
+
+Grind: godkänd som simulatorbevis för självvalda, bounded högre mål,
+modellbaserad intresseklassificering och säker målpreemption. Inte godkänd för
+fysisk idle-körning. Tal, gest, dashboardmål, kamera, mikrofon och flera
+controllers är ännu inte integrerade med denna lease.
 
 ## Fas 6 – Parallella snurror
 

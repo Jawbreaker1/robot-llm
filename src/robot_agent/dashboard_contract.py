@@ -40,11 +40,13 @@ REGISTRY_DISPLAY_NAME_KEYS = (
 EXPERIMENT_TITLE_KEYS = (
     "experiments.curated.dynamic_ir.title",
     "experiments.curated.weather_tool.title",
+    "experiments.curated.idle_autonomy.title",
     "experiments.curated.ev3_preflight.title",
 )
 EXPERIMENT_SUMMARY_KEYS = (
     "experiments.curated.dynamic_ir.summary",
     "experiments.curated.weather_tool.summary",
+    "experiments.curated.idle_autonomy.summary",
     "experiments.curated.ev3_preflight.summary",
 )
 EXPERIMENT_STATUSES = ("verified", "waiting")

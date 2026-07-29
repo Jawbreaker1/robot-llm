@@ -162,6 +162,17 @@ class FaultAtGoalSimulator(DifferentialDriveSimulator):
         )
 
 
+class CancelAtDispatchBoundary:
+    """Become cancelled only after arbitration has produced a pulse."""
+
+    def __init__(self):
+        self.checks = 0
+
+    def is_set(self):
+        self.checks += 1
+        return self.checks >= 3
+
+
 class NavigationSimulatorTests(unittest.TestCase):
     def test_forward_ray_reports_nearest_obstacle_identity(self):
         nearer = CircleObstacle(
@@ -965,6 +976,28 @@ class NavigationSimulatorTests(unittest.TestCase):
         self.assertEqual(result.actions, 0)
         self.assertTrue(result.terminal_stop_verified)
         self.assertIn("CANCELLED", result.trace)
+
+    def test_cancel_after_arbitration_revokes_pulse_before_dispatch(self):
+        plant, supervisor, inbox, _authority = make_stack()
+        cancel_event = CancelAtDispatchBoundary()
+        episode = NavigationEpisode(
+            plant,
+            supervisor,
+            inbox,
+            (GoalSeekingBehavior(),),
+            cancel_event=cancel_event,
+        )
+
+        result = episode.run(waypoint())
+
+        self.assertEqual(result.termination, NAVIGATION_ABORTED)
+        self.assertEqual(result.actions, 0)
+        self.assertEqual(
+            [pulse.kind for pulse in plant.applied_pulses],
+            ["STOP"],
+        )
+        self.assertTrue(result.terminal_stop_verified)
+        self.assertIn("CANCELLED_BEFORE_DISPATCH", result.trace)
 
     def test_async_inbox_proposals_count_toward_episode_budget(self):
         plant, supervisor, inbox, _authority = make_stack()

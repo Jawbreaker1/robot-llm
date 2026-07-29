@@ -75,7 +75,7 @@ permission to execute motion.
 
 ## What works today
 
-Status snapshot: **2026-07-28**.
+Status snapshot: **2026-07-29**.
 
 | Area | Verified now | Important boundary |
 |---|---|---|
@@ -84,7 +84,7 @@ Status snapshot: **2026-07-28**.
 | EV3 supervisor | Motion-free `brake`/`stop`/inventory/touch preflight passed on the real robot with zero motor starts | The newer foreground daemon has only been verified against fake sysfs |
 | Lab Console | Local Gemma chat, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | No motor, SSH, TTS, or stop routes exist in the dashboard |
 | RobotAPI loop | Typed, snapshot-bound arm API and a closed `observe → plan → act → verify → replan` loop | Simulator-only and currently driven by a scripted fake planner |
-| Navigation | Waypoint following, obstacle avoidance, version-bound multi-waypoint missions, one MotionSupervisor, and an independent collision oracle | 2D simulator only; no physical navigation adapter or model-authored mission planner |
+| Navigation | Waypoint following, obstacle avoidance, version-bound multi-waypoint missions, self-directed idle exploration, one MotionSupervisor, and an independent collision oracle | 2D simulator only; Gemma selects opaque host-created opportunities, not arbitrary coordinates or physical commands |
 | Concurrent interaction | Independent bounded workers plus one live local-Gemma simulator run where model speech overlapped a later navigation tick | Virtual callbacks only; no physical drive, speaker, or arm adapter |
 | Physical autonomy | Not enabled | Waiting for reliable EV3 power, physical transport validation, calibration, stop-latency evidence, and fault injection |
 
@@ -152,7 +152,43 @@ proposal, and replan budgets. The next leg starts only after the previous
 episode has reached its waypoint and verified a terminal STOP. A changed
 world model invalidates the remaining plan at that stopped boundary, and a
 failed leg never starts later legs. This is the deterministic plan-execution
-seam; Gemma does not author these mission plans yet.
+seam. Gemma does not author arbitrary multi-leg missions yet.
+
+The first self-directed layer now sits above that seam. When idle mode has
+been explicitly enabled and no user owns or is waiting for the goal lease, a
+typed range producer records exact stopped observations and the host creates
+a small feasible menu of local opportunities. Candidate IDs are opaque to the
+model; coordinates remain in a private host registry. Gemma may return only
+`SELECT`, `HOLD`, or `ABORT`, and `SELECT` must name exactly one offered ID.
+The host then revalidates the lease generation, deadline, state version,
+world-model version, observation producer/robot/controller/frame identity,
+host receive-time/TTL, candidate set, safe stopped snapshot, and cumulative
+budgets before creating one short one-leg mission.
+
+Completed cells are remembered only after waypoint success and verified STOP.
+Failed or stale attempts are counted separately and a cell is suppressed after
+a deterministic retry cap unless an exact new observation makes it relevant
+again. Session budgets are backed by a persistent duty-cycle budget across
+public scheduler calls; resetting it requires idle to be disabled with no
+owner, pending user, fault, motion, or outstanding selector worker. An atomic
+authority guard blocks idle enablement and new goal claims during the reset.
+An exact same-pose range or simulator-object change is published as typed
+evidence without being declared interesting by host heuristics; the model
+decides whether the linked opportunity is worth investigating. A user request
+first reserves `USER_PENDING`, atomically prevents new idle work, cancels the
+active idle lease, and receives a newer goal epoch only after the idle task has
+returned a verified STOP. Model selection runs behind a single-flight,
+cancelable boundary, so even a selector that never returns cannot hold up user
+activation; its late result is discarded and no replacement worker is spawned
+while it remains alive. This goal lease is separate from pulse arbitration:
+the model can choose a bounded purpose but can never transfer motor ownership
+to itself.
+
+Preemption is ordered and bounded, not physically instantaneous. Cancellation
+observed before dispatch prevents a pulse. If a user reservation lands inside
+the final simulator `apply` seam, at most the one already-dispatched pulse may
+finish; its duration is capped by the motion calibration. No later DRIVE is
+issued, STOP is verified, and only then can the newer user epoch activate.
 
 If geometry changes after observation but before dispatch, the stale pulse is
 rejected, the episode re-observes, and the retry consumes the existing replan
@@ -197,7 +233,11 @@ Verified or enforced today:
   endpoints;
 - simulator-only closed loops for typed arm actions, waypoint navigation, and
   concurrent navigation/expression/speech/propeller coordination, all without
-  a physical autonomy adapter.
+  a physical autonomy adapter;
+- simulator-only self-directed exploration with an exclusive goal lease,
+  opaque model-selected opportunities, persistent wandering budgets, bounded
+  ordered user preemption, stale-world replanning, and verified terminal
+  stops.
 
 Still required before autonomous physical motion:
 
@@ -263,6 +303,37 @@ Use `--scenario clear` for a direct waypoint and `--full` for the reproducible
 tick trace. Every measurement in `config/navigation_simulation.json` is
 labelled `simulation_only`. The command cannot import RobotAPI, SSH transport,
 or the EV3 HAL.
+
+### Run self-directed idle exploration
+
+Run the deterministic test oracle for three bounded, self-created waypoint
+tasks:
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.autonomy_demo
+```
+
+Let the loaded local Gemma model choose among the same opaque, host-owned
+opportunities:
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.autonomy_demo --lm-studio
+```
+
+The dynamic scenario completes one task, moves the synthetic box while the
+robot is stopped, and asks the model to choose again from candidates linked to
+the exact range transition:
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.autonomy_demo \
+  --lm-studio --scenario range-change
+```
+
+All three commands are simulator-only. Idle autonomy defaults off in the goal
+coordinator; the demo enables it explicitly. Every task receives a new lease
+and goal epoch, each task ends at a verified stopped boundary, and repeated
+scheduler calls share a persistent duty-cycle budget until an explicit safe
+re-arm.
 
 ### Run concurrent navigation and object interaction
 
@@ -380,7 +451,7 @@ This is a manual hardware test, not autonomous navigation. Read the full
 
 | Measurement | Result |
 |---|---:|
-| Hardware-free test suite | `574 / 574` passing |
+| Hardware-free test suite | `656 / 656` passing |
 | Physical supervisor preflight | `completed`, `0` motor-start commands |
 | Straight physical B/C pulse | `+175° / +175°` |
 | Physical B/C turn pulse | `+172° / −170°` |
@@ -390,6 +461,7 @@ This is a manual hardware test, not autonomous navigation. Read the full
 | IR gate released | `100 ms` after first filtered value `≥40` |
 | Gemma proposal in one physical shadow run | `417 ms` |
 | Live concurrent Gemma simulator run | `1` accepted expression; speech/navigation interleaving observed; `98` actions; verified stop |
+| Live idle Gemma range-change run | `2 / 2` self-selected tasks; same box `207 → 357 mm`; `22` actions; `0` collisions; verified stop |
 
 The IR figures verify filtering and hysteresis in stationary tests. They are
 not motor stop time, braking distance, a real-time guarantee, or a benchmark.
@@ -412,6 +484,10 @@ Protocols, limitations, and raw data are in the
   inter-leg stops, and world-version invalidation
 - [x] Concurrent simulator runtime: asynchronous navigation/expression/speech,
   optional propeller reaction, and serialized wheel ownership
+- [x] Self-directed simulator idle loop: typed change observations, opaque
+  Gemma-selected waypoint opportunities, cancelable single-flight selection,
+  goal leases, bounded user preemption, retry memory, and persistent wandering
+  budgets
 - [ ] Reliable EV3 power and physical motion-free foreground handshake
 - [ ] Physical RobotAPI adapter, semantic tools, calibration, and safety
   evidence

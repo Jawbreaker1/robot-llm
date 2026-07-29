@@ -831,6 +831,25 @@ class NavigationEpisode:
                     goal,
                     proposals,
                 )
+            # Goal ownership can change concurrently with arbitration.  A
+            # cancellation observed here must revoke the one-shot authority
+            # before the already-created pulse reaches the plant.
+            if self._cancelled():
+                trace.append("CANCELLED_BEFORE_DISPATCH")
+                try:
+                    self.supervisor.cancel(pulse)
+                    termination = NAVIGATION_ABORTED
+                except Exception:
+                    termination = NAVIGATION_EXECUTION_FAILED
+                return self._finish(
+                    goal,
+                    termination,
+                    counters,
+                    trace,
+                    steps,
+                    snapshot,
+                    already_stopped=False,
+                )
             if (
                 pulse.kind == "DRIVE"
                 and (

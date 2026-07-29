@@ -534,6 +534,18 @@ class DashboardService:
                 ),
             ),
             ExperimentDescriptor(
+                experiment_id="EXP-F5-IDLE-SIM-005",
+                title_key="experiments.curated.idle_autonomy.title",
+                summary_key=(
+                    "experiments.curated.idle_autonomy.summary"
+                ),
+                status="verified",
+                component_ids=(
+                    "mac-host",
+                    "lm-studio",
+                ),
+            ),
+            ExperimentDescriptor(
                 experiment_id="EV3-FOREGROUND-PREFLIGHT",
                 title_key="experiments.curated.ev3_preflight.title",
                 summary_key="experiments.curated.ev3_preflight.summary",

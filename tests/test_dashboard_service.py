@@ -545,7 +545,7 @@ class DashboardServiceTests(unittest.TestCase):
         bootstrap = service.bootstrap()
         experiments = bootstrap["experiments"]
 
-        self.assertEqual(len(experiments), 3)
+        self.assertEqual(len(experiments), 4)
         self.assertEqual(
             {item["title_key"] for item in experiments},
             set(EXPERIMENT_TITLE_KEYS),

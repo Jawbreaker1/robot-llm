@@ -31,7 +31,64 @@ _EXPORTS = {
     "DecisionProposal": (".agent_loop", "DecisionProposal"),
     "EvidenceProvenance": (".research", "EvidenceProvenance"),
     "EpisodeResult": (".agent_loop", "EpisodeResult"),
+    "ExplorationCandidate": (
+        ".autonomy_contract",
+        "ExplorationCandidate",
+    ),
+    "ExplorationMemory": (
+        ".autonomy_perception",
+        "ExplorationMemory",
+    ),
+    "ExplorationPolicy": (
+        ".autonomy_perception",
+        "ExplorationPolicy",
+    ),
+    "GoalLease": (".autonomy_authority", "GoalLease"),
+    "GoalLeaseCoordinator": (
+        ".autonomy_authority",
+        "GoalLeaseCoordinator",
+    ),
+    "IdleExplorationService": (
+        ".autonomy_runtime",
+        "IdleExplorationService",
+    ),
+    "IdleDutyCycleLimits": (
+        ".autonomy_runtime_contract",
+        "IdleDutyCycleLimits",
+    ),
+    "IdleDutyCycleState": (
+        ".autonomy_runtime_contract",
+        "IdleDutyCycleState",
+    ),
+    "IdleSessionLimits": (
+        ".autonomy_runtime_contract",
+        "IdleSessionLimits",
+    ),
+    "IdleSessionResult": (
+        ".autonomy_runtime_contract",
+        "IdleSessionResult",
+    ),
+    "IdleTaskResult": (
+        ".autonomy_runtime_contract",
+        "IdleTaskResult",
+    ),
+    "InterestObservation": (
+        ".autonomy_contract",
+        "InterestObservation",
+    ),
+    "InterestSelectionContext": (
+        ".autonomy_contract",
+        "InterestSelectionContext",
+    ),
+    "InterestSelectionProposal": (
+        ".autonomy_contract",
+        "InterestSelectionProposal",
+    ),
     "LMStudioError": (".lm_studio", "LMStudioError"),
+    "LMStudioInterestSelector": (
+        ".lm_studio_autonomy",
+        "LMStudioInterestSelector",
+    ),
     "LMStudioResearchPlanner": (
         ".lm_studio_research",
         "LMStudioResearchPlanner",
@@ -149,6 +206,10 @@ _EXPORTS = {
     "decode_decision_proposal": (
         ".agent_loop",
         "decode_decision_proposal",
+    ),
+    "decode_interest_selection": (
+        ".autonomy_contract",
+        "decode_interest_selection",
     ),
     "decode_mission_plan": (
         ".navigation_mission",

@@ -970,8 +970,11 @@ class ExpressionIsolationTests(unittest.TestCase):
                 release_planner.set()
             if cancel_event.is_set():
                 return
-            self.assertTrue(published.wait(1))
-            published.clear()
+            obstacle_published = inbox.source_published[
+                "obstacle-avoidance"
+            ]
+            self.assertTrue(obstacle_published.wait(1))
+            obstacle_published.clear()
 
         runtime = ConcurrentBehaviorRuntime(
             plant,
