@@ -53,6 +53,30 @@ verified motors, sensors, speech, and manual bounded movement; autonomous
 physical motion remains gated until the power, transport, calibration,
 braking, and fault-injection evidence is strong enough.
 
+## Why this differs from common LLM-controlled robots
+
+Many LLM–robot prototypes are essentially natural-language remote controls:
+
+`prompt → model chooses one command → robot executes it`
+
+Robot LLM Lab is built around a continuing feedback loop instead:
+
+`goal → plan → bounded action → observe → verify → continue, replan, or stop`
+
+A goal can persist across many actions. Independent workers can plan,
+perceive, map, validate, and speak in parallel. The LLM publishes typed,
+time-bounded proposals; a deterministic MotionSupervisor alone turns the best
+still-valid proposal into one short, interruptible execution decision per
+tick.
+
+This changes the model's role from a one-shot command translator into the
+reasoning layer of a system that can pursue an outcome, judge its own
+progress, investigate unexpected evidence, initiate bounded exploration when
+idle, and revise its plan. The complete control loop and concurrent runtime
+are implemented and tested in simulation; live Gemma already participates in
+bounded decision and expression seams. Arbitrary human-language missions and
+autonomous EV3 deployment remain explicitly gated.
+
 ## Core architecture
 
 ```mermaid
