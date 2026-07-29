@@ -19,11 +19,10 @@ deterministic software decides whether and how the motors may carry it out.
 > perception produce useful closed-loop robot behavior while a deterministic
 > safety and control layer remains the sole authority over motion?
 
-This is **not primarily a general-purpose chatbot**. The chat is the
-human-facing workbench for the future robot agent: it lets us test context,
-tool selection, evidence, personality, and model behavior before connecting
-natural-language goals to physical execution. The physical language-to-motion
-path is intentionally still locked.
+The Lab Console is the human-facing workbench for developing and observing
+the agent. Today it exercises dialogue, context, read-only tool use, evidence,
+personality, and model behavior while the physical language-to-motion path
+remains intentionally locked.
 
 <p align="center">
   <img src="src/robot_agent/dashboard_web/robot-llm-mascot.png" alt="Robot LLM Lab's mildly grumpy modular mascot waving" width="280">
@@ -31,15 +30,7 @@ path is intentionally still locked.
 
 <p align="center"><em>Mildly grumpy by design. Personality lives in the language layer; safety does not.</em></p>
 
-## The short answer
-
-| Question | Answer |
-|---|---|
-| What is this for? | Building and evaluating a local, agentic intelligence for a physical LEGO robot that can understand goals, form plans, observe, act, verify, speak, and replan |
-| Is it a chat where I can ask anything? | Gemma can hold a conversation, but general chat is a test harness—not the purpose of the project |
-| Can I give the EV3 natural-language instructions today? | Not physically yet. Model-driven goal selection and closed loops run in the 2D simulator; physical EV3 motion remains manual and explicitly acknowledged |
-| What does the Lab Console do? | It is an operator and observability workbench for dialogue, agent traces, evidence, experiments, component state, and the simulator-generated spatial map; it has no robot-control routes |
-| Why is there a weather demo? | Weather is a deliberately low-risk proof of semantic tool choice, fresh external information, provenance, and citations. The same pattern can later let the robot research something identified by perception; weather itself is not the product |
+## From a goal to robot behavior
 
 The intended interaction is a **goal**, not a low-level motor script:
 
