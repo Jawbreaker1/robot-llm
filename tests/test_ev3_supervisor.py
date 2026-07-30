@@ -2,6 +2,7 @@ import fcntl
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,9 @@ class FakeClock:
 
     def sleep(self, seconds):
         self.now_ms += int(round(seconds * 1000))
+        # The real EV3 sleep yields to the daemon's reader/writer threads.
+        # Preserve that scheduling property when the fake sysfs poll is fast.
+        time.sleep(0)
 
     def advance(self, milliseconds):
         self.now_ms += milliseconds
@@ -379,6 +383,292 @@ class EV3SupervisorTests(unittest.TestCase):
             self.supervisor.audit_events[0]["event"],
             "startup_complete",
         )
+
+    def test_steady_poll_uses_bound_paths_without_identity_resolution(self):
+        with patch.object(
+            self.hal,
+            "_motor_path_for_role",
+            side_effect=AssertionError("motor identity was re-resolved"),
+        ), patch.object(
+            self.hal,
+            "_sensor_path_for_role",
+            side_effect=AssertionError("touch identity was re-resolved"),
+        ):
+            self.supervisor.poll_once()
+            self.supervisor.poll_once()
+
+        self.assertEqual(self.supervisor.state, STATE_DISARMED)
+        self.assertIsNone(self.supervisor.fault)
+
+    def test_bound_dynamic_reads_observe_new_touch_and_encoder_values(self):
+        before = self.supervisor._owner.dynamic_motor_snapshots(
+            ("drive_b",)
+        )
+        before_by_role = dict(
+            (item["role"], item) for item in before
+        )
+        write(self.sysfs.motors["outB"] / "position", 37)
+        write(self.sysfs.sensors["in1"] / "value0", 1)
+
+        after = self.supervisor._owner.dynamic_motor_snapshots(
+            ("drive_b",)
+        )
+        after_by_role = dict(
+            (item["role"], item) for item in after
+        )
+
+        self.assertNotEqual(
+            before_by_role["drive_b"]["position"],
+            after_by_role["drive_b"]["position"],
+        )
+        self.assertEqual(
+            after_by_role["drive_b"]["position"],
+            37,
+        )
+        self.assertEqual(
+            self.supervisor._owner.read_touch_value(),
+            1,
+        )
+
+    def test_idle_poll_has_a_bounded_dynamic_io_budget(self):
+        real_read = supervisor_module.read_text
+        real_discover = (
+            self.supervisor._owner._discovered_motor_paths
+        )
+        real_identity = self.supervisor._owner._identity_token
+        read_paths = []
+        discovery_calls = []
+        identity_calls = []
+
+        def counted_read(path):
+            read_paths.append(Path(path).name)
+            return real_read(path)
+
+        def counted_discover():
+            discovery_calls.append(True)
+            return real_discover()
+
+        def counted_identity(path, kind, error_code):
+            identity_calls.append(path)
+            return real_identity(path, kind, error_code)
+
+        with patch.object(
+            supervisor_module,
+            "read_text",
+            side_effect=counted_read,
+        ), patch.object(
+            self.supervisor._owner,
+            "_discovered_motor_paths",
+            side_effect=counted_discover,
+        ), patch.object(
+            self.supervisor._owner,
+            "_identity_token",
+            side_effect=counted_identity,
+        ):
+            self.supervisor.poll_once()
+
+        self.assertEqual(
+            read_paths,
+            ["mode", "value0", "state", "state", "state"],
+        )
+        self.assertEqual(len(discovery_calls), 1)
+        self.assertEqual(len(identity_calls), 4)
+
+    def test_running_poll_has_a_bounded_dynamic_io_budget(self):
+        session_id = self.claim_and_arm()
+        self.start_drive(session_id, duration_ms=800)
+        real_read = supervisor_module.read_text
+        real_discover = (
+            self.supervisor._owner._discovered_motor_paths
+        )
+        real_identity = self.supervisor._owner._identity_token
+        read_paths = []
+        discovery_calls = []
+        identity_calls = []
+
+        def counted_read(path):
+            read_paths.append(Path(path).name)
+            return real_read(path)
+
+        def counted_discover():
+            discovery_calls.append(True)
+            return real_discover()
+
+        def counted_identity(path, kind, error_code):
+            identity_calls.append(path)
+            return real_identity(path, kind, error_code)
+
+        with patch.object(
+            supervisor_module,
+            "read_text",
+            side_effect=counted_read,
+        ), patch.object(
+            self.supervisor._owner,
+            "_discovered_motor_paths",
+            side_effect=counted_discover,
+        ), patch.object(
+            self.supervisor._owner,
+            "_identity_token",
+            side_effect=counted_identity,
+        ):
+            self.supervisor.poll_once()
+
+        self.assertEqual(
+            read_paths,
+            [
+                "mode",
+                "value0",
+                "state",
+                "state",
+                "position",
+                "state",
+                "position",
+            ],
+        )
+        self.assertEqual(len(discovery_calls), 1)
+        self.assertEqual(len(identity_calls), 4)
+
+    def test_missing_bound_dynamic_attribute_faults_and_stops(self):
+        state_path = self.sysfs.motors["outA"] / "state"
+        state_path.unlink()
+        try:
+            self.supervisor.poll_once()
+
+            self.assertEqual(
+                self.supervisor.state,
+                STATE_FAULT_LATCHED,
+            )
+            self.assertEqual(
+                self.supervisor.fault["code"],
+                "hardware_read_failed",
+            )
+            self.assert_all_stopped()
+        finally:
+            write(state_path, "")
+
+    def test_touch_mode_change_during_motion_faults_and_stops(self):
+        session_id = self.claim_and_arm()
+        self.start_drive(session_id, duration_ms=800)
+        write(self.sysfs.sensors["in1"] / "mode", "BROKEN")
+
+        self.supervisor.poll_once()
+
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "hardware_topology_changed",
+        )
+        self.assert_all_stopped()
+
+    def test_same_path_motor_replacement_during_motion_faults_and_stops(
+        self,
+    ):
+        session_id = self.claim_and_arm()
+        self.start_drive(session_id, duration_ms=800)
+        original = self.sysfs.motors["outB"]
+        replacement_name = "replacement-drive-b"
+        self.sysfs.add_motor(
+            replacement_name,
+            "outB",
+            "lego-ev3-l-motor",
+        )
+        replacement = (
+            self.sysfs.root / "tacho-motor" / replacement_name
+        )
+        shutil.rmtree(str(original))
+        replacement.rename(original)
+        self.sysfs.motors["outB"] = original
+
+        self.supervisor.poll_once()
+
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "hardware_topology_changed",
+        )
+        self.assert_all_stopped()
+
+    def test_touch_identity_mismatch_before_arm_faults_and_stops(self):
+        self.release_touch_samples()
+        claimed = self.supervisor.claim("host-agent")
+        session_id = claimed["session_id"]
+        self.supervisor.heartbeat(session_id, 1)
+        write(self.sysfs.sensors["in1"] / "mode", "BROKEN")
+
+        with self.assertRaises(SupervisorError) as context:
+            self.supervisor.arm(session_id, 2)
+
+        self.assertEqual(
+            context.exception.code,
+            "hardware_topology_changed",
+        )
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assert_all_stopped()
+
+    def test_unexpected_motor_before_start_faults_without_starting(self):
+        session_id = self.claim_and_arm()
+        self.sysfs.add_motor(
+            "motor-extra",
+            "outD",
+            "lego-ev3-l-motor",
+        )
+        starts_before = self.run_timed_write_count()
+
+        with self.assertRaises(SupervisorError) as context:
+            self.start_drive(session_id)
+
+        self.assertEqual(
+            context.exception.code,
+            "hardware_topology_changed",
+        )
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assertEqual(
+            self.run_timed_write_count(),
+            starts_before,
+        )
+        self.assert_all_stopped()
+
+    def test_fast_poll_keeps_twenty_ms_deadline_fail_closed(self):
+        self.assertEqual(
+            self.supervisor.limits["poll_interval_ms"],
+            20,
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        dynamic_snapshot = (
+            self.supervisor._owner.dynamic_motor_snapshots
+        )
+
+        def delayed_dynamic_snapshot(*args, **kwargs):
+            result = dynamic_snapshot(*args, **kwargs)
+            self.clock.advance(41)
+            return result
+
+        with patch.object(
+            self.supervisor._owner,
+            "dynamic_motor_snapshots",
+            side_effect=delayed_dynamic_snapshot,
+        ):
+            status = loop.run_once()
+
+        self.assertEqual(status["state"], STATE_FAULT_LATCHED)
+        self.assertEqual(
+            status["fault"]["code"],
+            "poll_deadline_missed",
+        )
+        self.assert_all_stopped()
 
     def test_lifetime_lock_blocks_direct_hal_motion(self):
         with self.assertRaises(MotorBusyError):
@@ -849,7 +1139,7 @@ class EV3SupervisorTests(unittest.TestCase):
         session_id = self.claim_and_arm()
         left = self.sysfs.motors["outB"]
         original_write = supervisor_module.write_text
-        real_read_sensor = self.hal.read_sensor
+        real_read_touch = self.supervisor._owner.read_touch_value
         first_started = {"value": False}
         delay_applied = {"value": False}
 
@@ -861,22 +1151,22 @@ class EV3SupervisorTests(unittest.TestCase):
             ):
                 first_started["value"] = True
 
-        def delayed_touch_read(role):
+        def delayed_touch_read():
             if (
                 first_started["value"]
                 and not delay_applied["value"]
             ):
                 self.clock.advance(26)
                 delay_applied["value"] = True
-            return real_read_sensor(role)
+            return real_read_touch()
 
         with patch.object(
             supervisor_module,
             "write_text",
             side_effect=mark_left_start,
         ), patch.object(
-            self.hal,
-            "read_sensor",
+            self.supervisor._owner,
+            "read_touch_value",
             side_effect=delayed_touch_read,
         ):
             with self.assertRaises(SupervisorError) as context:
@@ -890,7 +1180,9 @@ class EV3SupervisorTests(unittest.TestCase):
         session_id = self.claim_and_arm()
         left = self.sysfs.motors["outB"]
         original_write = supervisor_module.write_text
-        real_snapshot = self.supervisor._owner.snapshot_all
+        real_snapshot = (
+            self.supervisor._owner.dynamic_motor_snapshots
+        )
         first_started = {"value": False}
         delay_applied = {"value": False}
 
@@ -902,8 +1194,8 @@ class EV3SupervisorTests(unittest.TestCase):
             ):
                 first_started["value"] = True
 
-        def slow_snapshot():
-            result = real_snapshot()
+        def slow_snapshot(*args, **kwargs):
+            result = real_snapshot(*args, **kwargs)
             if (
                 first_started["value"]
                 and not delay_applied["value"]
@@ -918,7 +1210,7 @@ class EV3SupervisorTests(unittest.TestCase):
             side_effect=mark_left_start,
         ), patch.object(
             self.supervisor._owner,
-            "snapshot_all",
+            "dynamic_motor_snapshots",
             side_effect=slow_snapshot,
         ):
             with self.assertRaises(SupervisorError) as context:
@@ -1112,15 +1404,15 @@ class EV3SupervisorTests(unittest.TestCase):
     def test_slow_sensor_io_cannot_hide_expired_heartbeat(self):
         session_id = self.claim_and_arm()
         self.start_drive(session_id, duration_ms=800)
-        real_read_sensor = self.hal.read_sensor
+        real_read_touch = self.supervisor._owner.read_touch_value
 
-        def slow_read(role):
+        def slow_read():
             self.clock.advance(500)
-            return real_read_sensor(role)
+            return real_read_touch()
 
         with patch.object(
-            self.hal,
-            "read_sensor",
+            self.supervisor._owner,
+            "read_touch_value",
             side_effect=slow_read,
         ):
             self.supervisor.poll_once()
@@ -2040,10 +2332,21 @@ class EV3SupervisorTests(unittest.TestCase):
                     time.sleep(0.001)
                 input_stream.close()
 
-            result = self.run_interactive_session(
-                client,
-                output=output,
-            )
+            fake_sleep = self.clock.sleep
+
+            def scheduled_sleep(seconds):
+                fake_sleep(seconds)
+                time.sleep(0.001)
+
+            with patch.object(
+                self.hal,
+                "sleep_fn",
+                side_effect=scheduled_sleep,
+            ):
+                result = self.run_interactive_session(
+                    client,
+                    output=output,
+                )
             output.close()
         finally:
             if write_descriptor is not None:

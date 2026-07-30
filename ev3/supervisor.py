@@ -246,6 +246,9 @@ class SupervisorMotorOwner(object):
         self._lock_handle = robot._acquire_motor_lock()
         self.active = None
         self.closed = False
+        self._motor_bindings = None
+        self._motor_binding_by_role = None
+        self._touch_binding = None
 
     def _require_open(self):
         if self.closed:
@@ -281,29 +284,391 @@ class SupervisorMotorOwner(object):
             paths.append(path)
         return paths
 
-    def snapshot_all(self):
-        self._require_open()
-        configured_paths = self._configured_paths()
-        discovered_paths = self._discovered_motor_paths()
-        if set(configured_paths) != set(discovered_paths):
+    @staticmethod
+    def _attribute_text(path, attribute, kind, error_code):
+        try:
+            return read_text(os.path.join(path, attribute))
+        except (IOError, OSError, ValueError) as error:
             raise SupervisorError(
-                "unexpected_motor_inventory",
+                error_code,
+                "{} {} could not be read: {}".format(
+                    kind,
+                    attribute,
+                    error,
+                ),
+            )
+
+    @staticmethod
+    def _identity_token(path, kind, error_code):
+        try:
+            metadata = os.stat(path)
+        except (IOError, OSError, ValueError) as error:
+            raise SupervisorError(
+                error_code,
+                "{} identity could not be read: {}".format(
+                    kind,
+                    error,
+                ),
+            )
+        return (metadata.st_dev, metadata.st_ino)
+
+    def bind_topology(self):
+        """Bind immutable device identity once while the motor lock is held."""
+
+        self._require_open()
+        bindings = []
+        seen_paths = set()
+        try:
+            for role in sorted(self.robot.config["motors"]):
+                configured = self.robot.config["motors"][role]
+                path = self.robot._motor_path_for_role(role)
+                if path in seen_paths:
+                    raise SupervisorError(
+                        "hardware_topology_changed",
+                        "Two configured roles resolve to one motor",
+                    )
+                seen_paths.add(path)
+                kind = "Motor {}".format(role)
+                bindings.append(
+                    {
+                        "role": role,
+                        "path": path,
+                        "address": self._attribute_text(
+                            path,
+                            "address",
+                            kind,
+                            "hardware_topology_unreadable",
+                        ),
+                        "driver": self._attribute_text(
+                            path,
+                            "driver_name",
+                            kind,
+                            "hardware_topology_unreadable",
+                        ),
+                        "identity_token": self._identity_token(
+                            path,
+                            kind,
+                            "hardware_topology_unreadable",
+                        ),
+                    }
+                )
+        except SupervisorError:
+            raise
+        except (KeyError, IOError, OSError, RuntimeError, ValueError) as error:
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Motor topology could not be resolved: {}".format(error),
+            )
+
+        discovered_paths = self._discovered_motor_paths()
+        if seen_paths != set(discovered_paths):
+            raise SupervisorError(
+                "hardware_topology_changed",
                 "Discovered motors do not exactly match configuration",
             )
 
-        snapshots = []
-        for path in discovered_paths:
-            snapshots.append(
-                {
-                    "path": path,
-                    "address": read_text(os.path.join(path, "address")),
-                    "position": int(
-                        read_text(os.path.join(path, "position"))
-                    ),
-                    "state": read_text(os.path.join(path, "state")),
-                }
+        try:
+            touch_config = self.robot.config["sensors"]["touch"]
+            touch_path = self.robot._sensor_path_for_role("touch")
+        except (
+            KeyError,
+            IOError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as error:
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Touch sensor could not be resolved: {}".format(error),
             )
+        touch_address = self._attribute_text(
+            touch_path,
+            "address",
+            "Touch sensor",
+            "hardware_topology_unreadable",
+        )
+        touch_driver = self._attribute_text(
+            touch_path,
+            "driver_name",
+            "Touch sensor",
+            "hardware_topology_unreadable",
+        )
+        touch_mode = self._attribute_text(
+            touch_path,
+            "mode",
+            "Touch sensor",
+            "hardware_topology_unreadable",
+        )
+        if (
+            touch_driver != touch_config["driver"]
+            or touch_mode != touch_config["mode"]
+        ):
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Touch sensor identity does not match configuration",
+            )
+
+        # Publish the immutable bindings only after every identity check
+        # succeeds.  A failed partial bind can therefore never feed a poll.
+        self._motor_bindings = tuple(bindings)
+        self._motor_binding_by_role = dict(
+            (binding["role"], binding)
+            for binding in bindings
+        )
+        self._touch_binding = {
+            "path": touch_path,
+            "address": touch_address,
+            "driver": touch_driver,
+            "mode": touch_mode,
+            "identity_token": self._identity_token(
+                touch_path,
+                "Touch sensor",
+                "hardware_topology_unreadable",
+            ),
+        }
+
+    def _require_bound_topology(self):
+        if (
+            self._motor_bindings is None
+            or self._motor_binding_by_role is None
+            or self._touch_binding is None
+        ):
+            raise SupervisorError(
+                "hardware_topology_unbound",
+                "Supervisor hardware topology is not bound",
+            )
+
+    def revalidate_topology(self):
+        """Re-resolve every immutable identity before arming or motion."""
+
+        self._require_open()
+        self._require_bound_topology()
+        discovered_paths = self._discovered_motor_paths()
+        expected_paths = set(
+            binding["path"] for binding in self._motor_bindings
+        )
+        if set(discovered_paths) != expected_paths:
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Discovered motor set changed after startup",
+            )
+
+        for binding in self._motor_bindings:
+            role = binding["role"]
+            try:
+                resolved = self.robot._motor_path_for_role(role)
+            except (
+                IOError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as error:
+                raise SupervisorError(
+                    "hardware_topology_changed",
+                    "Motor {} could not be revalidated: {}".format(
+                        role,
+                        error,
+                    ),
+                )
+            address = self._attribute_text(
+                binding["path"],
+                "address",
+                "Motor {}".format(role),
+                "hardware_topology_unreadable",
+            )
+            driver = self._attribute_text(
+                binding["path"],
+                "driver_name",
+                "Motor {}".format(role),
+                "hardware_topology_unreadable",
+            )
+            identity_token = self._identity_token(
+                binding["path"],
+                "Motor {}".format(role),
+                "hardware_topology_unreadable",
+            )
+            if (
+                resolved != binding["path"]
+                or address != binding["address"]
+                or driver != binding["driver"]
+                or identity_token != binding["identity_token"]
+            ):
+                raise SupervisorError(
+                    "hardware_topology_changed",
+                    "Motor {} identity changed after startup".format(role),
+                )
+
+        try:
+            touch_path = self.robot._sensor_path_for_role("touch")
+        except (
+            IOError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as error:
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Touch sensor could not be revalidated: {}".format(
+                    error
+                ),
+            )
+        touch = self._touch_binding
+        address = self._attribute_text(
+            touch["path"],
+            "address",
+            "Touch sensor",
+            "hardware_topology_unreadable",
+        )
+        driver = self._attribute_text(
+            touch["path"],
+            "driver_name",
+            "Touch sensor",
+            "hardware_topology_unreadable",
+        )
+        mode = self._attribute_text(
+            touch["path"],
+            "mode",
+            "Touch sensor",
+            "hardware_topology_unreadable",
+        )
+        identity_token = self._identity_token(
+            touch["path"],
+            "Touch sensor",
+            "hardware_topology_unreadable",
+        )
+        if (
+            touch_path != touch["path"]
+            or address != touch["address"]
+            or driver != touch["driver"]
+            or mode != touch["mode"]
+            or identity_token != touch["identity_token"]
+        ):
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Touch sensor identity changed after startup",
+            )
+
+    def path_for_role(self, role):
+        self._require_bound_topology()
+        try:
+            return self._motor_binding_by_role[role]["path"]
+        except KeyError:
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Motor role {!r} is not bound".format(role),
+            )
+
+    def read_touch_value(self):
+        self._require_open()
+        self._require_bound_topology()
+        touch = self._touch_binding
+        identity_token = self._identity_token(
+            touch["path"],
+            "Touch sensor",
+            "hardware_topology_changed",
+        )
+        mode = self._attribute_text(
+            touch["path"],
+            "mode",
+            "Touch sensor",
+            "hardware_read_failed",
+        )
+        if (
+            identity_token != touch["identity_token"]
+            or mode != touch["mode"]
+        ):
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Touch sensor identity changed during polling",
+            )
+        raw = self._attribute_text(
+            touch["path"],
+            "value0",
+            "Touch sensor",
+            "hardware_read_failed",
+        )
+        try:
+            return int(raw)
+        except ValueError:
+            raise SupervisorError(
+                "hardware_read_failed",
+                "Touch sensor value is not an integer",
+            )
+
+    def dynamic_motor_snapshots(self, position_roles=()):
+        """Read one consolidated dynamic snapshot from bound devices."""
+
+        self._require_open()
+        self._require_bound_topology()
+        requested = set(position_roles)
+        if not requested <= set(self._motor_binding_by_role):
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Dynamic snapshot requested an unbound motor role",
+            )
+
+        # Retain hot-plug detection without resolving ports, drivers,
+        # addresses or modes again on every safety tick.
+        discovered_paths = set(self._discovered_motor_paths())
+        expected_paths = set(
+            binding["path"] for binding in self._motor_bindings
+        )
+        if discovered_paths != expected_paths:
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Discovered motor set changed during polling",
+            )
+
+        snapshots = []
+        for binding in self._motor_bindings:
+            role = binding["role"]
+            identity_token = self._identity_token(
+                binding["path"],
+                "Motor {}".format(role),
+                "hardware_topology_changed",
+            )
+            if identity_token != binding["identity_token"]:
+                raise SupervisorError(
+                    "hardware_topology_changed",
+                    "Motor {} identity changed during polling".format(
+                        role
+                    ),
+                )
+            snapshot = {
+                "role": role,
+                "path": binding["path"],
+                "address": binding["address"],
+                "state": self._attribute_text(
+                    binding["path"],
+                    "state",
+                    "Motor {}".format(role),
+                    "hardware_read_failed",
+                ),
+            }
+            if role in requested:
+                raw_position = self._attribute_text(
+                    binding["path"],
+                    "position",
+                    "Motor {}".format(role),
+                    "hardware_read_failed",
+                )
+                try:
+                    snapshot["position"] = int(raw_position)
+                except ValueError:
+                    raise SupervisorError(
+                        "hardware_read_failed",
+                        "Motor {} position is not an integer".format(role),
+                    )
+            snapshots.append(snapshot)
         return snapshots
+
+    def snapshot_all(self):
+        """Compatibility snapshot with dynamic state and all positions."""
+
+        self._require_bound_topology()
+        return self.dynamic_motor_snapshots(
+            tuple(self._motor_binding_by_role)
+        )
 
     def stop_all_verified(self):
         """Retry stop and require readable, inactive, stable motor state."""
@@ -494,8 +859,8 @@ class SupervisorMotorOwner(object):
             right_speed_dps,
             duration_ms,
         )
-        left_path = self.robot._motor_path_for_role(left_role)
-        right_path = self.robot._motor_path_for_role(right_role)
+        left_path = self.path_for_role(left_role)
+        right_path = self.path_for_role(right_role)
         if left_path == right_path:
             raise SupervisorError(
                 "duplicate_motor_path",
@@ -613,18 +978,33 @@ class SupervisorMotorOwner(object):
         )
         return left_role, right_role, forward_signs
 
-    def active_snapshot(self):
+    def active_snapshot(self, observations=None):
         self._require_open()
         if self.active is None:
             raise SupervisorError(
                 "no_active_motion",
                 "No motion command is active",
             )
+        active_roles = tuple(
+            configured["role"]
+            for configured in self.active["motors"]
+        )
+        if observations is None:
+            observations = self.dynamic_motor_snapshots(active_roles)
+        observed_by_path = dict(
+            (observed["path"], observed)
+            for observed in observations
+        )
         motors = []
         for configured in self.active["motors"]:
-            raw_state = read_text(
-                os.path.join(configured["path"], "state")
-            )
+            try:
+                observed = observed_by_path[configured["path"]]
+                position = observed["position"]
+            except KeyError:
+                raise SupervisorError(
+                    "hardware_read_failed",
+                    "Active motor is absent from the dynamic snapshot",
+                )
             motors.append(
                 {
                     "side": configured["side"],
@@ -634,15 +1014,8 @@ class SupervisorMotorOwner(object):
                         "physical_speed_dps"
                     ],
                     "position_before": configured["position_before"],
-                    "position": int(
-                        read_text(
-                            os.path.join(
-                                configured["path"],
-                                "position",
-                            )
-                        )
-                    ),
-                    "state": raw_state,
+                    "position": position,
+                    "state": observed["state"],
                 }
             )
         return {
@@ -851,7 +1224,10 @@ class EV3Supervisor(object):
 
         stop_result = self._owner.stop_all_verified()
         try:
-            startup_snapshots = self._owner.snapshot_all()
+            self._owner.bind_topology()
+            startup_snapshots = (
+                self._owner.dynamic_motor_snapshots()
+            )
             for snapshot in startup_snapshots:
                 tokens = _state_tokens(snapshot["state"])
                 if tokens & (
@@ -1249,8 +1625,7 @@ class EV3Supervisor(object):
         )
 
     def _read_touch(self):
-        reading = self.robot.read_sensor("touch")
-        value = reading.get("value0")
+        value = self._owner.read_touch_value()
         if not _is_int(value) or value not in (0, 1):
             raise SupervisorError(
                 "invalid_touch",
@@ -1261,10 +1636,13 @@ class EV3Supervisor(object):
             self.touch_released_samples += 1
         else:
             self.touch_released_samples = 0
-        return reading
+        return {
+            "observed_monotonic_ms": self._now_ms(),
+            "value0": value,
+        }
 
     def _check_idle_motors(self):
-        snapshots = self._owner.snapshot_all()
+        snapshots = self._owner.dynamic_motor_snapshots()
         for snapshot in snapshots:
             tokens = _state_tokens(snapshot["state"])
             if tokens & ACTIVE_MOTOR_STATES:
@@ -1284,10 +1662,17 @@ class EV3Supervisor(object):
                 )
         return snapshots
 
-    def _check_running_motion(self):
-        snapshot = self._owner.active_snapshot()
-        all_motors = self._owner.snapshot_all()
-        self._read_touch()
+    def _check_running_motion(self, touch_already_read=False):
+        if not touch_already_read:
+            self._read_touch()
+        active_roles = tuple(
+            motor["role"]
+            for motor in self._owner.active["motors"]
+        )
+        all_motors = self._owner.dynamic_motor_snapshots(
+            active_roles
+        )
+        snapshot = self._owner.active_snapshot(all_motors)
         now_ms = self._checked_now_ms()
         active_paths = frozenset(
             motor["path"] for motor in snapshot["motors"]
@@ -1454,7 +1839,9 @@ class EV3Supervisor(object):
             self._read_touch()
             now_ms = self._checked_now_ms()
             if self.state == STATE_RUNNING:
-                running = self._check_running_motion()
+                running = self._check_running_motion(
+                    touch_already_read=True
+                )
                 now_ms = running["observed_at_ms"]
                 if now_ms >= running["deadline_ms"]:
                     result = self._owner.finish_active(True)
@@ -1579,11 +1966,34 @@ class EV3Supervisor(object):
             ],
         }
 
+    def _revalidate_hardware_topology(self, phase):
+        try:
+            return self._owner.revalidate_topology()
+        except (
+            IOError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            SupervisorError,
+        ) as error:
+            code = getattr(
+                error,
+                "code",
+                "hardware_topology_changed",
+            )
+            detail = "{} topology revalidation failed: {}".format(
+                phase,
+                error,
+            )
+            self._enter_fault(code, detail)
+            raise SupervisorError(code, detail)
+
     def arm(self, session_id, sequence_id):
         self._require_dispatch_thread()
         self._require_state(STATE_DISARMED)
         self._require_session(session_id)
         self._validate_sequence(sequence_id)
+        self._revalidate_hardware_topology("arm")
         self.poll_once()
         self._require_state(STATE_DISARMED)
         now_ms = self._checked_now_ms()
@@ -1647,10 +2057,10 @@ class EV3Supervisor(object):
         if prior_start_times_ms:
             left_role, right_role, _signs = self.robot._drive_roles()
             for role in (left_role, right_role):
-                path = self.robot._motor_path_for_role(role)
+                path = self._owner.path_for_role(role)
                 if path != motor["path"]:
                     allowed_active_paths.add(path)
-        for observed in self._owner.snapshot_all():
+        for observed in self._owner.dynamic_motor_snapshots():
             tokens = _state_tokens(observed["state"])
             if tokens & FAULT_MOTOR_STATES:
                 raise SupervisorError(
@@ -1755,6 +2165,7 @@ class EV3Supervisor(object):
                 str(error),
             )
 
+        self._revalidate_hardware_topology("drive")
         self.poll_once()
         self._require_state(STATE_ARMED_IDLE)
         now_ms = self._checked_now_ms()
