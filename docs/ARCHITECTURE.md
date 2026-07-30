@@ -735,6 +735,20 @@ partiell skrivning, fel korrelations-ID, dubbla/oväntade svar eller ett
 asynkront läsfel poisonar kanalen och stänger dess stdin. När utfallet är
 okänt får samma kanal aldrig användas för ett nytt motorförslag.
 
+Korta rörelsefria engångskommandon kan återanvända en strikt verifierad
+OpenSSH-anslutning för att slippa ny nyckelväxling. Det är bara en
+latensoptimering och ersätter inte exekveringsprotokollet. Motor-supervisorn
+behåller sin egen explicita foreground-kanal så att heartbeat, länkbortfall
+och okänt utfall har entydig livscykel.
+
+Sensorperiferin har dessutom en separat persistent stdio-kanal med endast
+`describe`, `read_sensor` och `shutdown`. EV3-processen binder konfigurerade
+sensorvägar en gång men revaliderar adress, driver och mode vid varje färsk
+läsning. Protokollet kan inte uttrycka motor, TTS, shell eller nätverk.
+Sessionen och varje frame, svar, kö, TTL och requestbudget är begränsade.
+Det gör snabb perception möjlig utan att blanda blockerande tal eller
+motorägarskap i samma kanal.
+
 ## Kamera och mikrofon
 
 Kameror och mikrofoner är perceptionsnoder, inte motorcontrollers. Rå video

@@ -7,12 +7,15 @@ import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from .lm_studio import DEFAULT_BASE_URL, DEFAULT_MODEL, NativeLMStudioClient
+from .peripheral_transport import PeripheralSSHSession
 from .shadow_commentary import ShadowSpeechError, run_shadow_comment
+from .ssh_policy import motion_free_ssh_options
 
 
 REMOTE_ROBOT_CLI = "/home/robot/robot-llm/ev3/robot_cli.py"
 MAX_SSH_OUTPUT_BYTES = 64 * 1024
 IR_SAMPLE_COUNT = 3
+DEFAULT_CONTROLLER_ID = "ev3rstorm-01.ev3-main"
 
 Runner = Callable[..., Any]
 
@@ -112,15 +115,12 @@ class EV3SSHTransport:
         self._speech_timeout_seconds = speech_timeout_seconds
 
     def _argv(self, remote_arguments: List[str]) -> List[str]:
-        return [
-            "ssh",
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout={}".format(self._connect_timeout_seconds),
-            self.target,
-        ] + list(remote_arguments)
+        return (
+            ["ssh", "-T"]
+            + motion_free_ssh_options(self._connect_timeout_seconds)
+            + [self.target]
+            + list(remote_arguments)
+        )
 
     def _execute(
         self,
@@ -220,10 +220,25 @@ class EV3SSHTransport:
         return result
 
 
-def run_shadow_cycle(
-    transport: EV3SSHTransport,
-    model_client: Any,
-):
+class PersistentShadowTransport:
+    """Warm sensor channel plus independently bounded one-shot speech."""
+
+    def __init__(
+        self,
+        sensor_session: PeripheralSSHSession,
+        speech_transport: EV3SSHTransport,
+    ):
+        self._sensor_session = sensor_session
+        self._speech_transport = speech_transport
+
+    def read_infrared(self) -> Mapping[str, object]:
+        return self._sensor_session.read_sensor("infrared")
+
+    def speak(self, text: str) -> Mapping[str, object]:
+        return self._speech_transport.speak(text)
+
+
+def run_shadow_cycle(transport: Any, model_client: Any):
     readings = [
         transport.read_infrared()
         for _ in range(IR_SAMPLE_COUNT)
@@ -255,6 +270,10 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--ssh-target", required=True)
+    parser.add_argument(
+        "--controller-id",
+        default=DEFAULT_CONTROLLER_ID,
+    )
     parser.add_argument("--lm-studio-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     return parser
@@ -262,8 +281,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    sensor_session = None
     try:
-        transport = EV3SSHTransport(args.ssh_target)
+        sensor_session = PeripheralSSHSession(
+            args.ssh_target,
+            args.controller_id,
+        )
+        sensor_session.describe()
+        transport = PersistentShadowTransport(
+            sensor_session,
+            EV3SSHTransport(args.ssh_target),
+        )
         model_client = NativeLMStudioClient(
             base_url=args.lm_studio_url,
             model=args.model,
@@ -289,6 +317,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             file=sys.stderr,
         )
         return 2
+    finally:
+        if sensor_session is not None:
+            sensor_session.close()
 
     report = result.to_dict()
     report["status"] = "completed"

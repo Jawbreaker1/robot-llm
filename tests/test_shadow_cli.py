@@ -8,6 +8,7 @@ from robot_agent.shadow_cli import (
     EV3SSHProtocolError,
     EV3SSHTimeoutError,
     EV3SSHTransport,
+    PersistentShadowTransport,
     REMOTE_ROBOT_CLI,
     run_shadow_cycle,
 )
@@ -65,6 +66,38 @@ def sensor_result(value, timestamp):
 
 
 class ShadowCLITests(unittest.TestCase):
+    def test_persistent_shadow_transport_delegates_sensor_and_speech(self):
+        class SensorSession:
+            def __init__(self):
+                self.roles = []
+
+            def read_sensor(self, role):
+                self.roles.append(role)
+                return {"role": role, "value0": 22}
+
+        class SpeechTransport:
+            def __init__(self):
+                self.texts = []
+
+            def speak(self, text):
+                self.texts.append(text)
+                return {"status": "completed"}
+
+        sensor = SensorSession()
+        speech = SpeechTransport()
+        transport = PersistentShadowTransport(sensor, speech)
+
+        self.assertEqual(
+            transport.read_infrared()["value0"],
+            22,
+        )
+        self.assertEqual(
+            transport.speak("Hej"),
+            {"status": "completed"},
+        )
+        self.assertEqual(sensor.roles, ["infrared"])
+        self.assertEqual(speech.texts, ["Hej"])
+
     def test_target_validation_rejects_option_and_shell_characters(self):
         for target in [
             "",
@@ -97,6 +130,14 @@ class ShadowCLITests(unittest.TestCase):
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=3",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=~/.ssh/robot-llm-%C",
+                "-o",
+                "ControlPersist=60",
                 "robot@fe80::1234%en9",
                 "python3",
                 REMOTE_ROBOT_CLI,
