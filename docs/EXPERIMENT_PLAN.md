@@ -291,6 +291,9 @@ till TTS kräver en separat semantisk evalueringsgrind.
 ## Fas 1B – Trådlös transport
 
 USB behålls som återställningsväg under hela utvärderingen.
+Den konkreta, rörelsefria ordningen för adapterinventering, ConnMan,
+värdnyckelverifiering, länktest och återställning finns i
+[`EV3_WIFI.md`](EV3_WIFI.md).
 
 Spår:
 
@@ -430,6 +433,48 @@ EV3:an och rapporterar inte framgång utan stabil touch, verifierat motorläge,
 terminal audit och stängd supervisor. Experimentet innehöll ingen armering,
 inget `run-timed` och ingen rörelse. Det godkänner därför inte fysisk
 superviserad motorstyrning eller autonomi.
+
+### EXP-F2-DAEMON-PREFLIGHT-002 – fysisk polltiming och fail-closed
+
+- Datum: `2026-07-29`.
+- Transport: USB-SSH över brickans link-local-adress; Macens standardrutt
+  låg samtidigt kvar på sin vanliga Wi-Fi-anslutning.
+- Batteri före proven: `7,476466 V`; efter första fail-closed-omgången:
+  `7,421066 V`.
+- Första foreground-försöket startade supervisorn i `DISARMED` men räknade
+  reader-/writer-trådarnas cirka `33 ms` bootstrap mot en tillåten
+  pollförsening på `20 ms`. Resultatet blev
+  `startup_complete → fault_latched → supervisor_closed`, med
+  `poll_deadline_missed`, verifierat stopp och noll motorstarter.
+- Åtgärd: poll-epoken flyttades till efter att båda I/O-trådarna startat.
+  Första-tick- och steady-state-grindarna behölls oförändrade. Ett nytt
+  regressionstest injicerar `17 + 16 ms` trådstart och verifierar
+  `CLOSED`, `fault=null` och noll `run-timed`.
+- Den ändrade daemonen passerade `87` supervisortester, `25`
+  transporttester, Python 3.5-grammatikkontroll och därefter hela sviten på
+  `793` tester.
+- Distribuerad daemon-SHA-256:
+  `7744563d03a900eadb2a41e32f6b48fd9ceee41f717c2981950c39a7b5be6f83`.
+  Föregående fil sparades lokalt på brickan, inte i repot, som
+  `ev3/supervisor_daemon.py.before-poll-epoch-fix-20260729`.
+- Andra foreground-försöket passerade trådbootstrap men missade en riktig
+  poll-deadline med `220 ms`. Supervisorn latschade åter fault, stoppade och
+  stängde i `CLOSED`; hosten skickade inget motion request.
+- Ett separat rörelsefritt timingprov körde därefter tolv direkta
+  `poll_once` i `DISARMED`. Tiderna var
+  `[206,198,207,197,216,196,204,199,203,199,205,199] ms`, alltså
+  `196–216 ms` med median `201 ms`. Alla tolv gav `fault=null`; slutläget
+  var `CLOSED` med `audit_complete=true`.
+- Efter varje misslyckad foreground-körning bekräftade ett separat
+  `robot_cli.py stop` tre inaktiva, stabila motorer, tomma fault tokens och
+  `stop_confirmed=true`. Encoderpositionerna för A/B/C förblev `0°`.
+
+Slutsats: startup-felet är korrigerat utan att försvaga deadlinegrinden, men
+den nuvarande Python/sysfs-pollvägen kan inte uppfylla konfigurationens
+`20 ms`. Foreground-preflight och all fysisk motorstyrning förblir därför
+blockerade. Nästa steg är att profilera och optimera den fysiska pollvägen
+eller införa en separat, explicit och mätt kontrollprofil; gränsen ska inte
+höjas enbart för att göra testet grönt.
 
 ## Fas 3 – Robot-API på värddatorn
 

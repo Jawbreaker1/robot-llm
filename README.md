@@ -124,14 +124,14 @@ reinterpreting the user's sentence into a motor command.
 
 ## What works today
 
-Status snapshot: **2026-07-29**.
+Status snapshot: **2026-07-30**.
 
 | Area | Verified now | Important boundary |
 |---|---|---|
 | Physical EV3 baseline | ev3dev boot, USB/SSH, motors A/B/C, bounded manual drive/turn pulses, encoders, touch, relative IR, reflected-light sensing, and Swedish eSpeak TTS | This verifies the assembled EV3RSTORM, not autonomous motion |
 | Physical LLM path | One complete motion-free shadow cycle: IR readings → deterministic zone; Gemma generated an audit-only comment, while a separate deterministic Swedish fallback was sent to TTS | Gemma output was not spoken and had no tools or motor access |
-| EV3 supervisor | Motion-free `brake`/`stop`/inventory/touch preflight passed on the real robot with zero motor starts | The newer foreground daemon has only been verified against fake sysfs |
-| Lab Console | Local Gemma chat, standards-based microphone UI, local whisper.cpp STT, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | Swedish/English synthetic WAV passed the full local STT API; a real Mac-microphone utterance remains a gate. Speech becomes agent text—no motor, SSH, TTS, or stop routes exist here |
+| EV3 supervisor | Physical foreground startup, fault-stop, terminal audit, and clean lock release are now observed; 12 motion-free physical polls measured `196–216 ms` | The current `20 ms` poll contract is not met, so foreground preflight remains failed and physical motion remains disabled |
+| Lab Console | Local Gemma chat, standards-based microphone UI, local whisper.cpp STT, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | A live Razer Kiyo Pro utterance passed microphone → `large-v3-turbo` → Gemma → weather; a repeatable Swedish/English short-command accuracy corpus remains a gate. Speech becomes agent text—no motor, SSH, TTS, or stop routes exist here |
 | RobotAPI loop | Typed, snapshot-bound arm API and a closed `observe → plan → act → verify → replan` loop | Simulator-only and currently driven by a scripted fake planner |
 | Navigation | Waypoint following, obstacle avoidance, version-bound multi-waypoint missions, self-directed idle exploration, one MotionSupervisor, and an independent collision oracle | 2D simulator only; Gemma selects opaque host-created opportunities, not arbitrary coordinates or physical commands |
 | Spatial map | Continuous bounded occupancy fusion, robot pose, fresh sensor rays, and persistent opaque object hypotheses in a read-only Lab Console map | Current map input is simulator-only. The contract can later retain physical EV3 IR as low-confidence qualitative evidence without inventing metric distance or free space |
@@ -359,7 +359,9 @@ Verified or enforced today:
 
 Still required before autonomous physical motion:
 
-- foreground daemon deployment and motion-free handshake on the real EV3;
+- an optimized physical poll path and a passing motion-free foreground
+  handshake; the deployed daemon currently fails closed because measured
+  physical polls exceed its `20 ms` contract;
 - a motion-enabled physical adapter with lock-retaining fail-stop behavior;
 - measured stop latency, braking distance, polling jitter, and stall
   thresholds;
@@ -382,10 +384,10 @@ tests of the dependency-free dashboard JavaScript; CI currently uses Node 22.
 ### Start the Lab Console
 
 With LM Studio running on `127.0.0.1:1234` and
-`google/gemma-4-26b-a4b` loaded:
+`google/gemma-4-26b-a4b` loaded, the normal voice-enabled launch is:
 
 ```sh
-PYTHONPATH=src python3 -m robot_agent.dashboard_cli
+scripts/start_lab_console.sh
 ```
 
 Open the unique loopback session URL printed by the server:
@@ -398,38 +400,79 @@ Restarting the server invalidates the token. The language selector switches
 the complete UI and sends a typed `response_locale` with every model turn;
 conversation state and form state survive the switch.
 
-To talk through the Mac microphone, install `whisper.cpp`, download a
-checksum-verified multilingual model, and opt in when starting the console:
+The launch profile reuses a warm local `whisper.cpp` service at
+`http://127.0.0.1:8178/v1`, posts to the separately validated
+`/audio/transcriptions` inference path, and identifies the model as
+`ggml-large-v3-turbo-q5_0`. This is the quality standard for Swedish and
+English microphone input. On this development machine that service is already
+kept alive outside the dashboard; do not start a duplicate.
+
+For a new installation, install `whisper.cpp`, download the checksum-verified
+model, and run the same compatible local service in a separate terminal or
+service manager:
 
 ```sh
 brew install whisper-cpp
-sh scripts/download_whisper_model.sh small
-PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
-  --stt-model models/ggml-small.bin
+sh scripts/download_whisper_model.sh large-v3-turbo-q5_0
+whisper-server \
+  --model models/ggml-large-v3-turbo-q5_0.bin \
+  --host 127.0.0.1 \
+  --port 8178 \
+  --threads 8 \
+  --language auto \
+  --no-timestamps \
+  --suppress-nst \
+  --request-path /v1 \
+  --inference-path /audio/transcriptions
 ```
 
-`small` is the quality-first default for Swedish/English demonstrations.
-`base` is a smaller, faster comparison:
+Then run `scripts/start_lab_console.sh`. It probes the service before declaring
+the dashboard ready, so a missing or incompatible provider fails visibly
+instead of silently falling back to another model. The portable profile can be
+changed with `ROBOT_LLM_STT_URL`, `ROBOT_LLM_STT_INFERENCE_PATH`,
+`ROBOT_LLM_STT_MODEL_ID`, and `ROBOT_LLM_PYTHON`; ordinary dashboard CLI
+arguments are forwarded unchanged.
+
+`small` and `base` remain explicit comparison models:
 
 ```sh
+sh scripts/download_whisper_model.sh small
 sh scripts/download_whisper_model.sh base
 ```
 
-Managed STT prefers GPU/Metal for latency. If another local model already
-occupies the available GPU memory, add `--stt-cpu` for a slower but isolated
-CPU fallback.
+If no persistent service is available, managed STT remains an explicit
+fallback. Stop any competing GPU-backed Whisper service first, or choose an
+isolated CPU run:
+
+```sh
+ROBOT_LLM_STT_URL='' scripts/start_lab_console.sh \
+  --stt-model models/ggml-large-v3-turbo-q5_0.bin \
+  --stt-port 8180
+```
+
+External STT URLs are restricted to loopback. Their base path must be either
+the exact allowlisted `/v1` compatibility path or a long opaque private
+segment. The inference path is validated independently as a canonical
+relative path: no host, query, fragment, empty segment, traversal, or
+non-ASCII form is accepted. `/v1` is a compatibility allowlist entry, not an
+authentication secret.
 
 The **Talk** button uses standards-based `getUserMedia` and `AudioWorklet`,
 not a browser-vendor speech service. The settings view exposes microphone
 selection, live signal level and threshold, sensitivity, silence auto-stop,
 maximum utterance length, browser audio processing, spoken-language hint, and
-whether a fresh transcript is sent automatically or left editable.
+whether the selected stream stays warm between turns, and whether a fresh
+transcript is sent automatically or left editable. A warm stream can keep the
+browser's microphone indicator visible, but the PCM worklet remains stopped
+and does not accumulate audio until an explicitly generation-bound capture
+begins.
 
 Audio is converted in the browser to bounded 16 kHz mono PCM16 WAV and sent
-only to the loopback dashboard. It is held in memory while queued or while the
-local provider call is running, and never written to the event log. Queued
-audio is cleared immediately on cancellation; an in-flight provider may retain
-its request until its bounded call returns, after which the result is
+only to the loopback dashboard. It is held in application memory during active
+capture, while queued, or while the local provider call is running, and never
+written to the event log. Queued audio is cleared immediately on cancellation;
+an in-flight provider may retain its request until its bounded call returns,
+after which the result is
 discarded. STT has its own bounded worker, so it does not serialize Gemma
 dialogue, navigation, speech playback, or motor supervision.
 
@@ -558,6 +601,11 @@ files, verify the destination and hashes, keep a physical abort method ready,
 and compare the assembled wiring with
 [`config/ev3rstorm.json`](config/ev3rstorm.json). The committed map is
 specific to this EV3RSTORM.
+
+For untethered setup, keep mini-USB as the recovery path and follow the
+[EV3 Wi-Fi onboarding runbook](docs/EV3_WIFI.md). Its first command is a
+motion-free, read-only driver, firmware, interface, identity, and ConnMan
+inventory.
 
 Deploy and inventory:
 
