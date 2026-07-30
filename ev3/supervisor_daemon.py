@@ -519,11 +519,16 @@ class ForegroundSupervisorSession(object):
 
     def run(self):
         self._started_at_ms = self.local_now_ms()
-        self._loop = EV3SupervisorLoop(self.supervisor)
         self._writer = _ResponseWriter(self, self.output_stream)
         self._reader = _RequestReader(self, self.input_stream)
         self._writer.start()
         self._reader.start()
+        # Thread bootstrap on the EV3 can exceed one poll interval.  No
+        # request can dispatch before these workers exist and the supervisor
+        # is already verified DISARMED, so begin the safety-loop epoch only
+        # after both workers have started.  Once constructed, the normal
+        # first-tick and steady-state deadline checks remain unchanged.
+        self._loop = EV3SupervisorLoop(self.supervisor)
 
         status = None
         pending_error = None

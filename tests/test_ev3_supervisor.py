@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import ev3.supervisor_daemon as supervisor_daemon_module
 import ev3.supervisor as supervisor_module
 from ev3.robot_hal import MotorBusyError, RobotHAL, SafetyError, read_text
 from ev3.supervisor import (
@@ -1731,6 +1732,70 @@ class EV3SupervisorTests(unittest.TestCase):
         self.assertIsNone(result["transport_failure"])
         self.assertFalse(result["motion_enabled"])
         self.assertEqual(self.run_timed_write_count(), 0)
+        self.assert_all_stopped()
+
+    def test_foreground_session_excludes_worker_startup_from_poll_deadline(
+        self,
+    ):
+        responses = []
+
+        def client(input_stream, output):
+            input_stream.send(
+                self.protocol_wire(
+                    "status",
+                    request_id="status-after-worker-start",
+                )
+            )
+            responses.append(output.receive())
+            input_stream.send(
+                self.protocol_wire(
+                    "shutdown",
+                    request_id="shutdown-after-worker-start",
+                )
+            )
+            responses.append(output.receive())
+            input_stream.close()
+
+        writer_start = supervisor_daemon_module._ResponseWriter.start
+        reader_start = supervisor_daemon_module._RequestReader.start
+
+        def delayed_writer_start(writer):
+            self.clock.advance(17)
+            return writer_start(writer)
+
+        def delayed_reader_start(reader):
+            self.clock.advance(16)
+            return reader_start(reader)
+
+        with patch.object(
+            supervisor_daemon_module._ResponseWriter,
+            "start",
+            delayed_writer_start,
+        ), patch.object(
+            supervisor_daemon_module._RequestReader,
+            "start",
+            delayed_reader_start,
+        ):
+            result = self.run_interactive_session(client)
+
+        self.assertEqual(len(responses), 2)
+        self.assertTrue(responses[0]["ok"])
+        self.assertEqual(
+            responses[0]["result"]["state"],
+            STATE_DISARMED,
+        )
+        self.assertTrue(responses[1]["ok"])
+        self.assertEqual(result["status"]["state"], STATE_CLOSED)
+        self.assertIsNone(result["status"]["fault"])
+        self.assertIsNone(result["transport_failure"])
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assertNotIn(
+            "poll_deadline_missed",
+            [
+                event.get("reason_code")
+                for event in self.supervisor.audit_events
+            ],
+        )
         self.assert_all_stopped()
 
     def test_foreground_session_rejects_drive_when_motion_disabled(self):

@@ -564,9 +564,54 @@ class SupervisorChannelPoisonTests(unittest.TestCase):
             CONTROLLER_ID,
             process_factory=factory,
             response_timeout_seconds=0.1,
+            startup_response_timeout_seconds=0.1,
         )
         session._request_prefix = "fixed"
         return session
+
+    def test_first_read_only_request_allows_slow_ev3_cold_start(self):
+        factory = ControlledProcessFactory()
+        session = SupervisorSSHSession(
+            "robot@fake.local",
+            CONTROLLER_ID,
+            process_factory=factory,
+            response_timeout_seconds=0.1,
+            startup_response_timeout_seconds=0.5,
+        )
+        session._request_prefix = "cold"
+
+        def send_cold_start_response():
+            self.assertTrue(
+                factory.process.stdin.wait_for_writes(1)
+            )
+            time.sleep(0.2)
+            factory.process.stdout.send(
+                response_bytes(
+                    request_id="cold-1",
+                    payload={"motion_enabled": False},
+                )
+            )
+
+        responder = threading.Thread(
+            target=send_cold_start_response
+        )
+        responder.start()
+        try:
+            self.assertEqual(
+                session.request("describe"),
+                {"motion_enabled": False},
+            )
+            responder.join(timeout=1)
+            self.assertFalse(responder.is_alive())
+
+            started_at = time.monotonic()
+            with self.assertRaises(
+                SupervisorSSHChannelPoisonedError
+            ):
+                session.request("status")
+            self.assertLess(time.monotonic() - started_at, 0.3)
+        finally:
+            session.close()
 
     def test_timeout_poisons_and_late_response_cannot_shift_next_request(self):
         factory = ControlledProcessFactory()

@@ -23,6 +23,7 @@ MAX_ERROR_BYTES = 16 * 1024
 # outstanding request and unbuffered subprocess pipes, a real SSH stdin pipe
 # cannot accumulate a partial multi-frame backlog.
 MAX_REQUEST_BYTES = 512
+STARTUP_SAFE_OPERATIONS = frozenset(("describe", "status"))
 
 ProcessFactory = Callable[..., Any]
 
@@ -278,6 +279,7 @@ class SupervisorSSHSession:
         process_factory: ProcessFactory = subprocess.Popen,
         connect_timeout_seconds: int = 3,
         response_timeout_seconds: float = 3.0,
+        startup_response_timeout_seconds: float = 30.0,
         remote_session_ms: int = 15_000,
     ):
         self.target = _validate_target(target)
@@ -305,6 +307,17 @@ class SupervisorSSHSession:
         ):
             raise SupervisorSSHConfigurationError(
                 "Response timeout is invalid"
+            )
+        if (
+            isinstance(startup_response_timeout_seconds, bool)
+            or not isinstance(
+                startup_response_timeout_seconds,
+                (int, float),
+            )
+            or not 0.1 <= startup_response_timeout_seconds <= 60
+        ):
+            raise SupervisorSSHConfigurationError(
+                "Startup response timeout is invalid"
             )
         if (
             isinstance(remote_session_ms, bool)
@@ -354,6 +367,9 @@ class SupervisorSSHSession:
         self.argv = argv
         self._response_timeout_seconds = float(
             response_timeout_seconds
+        )
+        self._startup_response_timeout_seconds = float(
+            startup_response_timeout_seconds
         )
         self._responses = queue.Queue(maxsize=8)
         self._failed = threading.Event()
@@ -632,9 +648,21 @@ class SupervisorSSHSession:
                 outcome_unknown=True,
             ) from None
 
+        response_timeout = self._response_timeout_seconds
+        if (
+            self._request_number == 1
+            and operation in STARTUP_SAFE_OPERATIONS
+        ):
+            # The EV3's 300 MHz CPU can need well over ten seconds to import
+            # Python, inventory sysfs, acquire exclusive motor ownership, and
+            # prove a fail-closed stop.  Only the first read-only handshake
+            # receives this cold-start allowance.  Every later operation keeps
+            # the short response timeout, while request TTL is still stamped
+            # from the EV3's own receive clock.
+            response_timeout = self._startup_response_timeout_seconds
         try:
             kind, raw = self._responses.get(
-                timeout=self._response_timeout_seconds
+                timeout=response_timeout
             )
         except queue.Empty:
             raise self._poison(
