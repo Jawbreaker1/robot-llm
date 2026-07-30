@@ -318,6 +318,14 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--stt-inference-path",
+        default="/inference",
+        help=(
+            "Validerad relativ inferenssökväg vid --stt-url "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--stt-whisper-binary",
         default="whisper-server",
         help="whisper-server-binär (default: %(default)s)",
@@ -416,9 +424,11 @@ def _run(argv: Optional[Sequence[str]] = None) -> int:
 
             speech_transcriber = WhisperCppTranscriber(
                 base_url=args.stt_url,
+                inference_path=args.stt_inference_path,
                 model_id=args.stt_model_id,
                 require_opaque_path=True,
             )
+            speech_transcriber.probe()
         service = DashboardService(
             base_url=args.lm_studio_url,
             model=args.model,

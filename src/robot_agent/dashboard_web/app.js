@@ -1755,6 +1755,7 @@
         }
       },
       onError: (message) => showToast(message, true),
+      getUiLocale: () => i18n.locale,
       workletUrl: "assets/pcm_capture_worklet.js",
     });
     microphoneInput.initialize();

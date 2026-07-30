@@ -28,10 +28,14 @@ from .stt_provider import (
 
 
 DEFAULT_WHISPER_CPP_URL = "http://127.0.0.1:8178"
+DEFAULT_WHISPER_CPP_INFERENCE_PATH = "/inference"
 DEFAULT_STT_TIMEOUT_SECONDS = 12.0
 MAX_STT_PROVIDER_RESPONSE_BYTES = 64 * 1024
 MIN_OPAQUE_PATH_CHARACTERS = 22
 MAX_OPAQUE_PATH_CHARACTERS = 128
+MAX_INFERENCE_PATH_CHARACTERS = 128
+MAX_INFERENCE_PATH_SEGMENT_CHARACTERS = 64
+TRUSTED_LOOPBACK_BASE_PATHS = frozenset(("/v1",))
 
 Transport = Callable[..., object]
 
@@ -39,6 +43,8 @@ Transport = Callable[..., object]
 def _safe_opaque_path(path: str) -> str:
     if path in ("", "/"):
         return ""
+    if path in TRUSTED_LOOPBACK_BASE_PATHS:
+        return path
     segment = path[1:] if path.startswith("/") else ""
     if (
         not segment
@@ -54,6 +60,30 @@ def _safe_opaque_path(path: str) -> str:
     ):
         raise ValueError("Whisper server URL path is invalid")
     return "/" + segment
+
+
+def _safe_inference_path(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not 1 < len(value) <= MAX_INFERENCE_PATH_CHARACTERS
+        or not value.startswith("/")
+        or value.endswith("/")
+        or not value.isascii()
+    ):
+        raise ValueError("Whisper inference path is invalid")
+    segments = value[1:].split("/")
+    if any(
+        not segment
+        or len(segment) > MAX_INFERENCE_PATH_SEGMENT_CHARACTERS
+        or not all(
+            character.isalnum() or character in "-_"
+            for character in segment
+        )
+        for segment in segments
+    ):
+        raise ValueError("Whisper inference path is invalid")
+    return value
 
 
 def _safe_loopback_base_url(value: str) -> str:
@@ -228,6 +258,7 @@ class WhisperCppTranscriber:
         self,
         *,
         base_url: str = DEFAULT_WHISPER_CPP_URL,
+        inference_path: str = DEFAULT_WHISPER_CPP_INFERENCE_PATH,
         model_id: str = "whisper-multilingual",
         timeout_seconds: float = DEFAULT_STT_TIMEOUT_SECONDS,
         transport: Transport = direct_http_request,
@@ -253,6 +284,7 @@ class WhisperCppTranscriber:
                 "Whisper server URL requires a private request path"
             )
         self.model_id = _safe_display_id("model_id", model_id)
+        self._inference_path = _safe_inference_path(inference_path)
         self._timeout_seconds = float(timeout_seconds)
         self._transport = transport
         self._boundary_factory = boundary_factory
@@ -260,6 +292,10 @@ class WhisperCppTranscriber:
     @property
     def base_url(self) -> str:
         return self._base_url
+
+    @property
+    def inference_path(self) -> str:
+        return self._inference_path
 
     def probe(self) -> Mapping[str, object]:
         try:
@@ -313,7 +349,7 @@ class WhisperCppTranscriber:
         try:
             response = self._transport(
                 "POST",
-                self._base_url + "/inference",
+                self._base_url + self._inference_path,
                 headers,
                 body,
                 self._timeout_seconds,

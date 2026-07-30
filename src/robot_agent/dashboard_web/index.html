@@ -591,9 +591,10 @@
                 <span data-i18n="settings.microphone.language">Talat språk</span>
                 <select id="speech-input-language" name="speech-input-language">
                   <option value="auto" data-i18n="settings.microphone.language_auto">Identifiera automatiskt</option>
-                  <option value="sv" data-i18n="settings.microphone.language_swedish">Svenska</option>
+                  <option value="sv" data-i18n="settings.microphone.language_swedish" selected>Svenska</option>
                   <option value="en" data-i18n="settings.microphone.language_english">English</option>
                 </select>
+                <small data-i18n="settings.microphone.language_help">Välj språket du talar för säkrare korta instruktioner. Valet skickas direkt till Whisper.</small>
               </label>
               <label class="field microphone-range-field">
                 <span><span data-i18n="settings.microphone.sensitivity">Känslighet</span> <output id="microphone-sensitivity-output" for="microphone-sensitivity">65 %</output></span>
@@ -602,7 +603,7 @@
               </label>
               <label class="field">
                 <span data-i18n="settings.microphone.silence">Tystnad före automatiskt stopp, ms</span>
-                <input id="microphone-silence-ms" name="microphone-silence-ms" type="number" min="400" max="3000" step="100" value="800">
+                <input id="microphone-silence-ms" name="microphone-silence-ms" type="number" min="400" max="3000" step="100" value="1200">
               </label>
               <label class="field">
                 <span data-i18n="settings.microphone.maximum">Maximal taltid, ms</span>
@@ -613,7 +614,8 @@
               <legend data-i18n="settings.microphone.processing">Ljudbehandling</legend>
               <label><input id="microphone-echo-cancellation" name="microphone-echo-cancellation" type="checkbox" checked> <span data-i18n="settings.microphone.echo_cancellation">Ekoreducering</span></label>
               <label><input id="microphone-noise-suppression" name="microphone-noise-suppression" type="checkbox" checked> <span data-i18n="settings.microphone.noise_suppression">Brusreducering</span></label>
-              <label><input id="microphone-auto-gain" name="microphone-auto-gain" type="checkbox" checked> <span data-i18n="settings.microphone.auto_gain">Automatisk nivå</span></label>
+              <label><input id="microphone-auto-gain" name="microphone-auto-gain" type="checkbox"> <span data-i18n="settings.microphone.auto_gain">Automatisk nivå</span></label>
+              <label><input id="microphone-keep-ready" name="microphone-keep-ready" type="checkbox" checked> <span data-i18n="settings.microphone.keep_ready">Håll mikrofonen redo mellan yttranden</span></label>
               <label><input id="microphone-auto-send" name="microphone-auto-send" type="checkbox" checked> <span data-i18n="settings.microphone.auto_send">Skicka transkript automatiskt</span></label>
             </fieldset>
             <div class="microphone-settings-footer">

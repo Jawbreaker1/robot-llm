@@ -336,6 +336,7 @@ const bounded = logic.normalizeSettings({
   echoCancellation: false,
   noiseSuppression: "yes",
   autoGainControl: false,
+  keepReady: false,
   autoSend: false,
 });
 const sourcePcm = Float32Array.from([
@@ -353,6 +354,16 @@ const paddedWindow = logic.speechWindow(
   Float32Array.from([0.5, -0.5]),
   16000,
   { startedAtMs: 1000, speechStartedAtMs: 1000 },
+);
+const lateOnsetWindow = logic.speechWindow(
+  Float32Array.from({ length: 32000 }, (_value, index) => index + 1),
+  16000,
+  { startedAtMs: 1000, speechStartedAtMs: 2200 },
+);
+const boundedPrerollWindow = logic.speechWindow(
+  Float32Array.from({ length: 48000 }, (_value, index) => index + 1),
+  16000,
+  { startedAtMs: 1000, speechStartedAtMs: 3000 },
 );
 const wav = logic.encodePCM16Wav(downsampled, 16000);
 const wavView = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
@@ -389,6 +400,23 @@ for (const nowMs of [250, 1000, 3000, 5000]) {
   quiet = transition.state;
   quietAction = transition.action;
 }
+let hysteresis = logic.createVadState(0);
+const hysteresisActions = [];
+[
+  [250, -25],
+  [300, -25],
+  [1700, -51],
+  [2800, -60],
+  [3000, -60],
+].forEach(([nowMs, sampleLevelDb]) => {
+  const transition = logic.advanceVad(
+    hysteresis,
+    { nowMs, levelDb: sampleLevelDb },
+    defaults,
+  );
+  hysteresis = transition.state;
+  hysteresisActions.push(transition.action);
+});
 
 process.stdout.write(JSON.stringify({
   exports: Object.keys(logic).sort(),
@@ -407,6 +435,10 @@ process.stdout.write(JSON.stringify({
     paddedFirst: paddedWindow[0],
     paddedSecond: paddedWindow[1],
     paddedLast: paddedWindow[paddedWindow.length - 1],
+    lateOnsetLength: lateOnsetWindow.length,
+    lateOnsetFirst: lateOnsetWindow[0],
+    boundedPrerollLength: boundedPrerollWindow.length,
+    boundedPrerollFirst: boundedPrerollWindow[0],
   },
   wav: {
     length: wav.length,
@@ -422,6 +454,7 @@ process.stdout.write(JSON.stringify({
   vadPhase: vad.phase,
   quietAction,
   quietPhase: quiet.phase,
+  hysteresisActions,
 }));
 """
         completed = subprocess.run(
@@ -650,6 +683,9 @@ process.stdout.write(JSON.stringify({
             set(contract["exports"]),
             {
                 "DEFAULT_SETTINGS",
+                "EARLIEST_SETTINGS_STORAGE_KEY",
+                "LEGACY_SETTINGS_STORAGE_KEY",
+                "SETTINGS_SCHEMA_VERSION",
                 "SETTINGS_STORAGE_KEY",
                 "TARGET_SAMPLE_RATE_HZ",
                 "VAD_ACTION",
@@ -671,11 +707,12 @@ process.stdout.write(JSON.stringify({
                 "deviceId": "default",
                 "language": "auto",
                 "sensitivity": 65,
-                "silenceMs": 800,
+                "silenceMs": 1200,
                 "maxUtteranceMs": 12000,
                 "echoCancellation": True,
                 "noiseSuppression": True,
-                "autoGainControl": True,
+                "autoGainControl": False,
+                "keepReady": True,
                 "autoSend": True,
             },
         )
@@ -690,6 +727,7 @@ process.stdout.write(JSON.stringify({
                 "echoCancellation": False,
                 "noiseSuppression": True,
                 "autoGainControl": False,
+                "keepReady": False,
                 "autoSend": False,
             },
         )
@@ -707,12 +745,16 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(
             contract["speechWindow"],
             {
-                "length": 7200,
-                "first": 8800,
+                "length": 16000,
+                "first": 0,
                 "paddedLength": 4000,
                 "paddedFirst": 0.5,
                 "paddedSecond": -0.5,
                 "paddedLast": 0,
+                "lateOnsetLength": 32000,
+                "lateOnsetFirst": 1,
+                "boundedPrerollLength": 40000,
+                "boundedPrerollFirst": 8001,
             },
         )
         self.assertEqual(
@@ -744,6 +786,24 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(contract["vadPhase"], "speech")
         self.assertEqual(contract["quietAction"], "stop_no_speech")
         self.assertEqual(contract["quietPhase"], "waiting")
+        self.assertEqual(
+            contract["hysteresisActions"],
+            [
+                "none",
+                "speech_started",
+                "none",
+                "none",
+                "stop_silence",
+            ],
+        )
+
+    def test_speech_window_retains_late_onset_with_bounded_preroll(self):
+        window = self.speech_input_contract["speechWindow"]
+
+        self.assertEqual(window["lateOnsetLength"], 32000)
+        self.assertEqual(window["lateOnsetFirst"], 1)
+        self.assertEqual(window["boundedPrerollLength"], 40000)
+        self.assertEqual(window["boundedPrerollFirst"], 8001)
 
     def test_microphone_ui_is_accessible_explicit_and_browser_local(self):
         elements_by_id = {
@@ -765,6 +825,7 @@ process.stdout.write(JSON.stringify({
             "microphone-echo-cancellation",
             "microphone-noise-suppression",
             "microphone-auto-gain",
+            "microphone-keep-ready",
             "microphone-auto-send",
             "microphone-settings-meter",
         }
@@ -794,8 +855,19 @@ process.stdout.write(JSON.stringify({
         _, auto_send = elements_by_id["microphone-auto-send"]
         self.assertEqual(auto_send.get("type"), "checkbox")
         self.assertIn("checked", auto_send)
+        _, keep_ready = elements_by_id["microphone-keep-ready"]
+        self.assertEqual(keep_ready.get("type"), "checkbox")
+        self.assertIn("checked", keep_ready)
         self.assertIn(
             "robot-dashboard-microphone-v1",
+            self.speech_input_logic,
+        )
+        self.assertIn(
+            "robot-dashboard-microphone-v2",
+            self.speech_input_logic,
+        )
+        self.assertIn(
+            "robot-dashboard-microphone-v3",
             self.speech_input_logic,
         )
         self.assertNotIn(
@@ -851,7 +923,7 @@ process.stdout.write(JSON.stringify({
         )
         self.assertIn("requestController.abort()", self.microphone_input)
         self.assertIn("getTracks().forEach", self.microphone_input)
-        self.assertIn("await context.close()", self.microphone_input)
+        self.assertIn("await value.context.close()", self.microphone_input)
         self.assertNotIn("innerHTML", self.microphone_input)
         self.assertIn(
             'meter.setAttribute(\n          "aria-valuetext"',
@@ -862,9 +934,7 @@ process.stdout.write(JSON.stringify({
             self.microphone_input,
         )
 
-    def test_cancel_before_post_response_uses_request_id_and_drops_late_result(
-        self,
-    ):
+    def _run_microphone_harness(self):
         harness = (
             Path(__file__).resolve().parent
             / "browser_microphone_cancel_harness.js"
@@ -875,13 +945,19 @@ process.stdout.write(JSON.stringify({
                 str(harness),
                 str(WEB_ROOT / "speech_input_logic.js"),
                 str(WEB_ROOT / "microphone_input.js"),
+                str(WEB_ROOT / "pcm_capture_worklet.js"),
             ],
             check=True,
             capture_output=True,
             text=True,
             timeout=10,
         )
-        result = json.loads(completed.stdout)
+        return json.loads(completed.stdout)
+
+    def test_cancel_before_post_response_uses_request_id_and_drops_late_result(
+        self,
+    ):
+        result = self._run_microphone_harness()
 
         self.assertEqual(
             result["beforeCancel"],
@@ -920,7 +996,66 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(result["transcriptCount"], 0)
         self.assertEqual(result["finalPhase"], "cancelled")
 
-    def test_microphone_vad_clock_starts_after_permission_and_audio_setup(self):
+    def test_spoken_language_follows_ui_until_explicit_override(self):
+        result = self._run_microphone_harness()
+
+        self.assertEqual(result["swedishUiDefault"], "sv")
+        self.assertEqual(result["englishUiDefault"], "en")
+        self.assertEqual(result["explicitOverrideAfterUiChange"], "sv")
+        self.assertEqual(result["explicitOverrideAfterReload"], "sv")
+        self.assertTrue(result["persistedLanguageExplicit"])
+        self.assertEqual(result["persistedSchemaVersion"], 3)
+
+    def test_legacy_microphone_profile_migrates_without_losing_device(self):
+        migrated = self._run_microphone_harness()["migratedSettings"]
+
+        self.assertEqual(migrated["schemaVersion"], 3)
+        self.assertEqual(migrated["deviceId"], "razer-device-id")
+        self.assertEqual(migrated["language"], "en")
+        self.assertFalse(migrated["languageExplicit"])
+        self.assertEqual(migrated["silenceMs"], 1200)
+        self.assertEqual(migrated["sensitivity"], 72)
+        self.assertEqual(migrated["maxUtteranceMs"], 17000)
+        self.assertFalse(migrated["echoCancellation"])
+        self.assertFalse(migrated["noiseSuppression"])
+        self.assertFalse(migrated["autoGainControl"])
+        self.assertTrue(migrated["keepReady"])
+        self.assertFalse(migrated["autoSend"])
+
+    def test_microphone_reuses_warm_pipeline_and_vad_starts_after_setup(self):
+        result = self._run_microphone_harness()
+        expected_warm = {
+            "audioContextCloses": 0,
+            "audioContextCreations": 1,
+            "getUserMediaCalls": 1,
+            "trackStopCalls": 0,
+            "workletModuleLoads": 1,
+        }
+        self.assertEqual(result["permissionPrimePhase"], "ready")
+        self.assertEqual(
+            result["permissionPrimeResources"],
+            expected_warm,
+        )
+        self.assertEqual(
+            result["warmResourcesAfterFirstTurn"],
+            expected_warm,
+        )
+        self.assertEqual(
+            result["warmResourcesDuringSecondTurn"],
+            expected_warm,
+        )
+        self.assertEqual(result["secondTurnPhase"], "listening")
+        self.assertTrue(result["portHandlerAfterFirstTurn"])
+        self.assertEqual(
+            result["resourcesAfterDestroy"],
+            {
+                **expected_warm,
+                "audioContextCloses": 1,
+                "trackStopCalls": 1,
+            },
+        )
+        self.assertEqual(result["workletPortCloseCalls"], 1)
+
         start_source = self.microphone_input[
             self.microphone_input.index("    async start() {"):
             self.microphone_input.index(
@@ -929,27 +1064,99 @@ process.stdout.write(JSON.stringify({
             )
         ]
         self.assertLess(
-            start_source.index("await this._openStream()"),
+            start_source.index("await this._ensureAudioReady()"),
             start_source.index(
                 "this.vad = this.logic.createVadState(this._now())"
             ),
         )
-        self.assertIn("void this.refreshDevices(false)", start_source)
-        self.assertNotIn(
-            "await this.refreshDevices(false)",
-            start_source,
-        )
+        self.assertNotIn("this._openStream()", start_source)
+        pipeline_source = self.microphone_input[
+            self.microphone_input.index("    async _ensureAudioReady() {"):
+            self.microphone_input.index(
+                "\n    _effectiveSettings()",
+                self.microphone_input.index(
+                    "    async _ensureAudioReady() {"
+                ),
+            )
+        ]
         self.assertLess(
-            start_source.index("await context.audioWorklet.addModule"),
-            start_source.index(
-                "this.vad = this.logic.createVadState(this._now())"
+            pipeline_source.index(
+                "resources.stream = await this._openStream()"
+            ),
+            pipeline_source.index(
+                "await resources.context.audioWorklet.addModule"
             ),
         )
-        self.assertLess(
-            start_source.index(
-                "this.vad = this.logic.createVadState(this._now())"
-            ),
-            start_source.index("this.source.connect(this.worklet)"),
+        self.assertIn("void this.refreshDevices(false)", pipeline_source)
+
+    def test_warm_microphone_never_buffers_audio_between_turns(self):
+        result = self._run_microphone_harness()
+
+        self.assertTrue(result["idlePortHandlerInstalled"])
+        self.assertEqual(result["controlsBeforeFirstTalk"], [])
+        self.assertEqual(result["idleChunkPhase"], "ready")
+        self.assertEqual(result["staleChunkPhase"], "listening")
+        self.assertEqual(
+            result["captureControls"],
+            [
+                {
+                    "type": "capture-control",
+                    "action": "start",
+                    "captureGeneration": 1,
+                },
+                {
+                    "type": "capture-control",
+                    "action": "stop",
+                    "captureGeneration": 1,
+                },
+                {
+                    "type": "capture-control",
+                    "action": "start",
+                    "captureGeneration": 3,
+                },
+                {
+                    "type": "capture-control",
+                    "action": "stop",
+                    "captureGeneration": 3,
+                },
+            ],
+        )
+        protocol = result["workletProtocol"]
+        self.assertEqual(protocol["idleOutputCount"], 0)
+        self.assertEqual(protocol["idleOffset"], 0)
+        self.assertEqual(protocol["partialOffset"], 512)
+        self.assertEqual(protocol["stoppedOffset"], 0)
+        self.assertEqual(
+            protocol["outputsAfterStaleStop"],
+            [
+                {
+                    "type": "samples",
+                    "captureGeneration": 8,
+                    "sampleBytes": 4096,
+                },
+                {
+                    "type": "samples",
+                    "captureGeneration": 8,
+                    "sampleBytes": 4096,
+                },
+            ],
+        )
+        self.assertEqual(protocol["outputCountAfterFinalStop"], 2)
+        self.assertIsNone(protocol["activeGenerationAfterStop"])
+
+    def test_disabling_keep_ready_releases_pipeline_and_reports_idle(self):
+        result = self._run_microphone_harness()
+
+        self.assertEqual(result["phaseAfterKeepReadyDisabled"], "idle")
+        self.assertEqual(
+            result["resourcesAfterDestroy"],
+            {
+                "audioContextCloses": 1,
+                "audioContextCreations": 1,
+                "getUserMediaCalls": 1,
+                "trackStopCalls": 1,
+                "workletModuleLoads": 1,
+            },
         )
 
     def test_microphone_number_fields_commit_without_fighting_keyboard_input(self):

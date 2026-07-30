@@ -9,12 +9,19 @@
     "transcribing",
     "queued",
   ]);
+  const CAPTURE_PHASES = new Set([
+    "requesting",
+    "listening",
+    "speech",
+    "stopping",
+  ]);
   const POLL_INTERVAL_MS = 250;
   const TRANSCRIPTION_TIMEOUT_MS = 30000;
   const STATUS_KEYS = Object.freeze({
     unsupported: "microphone.status.unsupported",
     unavailable: "microphone.status.unavailable",
     idle: "microphone.status.idle",
+    ready: "microphone.status.ready",
     requesting: "microphone.status.requesting",
     listening: "microphone.status.listening",
     speech: "microphone.status.speech",
@@ -76,6 +83,9 @@
       request: requiredFunction(options.request, "request"),
       onTranscript: requiredFunction(options.onTranscript, "onTranscript"),
       onError: requiredFunction(options.onError, "onError"),
+      getUiLocale: typeof options.getUiLocale === "function"
+        ? options.getUiLocale
+        : () => logic.DEFAULT_SETTINGS.language,
       workletUrl: options.workletUrl || "assets/pcm_capture_worklet.js",
     });
     return controller.publicApi;
@@ -91,9 +101,11 @@
       this.request = dependencies.request;
       this.onTranscript = dependencies.onTranscript;
       this.onError = dependencies.onError;
+      this.getUiLocale = dependencies.getUiLocale;
       this.workletUrl = dependencies.workletUrl;
       this.elements = this._elements();
       this.phase = "unavailable";
+      this.languageExplicit = false;
       this.settings = this._loadSettings();
       this.levelPercent = 0;
       this.thresholdPercent = this.logic.meterPercent(
@@ -114,9 +126,13 @@
       this.context = null;
       this.source = null;
       this.worklet = null;
+      this.pipelinePromise = null;
+      this.pipelineSettingsKey = null;
+      this.pipelineGeneration = 0;
       this.sampleChunks = [];
       this.sampleFrames = 0;
       this.vad = null;
+      this.activeCaptureGeneration = null;
       this.captureTimer = null;
       this.pollTimer = null;
       this.requestController = null;
@@ -163,6 +179,7 @@
         echoCancellation: "microphone-echo-cancellation",
         noiseSuppression: "microphone-noise-suppression",
         autoGainControl: "microphone-auto-gain",
+        keepReady: "microphone-keep-ready",
         autoSend: "microphone-auto-send",
         refresh: "refresh-microphones-button",
       };
@@ -196,28 +213,96 @@
     }
 
     _loadSettings() {
-      let value = null;
+      const current = this._readStoredSettings(
+        this.logic.SETTINGS_STORAGE_KEY,
+      );
+      const previous = current
+        ? null
+        : this._readStoredSettings(
+          this.logic.LEGACY_SETTINGS_STORAGE_KEY,
+        );
+      const earliest = current || previous
+        ? null
+        : this._readStoredSettings(
+          this.logic.EARLIEST_SETTINGS_STORAGE_KEY,
+        );
+      const legacy = previous || earliest;
+      let value = current || legacy;
+      const stored = Boolean(value);
+      const legacyMigration = !current && Boolean(legacy);
+      if (stored) {
+        this.languageExplicit = typeof value.languageExplicit === "boolean"
+          ? value.languageExplicit
+          : value.language !== this.logic.DEFAULT_SETTINGS.language;
+      }
+      if (!this.languageExplicit) {
+        value = {
+          ...(stored ? value : {}),
+          language: this._uiLanguage(),
+        };
+      }
+      if (legacyMigration) {
+        value = {
+          ...value,
+          silenceMs: value.silenceMs === 800
+            ? this.logic.DEFAULT_SETTINGS.silenceMs
+            : value.silenceMs,
+          autoGainControl: (
+            this.logic.DEFAULT_SETTINGS.autoGainControl
+          ),
+          keepReady: this.logic.DEFAULT_SETTINGS.keepReady,
+        };
+      }
+      const normalized = this.logic.normalizeSettings(value);
+      if (legacyMigration) {
+        try {
+          this._persistSettings(normalized);
+        } catch (_error) {
+          // A blocked storage API must not prevent microphone setup.
+        }
+      }
+      return normalized;
+    }
+
+    _readStoredSettings(key) {
       try {
         const raw = this.environment.localStorage
-          ? this.environment.localStorage.getItem(
-            this.logic.SETTINGS_STORAGE_KEY,
-          )
+          ? this.environment.localStorage.getItem(key)
           : null;
-        value = raw ? JSON.parse(raw) : null;
+        const value = raw ? JSON.parse(raw) : null;
+        return (
+          value && typeof value === "object" && !Array.isArray(value)
+            ? value
+            : null
+        );
       } catch (_error) {
-        value = null;
+        return null;
       }
-      return this.logic.normalizeSettings(value);
+    }
+
+    _uiLanguage() {
+      return this.logic.normalizeSettings({
+        language: this.getUiLocale(),
+      }).language;
+    }
+
+    _persistSettings(settings) {
+      if (!this.environment.localStorage) {
+        return;
+      }
+      this.environment.localStorage.setItem(
+        this.logic.SETTINGS_STORAGE_KEY,
+        JSON.stringify({
+          ...settings,
+          schemaVersion: this.logic.SETTINGS_SCHEMA_VERSION,
+          languageExplicit: this.languageExplicit,
+        }),
+      );
     }
 
     _saveSettings() {
       try {
-        if (this.environment.localStorage) {
-          this.environment.localStorage.setItem(
-            this.logic.SETTINGS_STORAGE_KEY,
-            JSON.stringify(this.settings),
-          );
-        }
+        this._persistSettings(this.settings);
         this.elements.settingsState.dataset.status = "saved";
         this.elements.settingsState.textContent = this.translate(
           "settings.microphone.saved",
@@ -246,6 +331,7 @@
         echoCancellation: this.elements.echoCancellation.checked,
         noiseSuppression: this.elements.noiseSuppression.checked,
         autoGainControl: this.elements.autoGainControl.checked,
+        keepReady: this.elements.keepReady.checked,
         autoSend: this.elements.autoSend.checked,
       });
     }
@@ -278,10 +364,25 @@
         this.settings.noiseSuppression
       );
       this.elements.autoGainControl.checked = this.settings.autoGainControl;
+      this.elements.keepReady.checked = this.settings.keepReady;
       this.elements.autoSend.checked = this.settings.autoSend;
     }
 
-    _handleSettingsChange() {
+    _audioSettingsKey(settings = this.settings) {
+      return JSON.stringify({
+        deviceId: settings.deviceId,
+        echoCancellation: settings.echoCancellation,
+        noiseSuppression: settings.noiseSuppression,
+        autoGainControl: settings.autoGainControl,
+      });
+    }
+
+    _handleSettingsChange(event) {
+      const previousPipelineKey = this._audioSettingsKey();
+      const previousKeepReady = this.settings.keepReady;
+      if (event && event.target === this.elements.language) {
+        this.languageExplicit = true;
+      }
       this.settings = this._settingsFromForm();
       this._renderSettings();
       this._saveSettings();
@@ -294,6 +395,41 @@
           Number(this.elements.meter.getAttribute("aria-valuenow")) || 0,
           this.logic.meterPercent(threshold),
         );
+      }
+      if (
+        previousPipelineKey !== this._audioSettingsKey()
+        || previousKeepReady !== this.settings.keepReady
+      ) {
+        if (
+          CAPTURE_PHASES.has(this.phase)
+          && this.phase !== "stopping"
+        ) {
+          this.cancel();
+        }
+        const shouldRearm = (
+          this.settings.keepReady
+          && this.permissionObserved
+          && this.composerEnabled
+        );
+        void this._releaseAudio().then(() => {
+          if (!shouldRearm) {
+            if (this.phase === "ready") {
+              this._setPhase(
+                this.composerEnabled ? "idle" : "unavailable",
+              );
+            }
+            return null;
+          }
+          return this._ensureAudioReady().then(() => {
+            if (!ACTIVE_PHASES.has(this.phase)) {
+              this._setPhase("ready");
+            }
+          });
+        }).catch(() => {
+          if (!ACTIVE_PHASES.has(this.phase)) {
+            this._setPhase("audio_failed", true);
+          }
+        });
       }
     }
 
@@ -313,13 +449,13 @@
         "input",
         (event) => {
           if (event.target === this.elements.sensitivity) {
-            this._handleSettingsChange();
+            this._handleSettingsChange(event);
           }
         },
       );
       this.elements.settingsForm.addEventListener(
         "change",
-        () => this._handleSettingsChange(),
+        (event) => this._handleSettingsChange(event),
       );
       this.elements.refresh.addEventListener("click", () => {
         this.refreshDevices(true);
@@ -383,20 +519,71 @@
       if (!this.composerEnabled && ACTIVE_PHASES.has(this.phase)) {
         this.cancel();
       }
+      if (!this.composerEnabled) {
+        void this._releaseAudio();
+      }
       if (!ACTIVE_PHASES.has(this.phase)) {
         this._setPhase(
           !this.supported
             ? "unsupported"
             : this.composerEnabled
-              ? "idle"
+              ? this._audioPipelineReady()
+                ? "ready"
+                : "idle"
               : "unavailable",
         );
       } else {
         this._renderPhase();
       }
+      if (this.composerEnabled && this.settings.keepReady) {
+        void this._primeGrantedPermission();
+      }
+    }
+
+    async _primeGrantedPermission() {
+      const permissions = (
+        this.environment.navigator
+        && this.environment.navigator.permissions
+      );
+      if (
+        !permissions
+        || typeof permissions.query !== "function"
+        || !this.composerEnabled
+        || !this.settings.keepReady
+        || ACTIVE_PHASES.has(this.phase)
+      ) {
+        return;
+      }
+      try {
+        const status = await permissions.query({
+          name: "microphone",
+        });
+        if (
+          !status
+          || status.state !== "granted"
+          || !this.composerEnabled
+          || !this.settings.keepReady
+          || ACTIVE_PHASES.has(this.phase)
+        ) {
+          return;
+        }
+        await this._ensureAudioReady();
+        if (!ACTIVE_PHASES.has(this.phase)) {
+          this._setPhase("ready");
+        }
+      } catch (_error) {
+        // Permission introspection is optional. The explicit Talk action
+        // remains the portable path and may request access when needed.
+      }
     }
 
     renderLocale() {
+      if (!this.languageExplicit) {
+        this.settings = this.logic.normalizeSettings({
+          ...this.settings,
+          language: this._uiLanguage(),
+        });
+      }
       this._renderSettings();
       this._renderDeviceOptions();
       this._renderPhase();
@@ -606,6 +793,241 @@
       }
     }
 
+    _audioPipelineReady() {
+      return Boolean(
+        this.stream
+        && this.context
+        && this.source
+        && this.worklet
+        && this.context.state !== "closed"
+        && this.pipelineSettingsKey === this._audioSettingsKey()
+      );
+    }
+
+    _startWorkletCapture(generation) {
+      if (
+        !Number.isSafeInteger(generation)
+        || generation <= 0
+        || !this.worklet
+        || !this.worklet.port
+        || typeof this.worklet.port.postMessage !== "function"
+      ) {
+        throw new Error("Microphone capture control is unavailable.");
+      }
+      this.worklet.port.postMessage({
+        type: "capture-control",
+        action: "start",
+        captureGeneration: generation,
+      });
+      this.activeCaptureGeneration = generation;
+    }
+
+    _stopWorkletCapture() {
+      const generation = this.activeCaptureGeneration;
+      this.activeCaptureGeneration = null;
+      if (
+        generation === null
+        || !this.worklet
+        || !this.worklet.port
+        || typeof this.worklet.port.postMessage !== "function"
+      ) {
+        return;
+      }
+      try {
+        this.worklet.port.postMessage({
+          type: "capture-control",
+          action: "stop",
+          captureGeneration: generation,
+        });
+      } catch (_error) {
+        // A closing audio graph is already unable to deliver more samples.
+      }
+    }
+
+    async _closeAudioResources(resources) {
+      const value = resources || {};
+      if (value.worklet) {
+        value.worklet.port.onmessage = null;
+        if (typeof value.worklet.port.close === "function") {
+          try {
+            value.worklet.port.close();
+          } catch (_error) {
+            // A closed MessagePort has already released its queue.
+          }
+        }
+        try {
+          value.worklet.disconnect();
+        } catch (_error) {
+          // An already-disconnected worklet is safe.
+        }
+      }
+      if (value.source) {
+        try {
+          value.source.disconnect();
+        } catch (_error) {
+          // An already-disconnected source is safe.
+        }
+      }
+      if (value.stream) {
+        value.stream.getTracks().forEach((track) => track.stop());
+      }
+      if (
+        value.context
+        && typeof value.context.close === "function"
+        && value.context.state !== "closed"
+      ) {
+        try {
+          await value.context.close();
+        } catch (_error) {
+          // Releasing the microphone must remain best effort.
+        }
+      }
+    }
+
+    async _releaseAudio() {
+      this._stopWorkletCapture();
+      this.pipelineGeneration += 1;
+      const pending = this.pipelinePromise;
+      this.pipelinePromise = null;
+      const resources = {
+        context: this.context,
+        source: this.source,
+        stream: this.stream,
+        worklet: this.worklet,
+      };
+      this.context = null;
+      this.source = null;
+      this.stream = null;
+      this.worklet = null;
+      this.pipelineSettingsKey = null;
+      await this._closeAudioResources(resources);
+      if (pending) {
+        try {
+          await pending;
+        } catch (_error) {
+          // A superseded setup owns and releases its local resources.
+        }
+      }
+    }
+
+    async _ensureAudioReady() {
+      const requestedKey = this._audioSettingsKey();
+      if (this._audioPipelineReady()) {
+        return;
+      }
+      if (
+        this.pipelinePromise
+        && this.pipelineSettingsKey === requestedKey
+      ) {
+        return this.pipelinePromise;
+      }
+      if (
+        this.stream
+        || this.context
+        || this.source
+        || this.worklet
+        || this.pipelinePromise
+      ) {
+        await this._releaseAudio();
+      }
+
+      const pipelineGeneration = this.pipelineGeneration + 1;
+      this.pipelineGeneration = pipelineGeneration;
+      this.pipelineSettingsKey = requestedKey;
+      const setup = async () => {
+        const resources = {
+          context: null,
+          source: null,
+          stream: null,
+          worklet: null,
+        };
+        try {
+          resources.stream = await this._openStream();
+          resources.context = new this.environment.AudioContext({
+            latencyHint: "interactive",
+          });
+          if (
+            resources.context.state === "suspended"
+            && typeof resources.context.resume === "function"
+          ) {
+            try {
+              await resources.context.resume();
+            } catch (_error) {
+              // A later explicit Talk gesture gets another resume attempt.
+            }
+          }
+          await resources.context.audioWorklet.addModule(
+            this.workletUrl,
+          );
+          resources.source = (
+            resources.context.createMediaStreamSource(
+              resources.stream,
+            )
+          );
+          resources.worklet = new this.environment.AudioWorkletNode(
+            resources.context,
+            "robot-pcm-capture",
+          );
+          resources.worklet.port.onmessage = (event) => {
+            this._receiveSamples(
+              event,
+              pipelineGeneration,
+              resources.worklet,
+            );
+          };
+          resources.source.connect(resources.worklet);
+          resources.worklet.connect(resources.context.destination);
+          if (pipelineGeneration !== this.pipelineGeneration) {
+            await this._closeAudioResources(resources);
+            return;
+          }
+          this.stream = resources.stream;
+          this.context = resources.context;
+          this.source = resources.source;
+          this.worklet = resources.worklet;
+          this.pipelineSettingsKey = this._audioSettingsKey();
+          this.permissionObserved = true;
+          this.stream.getAudioTracks().forEach((track) => {
+            track.addEventListener("ended", () => {
+              if (
+                pipelineGeneration !== this.pipelineGeneration
+                || this.stream !== resources.stream
+              ) {
+                return;
+              }
+              if (CAPTURE_PHASES.has(this.phase)) {
+                this._failGeneration(
+                  this.generation,
+                  "device_lost",
+                );
+              } else {
+                void this._releaseAudio();
+                if (!ACTIVE_PHASES.has(this.phase)) {
+                  this._setPhase("device_lost", true);
+                }
+              }
+            }, { once: true });
+          });
+          void this.refreshDevices(false);
+        } catch (error) {
+          await this._closeAudioResources(resources);
+          throw error;
+        }
+      };
+      const promise = setup();
+      this.pipelinePromise = promise;
+      try {
+        await promise;
+      } finally {
+        if (this.pipelinePromise === promise) {
+          this.pipelinePromise = null;
+        }
+      }
+      if (!this._audioPipelineReady()) {
+        throw new Error("Microphone audio pipeline did not become ready.");
+      }
+    }
+
     _effectiveSettings() {
       return this.logic.normalizeSettings({
         ...this.settings,
@@ -670,56 +1092,36 @@
       this.vad = null;
       this._setPhase("requesting");
       try {
-        const stream = await this._openStream();
+        await this._ensureAudioReady();
         if (generation !== this.generation) {
-          stream.getTracks().forEach((track) => track.stop());
+          if (!this.settings.keepReady) {
+            await this._releaseAudio();
+          }
           return;
         }
-        this.stream = stream;
-        this.permissionObserved = true;
-        void this.refreshDevices(false);
-        const context = new this.environment.AudioContext({
-          latencyHint: "interactive",
-        });
-        this.context = context;
         if (
-          context.state === "suspended"
-          && typeof context.resume === "function"
+          this.context.state === "suspended"
+          && typeof this.context.resume === "function"
         ) {
-          await context.resume();
+          await this.context.resume();
         }
-        await context.audioWorklet.addModule(this.workletUrl);
         if (generation !== this.generation) {
           await this._cleanupCapture();
           return;
         }
-        this.source = context.createMediaStreamSource(stream);
-        this.worklet = new this.environment.AudioWorkletNode(
-          context,
-          "robot-pcm-capture",
-        );
-        this.worklet.port.onmessage = (event) => {
-          this._receiveSamples(event, generation);
-        };
+        if (this.context.state !== "running") {
+          throw new Error("Microphone audio context is not running.");
+        }
         this.vad = this.logic.createVadState(this._now());
-        this.source.connect(this.worklet);
-        this.worklet.connect(context.destination);
-        stream.getAudioTracks().forEach((track) => {
-          track.addEventListener("ended", () => {
-            if (
-              generation === this.generation
-              && (this.phase === "listening" || this.phase === "speech")
-            ) {
-              this._failGeneration(generation, "device_lost");
-            }
-          }, { once: true });
-        });
+        this._startWorkletCapture(generation);
         const effective = this._effectiveSettings();
         this.captureTimer = this.environment.setTimeout(
           () => this._finishCapture(generation, "maximum"),
           effective.maxUtteranceMs,
         );
-        this._setPhase("listening");
+        if (this.phase === "requesting") {
+          this._setPhase("listening");
+        }
       } catch (error) {
         if (generation !== this.generation) {
           return;
@@ -732,14 +1134,25 @@
       }
     }
 
-    _receiveSamples(event, generation) {
+    _receiveSamples(event, pipelineGeneration, sourceWorklet) {
+      const data = event && event.data;
+      const captureGeneration = data && data.captureGeneration;
       if (
-        generation !== this.generation
-        || (this.phase !== "listening" && this.phase !== "speech")
+        pipelineGeneration !== this.pipelineGeneration
+        || sourceWorklet !== this.worklet
+        || !Number.isSafeInteger(captureGeneration)
+        || captureGeneration <= 0
+        || captureGeneration !== this.activeCaptureGeneration
+        || captureGeneration !== this.generation
+        || !this.vad
+        || (
+          this.phase !== "requesting"
+          && this.phase !== "listening"
+          && this.phase !== "speech"
+        )
       ) {
         return;
       }
-      const data = event && event.data;
       if (
         !data
         || data.type !== "samples"
@@ -779,48 +1192,22 @@
         transition.action === this.logic.VAD_ACTION.STOP_SILENCE
         || transition.action === this.logic.VAD_ACTION.STOP_MAX_DURATION
       ) {
-        this._finishCapture(generation, transition.action);
+        this._finishCapture(captureGeneration, transition.action);
       } else if (
         transition.action === this.logic.VAD_ACTION.STOP_NO_SPEECH
       ) {
-        this._finishCapture(generation, "no_speech");
+        this._finishCapture(captureGeneration, "no_speech");
       }
     }
 
-    async _cleanupCapture() {
+    async _cleanupCapture(forceRelease = false) {
       if (this.captureTimer !== null) {
         this.environment.clearTimeout(this.captureTimer);
         this.captureTimer = null;
       }
-      if (this.worklet) {
-        this.worklet.port.onmessage = null;
-        try {
-          this.worklet.disconnect();
-        } catch (_error) {
-          // A disconnected graph is already safe.
-        }
-      }
-      if (this.source) {
-        try {
-          this.source.disconnect();
-        } catch (_error) {
-          // A disconnected graph is already safe.
-        }
-      }
-      if (this.stream) {
-        this.stream.getTracks().forEach((track) => track.stop());
-      }
-      const context = this.context;
-      this.worklet = null;
-      this.source = null;
-      this.stream = null;
-      this.context = null;
-      if (context && typeof context.close === "function") {
-        try {
-          await context.close();
-        } catch (_error) {
-          // Cleanup must continue even if the browser already closed it.
-        }
+      this._stopWorkletCapture();
+      if (forceRelease || !this.settings.keepReady) {
+        await this._releaseAudio();
       }
     }
 
@@ -1035,7 +1422,7 @@
         return;
       }
       this.generation += 1;
-      await this._cleanupCapture();
+      await this._cleanupCapture(true);
       this._setPhase(phase, true);
     }
 
@@ -1064,6 +1451,8 @@
 
     destroy() {
       this.cancel();
+      this.generation += 1;
+      void this._releaseAudio();
       this.composerEnabled = false;
       this._setPhase(this.supported ? "unavailable" : "unsupported");
     }

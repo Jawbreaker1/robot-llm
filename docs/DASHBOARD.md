@@ -39,29 +39,60 @@ kartprovider är ansluten.
 
 ### Starta med lokal taligenkänning
 
-STT är ett explicit opt-in. På Mac:
+Projektets normala röstprofil återanvänder en varm lokal `whisper.cpp`-tjänst
+med `large-v3-turbo-q5_0`, som är kvalitetsstandarden för svensk och engelsk
+mikrofoninmatning:
+
+```sh
+scripts/start_lab_console.sh
+```
+
+Profilen ansluter som standard till `http://127.0.0.1:8178/v1`, använder den
+separat validerade inferenssökvägen `/audio/transcriptions` och probar tjänsten
+innan dashboarden rapporteras som startklar. På den primära utvecklingsdatorn
+hålls tjänsten redan varm utanför dashboarden och ska inte startas en gång
+till.
+
+På en ny Mac installeras modellen och en kompatibel tjänst så här:
 
 ```sh
 brew install whisper-cpp
-sh scripts/download_whisper_model.sh small
-PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
-  --stt-model models/ggml-small.bin
+sh scripts/download_whisper_model.sh large-v3-turbo-q5_0
+whisper-server \
+  --model models/ggml-large-v3-turbo-q5_0.bin \
+  --host 127.0.0.1 \
+  --port 8178 \
+  --threads 8 \
+  --language auto \
+  --no-timestamps \
+  --suppress-nst \
+  --request-path /v1 \
+  --inference-path /audio/transcriptions
 ```
 
 Modellen ligger i den git-ignorerade katalogen `models/`. Nedladdningsscriptet
-accepterar `small` och `base` och verifierar den officiella filens SHA-256
-innan den aktiveras. `small` är kvalitetsvalet för svensk/engelsk demo;
-`base` är ett snabbare och mindre jämförelsealternativ.
-Hanterad STT föredrar GPU/Metal för låg latens. Om en annan lokal modell redan
-använder GPU-minnet kan `--stt-cpu` väljas explicit som en långsammare men
-isolerad fallback.
+accepterar `large-v3-turbo-q5_0`, `small` och `base` och verifierar den
+officiella filens SHA-256 innan den aktiveras. De två mindre modellerna är
+endast explicita jämförelsealternativ.
 
-Dashboarden startar modellen en gång och håller den varm. Ett redan startat,
-betrott `whisper.cpp` kan i stället anges med en explicit loopback-URL via
-`--stt-url`; externa nätverksadresser accepteras inte. URL:en måste innehålla
-en lång, opak `--request-path` som konfigurerats på servern. En oskyddad
-standardserver på rot-URL nekas eftersom dess CORS-ytor annars kan anropas av
-en fientlig webbsida.
+Profilen kan ändras portabelt med `ROBOT_LLM_STT_URL`,
+`ROBOT_LLM_STT_INFERENCE_PATH`, `ROBOT_LLM_STT_MODEL_ID` och
+`ROBOT_LLM_PYTHON`. Vanliga CLI-argument skickas vidare oförändrade.
+Om den externa tjänsten saknas kan dashboarden uttryckligen äga en modell
+under sin egen livstid. Stoppa först en konkurrerande GPU-tjänst, eller välj
+en isolerad CPU-körning:
+
+```sh
+ROBOT_LLM_STT_URL='' scripts/start_lab_console.sh \
+  --stt-model models/ggml-large-v3-turbo-q5_0.bin \
+  --stt-port 8180
+```
+
+Externa STT-adresser måste vara loopback. Bassökvägen måste vara antingen den
+exakt tillåtna kompatibilitetssökvägen `/v1` eller ett långt opakt privat
+segment. Inferenssökvägen valideras separat som en kanonisk relativ sökväg:
+värdnamn, query, fragment, tomma segment, traversal och icke-ASCII-former
+nekas. `/v1` är en kompatibilitetsregel, inte en autentiseringshemlighet.
 
 ## Språk
 
@@ -110,20 +141,30 @@ lagring:
 - känslighet med levande nivåmätare och synlig signaltröskel,
 - tystnadstid före automatiskt stopp och maximal taltid,
 - echo cancellation, noise suppression och automatisk gain,
+- om den valda mikrofonströmmen ska hållas varm mellan yttranden,
 - automatiskt skicka eller lämna transkriptet redigerbart.
 
 Känsligheten är en deterministisk signaltröskel, inte en semantisk
-klassificerare och inte hårdvaruförstärkning. En kort pre-roll behålls när tal
-upptäcks; väntetystnad trimmas och mycket korta segment fylls till backendens
-minsta säkra WAV-längd. Det minskar onödig inferenstid utan att klippa första
-ordet.
+klassificerare och inte hårdvaruförstärkning. Upp till 1,5 sekunders pre-roll
+behålls när tal upptäcks; längre väntetystnad trimmas och mycket korta segment
+fylls till backendens minsta säkra WAV-längd. Det ger externa mikrofoners
+signalbehandling och en låg första stavelse marginal utan att behålla
+obegränsad väntetystnad.
 
-Råljud finns bara i minnet medan ett bounded jobb väntar eller ett lokalt
-provideranrop kör. Det persisteras inte och eventloggen får varken ljud,
-ljudhash eller transkript. Transkript har en hostägd leverans-TTL; gamla
-resultat får inte auto-skickas. Cancel rensar köat ljud direkt. Ett redan
-påbörjat provideranrop kan behålla sin lokala request tills dess deadline,
-vilket redovisas som `audio.retained`; dess sena resultat kastas.
+Med **håll mikrofonen redo** aktiverat förblir browserns valda MediaStream och
+AudioContext öppna, så browserns mikrofonindikator kan fortsätta vara synlig.
+Själva PCM-workleten är däremot stoppad mellan yttranden: den buffrar eller
+publicerar inget ljud förrän ett generationsmärkt `start` har skickats och
+nollställer bufferten vid både `start` och `stop`. Om inställningen stängs av
+frigörs ström, ljudgraf och MessagePort.
+
+Råljud finns i applikationsminnet endast under en aktiv, begränsad inspelning,
+medan ett bounded jobb väntar eller medan ett lokalt provideranrop kör. Det
+persisteras inte och eventloggen får varken ljud, ljudhash eller transkript.
+Transkript har en hostägd leverans-TTL; gamla resultat får inte auto-skickas.
+Cancel rensar köat ljud direkt. Ett redan påbörjat provideranrop kan behålla
+sin lokala request tills dess deadline, vilket redovisas som
+`audio.retained`; dess sena resultat kastas.
 Browsern skapar request-ID:t före uppladdningen och kan därför avbryta även
 om POST-svaret ännu inte har kommit; en kortlivad, bounded tombstone gör att
 en samtidigt anländande uppladdning nekas.

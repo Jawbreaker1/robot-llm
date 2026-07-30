@@ -253,11 +253,14 @@ class DashboardCLITests(unittest.TestCase):
                 "http://127.0.0.1:8178",
                 "--stt-model-id",
                 "ggml-small",
+                "--stt-inference-path",
+                "/audio/transcriptions",
             ]
         )
 
         self.assertIsNone(defaults.stt_model)
         self.assertIsNone(defaults.stt_url)
+        self.assertEqual(defaults.stt_inference_path, "/inference")
         self.assertEqual(managed.stt_model, "models/ggml-base.bin")
         self.assertEqual(managed.stt_port, 8123)
         self.assertEqual(managed.stt_threads, 6)
@@ -267,6 +270,10 @@ class DashboardCLITests(unittest.TestCase):
             "http://127.0.0.1:8178",
         )
         self.assertEqual(external.stt_model_id, "ggml-small")
+        self.assertEqual(
+            external.stt_inference_path,
+            "/audio/transcriptions",
+        )
         with (
             self.assertRaises(SystemExit),
             mock.patch("sys.stderr", new_callable=io.StringIO),
@@ -279,6 +286,107 @@ class DashboardCLITests(unittest.TestCase):
                     "http://127.0.0.1:8178",
                 ]
             )
+
+    def test_main_wires_and_probes_external_speech_server(self):
+        transcriber = mock.Mock()
+        service = mock.Mock()
+        http_server = mock.Mock()
+        router = mock.Mock()
+        router.session_path = "/session/token/"
+        events = []
+        transcriber.probe.side_effect = lambda: events.append("probe")
+
+        def build_service(**kwargs):
+            events.append("service")
+            return service
+
+        with (
+            mock.patch(
+                "robot_agent.stt_whisper_cpp.WhisperCppTranscriber",
+                return_value=transcriber,
+            ) as transcriber_factory,
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+                side_effect=build_service,
+            ) as service_factory,
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+                return_value=(http_server, router),
+            ),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            result = main(
+                [
+                    "--stt-url",
+                    "http://127.0.0.1:8178/v1",
+                    "--stt-inference-path",
+                    "/audio/transcriptions",
+                    "--stt-model-id",
+                    "ggml-large-v3-turbo-q5_0",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        transcriber_factory.assert_called_once_with(
+            base_url="http://127.0.0.1:8178/v1",
+            inference_path="/audio/transcriptions",
+            model_id="ggml-large-v3-turbo-q5_0",
+            require_opaque_path=True,
+        )
+        transcriber.probe.assert_called_once_with()
+        self.assertEqual(events, ["probe", "service"])
+        self.assertIs(
+            service_factory.call_args.kwargs["speech_transcriber"],
+            transcriber,
+        )
+        http_server.serve_forever.assert_called_once_with(
+            poll_interval=0.25
+        )
+        http_server.server_close.assert_called_once_with()
+        service.shutdown.assert_called_once_with()
+        ready = json.loads(stdout.getvalue())
+        self.assertTrue(ready["speech_to_text_enabled"])
+
+    def test_external_speech_probe_failure_prevents_ready(self):
+        transcriber = mock.Mock()
+        transcriber.probe.side_effect = RuntimeError(
+            "Speech provider is unavailable"
+        )
+
+        with (
+            mock.patch(
+                "robot_agent.stt_whisper_cpp.WhisperCppTranscriber",
+                return_value=transcriber,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+            ) as service_factory,
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+            ) as server_factory,
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            result = main(
+                [
+                    "--stt-url",
+                    "http://127.0.0.1:8178/v1",
+                    "--stt-inference-path",
+                    "/audio/transcriptions",
+                ]
+            )
+
+        self.assertEqual(result, 2)
+        transcriber.probe.assert_called_once_with()
+        service_factory.assert_not_called()
+        server_factory.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        failure = json.loads(stderr.getvalue())
+        self.assertEqual(failure["status"], "failed")
+        self.assertEqual(
+            failure["error"],
+            "Speech provider is unavailable",
+        )
 
     def test_main_wires_and_stops_managed_speech_server(self):
         speech_server = mock.Mock()

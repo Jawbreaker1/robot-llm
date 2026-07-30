@@ -1,19 +1,23 @@
 #!/bin/sh
 set -eu
 
-model="${1:-small}"
+model="${1:-large-v3-turbo-q5_0}"
 
 case "$model" in
     base)
         expected_sha256="60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"
         maximum_bytes="200000000"
         ;;
+    large-v3-turbo-q5_0)
+        expected_sha256="394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+        maximum_bytes="650000000"
+        ;;
     small)
         expected_sha256="1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
         maximum_bytes="600000000"
         ;;
     *)
-        echo "Usage: sh scripts/download_whisper_model.sh [base|small]" >&2
+        echo "Usage: sh scripts/download_whisper_model.sh [base|small|large-v3-turbo-q5_0]" >&2
         exit 2
         ;;
 esac

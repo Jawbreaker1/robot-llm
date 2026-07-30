@@ -2,16 +2,20 @@
   "use strict";
 
   const TARGET_SAMPLE_RATE_HZ = 16000;
-  const SETTINGS_STORAGE_KEY = "robot-dashboard-microphone-v1";
+  const SETTINGS_SCHEMA_VERSION = 3;
+  const SETTINGS_STORAGE_KEY = "robot-dashboard-microphone-v3";
+  const LEGACY_SETTINGS_STORAGE_KEY = "robot-dashboard-microphone-v2";
+  const EARLIEST_SETTINGS_STORAGE_KEY = "robot-dashboard-microphone-v1";
   const DEFAULT_SETTINGS = Object.freeze({
     deviceId: "default",
     language: "auto",
     sensitivity: 65,
-    silenceMs: 800,
+    silenceMs: 1200,
     maxUtteranceMs: 12000,
     echoCancellation: true,
     noiseSuppression: true,
-    autoGainControl: true,
+    autoGainControl: false,
+    keepReady: true,
     autoSend: true,
   });
   const VAD_ACTION = Object.freeze({
@@ -31,7 +35,8 @@
   const NO_SPEECH_TIMEOUT_MS = 5000;
   const CALIBRATION_MS = 200;
   const SPEECH_ATTACK_FRAMES = 2;
-  const SPEECH_PREROLL_MS = 250;
+  const SPEECH_RELEASE_HYSTERESIS_DB = 4;
+  const SPEECH_PREROLL_MS = 1500;
   const MIN_UPLOAD_DURATION_MS = 250;
 
   function boundedInteger(value, fallback, minimum, maximum) {
@@ -96,6 +101,10 @@
       autoGainControl: boundedBoolean(
         candidate.autoGainControl,
         DEFAULT_SETTINGS.autoGainControl,
+      ),
+      keepReady: boundedBoolean(
+        candidate.keepReady,
+        DEFAULT_SETTINGS.keepReady,
       ),
       autoSend: boundedBoolean(
         candidate.autoSend,
@@ -181,6 +190,10 @@
       settings.sensitivity,
     );
     const voice = observedLevelDb >= currentThresholdDb;
+    const sustainedVoice = observedLevelDb >= Math.max(
+      MIN_LEVEL_DB,
+      currentThresholdDb - SPEECH_RELEASE_HYSTERESIS_DB,
+    );
     let phase = current.phase;
     let speechStartedAtMs = current.speechStartedAtMs;
     let lastVoiceAtMs = current.lastVoiceAtMs;
@@ -215,7 +228,7 @@
         action = VAD_ACTION.STOP_NO_SPEECH;
       }
     } else if (phase === "speech") {
-      if (voice) {
+      if (sustainedVoice) {
         lastVoiceAtMs = nowMs;
       } else if (
         lastVoiceAtMs !== null
@@ -417,6 +430,9 @@
 
   global.RobotSpeechInputLogic = Object.freeze({
     DEFAULT_SETTINGS,
+    EARLIEST_SETTINGS_STORAGE_KEY,
+    LEGACY_SETTINGS_STORAGE_KEY,
+    SETTINGS_SCHEMA_VERSION,
     SETTINGS_STORAGE_KEY,
     TARGET_SAMPLE_RATE_HZ,
     VAD_ACTION,

@@ -7,9 +7,42 @@ class RobotPCMCaptureProcessor extends AudioWorkletProcessor {
     super();
     this.buffer = new Float32Array(CHUNK_FRAMES);
     this.offset = 0;
+    this.captureGeneration = null;
+    this.port.onmessage = (event) => {
+      this.handleControl(event && event.data);
+    };
+  }
+
+  resetBuffer() {
+    this.buffer = new Float32Array(CHUNK_FRAMES);
+    this.offset = 0;
+  }
+
+  handleControl(message) {
+    if (
+      !message
+      || message.type !== "capture-control"
+      || !Number.isSafeInteger(message.captureGeneration)
+      || message.captureGeneration <= 0
+    ) {
+      return;
+    }
+    if (message.action === "start") {
+      this.captureGeneration = message.captureGeneration;
+      this.resetBuffer();
+    } else if (
+      message.action === "stop"
+      && message.captureGeneration === this.captureGeneration
+    ) {
+      this.captureGeneration = null;
+      this.resetBuffer();
+    }
   }
 
   process(inputs) {
+    if (this.captureGeneration === null) {
+      return true;
+    }
     const channels = inputs[0];
     if (!channels || channels.length === 0 || channels[0].length === 0) {
       return true;
@@ -25,11 +58,14 @@ class RobotPCMCaptureProcessor extends AudioWorkletProcessor {
       if (this.offset === this.buffer.length) {
         const samples = this.buffer;
         this.port.postMessage(
-          { type: "samples", samples: samples.buffer },
+          {
+            type: "samples",
+            captureGeneration: this.captureGeneration,
+            samples: samples.buffer,
+          },
           [samples.buffer],
         );
-        this.buffer = new Float32Array(CHUNK_FRAMES);
-        this.offset = 0;
+        this.resetBuffer();
       }
     }
     return true;

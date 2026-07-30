@@ -73,6 +73,10 @@ class WhisperCppConfigurationTests(unittest.TestCase):
                 "http://127.0.0.1:8178" + opaque,
                 "http://127.0.0.1:8178" + opaque,
             ),
+            (
+                "http://127.0.0.1:8178/v1",
+                "http://127.0.0.1:8178/v1",
+            ),
         )
         for value, expected in cases:
             with self.subTest(value=value):
@@ -101,6 +105,15 @@ class WhisperCppConfigurationTests(unittest.TestCase):
             transcriber.base_url,
             "http://127.0.0.1:8178" + opaque,
         )
+        trusted = WhisperCppTranscriber(
+            base_url="http://127.0.0.1:8178/v1",
+            inference_path="/audio/transcriptions",
+            require_opaque_path=True,
+        )
+        self.assertEqual(
+            trusted.base_url,
+            "http://127.0.0.1:8178/v1",
+        )
 
     def test_rejects_non_loopback_or_ambiguous_urls(self):
         cases = (
@@ -113,6 +126,9 @@ class WhisperCppConfigurationTests(unittest.TestCase):
             "http://user@127.0.0.1:8178",
             "http://127.0.0.1:8178/inference",
             "http://127.0.0.1:8178/short",
+            "http://127.0.0.1:8178/v2",
+            "http://127.0.0.1:8178/v1/",
+            "http://127.0.0.1:8178/v1/health",
             "http://127.0.0.1:8178/" + "a" * 129,
             "http://127.0.0.1:8178/" + "a" * 24 + "/nested",
             "http://127.0.0.1:8178/" + "a" * 24 + ".dot",
@@ -143,6 +159,43 @@ class WhisperCppConfigurationTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
                     WhisperCppTranscriber(**kwargs)
+
+    def test_accepts_only_canonical_relative_inference_paths(self):
+        accepted = (
+            "/inference",
+            "/audio/transcriptions",
+            "/api-v2/transcribe_audio",
+        )
+        for value in accepted:
+            with self.subTest(value=value):
+                transcriber = WhisperCppTranscriber(
+                    inference_path=value,
+                )
+                self.assertEqual(transcriber.inference_path, value)
+
+        rejected = (
+            None,
+            "",
+            "/",
+            "inference",
+            " /inference",
+            "/inference ",
+            "//inference",
+            "/audio/",
+            "/audio//transcriptions",
+            "/./inference",
+            "/../inference",
+            "/audio/transcriptions?format=json",
+            "/audio/transcriptions#fragment",
+            "/audio\\transcriptions",
+            "/transkribera-å",
+            "/" + "a" * 65,
+            "/" + "a" * 129,
+        )
+        for value in rejected:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    WhisperCppTranscriber(inference_path=value)
 
 
 class WhisperCppTranscriptionTests(unittest.TestCase):
@@ -225,6 +278,23 @@ class WhisperCppTranscriptionTests(unittest.TestCase):
         ):
             self.assertIn(expected, body)
         self.assertTrue(body.endswith(b"--Boundary123--\r\n"))
+
+    def test_posts_to_explicit_openai_compatible_inference_path(self):
+        transport = RecordingTransport()
+        transcriber = WhisperCppTranscriber(
+            base_url="http://127.0.0.1:8178/v1",
+            inference_path="/audio/transcriptions",
+            transport=transport,
+            boundary_factory=lambda: "SafeBoundary",
+            require_opaque_path=True,
+        )
+
+        transcriber.transcribe(request())
+
+        self.assertEqual(
+            transport.calls[0][1],
+            "http://127.0.0.1:8178/v1/audio/transcriptions",
+        )
 
     def test_auto_language_is_sent_without_command_vocabulary_prompt(self):
         transport = RecordingTransport()
