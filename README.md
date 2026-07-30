@@ -130,8 +130,8 @@ Status snapshot: **2026-07-30**.
 | Area | Verified now | Important boundary |
 |---|---|---|
 | Physical EV3 baseline | ev3dev boot, USB/SSH, motors A/B/C, bounded manual drive/turn pulses, encoders, touch, relative IR, reflected-light sensing, and Swedish eSpeak TTS | This verifies the assembled EV3RSTORM, not autonomous motion |
-| EV3 Wi-Fi transport | The AR9271 adapter, `ath9k_htc` driver/firmware path, ConnMan onboarding, key-only SSH, and same-brick identity across USB and Wi-Fi are verified | Motion-free only; no SSID, address, or device identifier is stored here |
-| Persistent EV3 sensors | One authenticated Wi-Fi SSH process can serve repeated IR and touch reads; controlled disconnect detection and ConnMan auto-reconnect were also observed | Constant sensor values verify transport continuity, not sensor stimulus, motor-stop latency, or heartbeat behavior |
+| EV3 Wi-Fi transport | The AR9271 adapter, `ath9k_htc` driver/firmware path, ConnMan onboarding, key-only SSH, same-brick identity, reboot auto-connect, and operation with mini-USB physically removed are verified | Motion-free only; no SSID, address, or device identifier is stored here |
+| Persistent EV3 sensors | One authenticated Wi-Fi SSH process can serve repeated IR and touch reads; controlled disconnect detection, ConnMan recovery, and post-reboot cable-free IR reads were observed | Constant sensor values verify transport continuity, not sensor stimulus, motor-stop latency, or heartbeat behavior |
 | Physical LLM path | One complete motion-free shadow cycle: IR readings → deterministic zone; Gemma generated an audit-only comment, while a separate deterministic Swedish fallback was sent to TTS | Gemma output was not spoken and had no tools or motor access |
 | EV3 supervisor | Physical foreground startup, fault-stop, terminal audit, and clean lock release are now observed; the last 12 motion-free physical polls measured `196–216 ms` | This is the pre-optimization result. The `20 ms` contract remains unproven until the optimized path is remeasured, so physical motion remains disabled |
 | Lab Console | Local Gemma chat, standards-based microphone UI, local whisper.cpp STT, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | A live Razer Kiyo Pro utterance passed microphone → `large-v3-turbo` → Gemma → weather; a repeatable Swedish/English short-command accuracy corpus remains a gate. Speech becomes agent text—no motor, SSH, TTS, or stop routes exist here |
@@ -682,6 +682,7 @@ This is a manual hardware test, not autonomous navigation. Read the full
 | Persistent IR transport | cold request `13.307 s` / `14.138 s` total; 10 warm reads: min `70 ms`, median `82 ms`, p95/max `96 ms`; value `55 → 55` |
 | Persistent touch transport | cold request `16.995 s` / `17.244 s` total; 3 warm reads: min `73 ms`, median `86 ms`, p95/max `88 ms`; value `0 → 0` |
 | Controlled Wi-Fi disconnect | `PeripheralSSHTimeoutError` after `3.005 s`; ConnMan had auto-reconnected by the third `3 s` poll |
+| Post-reboot cable-free Wi-Fi | ConnMan auto-connected; USB interface absent; Mac default route unchanged; strict key-only SSH passed; runtime manifest `6/6`; 3 warm IR reads min `70 ms`, median `88 ms`, p95/max `91 ms`; value `57 → 57` |
 | Physical supervisor polling, before optimization | 12 motion-free polls: `196–216 ms`, median `201 ms`; physical remeasurement pending |
 | Local `small` STT synthetic acceptance | exact Swedish + English transcripts; `495 ms` first inference / `120 ms` warm follow-up |
 | Physical supervisor preflight | `completed`, `0` motor-start commands |
@@ -734,7 +735,8 @@ Protocols, limitations, and raw data are in the
 - [x] Asynchronous simulator spatial map with bounded occupancy evidence,
   persistent unknown-object hypotheses, and a read-only live GUI view
 - [x] AR9271 Wi-Fi onboarding, key-only SSH, USB/Wi-Fi brick identity match,
-  and persistent motion-free sensor transport
+  reboot auto-connect, mini-USB removal, and persistent motion-free sensor
+  transport
 - [ ] Remeasure the optimized physical supervisor poll path and complete the
   motion-free foreground timing gate
 - [ ] Physical RobotAPI adapter, semantic tools, calibration, and safety

@@ -312,6 +312,9 @@ Verifierat:
   ny anslutning för varje observation.
 - Ett kontrollerat länkbortfall upptäcktes av hosttransporten och ConnMan
   återanslöt automatiskt.
+- Efter en fysisk omstart återanslöt ConnMan automatiskt. Key-only SSH,
+  sexfilers runtime-preflight och tre nya IR-läsningar passerade även sedan
+  mini-USB-kabeln hade kopplats ur; Macens normala standardrutt var oförändrad.
 
 Återstår:
 
@@ -343,6 +346,12 @@ Verifierat:
   `PeripheralSSHTimeoutError` efter `3.005 s`. ConnMan hade återanslutit
   automatiskt vid den tredje kontrollen i en serie med `3 s` mellan
   kontrollerna.
+- En efterföljande fysisk omstart verifierade ConnMans auto-connect. Efter att
+  mini-USB kopplats ur saknades USB-interfacet, Macens standardrutt var
+  oförändrad och strict key-only SSH fungerade fortfarande. Periferiprofilens
+  runtime-preflight matchade `6/6` filer. Tre helt kabelbefriade varma
+  IR-läsningar gav min `70 ms`, median `88 ms` och p95/max `91 ms`; värdet var
+  `57 → 57`.
 - Hela experimentet var motorfritt. De konstanta IR- och touchvärdena visar
   transportkontinuitet, inte att en fysisk stimulus upptäcktes.
 - Timeout- och återanslutningsresultatet är inte evidens för motorstopp,

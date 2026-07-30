@@ -209,6 +209,14 @@ Over the Wi-Fi target:
 
 Only after those checks pass should the mini-USB cable be removed.
 
+The motion-free physical run on `2026-07-30` passed this sequence. After a
+real reboot, ConnMan auto-connected, strict key-only SSH and the six-file
+peripheral runtime preflight passed, and the mini-USB interface disappeared
+when the cable was removed while the Mac retained its normal default route.
+Three subsequent cable-free IR reads completed with warm round trips of
+`70–91 ms`. Network names, addresses, interface identifiers, brick identity,
+and host-key evidence are intentionally omitted.
+
 ## 7. Measure what actually became faster
 
 Record these separately over USB and Wi-Fi:
