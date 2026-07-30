@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from robot_agent.peripheral_transport import (
@@ -349,6 +350,148 @@ class PeripheralSessionTests(unittest.TestCase):
             self.assertEqual(session.lifecycle_state, "POISONED")
         finally:
             session.close()
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+        self.assert_motor_traps_untouched()
+
+    def test_remote_exit_before_response_fails_without_startup_timeout(self):
+        processes = []
+
+        def exiting_factory(_argv, **kwargs):
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys; "
+                        "sys.stdin.buffer.readline(); "
+                        "sys.stderr.write('remote daemon missing\\n'); "
+                        "sys.exit(127)"
+                    ),
+                ],
+                **kwargs
+            )
+            processes.append(process)
+            return process
+
+        session = PeripheralSSHSession(
+            "robot@fake.local",
+            CONTROLLER_ID,
+            process_factory=exiting_factory,
+            response_timeout_seconds=1,
+            startup_response_timeout_seconds=5,
+        )
+        started_at = time.monotonic()
+        try:
+            with self.assertRaises(
+                PeripheralSSHChannelPoisonedError
+            ) as context:
+                session.describe()
+            elapsed = time.monotonic() - started_at
+            self.assertLess(elapsed, 1)
+            self.assertIn(
+                "response stream closed",
+                str(context.exception).lower(),
+            )
+            self.assertEqual(
+                session.lifecycle_state,
+                "POISONED",
+            )
+            with self.assertRaises(
+                PeripheralSSHChannelPoisonedError
+            ):
+                session.describe()
+        finally:
+            session.close()
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+        self.assert_motor_traps_untouched()
+
+    def test_valid_response_before_remote_exit_returns_then_poisons(self):
+        processes = []
+        description = {
+            "schema": "ev3-peripheral-response/v1",
+            "request_id": "",
+            "controller_id": CONTROLLER_ID,
+            "ok": True,
+            "result": {
+                "protocol_version": 1,
+                "robot_id": "ev3rstorm-01",
+                "controller_id": CONTROLLER_ID,
+                "peripheral_instance_id": "instance-1",
+                "motion_enabled": False,
+                "speech_enabled": False,
+                "capabilities": {
+                    "configured_sensor_read": {
+                        "enabled": True,
+                        "roles": ["color", "infrared", "touch"],
+                    },
+                },
+            },
+        }
+        script = (
+            "import json,sys\n"
+            "request=json.loads(sys.stdin.buffer.readline())\n"
+            "response=json.loads({response!r})\n"
+            "response['request_id']=request['request_id']\n"
+            "if request['op']=='shutdown':\n"
+            "    response['result']={{'status':'closed'}}\n"
+            "sys.stdout.write(json.dumps(response)+'\\n')\n"
+            "sys.stdout.flush()\n"
+        ).format(response=json.dumps(description))
+
+        def responding_factory(_argv, **kwargs):
+            process = subprocess.Popen(
+                [sys.executable, "-c", script],
+                **kwargs
+            )
+            processes.append(process)
+            return process
+
+        session = PeripheralSSHSession(
+            "robot@fake.local",
+            CONTROLLER_ID,
+            process_factory=responding_factory,
+            response_timeout_seconds=1,
+            startup_response_timeout_seconds=5,
+        )
+        shutdown_session = None
+        try:
+            result = session.describe()
+            self.assertEqual(result["robot_id"], "ev3rstorm-01")
+            with self.assertRaises(
+                PeripheralSSHChannelPoisonedError
+            ):
+                session.read_sensor("infrared")
+            self.assertEqual(
+                session.lifecycle_state,
+                "POISONED",
+            )
+
+            shutdown_session = PeripheralSSHSession(
+                "robot@fake.local",
+                CONTROLLER_ID,
+                process_factory=responding_factory,
+                response_timeout_seconds=1,
+                startup_response_timeout_seconds=5,
+            )
+            self.assertEqual(
+                shutdown_session.request("shutdown"),
+                {"status": "closed"},
+            )
+            self.assertEqual(
+                shutdown_session.lifecycle_state,
+                "CLOSING",
+            )
+            self.assertEqual(shutdown_session.wait_closed(), 0)
+        finally:
+            session.close()
+            if shutdown_session is not None:
+                shutdown_session.close()
             for process in processes:
                 if process.poll() is None:
                     process.kill()

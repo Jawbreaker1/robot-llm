@@ -15,6 +15,7 @@ MAX_REQUEST_BYTES = 2048
 MAX_RESPONSE_BYTES = 4096
 MAX_ERROR_BYTES = 16 * 1024
 MAX_TTL_MS = 5000
+_RECEIVE_FAILURE = object()
 ALLOWED_OPERATIONS = frozenset(
     ("describe", "read_sensor", "shutdown")
 )
@@ -601,6 +602,10 @@ class PeripheralSSHSession:
                 close_input = True
         if close_input:
             self._close_input()
+        try:
+            self._responses.put_nowait(_RECEIVE_FAILURE)
+        except queue.Full:
+            pass
 
     def _poison(
         self,
@@ -753,6 +758,13 @@ class PeripheralSSHSession:
                     "Peripheral response timed out",
                     timeout=True,
                 ) from None
+            if raw is _RECEIVE_FAILURE:
+                with self._state_lock:
+                    receive_failure = self._receive_failure
+                raise self._poison(
+                    receive_failure
+                    or "Peripheral response stream closed"
+                )
             try:
                 result = decode_peripheral_response(
                     raw,
@@ -765,18 +777,24 @@ class PeripheralSSHSession:
                 raise
             except PeripheralSSHProtocolError as error:
                 raise self._poison(str(error)) from None
-            if not self._responses.empty():
-                raise self._poison(
-                    "Peripheral returned more than one response"
-                )
+            while True:
+                try:
+                    queued = self._responses.get_nowait()
+                except queue.Empty:
+                    break
+                if queued is not _RECEIVE_FAILURE:
+                    raise self._poison(
+                        "Peripheral returned more than one response"
+                    )
             if operation == "shutdown":
                 with self._state_lock:
                     self._shutdown_confirmed = True
                     self._lifecycle_state = "CLOSING"
             elif operation == "describe":
                 self._described = True
-            else:
-                self._require_open()
+            # A receive failure sequenced after this correlated response
+            # poisons the channel for future requests, but cannot make this
+            # already confirmed result ambiguous.
             return result
 
     def describe(self) -> Dict[str, object]:

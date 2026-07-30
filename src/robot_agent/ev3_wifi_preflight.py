@@ -8,6 +8,8 @@ from .ssh_policy import motion_free_ssh_options
 
 
 MAX_OUTPUT_BYTES = 64 * 1024
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
+MAX_COMMAND_TIMEOUT_SECONDS = 60
 Runner = Callable[..., Any]
 
 
@@ -417,14 +419,18 @@ def run_ev3_wifi_preflight(
     target: str,
     runner: Runner = subprocess.run,
     connect_timeout_seconds: int = 3,
-    command_timeout_seconds: int = 20,
+    command_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
 ) -> Dict[str, object]:
     """Inventory Wi-Fi readiness without changing EV3 network state."""
 
     validated_target = _validate_target(target)
     for name, value, maximum in (
         ("connect timeout", connect_timeout_seconds, 30),
-        ("command timeout", command_timeout_seconds, 60),
+        (
+            "command timeout",
+            command_timeout_seconds,
+            MAX_COMMAND_TIMEOUT_SECONDS,
+        ),
     ):
         if (
             isinstance(value, bool)
@@ -456,7 +462,8 @@ def run_ev3_wifi_preflight(
         )
     except subprocess.TimeoutExpired:
         raise EV3WiFiPreflightTransportError(
-            "EV3 Wi-Fi preflight timed out"
+            "EV3 Wi-Fi preflight exceeded the {}-second "
+            "command deadline".format(command_timeout_seconds)
         ) from None
     except OSError:
         raise EV3WiFiPreflightTransportError(

@@ -49,8 +49,9 @@ Today the motion, observation, arbitration, and verification parts of that
 loop are exercised against a synthetic robot and world. Live Gemma has made
 bounded exploration and expression decisions in simulator runs, but arbitrary
 human-language missions are not yet wired end-to-end. The real EV3RSTORM has
-verified motors, sensors, speech, and manual bounded movement; autonomous
-physical motion remains gated until the power, transport, calibration,
+verified motors, sensors, speech, manual bounded movement, and key-only SSH
+over both USB and Wi-Fi. Autonomous physical motion remains gated until the
+optimized supervisor poll path is remeasured on the brick and the calibration,
 braking, and fault-injection evidence is strong enough.
 
 ## Why this differs from common LLM-controlled robots
@@ -129,24 +130,16 @@ Status snapshot: **2026-07-30**.
 | Area | Verified now | Important boundary |
 |---|---|---|
 | Physical EV3 baseline | ev3dev boot, USB/SSH, motors A/B/C, bounded manual drive/turn pulses, encoders, touch, relative IR, reflected-light sensing, and Swedish eSpeak TTS | This verifies the assembled EV3RSTORM, not autonomous motion |
+| EV3 Wi-Fi transport | The AR9271 adapter, `ath9k_htc` driver/firmware path, ConnMan onboarding, key-only SSH, and same-brick identity across USB and Wi-Fi are verified | Motion-free only; no SSID, address, or device identifier is stored here |
+| Persistent EV3 sensors | One authenticated Wi-Fi SSH process can serve repeated IR and touch reads; controlled disconnect detection and ConnMan auto-reconnect were also observed | Constant sensor values verify transport continuity, not sensor stimulus, motor-stop latency, or heartbeat behavior |
 | Physical LLM path | One complete motion-free shadow cycle: IR readings → deterministic zone; Gemma generated an audit-only comment, while a separate deterministic Swedish fallback was sent to TTS | Gemma output was not spoken and had no tools or motor access |
-| EV3 supervisor | Physical foreground startup, fault-stop, terminal audit, and clean lock release are now observed; 12 motion-free physical polls measured `196–216 ms` | The current `20 ms` poll contract is not met, so foreground preflight remains failed and physical motion remains disabled |
+| EV3 supervisor | Physical foreground startup, fault-stop, terminal audit, and clean lock release are now observed; the last 12 motion-free physical polls measured `196–216 ms` | This is the pre-optimization result. The `20 ms` contract remains unproven until the optimized path is remeasured, so physical motion remains disabled |
 | Lab Console | Local Gemma chat, standards-based microphone UI, local whisper.cpp STT, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | A live Razer Kiyo Pro utterance passed microphone → `large-v3-turbo` → Gemma → weather; a repeatable Swedish/English short-command accuracy corpus remains a gate. Speech becomes agent text—no motor, SSH, TTS, or stop routes exist here |
 | RobotAPI loop | Typed, snapshot-bound arm API and a closed `observe → plan → act → verify → replan` loop | Simulator-only and currently driven by a scripted fake planner |
 | Navigation | Waypoint following, obstacle avoidance, version-bound multi-waypoint missions, self-directed idle exploration, one MotionSupervisor, and an independent collision oracle | 2D simulator only; Gemma selects opaque host-created opportunities, not arbitrary coordinates or physical commands |
 | Spatial map | Continuous bounded occupancy fusion, robot pose, fresh sensor rays, and persistent opaque object hypotheses in a read-only Lab Console map | Current map input is simulator-only. The contract can later retain physical EV3 IR as low-confidence qualitative evidence without inventing metric distance or free space |
 | Concurrent interaction | Independent bounded workers plus one live local-Gemma simulator run where model speech overlapped a later navigation tick | Virtual callbacks only; no physical drive, speaker, or arm adapter |
-| Physical autonomy | Not enabled | Waiting for reliable EV3 power, physical transport validation, calibration, stop-latency evidence, and fault injection |
-
-<details>
-<summary><strong>Why physical autonomy remains locked</strong></summary>
-
-The latest EV3 power check measured **5.889 V**. Physical deployment of the
-foreground daemon was intentionally stopped before file transfer to avoid a
-brownout and unnecessary SD-card risk. Physical testing remains paused until
-reliable battery power is available.
-
-</details>
+| Physical autonomy | Not enabled | Waiting for physical supervisor timing, calibration, stop-latency evidence, and fault injection |
 
 English and Swedish are verified for the dashboard and model text responses.
 The local STT path is provider-neutral and accepts explicit language hints;
@@ -596,9 +589,9 @@ IDs, timestamps, TTL, source URLs, byte counts, and SHA-256 hashes.
 <details>
 <summary><strong>Physical EV3 operator path</strong></summary>
 
-Do not deploy or test on the EV3 until it has reliable power. Back up current
-files, verify the destination and hashes, keep a physical abort method ready,
-and compare the assembled wiring with
+Before deploying or testing on the EV3, back up current files, verify the
+destination and hashes, keep a physical abort method ready, and compare the
+assembled wiring with
 [`config/ev3rstorm.json`](config/ev3rstorm.json). The committed map is
 specific to this EV3RSTORM.
 
@@ -612,9 +605,17 @@ Deploy and inventory:
 ```sh
 ssh 'robot@<EV3-host>' 'mkdir -p /home/robot/robot-llm'
 scp -r ev3 config 'robot@<EV3-host>:/home/robot/robot-llm/'
+PYTHONPATH=src python3 -m robot_agent.ev3_runtime_preflight_cli \
+  --ssh-target 'robot@<EV3-host>' \
+  --profile peripheral
 ssh 'robot@<EV3-host>' \
   'cd /home/robot/robot-llm && python3 ev3/robot_cli.py inventory'
 ```
+
+The [runtime deployment preflight](docs/EV3_RUNTIME_DEPLOYMENT.md) compares
+the fixed local and remote manifests, including SHA-256 and Python 3.5
+compatibility, without importing a daemon or enabling motion. Run the
+`supervisor` profile before any foreground-supervisor test.
 
 Read the IR sensor or test the already verified **Swedish** TTS path without
 motion:
@@ -676,6 +677,12 @@ This is a manual hardware test, not autonomous navigation. Read the full
 | Measurement | Result |
 |---|---:|
 | Hardware-free test suite | `scripts/quality_check.sh` passing |
+| EV3 Wi-Fi onboarding | AR9271 + `ath9k_htc` firmware + ConnMan ready; key-only SSH; USB/Wi-Fi brick identity matched |
+| Persistent full inventory | cold attempt exceeded the previous `20 s` client deadline, with remote completion unknown; immediate warm retry `15.721 s` |
+| Persistent IR transport | cold request `13.307 s` / `14.138 s` total; 10 warm reads: min `70 ms`, median `82 ms`, p95/max `96 ms`; value `55 → 55` |
+| Persistent touch transport | cold request `16.995 s` / `17.244 s` total; 3 warm reads: min `73 ms`, median `86 ms`, p95/max `88 ms`; value `0 → 0` |
+| Controlled Wi-Fi disconnect | `PeripheralSSHTimeoutError` after `3.005 s`; ConnMan had auto-reconnected by the third `3 s` poll |
+| Physical supervisor polling, before optimization | 12 motion-free polls: `196–216 ms`, median `201 ms`; physical remeasurement pending |
 | Local `small` STT synthetic acceptance | exact Swedish + English transcripts; `495 ms` first inference / `120 ms` warm follow-up |
 | Physical supervisor preflight | `completed`, `0` motor-start commands |
 | Straight physical B/C pulse | `+175° / +175°` |
@@ -689,8 +696,15 @@ This is a manual hardware test, not autonomous navigation. Read the full
 | Live idle Gemma range-change run | `2 / 2` self-selected tasks; same box `207 → 357 mm`; `22` actions; `0` collisions; verified stop |
 | Spatial-map simulator run | `100` fused snapshots; `193` retained cells; `9` opaque hypotheses; `98` actions; `0` collisions; verified stop |
 
-The IR figures verify filtering and hysteresis in stationary tests. They are
-not motor stop time, braking distance, a real-time guarantee, or a benchmark.
+The persistent Wi-Fi sensor run was entirely motion-free. Its unchanged IR
+and touch values prove that requests and responses crossed the transport, not
+that either sensor reacted to a physical stimulus. The disconnect result
+measures host-side timeout and ConnMan recovery only; it is not evidence for
+motor-stop latency, heartbeat enforcement, or safe motion over Wi-Fi.
+
+The IR gate figures verify filtering and hysteresis in stationary tests. They
+are not motor stop time, braking distance, a real-time guarantee, or a
+benchmark.
 The STT figures use locally synthesized canonical WAV fixtures, not a physical
 microphone recording, and therefore verify the managed server and API path
 rather than room-noise robustness.
@@ -719,7 +733,10 @@ Protocols, limitations, and raw data are in the
   budgets
 - [x] Asynchronous simulator spatial map with bounded occupancy evidence,
   persistent unknown-object hypotheses, and a read-only live GUI view
-- [ ] Reliable EV3 power and physical motion-free foreground handshake
+- [x] AR9271 Wi-Fi onboarding, key-only SSH, USB/Wi-Fi brick identity match,
+  and persistent motion-free sensor transport
+- [ ] Remeasure the optimized physical supervisor poll path and complete the
+  motion-free foreground timing gate
 - [ ] Physical RobotAPI adapter, semantic tools, calibration, and safety
   evidence
 - [ ] Gemma-driven physical `ACT`/`ABORT` loop behind a separate motion gate
@@ -730,7 +747,8 @@ Protocols, limitations, and raw data are in the
   cancellation, and the normal versioned agent-submit path
 - [ ] Real browser-permission + Mac-microphone acceptance runs in Swedish and
   English
-- [ ] Wi-Fi, camera, microphones, vision, and sound-source localization
+- [ ] Camera and robot-mounted microphone transport
+- [ ] Vision and sound-source localization
 - [ ] Multi-controller orchestration across EV3, Robot Inventor, and BOOST
 
 The dream demo:

@@ -18,10 +18,11 @@ En lokal EV3-supervisor behåller exklusivt motorägarskap.
    använda regexp, substrings eller keywords som alternativ klassificerare.
 3. **Lokal EV3-supervisor:** tar emot redan typade, tidsbegränsade
    motorprimitiver. I målarkitekturen når de den först efter host-policyns
-   auktorisation; transport och autentisering är ännu inte implementerade.
-   Supervisorn äger motorerna exklusivt och verkställer heartbeat, touchstopp,
-   stallstopp, timeout och lokala hårdgränser oberoende av LLM och
-   nätverkslatens.
+   auktorisation. Key-only SSH är nu verifierat som generell administrativ
+   transport, men den rörelseaktiverade hostadaptern och dess avgränsade
+   forced-command-yta är ännu inte implementerade. Supervisorn äger motorerna
+   exklusivt och verkställer heartbeat, touchstopp, stallstopp, timeout och
+   lokala hårdgränser oberoende av LLM och nätverkslatens.
 
 Ogiltig modell-JSON, okänd avsikt, gammal kontext eller olöst referens leder
 till `reject` eller `clarify`, aldrig till en heuristiskt gissad handling.
@@ -295,23 +296,61 @@ Den konkreta, rörelsefria ordningen för adapterinventering, ConnMan,
 värdnyckelverifiering, länktest och återställning finns i
 [`EV3_WIFI.md`](EV3_WIFI.md).
 
-Spår:
+Status: Wi-Fi-onboarding, key-only SSH, enhetsidentitet över USB/Wi-Fi och
+motorfri persistent sensortransport verifierades `2026-07-30`. Grinden för
+säker rörelse över en bruten länk är inte passerad.
 
-- Bluetooth-parning och tjänsteinventering.
-- Bluetooth PAN om värddatorn erbjuder nätverksprofilen.
-- Bluetooth RFCOMM för ett litet seriellt kommandoformat.
-- USB Wi-Fi-dongel för normal IP, SSH och senare robot-API.
+Verifierat:
 
-Mätningar:
+- USB-adaptern identifierades som AR9271; `ath9k_htc`, nödvändig firmware,
+  Wi-Fi-interfacet och ConnMan var redo.
+- SSH accepterade endast publik nyckel i provet.
+- Samma EV3-identitet verifierades först över USB och därefter över Wi-Fi,
+  utan att nätverksnamn, adresser eller enhetsidentifierare lagras i denna
+  rapport.
+- En persistent SSH-process kunde bära upprepade IR- och touchläsningar utan
+  ny anslutning för varje observation.
+- Ett kontrollerat länkbortfall upptäcktes av hosttransporten och ConnMan
+  återanslöt automatiskt.
 
-- rundturstid och variation,
-- faktisk genomströmning,
-- återanslutning,
+Återstår:
+
+- separat privilegiebegränsad/forced-command-yta för robottransporten,
+- fysisk heartbeat- och lokal stoppverifiering vid länkbortfall,
 - tappade och duplicerade kommandon,
-- beteende när länken bryts mitt under en begäran.
+- genomströmning för framtida ljuddata,
+- Bluetooth-parning, PAN och RFCOMM om de spåren fortfarande är relevanta.
+
+### EXP-F1B-WIFI-001 – motorfri Wi-Fi- och persistent sensortransport
+
+- Datum: `2026-07-30`.
+- Adapterns AR9271-chip, `ath9k_htc`, firmwareladdning och ConnMan verifierades
+  före anslutning.
+- Key-only SSH passerade. EV3:ans identitet matchade mellan USB- och
+  Wi-Fi-vägen; faktiska SSID, IP-/MAC-adresser, machine-id och
+  nyckelfingeravtryck ingår inte i evidensen.
+- En kall full inventering överskred klientens tidigare deadline på `20 s`.
+  Klienten observerade därför inget färdigt resultat och det är okänt om
+  fjärrprocessen senare slutförde inventeringen. En omedelbar varm
+  återkörning slutfördes på `15.721 s`.
+- IR: den kalla begäran tog `13.307 s` och hela kalla sessionen `14.138 s`.
+  Tio efterföljande varma läsningar gav min `70 ms`, median `82 ms` och
+  p95/max `96 ms`. Värdet var `55 → 55`.
+- Touch: den kalla begäran tog `16.995 s` och hela kalla sessionen
+  `17.244 s`. Tre efterföljande varma läsningar gav min `73 ms`, median
+  `86 ms` och p95/max `88 ms`. Värdet var `0 → 0`.
+- Vid ett kontrollerat länkbortfall rapporterade hosten
+  `PeripheralSSHTimeoutError` efter `3.005 s`. ConnMan hade återanslutit
+  automatiskt vid den tredje kontrollen i en serie med `3 s` mellan
+  kontrollerna.
+- Hela experimentet var motorfritt. De konstanta IR- och touchvärdena visar
+  transportkontinuitet, inte att en fysisk stimulus upptäcktes.
+- Timeout- och återanslutningsresultatet är inte evidens för motorstopp,
+  heartbeat, bromssträcka eller säker fysisk exekvering vid länkbortfall.
 
 Grind: länkbortfall stoppar lokalt, gamla kommandon återspelas inte och varje
-kommando har ett unikt ID.
+kommando har ett unikt ID. Experimentet ovan passerar transportdelen men inte
+denna rörelsegrind.
 
 ## Fas 2 – EV3-supervisor
 

@@ -1,16 +1,22 @@
 import ast
+import contextlib
+import io
 import json
 import subprocess
 import unittest
 from dataclasses import dataclass
+from unittest.mock import patch
 
 from robot_agent.ev3_wifi_preflight import (
+    DEFAULT_COMMAND_TIMEOUT_SECONDS,
     EV3WiFiPreflightConfigurationError,
     EV3WiFiPreflightProtocolError,
     EV3WiFiPreflightTransportError,
+    MAX_COMMAND_TIMEOUT_SECONDS,
     REMOTE_PREFLIGHT_PROGRAM,
     run_ev3_wifi_preflight,
 )
+from robot_agent.ev3_wifi_preflight_cli import main
 
 
 @dataclass
@@ -143,7 +149,46 @@ class EV3WiFiPreflightTests(unittest.TestCase):
         self.assertEqual(kwargs["input"], REMOTE_PREFLIGHT_PROGRAM)
         self.assertTrue(kwargs["text"])
         self.assertFalse(kwargs["check"])
-        self.assertEqual(kwargs["timeout"], 20)
+        self.assertEqual(
+            kwargs["timeout"],
+            DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        )
+
+    def test_cli_uses_bounded_default_and_forwards_override(self):
+        for arguments, expected_timeout in (
+            (
+                ["--ssh-target", "robot@ev3dev.local"],
+                DEFAULT_COMMAND_TIMEOUT_SECONDS,
+            ),
+            (
+                [
+                    "--ssh-target",
+                    "robot@ev3dev.local",
+                    "--command-timeout-seconds",
+                    str(MAX_COMMAND_TIMEOUT_SECONDS),
+                ],
+                MAX_COMMAND_TIMEOUT_SECONDS,
+            ),
+        ):
+            with self.subTest(arguments=arguments):
+                output = io.StringIO()
+                with patch(
+                    "robot_agent.ev3_wifi_preflight_cli."
+                    "run_ev3_wifi_preflight",
+                    return_value=valid_result(),
+                ) as preflight:
+                    with contextlib.redirect_stdout(output):
+                        status = main(arguments)
+
+                self.assertEqual(status, 0)
+                preflight.assert_called_once_with(
+                    "robot@ev3dev.local",
+                    command_timeout_seconds=expected_timeout,
+                )
+                self.assertEqual(
+                    json.loads(output.getvalue())["status"],
+                    "observed",
+                )
 
     def test_ready_requires_wireless_interface_bound_to_ath9k_htc(self):
         ready = run_ev3_wifi_preflight(
@@ -200,14 +245,28 @@ class EV3WiFiPreflightTests(unittest.TestCase):
                 runner=runner,
                 command_timeout_seconds=0,
             )
+        with self.assertRaises(EV3WiFiPreflightConfigurationError):
+            run_ev3_wifi_preflight(
+                "robot@ev3dev.local",
+                runner=runner,
+                command_timeout_seconds=(
+                    MAX_COMMAND_TIMEOUT_SECONDS + 1
+                ),
+            )
         self.assertEqual(runner.calls, [])
 
     def test_timeout_and_nonzero_exit_are_wrapped(self):
-        with self.assertRaises(EV3WiFiPreflightTransportError):
+        with self.assertRaisesRegex(
+            EV3WiFiPreflightTransportError,
+            "30-second command deadline",
+        ):
             run_ev3_wifi_preflight(
                 "robot@ev3dev.local",
                 runner=RecordingRunner(
-                    subprocess.TimeoutExpired("ssh", 20)
+                    subprocess.TimeoutExpired(
+                        "ssh",
+                        DEFAULT_COMMAND_TIMEOUT_SECONDS,
+                    )
                 ),
             )
         with self.assertRaises(EV3WiFiPreflightTransportError):

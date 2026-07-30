@@ -1,26 +1,36 @@
-"""Command-line entry point for the read-only EV3 Wi-Fi preflight."""
+"""CLI for the read-only EV3 runtime deployment preflight."""
 
 import argparse
 import json
 import sys
 from typing import List, Optional
 
-from .ev3_wifi_preflight import (
+from .ev3_runtime_preflight import (
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
-    EV3WiFiPreflightError,
+    EV3RuntimePreflightError,
     MAX_COMMAND_TIMEOUT_SECONDS,
-    run_ev3_wifi_preflight,
+    run_ev3_runtime_preflight,
 )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Inventory EV3 Wi-Fi readiness over the existing USB SSH "
-            "link without changing network state."
+            "Compare a fixed local EV3 runtime profile with its deployed "
+            "files over strict SSH. No daemon or motion is started."
         )
     )
     parser.add_argument("--ssh-target", required=True)
+    parser.add_argument(
+        "--profile",
+        choices=("peripheral", "supervisor"),
+        default="peripheral",
+    )
+    parser.add_argument(
+        "--local-root",
+        default=".",
+        help="local robot-llm checkout (default: current directory)",
+    )
     parser.add_argument(
         "--command-timeout-seconds",
         type=int,
@@ -40,16 +50,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        result = run_ev3_wifi_preflight(
+        result = run_ev3_runtime_preflight(
             args.ssh_target,
+            profile=args.profile,
+            local_root=args.local_root,
             command_timeout_seconds=args.command_timeout_seconds,
         )
-    except EV3WiFiPreflightError as error:
+    except EV3RuntimePreflightError as error:
         print(
             json.dumps(
                 {
+                    "schema_version": 1,
                     "status": "failed",
-                    "mode": "ev3-wifi-read-only-preflight",
+                    "mode": "ev3-runtime-deployment-preflight",
+                    "effects": "read_only",
+                    "error_code": error.code,
                     "error": " ".join(str(error).split())[:240],
                 },
                 ensure_ascii=False,

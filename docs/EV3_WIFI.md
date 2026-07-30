@@ -111,8 +111,12 @@ The command changes no EV3 network state. It records:
 After the adapter binds correctly, `network.ath9k_htc_interfaces` must
 contain a wireless interface and `onboarding_ready` must be `true`. A generic
 Wi-Fi interface driven by some other module is deliberately insufficient.
-Save the JSON as experiment evidence, but do not commit machine-specific
-network details without reviewing them.
+Save raw JSON only below the ignored `local-artifacts/` directory. It can
+contain the private SSID and ConnMan service ID, IP addresses, interface MAC,
+machine ID, routes, and SSH host-key evidence; none of those values belong in
+public commits or screenshots. Public experiment evidence may name the
+adapter model, USB VID:PID, and `ath9k_htc`, because those identify the
+hardware class rather than this robot or network.
 
 If the USB device appears but no wireless interface does, stop there. Inspect
 the reported driver and firmware fields before installing or upgrading
@@ -120,6 +124,16 @@ anything.
 
 `onboarding_ready` describes adapter/driver/ConnMan readiness only. It does
 not replace the mandatory credential gate above.
+
+The complete inventory has a 30-second deadline. In one live check the first
+cold run exceeded the former 20-second deadline; its actual completion time
+is unknown. An immediate warm retry completed in 15.721 seconds. The new
+default therefore provides bounded headroom, but still requires cold
+validation on the physical EV3. If a measured cold boot genuinely needs more
+headroom, use `--command-timeout-seconds <seconds>`; accepted values are
+1–60. Keep the smallest value that reliably covers the measured device.
+Repeated timeouts should be investigated rather than hidden behind an
+unbounded retry.
 
 ## 4. Join Wi-Fi interactively
 
@@ -182,13 +196,16 @@ its expected host key and controller identity.
 Over the Wi-Fi target:
 
 1. Run the read-only Wi-Fi preflight again.
-2. Run inventory and IR reads only; do not move motors.
-3. Run at least ten short requests and record latency and failures.
-4. Keep one bounded persistent session open and confirm it detects a forced
+2. Run the fixed-manifest
+   [runtime deployment preflight](EV3_RUNTIME_DEPLOYMENT.md) before starting
+   any peripheral or supervisor daemon.
+3. Run inventory and IR reads only; do not move motors.
+4. Run at least ten short requests and record latency and failures.
+5. Keep one bounded persistent session open and confirm it detects a forced
    Wi-Fi disconnect.
-5. Confirm the Mac's default Internet route still uses normal Mac Wi-Fi, not
+6. Confirm the Mac's default Internet route still uses normal Mac Wi-Fi, not
    the EV3 USB interface.
-6. Reboot the EV3 once and verify ConnMan reconnects automatically.
+7. Reboot the EV3 once and verify ConnMan reconnects automatically.
 
 Only after those checks pass should the mini-USB cable be removed.
 
