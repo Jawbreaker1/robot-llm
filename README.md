@@ -181,6 +181,14 @@ failure. The worker and host now publish and validate the same filter window,
 the original fault is retained in dashboard telemetry, and the exact real
 sample pattern is covered by regression tests.
 
+The session also exposed a separate no-progress speech loop in which the same
+assessment was heard repeatedly. Speech now drops the same normalized
+utterance within an unchanged episode/locale/progress revision as
+`duplicate_without_progress`, and an uninformative repeated `OBSERVE` is no
+longer offered to the next model turn. These are generic state/progress rules,
+not phrase, regular-expression, or Swedish-specific routing. They pass the
+quality suite and still need one live recheck after the battery change.
+
 All `1,236` hardware-free tests passed after the correction. Encoder evidence
 also confirmed that the failed attempt had not moved either drive wheel. The
 EV3 batteries expired before the corrected worker files could be copied back
@@ -694,7 +702,8 @@ matched-load records in
 - [x] Robot/Workbench GUI split with opt-in runtime, episode controls,
   settings, stop, emergency stop, snapshots, and technical events
 - [x] Bounded asynchronous host-generated Swedish WAV speech transport,
-  scheduler, duplicate suppression, and physical runtime composition
+  scheduler, hardware-free-verified duplicate suppression, and physical
+  runtime composition
 - [ ] Repeat Swedish TTS during completed motion and add a separately
   configured, live-tested English host voice
 - [ ] Deploy the corrected scan-filter contract after the battery change and
