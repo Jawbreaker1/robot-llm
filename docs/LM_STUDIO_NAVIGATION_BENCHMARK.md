@@ -97,6 +97,39 @@ of the formal navigation suite.
 The evidence record, including makespan and completion-token totals, is stored
 in [`docs/data/EXP-GEMMA4-QAT-NAV-001.json`](data/EXP-GEMMA4-QAT-NAV-001.json).
 
+## Recorded batch-matched Q8/QAT comparison
+
+`EXP-GEMMA4-Q8-NAV-001` and `EXP-GEMMA4-QAT-NAV-002` each contain 45 measured
+planner calls with evaluation batch `512`. Context `32000`, physical batch
+`512`, maximum concurrency `4`, Flash Attention, GPU KV cache, eight active
+experts, prompts, schema, cases, warmups, and repetitions also matched. Both
+models passed all 45 schemas, semantic actions, and identity checks.
+
+| Client concurrency | Q8 / QAT median E2E latency | Q8 / QAT median server decode | Q8 / QAT aggregate output | QAT decode advantage |
+|---:|---:|---:|---:|---:|
+| 1 | `3.312 / 3.017 s` | `91.112 / 106.633 tok/s` | `82.790 / 98.206 tok/s` | `17.035%` |
+| 2 | `7.466 / 7.118 s` | `46.171 / 50.008 tok/s` | `77.084 / 85.069 tok/s` | `8.310%` |
+| 4 | `12.027 / 12.991 s` | `25.181 / 26.098 tok/s` | `90.468 / 89.782 tok/s` | `3.642%` |
+
+The matched run therefore supports QAT as the latency-critical single-flight
+planner: it decoded `17.0%` faster, reduced median wall latency by `8.9%`
+(`295 ms`), and produced `18.6%` more aggregate output per measured second.
+At four concurrent requests, aggregate throughput was effectively tied and Q8
+had lower observed latency. This is not evidence for using four simultaneous
+physical planners: both variants were roughly four times slower per request
+than at single flight, and the 15-sample p95 is effectively the run maximum.
+
+The comparison remains between two distinct published artifacts rather than a
+guaranteed bit-width-only conversion. Full Q8 weight offload was not
+independently visible in the load API, and the result must not be generalized
+to every prompt or system state without replicated, counterbalanced runs.
+
+Evidence is stored in
+[`EXP-GEMMA4-Q8-NAV-001.json`](data/EXP-GEMMA4-Q8-NAV-001.json) and
+[`EXP-GEMMA4-QAT-NAV-002.json`](data/EXP-GEMMA4-QAT-NAV-002.json), with the
+explicit comparison and limitations in
+[`EXP-GEMMA4-QAT-Q8-NAV-COMP-001.json`](data/EXP-GEMMA4-QAT-Q8-NAV-COMP-001.json).
+
 ## Report
 
 The JSON report includes:

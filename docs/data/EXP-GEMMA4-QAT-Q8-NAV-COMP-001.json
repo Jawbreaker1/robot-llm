@@ -1,0 +1,102 @@
+{
+  "schema": "robot-llm-model-benchmark-comparison/v1",
+  "experiment_id": "EXP-GEMMA4-QAT-Q8-NAV-COMP-001",
+  "recorded_date": "2026-07-31",
+  "source_records": [
+    "EXP-GEMMA4-Q8-NAV-001",
+    "EXP-GEMMA4-QAT-NAV-002"
+  ],
+  "models": {
+    "q8": {
+      "requested_id": "google/gemma-4-26b-a4b",
+      "served_id": "google/gemma-4-26b-a4b",
+      "variant": "google/gemma-4-26b-a4b@q8_0",
+      "quantization": "Q8_0",
+      "artifact_size_bytes": 28054755129
+    },
+    "qat": {
+      "requested_id": "google/gemma-4-26b-a4b-qat",
+      "served_id": "google/gemma-4-26b-a4b-qat",
+      "variant": "google/gemma-4-26b-a4b-qat@q4_0",
+      "quantization": "Q4_0",
+      "artifact_size_bytes": 15634288486
+    }
+  },
+  "matched_visible_load_settings": {
+    "context_length": 32000,
+    "evaluation_batch_size": 512,
+    "physical_batch_size": 512,
+    "maximum_concurrent_requests": 4,
+    "flash_attention": true,
+    "kv_cache_on_gpu": true,
+    "active_experts": 8,
+    "speculative_decoding": false
+  },
+  "matched_method": {
+    "benchmark_report_schema": "robot-physical-navigation-benchmark/v2",
+    "inference_path": "/api/v0/chat/completions",
+    "cases": [
+      "clear_progress_en",
+      "blocked_requires_scan_sv",
+      "completed_finish_en"
+    ],
+    "warmups_per_case": 1,
+    "measured_repetitions_per_case": 5,
+    "temperature": 0,
+    "first_pass_only": true,
+    "strict_navigation_schema": true
+  },
+  "quality": {
+    "q8_schema_valid_and_expected_action": "45/45",
+    "qat_schema_valid_and_expected_action": "45/45",
+    "interpretation": "Both completed this small suite perfectly; this is not a general model-quality equivalence claim."
+  },
+  "comparison": [
+    {
+      "parallelism": 1,
+      "q8_median_wall_latency_ms": 3312,
+      "qat_median_wall_latency_ms": 3017,
+      "qat_wall_latency_delta_percent_vs_q8": -8.907,
+      "q8_median_server_decode_tokens_per_second": 91.112,
+      "qat_median_server_decode_tokens_per_second": 106.633,
+      "qat_decode_advantage_percent_vs_q8": 17.035,
+      "q8_aggregate_output_tokens_per_second": 82.790,
+      "qat_aggregate_output_tokens_per_second": 98.206
+    },
+    {
+      "parallelism": 2,
+      "q8_median_wall_latency_ms": 7466,
+      "qat_median_wall_latency_ms": 7118,
+      "qat_wall_latency_delta_percent_vs_q8": -4.661,
+      "q8_median_server_decode_tokens_per_second": 46.171,
+      "qat_median_server_decode_tokens_per_second": 50.008,
+      "qat_decode_advantage_percent_vs_q8": 8.310,
+      "q8_aggregate_output_tokens_per_second": 77.084,
+      "qat_aggregate_output_tokens_per_second": 85.069
+    },
+    {
+      "parallelism": 4,
+      "q8_median_wall_latency_ms": 12027,
+      "qat_median_wall_latency_ms": 12991,
+      "qat_wall_latency_delta_percent_vs_q8": 8.015,
+      "q8_median_server_decode_tokens_per_second": 25.181,
+      "qat_median_server_decode_tokens_per_second": 26.098,
+      "qat_decode_advantage_percent_vs_q8": 3.642,
+      "q8_aggregate_output_tokens_per_second": 90.468,
+      "qat_aggregate_output_tokens_per_second": 89.782
+    }
+  ],
+  "decision": {
+    "planner_default": "QAT Q4_0, single-flight",
+    "reason": "In this matched run, QAT provided the best latency-critical single-flight decode and wall latency without losing any decision in the fixed suite.",
+    "parallel_scheduling": "Do not infer that four simultaneous heavy planner calls are useful. Schedule urgent physical replanning single-flight and keep other model work asynchronous and load-aware."
+  },
+  "limitations": [
+    "This is one run order, not a replicated or counterbalanced experiment.",
+    "Each concurrency has 15 mixed-case samples; nearest-rank p95 is effectively the maximum.",
+    "Completion-token totals differ by 2.8-4.1 percent between model runs.",
+    "The models are distinct published artifacts, not a guaranteed bit-width-only conversion of identical weights.",
+    "Full Q8 weight offload, GPU layer count, KV-cache data types, CPU thread-pool parity, runtime version parity, and base-checkpoint provenance were not independently recorded.",
+    "No confidence interval or significance test is claimed."
+  ]
+}

@@ -20,7 +20,11 @@
     "bits_per_weight": 4,
     "loaded_context_length": 32000,
     "loaded_parallelism": 4,
-    "flash_attention": true
+    "evaluation_batch_size": 2048,
+    "physical_batch_size": 512,
+    "flash_attention": true,
+    "kv_cache_on_gpu": true,
+    "active_experts": 8
   },
   "method": {
     "cases": [
@@ -105,6 +109,6 @@
     "latency": "Use single-flight inference for the latency-critical physical planner: median end-to-end latency rose from 3.220 seconds at one request to 11.920 seconds at four.",
     "concurrency": "For this structured production workload, median per-request server decode speed fell from 99.559 tokens/s at one request to 27.872 tokens/s at four, while measured aggregate end-to-end throughput stayed within 85.232-90.678 tokens/s. Four requests therefore provided no demonstrated planner-throughput gain.",
     "workload_boundary": "A separate unconstrained 192-token diagnostic reached 160.86-167.04 server tokens/s per stream at four requests. That diagnostic is not part of this evidence run; it shows that the structured planner result must not be generalized to every prompt or to lmlink transport itself.",
-    "comparison_limit": "No relative speed claim is made until another model or quantization is run with this exact harness."
+    "comparison_limit": "The later Q8 run used this exact harness but evaluation batch 512 rather than 2048. It supports an operational deployment comparison, not a batch-matched attribution to quantization alone."
   }
 }

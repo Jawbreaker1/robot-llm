@@ -141,7 +141,7 @@ but the complete path has not yet run as one physical autonomous episode.
 | Physical EV3 baseline | Live-verified ev3dev boot, USB and Wi-Fi SSH, motors A/B/C, encoders, touch, relative IR, reflected light, manual bounded movement, and Swedish TTS | Historical measurements are listed below; they do not validate the new complete autonomous runtime |
 | EV3 navigation worker | Production bounded JSONL worker and persistent Wi-Fi SSH transport are implemented and hardware-free tested, including exclusive motor ownership, strict identity/sequencing, interruptible slices, verified stop, EOF/signal handling, and bounded session renewal | The worker has not yet completed a live autonomous episode on the EV3 |
 | Physical closed loop | Goal → structured model plan → short semantic action → observe/verify → replan is implemented on the host with fixed action profiles and cumulative budgets | End-to-end model + Wi-Fi + worker + moving EV3 validation is still pending |
-| Gemma 4 QAT planner | The loaded `google/gemma-4-26b-a4b-qat` Q4_0 model produced 45/45 valid first-pass structured decisions and 45/45 expected semantic actions in the hardware-free physical-planner benchmark | This is planner evidence, not a moving-robot run or proof that QAT is faster than Q8 |
+| Gemma 4 planner comparison | In one matched-load run, QAT Q4_0 produced `106.633 tok/s` single-flight median server decode versus Q8_0's `91.112 tok/s` (`+17.0%`), with `3.017` versus `3.312 s` median latency; both produced 45/45 schema-valid expected actions | This is one hardware-free planner run, not a moving-robot run or a general model-quality claim; four-way aggregate throughput was effectively tied |
 | Active IR investigation | Bilateral coarse-to-fine front-arc scanning, encoder-derived headings, boundary observations, and restoration to the starting heading are implemented | The current `682°` mean wheel-encoder estimate for an approximately `90°` body turn is provisional and must be live-calibrated |
 | Obstacle memory | Physical navigation retains qualitative IR hazard hypotheses after turning and applies swept-path vetoes instead of assuming “not in front” means “gone” | IR-PROX is not metric distance or object identity; the physical map is deliberately qualitative |
 | Robot speech | A bounded asynchronous speech runtime and fixed EV3 `speak-stdin --voice sv|en` path are implemented; speech failures are isolated from navigation | Runtime integration is in progress and English physical TTS has not had a live acceptance run |
@@ -150,18 +150,16 @@ but the complete path has not yet run as one physical autonomous episode.
 | Spatial UI map | The simulator occupancy map and opaque object hypotheses are available in the read-only Map view | Physical qualitative hazard memory is implemented in the runtime but is not yet rendered as the metric simulator map |
 | Multi-controller architecture | Identity, proposal, and authority contracts are designed to grow to EV3, Robot Inventor 51515, BOOST, cameras, and microphones | Only the EV3 path has a production physical worker today |
 
-On the operator-confirmed `lmlink` path to the gaming computer, the QAT Q4_0
-planner produced `45/45` valid, expected first-pass decisions. At client
-concurrency `1 / 2 / 4`, median end-to-end latency was
-`3.220 / 7.054 / 11.920 s`, median LM Studio server decode speed was
-`99.559 / 50.828 / 27.872 tok/s` per request, and measured aggregate
-end-to-end output was `90.678 / 85.232 / 90.408 tok/s`. Four concurrent
-structured planners therefore did not improve total measured throughput and
-materially hurt latency; the physical planner will start single-flight. A
-separate unconstrained diagnostic was much faster at four requests, so this is
-a structured-workload result rather than evidence that `lmlink` universally
-serializes generation. This is not a claim that QAT is faster than Q8; that
-requires running the same harness after loading Q8. An earlier project update
+On the operator-confirmed `lmlink` path to the gaming computer, matched-load
+QAT Q4_0 and Q8_0 runs both produced `45/45` schema-valid expected first-pass
+decisions. In this run's latency-critical single-flight mode, QAT median server
+decode was `106.633 tok/s` versus Q8's `91.112 tok/s` (`+17.0%`), and median
+end-to-end latency was `3.017` versus `3.312 s` (`-8.9%`). This advantage did
+not generalize to four concurrent requests: aggregate output was effectively
+tied at `89.782` versus `90.468 tok/s`, and QAT median latency was worse. The
+physical planner will therefore start single-flight. These are workload- and
+run-specific observations between distinct model artifacts, not a general
+claim that four-bit models are faster or equally capable. An earlier project update
 mislabelled client end-to-end token rate as generation speed; the v2 evidence
 now records server decode, TTFT, client wall time, makespan, and aggregate rate
 separately.
@@ -554,7 +552,8 @@ live run.
 | IR gate blocked | `100 ms` after first raw value `≤35` |
 | IR gate released | `100 ms` after first filtered value `≥40` |
 | Gemma proposal in one physical shadow run | `417 ms` |
-| Gemma 4 QAT structured physical planner | `45/45` valid schemas and expected actions; single-flight median/p95 `3.220 / 3.513 s`; median server decode `99.559 tok/s`; measured aggregate E2E output `90.678 tok/s` |
+| Gemma 4 QAT structured physical planner | Matched-load run: `45/45` valid schemas and expected actions; single-flight median/p95 `3.017 / 3.147 s`; median server decode `106.633 tok/s`; measured aggregate E2E output `98.206 tok/s` |
+| Gemma 4 Q8 structured physical planner | `45/45` valid schemas and expected actions; single-flight median/p95 `3.312 / 3.922 s`; median server decode `91.112 tok/s`; measured aggregate E2E output `82.790 tok/s` |
 | Live concurrent Gemma simulator run | `1` accepted expression; speech/navigation interleaving observed; `98` actions; verified stop |
 | Live idle Gemma range-change run | `2 / 2` self-selected tasks; same box `207 → 357 mm`; `22` actions; `0` collisions; verified stop |
 | Spatial-map simulator run | `100` fused snapshots; `193` retained cells; `9` opaque hypotheses; `98` actions; `0` collisions; verified stop |
@@ -579,7 +578,11 @@ Protocols, limitations, and raw data are in the
 [experiment plan](docs/EXPERIMENT_PLAN.md) and
 [EXP-F1-IR-DYN-002.json](docs/data/EXP-F1-IR-DYN-002.json). The QAT planner
 benchmark is recorded separately in
-[EXP-GEMMA4-QAT-NAV-001.json](docs/data/EXP-GEMMA4-QAT-NAV-001.json).
+[EXP-GEMMA4-QAT-NAV-001.json](docs/data/EXP-GEMMA4-QAT-NAV-001.json), with the
+matched-load records in
+[EXP-GEMMA4-Q8-NAV-001.json](docs/data/EXP-GEMMA4-Q8-NAV-001.json) and
+[EXP-GEMMA4-QAT-NAV-002.json](docs/data/EXP-GEMMA4-QAT-NAV-002.json), plus the
+[comparison record](docs/data/EXP-GEMMA4-QAT-Q8-NAV-COMP-001.json).
 
 ## Roadmap
 

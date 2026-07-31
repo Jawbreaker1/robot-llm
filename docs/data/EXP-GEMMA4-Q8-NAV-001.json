@@ -1,0 +1,148 @@
+{
+  "schema": "robot-llm-model-benchmark-evidence/v2",
+  "experiment_id": "EXP-GEMMA4-Q8-NAV-001",
+  "recorded_date": "2026-07-31",
+  "scope": {
+    "benchmark": "physical_navigation_structured_planner",
+    "ev3_contact": false,
+    "motor_api_exposed": false
+  },
+  "endpoint": {
+    "url": "http://127.0.0.1:1234",
+    "exposure": "operator-confirmed lmlink to gaming computer"
+  },
+  "model": {
+    "requested_id": "google/gemma-4-26b-a4b",
+    "served_id": "google/gemma-4-26b-a4b",
+    "display_name": "Gemma 4 26B A4B",
+    "variant": "google/gemma-4-26b-a4b@q8_0",
+    "quantization": "Q8_0",
+    "artifact_size_bytes": 28054755129,
+    "loaded_context_length": 32000,
+    "loaded_parallelism": 4,
+    "evaluation_batch_size": 512,
+    "physical_batch_size": 512,
+    "flash_attention": true,
+    "kv_cache_on_gpu": true,
+    "active_experts": 8,
+    "full_weight_gpu_offload_verified": false
+  },
+  "method": {
+    "cases": [
+      "clear_progress_en",
+      "blocked_requires_scan_sv",
+      "completed_finish_en"
+    ],
+    "warmups_per_case": 1,
+    "measured_repetitions_per_case": 5,
+    "temperature": 0,
+    "first_pass_only": true,
+    "strict_navigation_schema": true,
+    "benchmark_report_schema": "robot-physical-navigation-benchmark/v2",
+    "inference_api": "lmstudio-v0",
+    "inference_path": "/api/v0/chat/completions",
+    "parallelism_meaning": "maximum concurrent client requests"
+  },
+  "results": [
+    {
+      "parallelism": 1,
+      "measured_samples": 15,
+      "schema_valid": 15,
+      "semantic_action_agreement": 15,
+      "served_model_exact_match": 15,
+      "failures": 0,
+      "server_stats_present": 15,
+      "median_wall_latency_ms": 3312,
+      "p95_wall_latency_ms": 3922,
+      "median_end_to_end_completion_tokens_per_second": 83.333,
+      "p95_end_to_end_completion_tokens_per_second": 85.581,
+      "median_server_decode_tokens_per_second": 91.112,
+      "p95_server_decode_tokens_per_second": 93.259,
+      "median_server_time_to_first_token_seconds": 0.123,
+      "p95_server_time_to_first_token_seconds": 0.180,
+      "measured_phase_makespan_ms": 51830,
+      "completion_tokens_total": 4291,
+      "aggregate_completion_tokens_per_end_to_end_second": 82.790
+    },
+    {
+      "parallelism": 2,
+      "measured_samples": 15,
+      "schema_valid": 15,
+      "semantic_action_agreement": 15,
+      "served_model_exact_match": 15,
+      "failures": 0,
+      "server_stats_present": 15,
+      "median_wall_latency_ms": 7466,
+      "p95_wall_latency_ms": 9321,
+      "median_end_to_end_completion_tokens_per_second": 39.064,
+      "p95_end_to_end_completion_tokens_per_second": 69.617,
+      "median_server_decode_tokens_per_second": 46.171,
+      "p95_server_decode_tokens_per_second": 81.877,
+      "median_server_time_to_first_token_seconds": 0.600,
+      "p95_server_time_to_first_token_seconds": 0.645,
+      "measured_phase_makespan_ms": 55511,
+      "completion_tokens_total": 4279,
+      "aggregate_completion_tokens_per_end_to_end_second": 77.084
+    },
+    {
+      "parallelism": 4,
+      "measured_samples": 15,
+      "schema_valid": 15,
+      "semantic_action_agreement": 15,
+      "served_model_exact_match": 15,
+      "failures": 0,
+      "server_stats_present": 15,
+      "median_wall_latency_ms": 12027,
+      "p95_wall_latency_ms": 15350,
+      "median_end_to_end_completion_tokens_per_second": 23.904,
+      "p95_end_to_end_completion_tokens_per_second": 32.650,
+      "median_server_decode_tokens_per_second": 25.181,
+      "p95_server_decode_tokens_per_second": 42.373,
+      "median_server_time_to_first_token_seconds": 0.785,
+      "p95_server_time_to_first_token_seconds": 0.964,
+      "measured_phase_makespan_ms": 47630,
+      "completion_tokens_total": 4309,
+      "aggregate_completion_tokens_per_end_to_end_second": 90.468
+    }
+  ],
+  "comparison_to_qat_001": {
+    "quality": "Both runs produced 45/45 valid first-pass schemas, expected semantic actions, and exact served-model matches.",
+    "median_server_decode_delta_percent_q8_vs_qat": {
+      "parallelism_1": -8.484,
+      "parallelism_2": -9.162,
+      "parallelism_4": -9.655
+    },
+    "median_wall_latency_delta_percent_q8_vs_qat": {
+      "parallelism_1": 2.857,
+      "parallelism_2": 5.841,
+      "parallelism_4": 0.898
+    },
+    "comparison_boundary": "The harness and visible load settings matched except evaluation batch: Q8 used 512 and QAT used 2048. The artifacts also differ by more than a guaranteed bit-width-only conversion, and full Q8 weight offload was not independently verified. These results compare the observed deployments; they do not isolate quantization as the cause."
+  },
+  "batch_matched_comparison_to_qat_002": {
+    "quality": "Both runs produced 45/45 valid first-pass schemas, expected semantic actions, and exact served-model matches.",
+    "median_server_decode_delta_percent_q8_vs_qat": {
+      "parallelism_1": -14.556,
+      "parallelism_2": -7.673,
+      "parallelism_4": -3.514
+    },
+    "median_wall_latency_delta_percent_q8_vs_qat": {
+      "parallelism_1": 9.778,
+      "parallelism_2": 4.889,
+      "parallelism_4": -7.421
+    },
+    "aggregate_throughput_delta_percent_q8_vs_qat": {
+      "parallelism_1": -15.698,
+      "parallelism_2": -9.386,
+      "parallelism_4": 0.764
+    },
+    "comparison_boundary": "Visible runtime settings and benchmark harness matched. QAT and Q8 remain distinct published artifacts, not a guaranteed bit-width-only conversion. Full Q8 weight offload was not independently visible in the load API, and 15 samples per concurrency do not characterize every prompt or system state."
+  },
+  "interpretation": {
+    "quality": "All 45 measured responses were valid first-pass decisions and selected the expected semantic action.",
+    "latency": "Use single-flight inference for the latency-critical physical planner: median end-to-end latency rose from 3.312 seconds at one request to 12.027 seconds at four.",
+    "concurrency": "Median per-request server decode speed fell from 91.112 tokens/s at one request to 25.181 tokens/s at four. Four client requests did not demonstrate a useful latency tradeoff for the physical planner.",
+    "comparison": "In the batch-matched single-flight run, Q8 had 14.556 percent lower median server decode and 9.778 percent higher median wall latency than QAT, while decision quality was identical.",
+    "control_status": "The evaluation-batch-512 QAT control is complete and recorded as EXP-GEMMA4-QAT-NAV-002."
+  }
+}
