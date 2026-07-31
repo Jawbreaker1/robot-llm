@@ -9,7 +9,7 @@
 ![Live autonomous validation: pending](https://img.shields.io/badge/live%20autonomy-pending-f59e0b)
 
 **A real LEGO robot controlled by a local agentic AI that can plan, observe,
-speak, and change course as it goes.**
+speak, and adapt as it goes.**
 
 > **Running on real hardware:** the project now communicates with an assembled
 > physical EV3RSTORM over Wi-Fi/SSH. ev3dev boot, motors A/B/C, encoders, IR,
