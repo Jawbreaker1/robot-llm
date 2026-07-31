@@ -7,8 +7,10 @@ import fcntl
 import glob
 import io
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 
 if __package__:
@@ -28,6 +30,10 @@ class MotorBusyError(RuntimeError):
 
 
 class SpeechBusyError(RuntimeError):
+    pass
+
+
+class SpeechInterruptedError(RuntimeError):
     pass
 
 
@@ -604,9 +610,21 @@ class RobotHAL(object):
         lock_handle = self._acquire_speech_lock()
         producer = None
         consumer = None
+        previous_signal_handlers = {}
         started = self.monotonic_fn()
 
         try:
+            if threading.current_thread() is threading.main_thread():
+                def interrupt_speech(signum, _frame):
+                    raise SpeechInterruptedError(
+                        "Speech interrupted by signal {}".format(signum)
+                    )
+
+                for signum in (signal.SIGHUP, signal.SIGTERM):
+                    previous_signal_handlers[signum] = signal.getsignal(
+                        signum
+                    )
+                    signal.signal(signum, interrupt_speech)
             producer = subprocess.Popen(
                 [
                     "espeak",
@@ -667,9 +685,16 @@ class RobotHAL(object):
             raise
         finally:
             try:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                for signum, handler in previous_signal_handlers.items():
+                    try:
+                        signal.signal(signum, handler)
+                    except (ValueError, OSError, RuntimeError):
+                        pass
             finally:
-                lock_handle.close()
+                try:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    lock_handle.close()
 
         return {
             "status": "completed",

@@ -72,9 +72,18 @@ class ActiveIrScanCalibration:
 
 def worst_case_scan_budget(
     calibration: ActiveIrScanCalibration = ActiveIrScanCalibration(),
+    *,
+    request_round_trip_headroom_ms: int = (
+        SCAN_REQUEST_ROUND_TRIP_HEADROOM_MS
+    ),
 ) -> Mapping[str, int]:
     """Return the fixed coarse plus maximum-refinement EV3 scan budget."""
-    if not isinstance(calibration, ActiveIrScanCalibration):
+    if (
+        not isinstance(calibration, ActiveIrScanCalibration)
+        or isinstance(request_round_trip_headroom_ms, bool)
+        or not isinstance(request_round_trip_headroom_ms, int)
+        or not 1 <= request_round_trip_headroom_ms <= 10_000
+    ):
         raise ActiveIrScanContractError(
             "invalid_scan_calibration",
             "Active IR scan calibration is invalid",
@@ -123,7 +132,7 @@ def worst_case_scan_budget(
     minimum_deadline_ms = (
         turn_duration_ms
         + stationary_sampling_ms
-        + worker_request_count * SCAN_REQUEST_ROUND_TRIP_HEADROOM_MS
+        + worker_request_count * request_round_trip_headroom_ms
         + SCAN_FIXED_DEADLINE_HEADROOM_MS
     )
     return {
@@ -135,6 +144,9 @@ def worst_case_scan_budget(
         "samples_per_batch": SCAN_SAMPLE_COUNT,
         "stationary_sampling_ms": stationary_sampling_ms,
         "worker_request_count": worker_request_count,
+        "request_round_trip_headroom_ms": (
+            request_round_trip_headroom_ms
+        ),
         "minimum_deadline_ms": minimum_deadline_ms,
     }
 
@@ -176,6 +188,8 @@ class ActiveIrScanRequest:
     start_state_version: int
     created_at_ms: int
     deadline_ms: int
+    created_monotonic_ms: int
+    deadline_monotonic_ms: int
     max_snapshot_age_ms: int
     calibration: ActiveIrScanCalibration
 
@@ -200,6 +214,8 @@ class ActiveIrScanRequest:
                 self.start_state_version,
                 self.created_at_ms,
                 self.deadline_ms,
+                self.created_monotonic_ms,
+                self.deadline_monotonic_ms,
                 self.max_snapshot_age_ms,
             )
         ) or (
@@ -207,6 +223,10 @@ class ActiveIrScanRequest:
             or self.start_state_version <= 0
             or self.created_at_ms < 0
             or self.deadline_ms <= self.created_at_ms
+            or self.created_monotonic_ms < 0
+            or self.deadline_monotonic_ms <= self.created_monotonic_ms
+            or self.deadline_ms - self.created_at_ms
+            != self.deadline_monotonic_ms - self.created_monotonic_ms
             or not 1 <= self.max_snapshot_age_ms <= 2_000
         ):
             raise ActiveIrScanContractError(
@@ -225,9 +245,15 @@ def build_scan_request(
     start_state_version: int,
     created_at_ms: int,
     deadline_ms: int,
+    created_monotonic_ms: Optional[int] = None,
+    deadline_monotonic_ms: Optional[int] = None,
     max_snapshot_age_ms: int = 300,
     calibration: ActiveIrScanCalibration = ActiveIrScanCalibration(),
 ) -> ActiveIrScanRequest:
+    if created_monotonic_ms is None:
+        created_monotonic_ms = created_at_ms
+    if deadline_monotonic_ms is None:
+        deadline_monotonic_ms = deadline_ms
     raw = "\0".join(
         (
             map_generation_id,
@@ -247,6 +273,8 @@ def build_scan_request(
         start_state_version=start_state_version,
         created_at_ms=created_at_ms,
         deadline_ms=deadline_ms,
+        created_monotonic_ms=created_monotonic_ms,
+        deadline_monotonic_ms=deadline_monotonic_ms,
         max_snapshot_age_ms=max_snapshot_age_ms,
         calibration=calibration,
     )

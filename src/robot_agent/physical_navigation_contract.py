@@ -13,7 +13,7 @@ from typing import Mapping, Optional, Tuple
 
 DECISION_SCHEMA = "robot-physical-navigation-decision/v1"
 REQUEST_SCHEMA = "ev3-agent-worker-request/v1"
-RESPONSE_SCHEMA = "ev3-agent-worker-response/v1"
+RESPONSE_SCHEMA = "ev3-agent-worker-response/v2"
 
 ADVANCE = "ADVANCE"
 REVERSE = "REVERSE"
@@ -32,7 +32,7 @@ MAX_PLAN_ACTIONS = 3
 
 SCAN_TURN_OPERATION = "scan_turn"
 SCAN_SAMPLE_OPERATION = "scan_sample"
-SCAN_TURN_PROFILE_ID = "ev3rstorm-provisional-ir-turn-v1"
+SCAN_TURN_PROFILE_ID = "ev3rstorm-provisional-ir-turn-v2"
 SCAN_TURN_CALIBRATION = "provisional_live_encoder_derived"
 SCAN_TURN_ALLOWED_DELTAS_MDEG = tuple(
     value
@@ -46,6 +46,7 @@ SCAN_TURN_SPEED_DPS = 250
 SCAN_TURN_MAX_SLICE_DURATION_MS = 800
 SCAN_TURN_MAX_SIDE_DIVERGENCE_DEGREES = 80
 SCAN_SAMPLE_COUNT = 5
+SCAN_SAMPLE_FILTER_WINDOW = 3
 SCAN_SAMPLE_INTERVAL_MS = 30
 SCAN_SAMPLE_SETTLED_DURATION_MS = (
     (SCAN_SAMPLE_COUNT - 1) * SCAN_SAMPLE_INTERVAL_MS
@@ -87,22 +88,22 @@ REASON_CODES = frozenset(
 # worker.  They are not host-selected motor commands.
 EXPECTED_ACTION_SPECS = {
     ADVANCE: {
-        "left_speed_dps": 250,
-        "right_speed_dps": 250,
-        "slice_durations_ms": [800],
+        "left_speed_dps": 800,
+        "right_speed_dps": 800,
+        "slice_durations_ms": [250],
         "slice_count": 1,
-        "total_duration_ms": 800,
+        "total_duration_ms": 250,
         "estimated_body_turn_degrees": None,
         "target_mean_abs_encoder_degrees": None,
         "calibration_evidence": None,
         "calibration": "not_applicable",
     },
     REVERSE: {
-        "left_speed_dps": -250,
-        "right_speed_dps": -250,
-        "slice_durations_ms": [800],
+        "left_speed_dps": -800,
+        "right_speed_dps": -800,
+        "slice_durations_ms": [250],
         "slice_count": 1,
-        "total_duration_ms": 800,
+        "total_duration_ms": 250,
         "estimated_body_turn_degrees": None,
         "target_mean_abs_encoder_degrees": None,
         "calibration_evidence": None,
@@ -154,14 +155,16 @@ def _rounded_ratio(numerator: int, denominator: int) -> int:
 
 
 def _scan_turn_durations(total_duration_ms: int):
-    durations = []
-    remaining = total_duration_ms
-    while remaining > SCAN_TURN_MAX_SLICE_DURATION_MS:
-        durations.append(SCAN_TURN_MAX_SLICE_DURATION_MS)
-        remaining -= SCAN_TURN_MAX_SLICE_DURATION_MS
-    if remaining:
-        durations.append(remaining)
-    return durations
+    count = max(
+        1,
+        (
+            total_duration_ms
+            + SCAN_TURN_MAX_SLICE_DURATION_MS
+            - 1
+        ) // SCAN_TURN_MAX_SLICE_DURATION_MS,
+    )
+    base, extra = divmod(total_duration_ms, count)
+    return [base + (1 if index < extra else 0) for index in range(count)]
 
 
 def expected_scan_turn_spec(relative_delta_mdeg: int):
@@ -227,6 +230,7 @@ def expected_scan_turn_profile():
 def expected_scan_sample_profile():
     return {
         "sample_count": SCAN_SAMPLE_COUNT,
+        "filter_window_samples": SCAN_SAMPLE_FILTER_WINDOW,
         "sample_interval_ms": SCAN_SAMPLE_INTERVAL_MS,
         "settled_duration_ms": SCAN_SAMPLE_SETTLED_DURATION_MS,
         "motors_stopped_before_sampling": True,

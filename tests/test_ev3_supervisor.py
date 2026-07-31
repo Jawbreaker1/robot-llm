@@ -431,6 +431,34 @@ class EV3SupervisorTests(unittest.TestCase):
             1,
         )
 
+    def test_internal_single_drive_side_uses_existing_owner_and_encoder(self):
+        active = self.supervisor._owner.start_drive_side(
+            "right",
+            100,
+            100,
+        )
+
+        self.assertEqual(len(active["motors"]), 1)
+        self.assertEqual(active["motors"][0]["side"], "right")
+        self.assertEqual(active["motors"][0]["role"], "drive_c")
+        self.assertEqual(
+            read_text(str(self.sysfs.motors["outC"] / "command")),
+            "run-timed",
+        )
+        self.assertNotEqual(
+            read_text(str(self.sysfs.motors["outB"] / "command")),
+            "run-timed",
+        )
+
+        write(self.sysfs.motors["outC"] / "position", 10)
+        finished = self.supervisor._owner.finish_active(True)
+
+        self.assertNotIn("verification_error", finished)
+        self.assertEqual(len(finished["motors"]), 1)
+        self.assertEqual(finished["motors"][0]["side"], "right")
+        self.assertEqual(finished["motors"][0]["position_delta"], 10)
+        self.assertTrue(finished["stop"]["stop_confirmed"])
+
     def test_second_topology_bind_is_rejected_without_replacing_readers(self):
         readers = self.supervisor._owner._bound_readers
         descriptors = tuple(reader.descriptor for reader in readers)
@@ -987,11 +1015,14 @@ class EV3SupervisorTests(unittest.TestCase):
         self.assertEqual(read_text(str(left / "speed_sp")), "0")
         self.assertEqual(read_text(str(right / "speed_sp")), "0")
 
+        unsafe_speed = (
+            self.hal.config["limits"]["drive"]["max_abs_speed_dps"] + 1
+        )
         with self.assertRaises(SupervisorError):
             self.start_drive(
                 session_id,
                 sequence_id=4,
-                left_speed=251,
+                left_speed=unsafe_speed,
             )
         self.assertEqual(self.supervisor.state, STATE_ARMED_IDLE)
         self.assertEqual(read_text(str(left / "speed_sp")), "0")
@@ -1190,6 +1221,7 @@ class EV3SupervisorTests(unittest.TestCase):
 
     def test_partial_second_motor_start_failure_stops_every_motor(self):
         session_id = self.claim_and_arm()
+        left = self.sysfs.motors["outB"]
         right = self.sysfs.motors["outC"]
         original_write = supervisor_module.write_text
 
@@ -1198,6 +1230,7 @@ class EV3SupervisorTests(unittest.TestCase):
                 path == str(right / "command")
                 and value == "run-timed"
             ):
+                write(left / "position", 17)
                 raise IOError("injected second start failure")
             original_write(path, value)
 
@@ -1226,6 +1259,14 @@ class EV3SupervisorTests(unittest.TestCase):
             start_events,
             [(str(self.sysfs.motors["outB"] / "command"), "run-timed")],
         )
+        evidence = context.exception.supervisor_start_evidence
+        self.assertTrue(evidence["complete"])
+        self.assertEqual(evidence["started_sides"], ["left"])
+        self.assertEqual(
+            [motor["position_delta"] for motor in evidence["motors"]],
+            [17, 0],
+        )
+        self.assertTrue(evidence["stop"]["stop_confirmed"])
         self.assert_all_stopped()
 
     def test_keyboard_interrupt_on_second_start_stops_every_motor(self):

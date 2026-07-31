@@ -50,8 +50,9 @@ class SafetyPolicyTests(unittest.TestCase):
         self.policy.validate_motion(self.command(), self.clock())
 
     def test_speed_limit_is_enforced(self):
-        self.assert_violation("speed_limit", speed_dps=251)
-        self.assert_violation("speed_limit", speed_dps=-251)
+        unsafe_speed = self.limits.drive.max_abs_speed_dps + 1
+        self.assert_violation("speed_limit", speed_dps=unsafe_speed)
+        self.assert_violation("speed_limit", speed_dps=-unsafe_speed)
 
     def test_duration_limit_is_enforced(self):
         self.assert_violation("duration_limit", duration_ms=801)

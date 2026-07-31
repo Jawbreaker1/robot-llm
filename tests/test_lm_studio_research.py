@@ -486,11 +486,11 @@ class LMStudioResearchPlannerTests(unittest.TestCase):
                 }
             ).encode("utf-8"),
             (
-                b'{"object":"chat.completion",'
-                b'"object":"chat.completion",'
-                b'"model":"google/gemma-4-26b-a4b",'
-                b'"choices":[]}'
-            ),
+                '{"object":"chat.completion",'
+                '"object":"chat.completion",'
+                '"model":' + json.dumps(DEFAULT_MODEL) + ','
+                '"choices":[]}'
+            ).encode("utf-8"),
         ]
         for body in invalid:
             with self.subTest(body=body):

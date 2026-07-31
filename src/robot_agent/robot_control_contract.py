@@ -18,6 +18,7 @@ from .dashboard_contract import (
     freeze_json,
     thaw_json,
 )
+from .lm_studio import DEFAULT_MODEL
 
 
 CONTROL_SCHEMA = "robot-control/v1"
@@ -68,6 +69,7 @@ RUNTIME_UPDATE_FIELDS = frozenset(
 MAX_GOAL_CHARACTERS = 2_000
 MAX_MODEL_CHARACTERS = 256
 MAX_RUNTIME_UPDATE_BYTES = 32 * 1024
+MAX_FAULT_DIAGNOSTIC_CHARACTERS = 240
 MAX_PLAN_STEPS = 16
 MAX_PLAN_STEP_CHARACTERS = 256
 MAX_INT = 2**63 - 1
@@ -154,7 +156,7 @@ class RobotControlSettings:
     """Settings captured atomically when a physical episode starts."""
 
     revision: int = 1
-    model: str = "google/gemma-4-26b-a4b"
+    model: str = DEFAULT_MODEL
     max_episode_ms: int = 15 * 60 * 1_000
     speech_enabled: bool = True
 
@@ -362,6 +364,8 @@ class RobotControlSnapshot:
     terminal_reason: Optional[str]
     last_error_code: Optional[str]
     runtime: RobotRuntimeUpdate
+    primary_error_code: Optional[str] = None
+    primary_error_message: Optional[str] = None
 
     def __post_init__(self) -> None:
         _integer("sequence", self.sequence, 1)
@@ -402,6 +406,27 @@ class RobotControlSnapshot:
             _text("terminal_reason", self.terminal_reason, 128)
         if self.last_error_code is not None:
             _identifier("last_error_code", self.last_error_code)
+        if (self.primary_error_code is None) != (
+            self.primary_error_message is None
+        ):
+            raise DashboardContractError(
+                "invalid_robot_fault_diagnostic",
+                "Robot primary fault diagnostic is incomplete",
+            )
+        if self.primary_error_code is not None:
+            _identifier("primary_error_code", self.primary_error_code)
+            _text(
+                "primary_error_message",
+                self.primary_error_message,
+                MAX_FAULT_DIAGNOSTIC_CHARACTERS,
+            )
+            if self.primary_error_message != " ".join(
+                self.primary_error_message.split()
+            ):
+                raise DashboardContractError(
+                    "invalid_robot_fault_diagnostic",
+                    "Robot primary fault diagnostic must be single-line",
+                )
         if not isinstance(self.runtime, RobotRuntimeUpdate):
             raise DashboardContractError(
                 "invalid_robot_runtime_update",
@@ -425,6 +450,8 @@ class RobotControlSnapshot:
             },
             "updated_at_unix_ms": self.updated_at_unix_ms,
             "last_error_code": self.last_error_code,
+            "primary_error_code": self.primary_error_code,
+            "primary_error_message": self.primary_error_message,
             "runtime": self.runtime.to_dict(),
         }
 

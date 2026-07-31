@@ -5,11 +5,13 @@ from types import SimpleNamespace
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import uuid
 
 from robot_agent.active_ir_scan import ActiveIrScanExecutor
 from robot_agent.active_ir_scan_contract import (
     ActiveIrScanCalibration,
+    ActiveIrScanResult,
     ModelScanChoice,
     build_scan_request,
     validate_scan_result,
@@ -17,6 +19,7 @@ from robot_agent.active_ir_scan_contract import (
 from robot_agent.ev3_navigation_transport import (
     EV3NavigationRemoteError,
     EV3NavigationSSHTransport,
+    EV3NavigationTransportError,
 )
 from robot_agent.maneuver_commitment import (
     FACT_GOAL_CORRIDOR_CLEAR,
@@ -26,7 +29,12 @@ from robot_agent.maneuver_commitment import (
     ManeuverCommitmentError,
     empty_commitment,
 )
-from robot_agent.lm_studio_navigation import LMStudioNavigationPlanner
+from robot_agent.lm_studio_navigation import (
+    LMStudioNavigationDecisionError,
+    LMStudioNavigationError,
+    LMStudioNavigationPlanner,
+    _maneuver_schema,
+)
 from robot_agent.navigation_memory_store import NavigationMemoryStore
 from robot_agent.navigation_memory_store import NavigationMemoryError
 from robot_agent.navigation_plan_tail import NavigationPlanTail
@@ -47,11 +55,19 @@ from robot_agent.physical_navigation_contract import (
 from robot_agent.physical_navigation_mission import DirectionalMission
 from robot_agent.physical_navigation_runtime import (
     PhysicalNavigationRuntime,
-    PhysicalNavigationRuntimeAdapter,
     PhysicalNavigationRuntimeConfig,
     PhysicalNavigationRuntimeError,
 )
-from robot_agent.physical_odometry import DriveMotorRoles, PhysicalPose
+from robot_agent.physical_navigation_adapter import (
+    PhysicalNavigationRuntimeAdapter,
+)
+from robot_agent.physical_odometry import (
+    DriveMotorRoles,
+    PhysicalPose,
+    apply_verified_motion,
+    verified_motion_from_result,
+)
+from robot_agent.robot_speech_runtime import RobotSpeechRuntime
 
 
 def observation(
@@ -120,6 +136,7 @@ def decision_mapping(
     reason_code,
     commitment=None,
     target=None,
+    utterance=None,
 ):
     return {
         "schema": DECISION_SCHEMA,
@@ -130,7 +147,7 @@ def decision_mapping(
         "plan": list(plan),
         "reason_code": reason_code,
         "assessment": "The selected action follows the published facts.",
-        "utterance": None,
+        "utterance": utterance,
         "perception_target_hypothesis_id": target,
         "maneuver_commitment": (
             empty_commitment() if commitment is None else commitment
@@ -146,6 +163,291 @@ def stop_proof():
         "positions": {},
         "fault_tokens": {},
         "errors": [],
+    }
+
+
+def degraded_motion_result(
+    *,
+    action=ADVANCE,
+    left_delta=174,
+    right_delta=0,
+    version=2,
+    left_role="left_drive",
+    right_role="right_drive",
+):
+    receipt = {
+        "slice_index": 1,
+        "slice_count": 1,
+        "duration_ms": 250,
+        "status": "verification_failed",
+        "reason": "encoder_undertravel_observed",
+        "started_monotonic_ms": 10,
+        "completed_monotonic_ms": 810,
+        "motors": [
+            {
+                "side": "left",
+                "role": left_role,
+                "position_before": 0,
+                "position_after": left_delta,
+                "position_delta": left_delta,
+                "state": "",
+            },
+            {
+                "side": "right",
+                "role": right_role,
+                "position_before": 0,
+                "position_after": right_delta,
+                "position_delta": right_delta,
+                "state": "",
+            },
+        ],
+        "encoder_verification": {
+            "passed": False,
+            "error": "simulated undertravel",
+            "checks": [{"passed": False}],
+        },
+        "stop": stop_proof(),
+    }
+    receipt["segments"] = [
+        {
+            "segment_index": 1,
+            "kind": "paired",
+            "commanded_sides": ["left", "right"],
+            "duration_ms": receipt["duration_ms"],
+            "status": receipt["status"],
+            "reason": receipt["reason"],
+            "started_monotonic_ms": receipt["started_monotonic_ms"],
+            "completed_monotonic_ms": receipt[
+                "completed_monotonic_ms"
+            ],
+            "motors": copy.deepcopy(receipt["motors"]),
+            "encoder_verification": copy.deepcopy(
+                receipt["encoder_verification"]
+            ),
+            "stop": copy.deepcopy(receipt["stop"]),
+        }
+    ]
+    outcome = {
+        "kind": "pulse",
+        "action": action,
+        "status": "verification_failed",
+        "reason": "encoder_undertravel_observed",
+        "started_monotonic_ms": 10,
+        "completed_monotonic_ms": 810,
+        "stop_confirmed": True,
+        "requested_slice_count": 1,
+        "completed_slice_count": 0,
+        "slices": [receipt],
+        "encoder_verification": {
+            "passed": False,
+            "verified_slice_count": 0,
+            "requested_slice_count": 1,
+        },
+    }
+    return {
+        "action": action,
+        "outcome": outcome,
+        "observation": observation(
+            version,
+            left_position=left_delta,
+            right_position=right_delta,
+            left_role=left_role,
+            right_role=right_role,
+            last_outcome=outcome,
+        ),
+        "stop": stop_proof(),
+    }
+
+
+def partial_start_motion_result(
+    *,
+    left_delta=24,
+    right_delta=0,
+    commanded_sides=("left",),
+):
+    result = degraded_motion_result(
+        left_delta=left_delta,
+        right_delta=right_delta,
+    )
+    outcome = result["outcome"]
+    receipt = outcome["slices"][0]
+    reason = "cancel_requested"
+    checks = [
+        {
+            "role": motor["role"],
+            "side": motor["side"],
+            "position_delta": motor["position_delta"],
+            "passed": motor["side"] in commanded_sides,
+        }
+        for motor in receipt["motors"]
+    ]
+    checks.append(
+        {
+            "role": "paired_start_completion",
+            "side": "paired",
+            "position_delta": 0,
+            "passed": False,
+        }
+    )
+    failed_proof = {
+        "passed": False,
+        "error": "paired motor start was incomplete",
+        "checks": checks,
+    }
+    receipt["status"] = "interrupted"
+    receipt["reason"] = reason
+    receipt["encoder_verification"] = copy.deepcopy(failed_proof)
+    segment = receipt["segments"][0]
+    segment["kind"] = "partial_start"
+    segment["commanded_sides"] = list(commanded_sides)
+    segment["status"] = "interrupted"
+    segment["reason"] = reason
+    segment["encoder_verification"] = copy.deepcopy(failed_proof)
+    outcome["status"] = "interrupted"
+    outcome["reason"] = reason
+    result["observation"]["last_outcome"] = outcome
+    return result
+
+
+def recovered_motion_result():
+    primary_motors = [
+        {
+            "side": "left",
+            "role": "left_drive",
+            "position_before": 0,
+            "position_after": 75,
+            "position_delta": 75,
+            "state": "",
+        },
+        {
+            "side": "right",
+            "role": "right_drive",
+            "position_before": 0,
+            "position_after": 0,
+            "position_delta": 0,
+            "state": "",
+        },
+    ]
+    catch_up_motors = [
+        {
+            "side": "left",
+            "role": "left_drive",
+            "position_before": 75,
+            "position_after": 75,
+            "position_delta": 0,
+            "state": "",
+        },
+        {
+            "side": "right",
+            "role": "right_drive",
+            "position_before": 0,
+            "position_after": 75,
+            "position_delta": 75,
+            "state": "",
+        },
+    ]
+    segments = [
+        {
+            "segment_index": 1,
+            "kind": "paired",
+            "commanded_sides": ["left", "right"],
+            "duration_ms": 250,
+            "status": "verification_failed",
+            "reason": "encoder_undertravel_observed",
+            "started_monotonic_ms": 10,
+            "completed_monotonic_ms": 810,
+            "motors": primary_motors,
+            "encoder_verification": {
+                "passed": False,
+                "error": "right motor undertravel",
+                "checks": [{"passed": True}, {"passed": False}],
+            },
+            "stop": stop_proof(),
+        },
+        {
+            "segment_index": 2,
+            "kind": "right_catch_up",
+            "commanded_sides": ["right"],
+            "duration_ms": 300,
+            "status": "completed",
+            "reason": "duration_elapsed",
+            "started_monotonic_ms": 820,
+            "completed_monotonic_ms": 1_120,
+            "motors": catch_up_motors,
+            "encoder_verification": {
+                "passed": True,
+                "error": None,
+                "checks": [{"passed": True}],
+            },
+            "stop": stop_proof(),
+        },
+    ]
+    aggregate_motors = [
+        {
+            "side": "left",
+            "role": "left_drive",
+            "position_before": 0,
+            "position_after": 75,
+            "position_delta": 75,
+            "state": "",
+        },
+        {
+            "side": "right",
+            "role": "right_drive",
+            "position_before": 0,
+            "position_after": 75,
+            "position_delta": 75,
+            "state": "",
+        },
+    ]
+    receipt = {
+        "slice_index": 1,
+        "slice_count": 1,
+        "duration_ms": 250,
+        "status": "completed",
+        "reason": "encoder_recovered",
+        "started_monotonic_ms": 10,
+        "completed_monotonic_ms": 1_120,
+        "motors": aggregate_motors,
+        "segments": segments,
+        "encoder_verification": {
+            "passed": True,
+            "error": None,
+            "checks": [
+                {"passed": True},
+                {"passed": True},
+                {"passed": True},
+            ],
+        },
+        "stop": stop_proof(),
+    }
+    outcome = {
+        "kind": "pulse",
+        "action": ADVANCE,
+        "status": "completed",
+        "reason": "semantic_action_completed",
+        "started_monotonic_ms": 10,
+        "completed_monotonic_ms": 1_120,
+        "stop_confirmed": True,
+        "requested_slice_count": 1,
+        "completed_slice_count": 1,
+        "slices": [receipt],
+        "encoder_verification": {
+            "passed": True,
+            "verified_slice_count": 1,
+            "requested_slice_count": 1,
+        },
+    }
+    return {
+        "action": ADVANCE,
+        "outcome": outcome,
+        "observation": observation(
+            2,
+            left_position=75,
+            right_position=75,
+            last_outcome=outcome,
+        ),
+        "stop": stop_proof(),
     }
 
 
@@ -240,6 +542,82 @@ class PhysicalMemoryAndMapTests(unittest.TestCase):
         )
         self.assertEqual(loaded.hazard_map.hazard_ids, hazard_ids)
 
+    def test_scan_boundaries_survive_later_reanchor_observation_time(self):
+        self.memory.begin_episode(
+            observation(1, blocked=True),
+            1_001,
+        )
+        target = self.memory.hazard_map.hazard_ids[0]
+        scan_basis = self.memory.hazard_map.revision
+
+        self.memory.ingest_stationary_observation(
+            observation(2, blocked=True),
+            3_000,
+        )
+        refreshed = self.memory.hazard_map.get(target)
+        self.assertEqual(refreshed.last_seen_at_ms, 3_000)
+
+        recorded = self.memory.hazard_map.record_scan_boundaries(
+            target,
+            evidence_frame_id=self.memory.frame_id,
+            evidence_map_generation_id=self.memory.generation_id,
+            based_on_map_version=scan_basis,
+            completed_at_ms=2_000,
+            left_boundary_mdeg=20_000,
+            right_boundary_mdeg=-20_000,
+        )
+
+        self.assertEqual(recorded.scan_completed_at_ms, 2_000)
+        self.assertEqual(recorded.last_seen_at_ms, 3_000)
+        self.assertTrue(recorded.bilateral_scan_complete)
+
+    def test_scan_boundary_fusion_rejects_foreign_or_stale_basis(self):
+        self.memory.begin_episode(
+            observation(1, blocked=True),
+            1_001,
+        )
+        target = self.memory.hazard_map.hazard_ids[0]
+        scan_basis = self.memory.hazard_map.revision
+        self.memory.ingest_stationary_observation(
+            observation(2, blocked=True),
+            2_500,
+        )
+        common = {
+            "completed_at_ms": 2_000,
+            "left_boundary_mdeg": 20_000,
+            "right_boundary_mdeg": -20_000,
+        }
+
+        with self.assertRaisesRegex(ValueError, "foreign map"):
+            self.memory.hazard_map.record_scan_boundaries(
+                target,
+                evidence_frame_id="foreign-frame",
+                evidence_map_generation_id=self.memory.generation_id,
+                based_on_map_version=scan_basis,
+                **common,
+            )
+        with self.assertRaisesRegex(ValueError, "foreign map"):
+            self.memory.hazard_map.record_scan_boundaries(
+                target,
+                evidence_frame_id=self.memory.frame_id,
+                evidence_map_generation_id="foreign-generation",
+                based_on_map_version=scan_basis,
+                **common,
+            )
+
+        self.memory.ingest_stationary_observation(
+            observation(3, blocked=False),
+            3_000,
+        )
+        with self.assertRaisesRegex(ValueError, "basis is stale"):
+            self.memory.hazard_map.record_scan_boundaries(
+                target,
+                evidence_frame_id=self.memory.frame_id,
+                evidence_map_generation_id=self.memory.generation_id,
+                based_on_map_version=scan_basis,
+                **common,
+            )
+
     def test_swept_path_vetoes_approach_and_allows_monotonic_escape(self):
         self.memory.begin_episode(
             observation(1, blocked=True),
@@ -326,6 +704,100 @@ class PhysicalMemoryAndMapTests(unittest.TestCase):
                     1_002,
                 )
             self.assertFalse(memory.localization_valid)
+
+    def test_clean_undertravel_updates_arc_pose_and_keeps_localization(self):
+        self.memory.begin_episode(observation(1), 1_001)
+        result = degraded_motion_result()
+
+        self.memory.apply_motion_result(ADVANCE, result, 1_002)
+
+        self.assertTrue(self.memory.localization_valid)
+        self.assertEqual(self.memory.pose.x_mm, 30)
+        self.assertEqual(self.memory.pose.y_mm, -3)
+        self.assertEqual(self.memory.pose.heading_mdeg, -11_484)
+        self.assertEqual(
+            self.memory.motor_positions,
+            {"left_drive": 174, "right_drive": 0},
+        )
+
+
+class PhysicalOdometryEvidenceTests(unittest.TestCase):
+    def test_partial_start_encoder_motion_reaches_odometry(self):
+        motion = verified_motion_from_result(
+            ADVANCE,
+            partial_start_motion_result(),
+        )
+
+        self.assertFalse(motion.complete)
+        self.assertEqual(motion.observed_slice_count, 1)
+        self.assertEqual(motion.left_encoder_delta_degrees, 24)
+        self.assertEqual(motion.right_encoder_delta_degrees, 0)
+        pose = apply_verified_motion(PhysicalPose(), motion)
+        self.assertEqual(pose.x_mm, 4)
+        self.assertEqual(pose.heading_mdeg, -1_584)
+
+    def test_failed_command_retains_clean_encoder_observation(self):
+        result = degraded_motion_result()
+        motion = verified_motion_from_result(ADVANCE, result)
+
+        self.assertFalse(motion.complete)
+        self.assertEqual(motion.verified_slice_count, 0)
+        self.assertEqual(motion.observed_slice_count, 1)
+        self.assertEqual(motion.left_encoder_delta_degrees, 174)
+        self.assertEqual(motion.right_encoder_delta_degrees, 0)
+
+        pose = apply_verified_motion(PhysicalPose(), motion)
+        self.assertEqual(pose.x_mm, 30)
+        self.assertEqual(pose.y_mm, -3)
+        self.assertEqual(pose.heading_mdeg, -11_484)
+
+    def test_zero_zero_undertravel_reanchors_without_false_motion(self):
+        result = degraded_motion_result(left_delta=0, right_delta=0)
+        motion = verified_motion_from_result(ADVANCE, result)
+
+        self.assertEqual(
+            apply_verified_motion(PhysicalPose(), motion),
+            PhysicalPose(),
+        )
+
+    def test_wrong_direction_observation_is_not_localizable(self):
+        result = degraded_motion_result(left_delta=20, right_delta=-5)
+        motion = verified_motion_from_result(ADVANCE, result)
+
+        with self.assertRaises(PhysicalNavigationContractError) as caught:
+            apply_verified_motion(PhysicalPose(), motion)
+        self.assertEqual(caught.exception.code, "encoder_direction_mismatch")
+
+    def test_recovery_segments_preserve_the_real_two_arc_path(self):
+        motion = verified_motion_from_result(
+            ADVANCE,
+            recovered_motion_result(),
+        )
+
+        self.assertTrue(motion.complete)
+        self.assertEqual(motion.observed_slice_count, 2)
+        self.assertEqual(motion.left_encoder_delta_degrees, 75)
+        self.assertEqual(motion.right_encoder_delta_degrees, 75)
+        pose = apply_verified_motion(PhysicalPose(), motion)
+        self.assertEqual(pose.x_mm, 26)
+        self.assertEqual(pose.y_mm, -2)
+        self.assertEqual(pose.heading_mdeg, 0)
+
+    def test_recovery_segment_totals_must_match_slice_aggregate(self):
+        result = recovered_motion_result()
+        result["outcome"]["slices"][0]["motors"][0][
+            "position_after"
+        ] = 76
+        result["outcome"]["slices"][0]["motors"][0][
+            "position_delta"
+        ] = 76
+
+        with self.assertRaises(PhysicalNavigationContractError) as caught:
+            verified_motion_from_result(ADVANCE, result)
+        self.assertEqual(
+            caught.exception.code,
+            "motion_segment_aggregate_mismatch",
+        )
 
 
 class PlanTailAndCommitmentTests(unittest.TestCase):
@@ -421,8 +893,16 @@ class PlanTailAndCommitmentTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "bilateral_scan_required")
 
+        scan_basis = memory.hazard_map.revision
+        memory.ingest_stationary_observation(
+            observation(3, blocked=True),
+            2_001,
+        )
         memory.hazard_map.record_scan_boundaries(
             target,
+            evidence_frame_id=memory.frame_id,
+            evidence_map_generation_id=memory.generation_id,
+            based_on_map_version=scan_basis,
             completed_at_ms=2_000,
             left_boundary_mdeg=20_000,
             right_boundary_mdeg=-20_000,
@@ -441,8 +921,14 @@ class PlanTailAndCommitmentTests(unittest.TestCase):
 
 
 class FakeScanRig:
-    def __init__(self, late_final=False, touch_after_turn=False):
+    def __init__(
+        self,
+        late_final=False,
+        touch_after_turn=False,
+        evidence_offset_ms=0,
+    ):
         self.now = 1_000
+        self.evidence_offset_ms = evidence_offset_ms
         self.heading = 0
         self.state_version = 1
         self.read_count = 0
@@ -462,7 +948,7 @@ class FakeScanRig:
     def stop(self):
         return {"stop_confirmed": True}
 
-    def read_snapshot(self):
+    def read_snapshot(self, _deadline_ms=None):
         self.read_count += 1
         self.now += 10
         if self.late_final and self.heading == 0 and self.read_count > 5:
@@ -471,7 +957,7 @@ class FakeScanRig:
         blocked = abs(self.heading) <= 20_000
         return {
             "state_version": self.state_version,
-            "observed_at_ms": self.now,
+            "observed_at_ms": self.now + self.evidence_offset_ms,
             "pose_heading_mdeg": self.heading,
             "touch_pressed": (
                 self.touch_after_turn and self.heading != 0
@@ -486,6 +972,83 @@ class FakeScanRig:
 
 
 class ActiveIrScanTests(unittest.TestCase):
+    def test_scan_deadlines_use_monotonic_time_with_epoch_evidence(self):
+        rig = FakeScanRig(evidence_offset_ms=999_000)
+        request = build_scan_request(
+            choice=ModelScanChoice("target-a"),
+            frame_id="frame-a",
+            map_generation_id="generation-a",
+            map_version=3,
+            start_pose=PhysicalPose(),
+            start_state_version=1,
+            created_at_ms=1_000_000,
+            deadline_ms=1_029_000,
+            created_monotonic_ms=1_000,
+            deadline_monotonic_ms=30_000,
+            calibration=ActiveIrScanCalibration(
+                estimated_turn_ms_per_degree=2
+            ),
+        )
+
+        result = ActiveIrScanExecutor(
+            rig=rig,
+            clock_ms=lambda: rig.now,
+        ).execute(request)
+
+        self.assertTrue(result.bilateral_complete)
+        self.assertGreaterEqual(result.started_at_ms, request.created_at_ms)
+        self.assertLessEqual(result.completed_at_ms, request.deadline_ms)
+        validate_scan_result(
+            result,
+            request,
+            current_frame_id="frame-a",
+            current_map_generation_id="generation-a",
+            current_map_version=3,
+        )
+
+    def test_late_result_assembly_preserves_verified_restoration(self):
+        rig = FakeScanRig()
+        final_clock_calls = [0]
+
+        def clock():
+            if rig.heading == 0 and rig.read_count >= 8:
+                final_clock_calls[0] += 1
+                if final_clock_calls[0] == 2:
+                    rig.now = 30_001
+            return rig.now
+
+        request = build_scan_request(
+            choice=ModelScanChoice("target-a"),
+            frame_id="frame-a",
+            map_generation_id="generation-a",
+            map_version=3,
+            start_pose=PhysicalPose(),
+            start_state_version=1,
+            created_at_ms=1_000,
+            deadline_ms=30_000,
+            calibration=ActiveIrScanCalibration(
+                estimated_turn_ms_per_degree=2
+            ),
+        )
+
+        result = ActiveIrScanExecutor(
+            rig=rig,
+            clock_ms=clock,
+        ).execute(request)
+
+        self.assertEqual(result.status, "CANCELLED")
+        self.assertEqual(result.reason, "scan_deadline_exceeded")
+        self.assertTrue(result.stop_confirmed)
+        self.assertTrue(result.restored_start_heading)
+        self.assertLessEqual(result.completed_at_ms, request.deadline_ms)
+        validate_scan_result(
+            result,
+            request,
+            current_frame_id="frame-a",
+            current_map_generation_id="generation-a",
+            current_map_version=3,
+        )
+
     def test_model_cannot_choose_bearings_and_scan_finds_both_boundaries(self):
         with self.assertRaises(Exception):
             ModelScanChoice.from_mapping(
@@ -550,6 +1113,44 @@ class ActiveIrScanTests(unittest.TestCase):
 
 
 class EV3NavigationTransportTests(unittest.TestCase):
+    def test_scan_sample_uses_declared_filter_tail_not_whole_batch(self):
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+        current = observation(2, blocked=True)
+        current["infrared"].update(
+            raw=33,
+            filtered=34,
+            reason="blocked_hysteresis_hold",
+            sample_count=5,
+        )
+        response = {
+            "state_version": 2,
+            "result": {
+                "sample_count": 5,
+                "raw_samples": [33, 33, 34, 34, 33],
+                "started_monotonic_ms": 1_000,
+                "completed_monotonic_ms": 1_120,
+                "observation": current,
+                "stop": stop_proof(),
+            },
+        }
+
+        transport._validate_success_result("scan_sample", {}, response)
+
+        malformed = copy.deepcopy(response)
+        malformed["result"]["observation"]["infrared"]["filtered"] = 33
+        with self.assertRaises(EV3NavigationTransportError):
+            transport._validate_success_result(
+                "scan_sample",
+                {},
+                malformed,
+            )
+
     def test_worker_error_with_observation_and_stop_is_typed_remote_error(self):
         transport = EV3NavigationSSHTransport(
             target="robot@ev3.local",
@@ -558,7 +1159,7 @@ class EV3NavigationTransportTests(unittest.TestCase):
         )
         current = observation(4)
         frame = {
-            "schema": "ev3-agent-worker-response/v1",
+            "schema": "ev3-agent-worker-response/v2",
             "controller_id": "ev3-main",
             "request_id": "host-0001",
             "ok": False,
@@ -576,6 +1177,422 @@ class EV3NavigationTransportTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "infrared_blocked")
         self.assertEqual(caught.exception.observation, current)
         self.assertEqual(caught.exception.stop, stop_proof())
+
+    def test_clean_degraded_pulse_is_strictly_validated(self):
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+        result = degraded_motion_result()
+        response = {"state_version": 2, "result": result}
+
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            response,
+        )
+
+        malformed = copy.deepcopy(response)
+        malformed["result"]["outcome"]["slices"][0]["motors"][0][
+            "position_delta"
+        ] = 173
+        with self.assertRaises(EV3NavigationTransportError):
+            transport._validate_success_result(
+                "pulse",
+                {"action": ADVANCE},
+                malformed,
+            )
+
+    def test_partial_start_requires_complete_terminal_failure_evidence(self):
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+        result = partial_start_motion_result()
+        response = {"state_version": 2, "result": result}
+
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            response,
+        )
+
+        post_write_failure = partial_start_motion_result(
+            left_delta=24,
+            right_delta=19,
+            commanded_sides=("left", "right"),
+        )
+        post_write_outcome = post_write_failure["outcome"]
+        post_write_receipt = post_write_outcome["slices"][0]
+        post_write_outcome["reason"] = "clock_rollback"
+        post_write_receipt["reason"] = "clock_rollback"
+        post_write_receipt["segments"][0][
+            "reason"
+        ] = "clock_rollback"
+        post_write_failure["observation"][
+            "last_outcome"
+        ] = post_write_outcome
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            {"state_version": 2, "result": post_write_failure},
+        )
+
+        recovery_tail = recovered_motion_result()
+        tail_outcome = recovery_tail["outcome"]
+        tail_receipt = tail_outcome["slices"][0]
+        tail_segment = tail_receipt["segments"][1]
+        tail_reason = "cancel_requested"
+        tail_segment["kind"] = "partial_start"
+        tail_segment["commanded_sides"] = ["right"]
+        tail_segment["status"] = "interrupted"
+        tail_segment["reason"] = tail_reason
+        tail_segment["encoder_verification"] = {
+            "passed": False,
+            "error": "paired motor start was incomplete",
+            "checks": [
+                {
+                    "role": "left_drive",
+                    "side": "left",
+                    "position_delta": 0,
+                    "passed": False,
+                },
+                {
+                    "role": "right_drive",
+                    "side": "right",
+                    "position_delta": 75,
+                    "passed": True,
+                },
+                {
+                    "role": "paired_start_completion",
+                    "side": "paired",
+                    "position_delta": 0,
+                    "passed": False,
+                },
+            ],
+        }
+        tail_receipt["status"] = "interrupted"
+        tail_receipt["reason"] = tail_reason
+        tail_receipt["encoder_verification"] = {
+            "passed": False,
+            "error": "encoder recovery did not satisfy paired motion",
+            "checks": [{"passed": False}],
+        }
+        tail_outcome["status"] = "interrupted"
+        tail_outcome["reason"] = tail_reason
+        tail_outcome["completed_slice_count"] = 0
+        tail_outcome["encoder_verification"] = {
+            "passed": False,
+            "verified_slice_count": 0,
+            "requested_slice_count": 1,
+        }
+        recovery_tail["observation"]["last_outcome"] = tail_outcome
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            {"state_version": 2, "result": recovery_tail},
+        )
+
+        invalid_responses = []
+        for commanded_sides in (
+            [],
+            ["left", "left"],
+            ["right", "left"],
+            ["right"],
+        ):
+            malformed = copy.deepcopy(response)
+            malformed["result"]["outcome"]["slices"][0]["segments"][
+                0
+            ]["commanded_sides"] = commanded_sides
+            invalid_responses.append(malformed)
+
+        completed = copy.deepcopy(response)
+        completed["result"]["outcome"]["slices"][0]["segments"][0][
+            "status"
+        ] = "completed"
+        invalid_responses.append(completed)
+
+        passed = copy.deepcopy(response)
+        segment_proof = passed["result"]["outcome"]["slices"][0][
+            "segments"
+        ][0]["encoder_verification"]
+        segment_proof["passed"] = True
+        segment_proof["error"] = None
+        for check in segment_proof["checks"]:
+            check["passed"] = True
+        invalid_responses.append(passed)
+
+        incomplete = copy.deepcopy(response)
+        incomplete["result"]["outcome"]["slices"][0]["segments"][0][
+            "motors"
+        ].pop()
+        invalid_responses.append(incomplete)
+
+        dirty_stop = copy.deepcopy(response)
+        dirty_stop["result"]["outcome"]["slices"][0]["segments"][0][
+            "stop"
+        ]["errors"] = ["cleanup failed"]
+        invalid_responses.append(dirty_stop)
+
+        denied_with_segment = copy.deepcopy(response)
+        denied_outcome = denied_with_segment["result"]["outcome"]
+        denied_receipt = denied_outcome["slices"][0]
+        denied_receipt["status"] = "denied"
+        denied_receipt["started_monotonic_ms"] = None
+        denied_receipt["motors"] = []
+        denied_receipt["encoder_verification"] = {
+            "passed": False,
+            "error": None,
+            "checks": [],
+        }
+        denied_outcome["status"] = "denied"
+        denied_outcome["started_monotonic_ms"] = None
+        denied_with_segment["result"]["observation"][
+            "last_outcome"
+        ] = denied_outcome
+        invalid_responses.append(denied_with_segment)
+
+        for malformed in invalid_responses:
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(EV3NavigationTransportError):
+                    transport._validate_success_result(
+                        "pulse",
+                        {"action": ADVANCE},
+                        malformed,
+                    )
+
+    def test_interrupted_pulse_can_retain_successful_encoder_evidence(self):
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+        result = degraded_motion_result(
+            left_delta=80,
+            right_delta=78,
+        )
+        receipt = result["outcome"]["slices"][0]
+        receipt["status"] = "interrupted"
+        receipt["reason"] = "touch_pressed"
+        receipt["encoder_verification"] = {
+            "passed": True,
+            "error": None,
+            "checks": [{"passed": True}, {"passed": True}],
+        }
+        segment = receipt["segments"][0]
+        segment["status"] = receipt["status"]
+        segment["reason"] = receipt["reason"]
+        segment["encoder_verification"] = copy.deepcopy(
+            receipt["encoder_verification"]
+        )
+        outcome = result["outcome"]
+        outcome["status"] = "interrupted"
+        outcome["reason"] = "touch_pressed"
+        outcome["encoder_verification"] = {
+            "passed": True,
+            "verified_slice_count": 1,
+            "requested_slice_count": 1,
+        }
+        result["observation"]["last_outcome"] = outcome
+
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            {"state_version": 2, "result": result},
+        )
+
+    def test_completed_pulse_requires_real_profile_encoder_evidence(self):
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+        result = degraded_motion_result(
+            left_delta=200,
+            right_delta=200,
+        )
+        receipt = result["outcome"]["slices"][0]
+        receipt["status"] = "completed"
+        receipt["reason"] = "duration_elapsed"
+        receipt["encoder_verification"] = {
+            "passed": True,
+            "error": None,
+            "checks": [{"passed": True}, {"passed": True}],
+        }
+        segment = receipt["segments"][0]
+        segment["status"] = receipt["status"]
+        segment["reason"] = receipt["reason"]
+        segment["encoder_verification"] = copy.deepcopy(
+            receipt["encoder_verification"]
+        )
+        outcome = result["outcome"]
+        outcome["status"] = "completed"
+        outcome["reason"] = "semantic_action_completed"
+        outcome["completed_slice_count"] = 1
+        outcome["encoder_verification"] = {
+            "passed": True,
+            "verified_slice_count": 1,
+            "requested_slice_count": 1,
+        }
+        result["observation"]["last_outcome"] = outcome
+        response = {"state_version": 2, "result": result}
+
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            response,
+        )
+
+        invalid_results = []
+        missing = copy.deepcopy(response)
+        missing_receipt = missing["result"]["outcome"]["slices"][0]
+        missing_receipt["started_monotonic_ms"] = None
+        missing_receipt["motors"] = []
+        missing_receipt["encoder_verification"]["checks"] = []
+        invalid_results.append(missing)
+
+        wrong_duration = copy.deepcopy(response)
+        wrong_duration["result"]["outcome"]["slices"][0][
+            "duration_ms"
+        ] = 1
+        invalid_results.append(wrong_duration)
+
+        duplicate_role = copy.deepcopy(response)
+        duplicate_role["result"]["outcome"]["slices"][0]["motors"][1][
+            "role"
+        ] = "left_drive"
+        invalid_results.append(duplicate_role)
+
+        for malformed in invalid_results:
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(EV3NavigationTransportError):
+                    transport._validate_success_result(
+                        "pulse",
+                        {"action": ADVANCE},
+                        malformed,
+                    )
+
+    def test_recovered_pulse_validates_temporal_encoder_continuity(self):
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+        result = recovered_motion_result()
+        response = {"state_version": 2, "result": result}
+
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            response,
+        )
+
+        backlash = copy.deepcopy(response)
+        backlash_result = backlash["result"]
+        backlash_receipt = backlash_result["outcome"]["slices"][0]
+        uncommanded = backlash_receipt["segments"][1]["motors"][0]
+        uncommanded["position_after"] = 74
+        uncommanded["position_delta"] = -1
+        aggregate_left = backlash_receipt["motors"][0]
+        aggregate_left["position_after"] = 74
+        aggregate_left["position_delta"] = 74
+        backlash_result["observation"]["motors"][0]["position"] = 74
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            backlash,
+        )
+
+        malformed = copy.deepcopy(response)
+        malformed["result"]["outcome"]["slices"][0]["segments"][1][
+            "motors"
+        ][0]["position_before"] = 74
+        malformed["result"]["outcome"]["slices"][0]["segments"][1][
+            "motors"
+        ][0]["position_delta"] = 1
+        with self.assertRaises(EV3NavigationTransportError):
+            transport._validate_success_result(
+                "pulse",
+                {"action": ADVANCE},
+                malformed,
+            )
+
+    def test_recovery_start_denial_accepts_newer_clean_outer_stop(self):
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+        result = degraded_motion_result()
+        outcome = result["outcome"]
+        receipt = outcome["slices"][0]
+        receipt["status"] = "interrupted"
+        receipt["reason"] = "infrared_blocked"
+        outcome["status"] = receipt["status"]
+        outcome["reason"] = receipt["reason"]
+        cleanup_stop = stop_proof()
+        cleanup_stop["positions"] = {"right_drive": 0}
+        cleanup_stop["states"] = {"right_drive": ""}
+        receipt["stop"] = cleanup_stop
+        result["stop"] = cleanup_stop
+        result["observation"]["last_outcome"] = outcome
+
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            {"state_version": 2, "result": result},
+        )
+
+        completed = recovered_motion_result()
+        completed_receipt = completed["outcome"]["slices"][0]
+        completed_receipt["stop"] = cleanup_stop
+        completed["stop"] = cleanup_stop
+        completed["observation"]["last_outcome"] = completed["outcome"]
+        with self.assertRaises(EV3NavigationTransportError):
+            transport._validate_success_result(
+                "pulse",
+                {"action": ADVANCE},
+                {"state_version": 2, "result": completed},
+            )
+
+    def test_wrong_direction_terminal_failure_remains_valid_evidence(self):
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+        result = degraded_motion_result(left_delta=-20, right_delta=0)
+        outcome = result["outcome"]
+        receipt = outcome["slices"][0]
+        outcome["reason"] = "encoder_verification_failed"
+        receipt["reason"] = outcome["reason"]
+        receipt["segments"][0]["reason"] = outcome["reason"]
+        result["observation"]["budgets"][
+            "motion_fault_latched"
+        ] = True
+        result["observation"]["last_outcome"] = outcome
+
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            {"state_version": 2, "result": result},
+        )
 
 
 class FakeRuntimeTransport:
@@ -633,7 +1650,7 @@ class FakeRuntimeTransport:
                     "policy_owner": "host",
                     "controller_id": "ev3-main",
                     "request_schema": "ev3-agent-worker-request/v1",
-                    "response_schema": "ev3-agent-worker-response/v1",
+                    "response_schema": "ev3-agent-worker-response/v2",
                     "operations": [
                         "describe",
                         "observe",
@@ -688,7 +1705,7 @@ class FakeRuntimeTransport:
                     {
                         "slice_index": 1,
                         "slice_count": 1,
-                        "duration_ms": 800,
+                        "duration_ms": 250,
                         "status": "completed",
                         "reason": "duration_elapsed",
                         "started_monotonic_ms": 1,
@@ -799,6 +1816,43 @@ class BlockingPulseTransport(FakeRuntimeTransport):
         raise RuntimeError("simulated SSH cancellation")
 
 
+class DegradedFirstPulseTransport(FakeRuntimeTransport):
+    def __init__(self):
+        super().__init__()
+        self.degraded_sent = False
+
+    def request(
+        self,
+        operation,
+        arguments,
+        timeout,
+        cancel_requested=None,
+    ):
+        if operation != "pulse" or self.degraded_sent:
+            return super().request(
+                operation,
+                arguments,
+                timeout,
+                cancel_requested=cancel_requested,
+            )
+        self.calls.append((operation, copy.deepcopy(arguments)))
+        self.degraded_sent = True
+        self.version += 1
+        self.left += 174
+        result = degraded_motion_result(
+            action=arguments["action"],
+            left_delta=174,
+            right_delta=0,
+            version=self.version,
+            left_role="drive_b",
+            right_role="drive_c",
+        )
+        return {
+            "state_version": self.version,
+            "result": result,
+        }
+
+
 class FakeRuntimePlanner:
     def __init__(self):
         self.calls = 0
@@ -831,6 +1885,152 @@ class FakeRuntimePlanner:
             state_version=context["observation"]["state_version"],
             available_actions=context["available_actions"],
             published_target_ids=(),
+        )
+
+
+class DegradedFeedbackPlanner:
+    def __init__(self):
+        self.calls = 0
+        self.feedback = None
+
+    def decide(self, **context):
+        self.calls += 1
+        if self.calls == 1:
+            value = decision_mapping(
+                episode_id=context["episode_id"],
+                turn=context["turn"],
+                state_version=context["observation"]["state_version"],
+                action=ADVANCE,
+                plan=[ADVANCE, ADVANCE],
+                reason_code="PROGRESS_GOAL",
+            )
+        else:
+            self.feedback = copy.deepcopy(context["last_tool_result"])
+            value = decision_mapping(
+                episode_id=context["episode_id"],
+                turn=context["turn"],
+                state_version=context["observation"]["state_version"],
+                action=OBSERVE,
+                plan=[OBSERVE],
+                reason_code="VERIFY_RESULT",
+            )
+        return NavigationDecision.from_mapping(
+            value,
+            episode_id=context["episode_id"],
+            turn=context["turn"],
+            state_version=context["observation"]["state_version"],
+            available_actions=context["available_actions"],
+            published_target_ids=(),
+        )
+
+
+class SpeechRuntimePlanner(FakeRuntimePlanner):
+    def decide(self, **context):
+        decision = super().decide(**context)
+        if self.calls != 1:
+            return decision
+        value = decision.to_dict()
+        value["utterance"] = "Jag rullar medan jag pratar."
+        return NavigationDecision.from_mapping(
+            value,
+            episode_id=context["episode_id"],
+            turn=context["turn"],
+            state_version=context["observation"]["state_version"],
+            available_actions=context["available_actions"],
+            published_target_ids=(),
+        )
+
+
+class InvalidThenValidSpeechPlanner:
+    def __init__(self):
+        self.calls = 0
+
+    def decide(self, **context):
+        self.calls += 1
+        if self.calls == 1:
+            value = decision_mapping(
+                episode_id=context["episode_id"],
+                turn=context["turn"],
+                state_version=context["observation"]["state_version"],
+                action=FINISH,
+                plan=[FINISH],
+                reason_code="COMPLETE_GOAL",
+                utterance="Det här förslaget ska aldrig sägas.",
+            )
+        else:
+            value = decision_mapping(
+                episode_id=context["episode_id"],
+                turn=context["turn"],
+                state_version=context["observation"]["state_version"],
+                action=ADVANCE,
+                plan=[ADVANCE, ADVANCE],
+                reason_code="PROGRESS_GOAL",
+                utterance="Nu kör jag framåt.",
+            )
+        return NavigationDecision.from_mapping(
+            value,
+            episode_id=context["episode_id"],
+            turn=context["turn"],
+            state_version=context["observation"]["state_version"],
+            available_actions=context["available_actions"],
+            published_target_ids=(),
+        )
+
+
+class InvalidModelOutputThenValidPlanner:
+    def __init__(self):
+        self.calls = 0
+        self.feedback = None
+
+    def decide(self, **context):
+        self.calls += 1
+        if self.calls == 1:
+            raise LMStudioNavigationDecisionError(
+                "unexpected_perception_target",
+                "Only SCAN_FRONT_ARC may name a perception target",
+                latency_ms=17,
+            )
+        self.feedback = copy.deepcopy(context["validation_feedback"])
+        return NavigationDecision.from_mapping(
+            decision_mapping(
+                episode_id=context["episode_id"],
+                turn=context["turn"],
+                state_version=context["observation"]["state_version"],
+                action=OBSERVE,
+                plan=[OBSERVE],
+                reason_code="VERIFY_RESULT",
+            ),
+            episode_id=context["episode_id"],
+            turn=context["turn"],
+            state_version=context["observation"]["state_version"],
+            available_actions=context["available_actions"],
+            published_target_ids=(),
+        )
+
+
+class VetoedSpeechPlanner:
+    def decide(self, **context):
+        targets = tuple(
+            item["hypothesis_id"]
+            for item in context["navigation"][
+                "navigation_hazard_hypotheses"
+            ]
+        )
+        return NavigationDecision.from_mapping(
+            decision_mapping(
+                episode_id=context["episode_id"],
+                turn=context["turn"],
+                state_version=context["observation"]["state_version"],
+                action=ADVANCE,
+                plan=[ADVANCE, ADVANCE],
+                reason_code="PROGRESS_GOAL",
+                utterance="Jag kör trots hindret.",
+            ),
+            episode_id=context["episode_id"],
+            turn=context["turn"],
+            state_version=context["observation"]["state_version"],
+            available_actions=context["available_actions"],
+            published_target_ids=targets,
         )
 
 
@@ -888,6 +2088,50 @@ class SingleScanPlanner:
         )
 
 
+class ObserveThenScanPlanner:
+    def __init__(self):
+        self.calls = 0
+        self.available_history = []
+        self.second_feedback = None
+
+    def decide(self, **context):
+        self.calls += 1
+        self.available_history.append(tuple(context["available_actions"]))
+        targets = tuple(
+            item["hypothesis_id"]
+            for item in context["navigation"][
+                "navigation_hazard_hypotheses"
+            ]
+        )
+        if self.calls == 1:
+            action = OBSERVE
+            reason = "VERIFY_RESULT"
+            target = None
+        else:
+            self.second_feedback = copy.deepcopy(
+                context["last_tool_result"]
+            )
+            action = SCAN_FRONT_ARC
+            reason = "HANDLE_OBSTACLE"
+            target = targets[0]
+        return NavigationDecision.from_mapping(
+            decision_mapping(
+                episode_id=context["episode_id"],
+                turn=context["turn"],
+                state_version=context["observation"]["state_version"],
+                action=action,
+                plan=[action],
+                reason_code=reason,
+                target=target,
+            ),
+            episode_id=context["episode_id"],
+            turn=context["turn"],
+            state_version=context["observation"]["state_version"],
+            available_actions=context["available_actions"],
+            published_target_ids=targets,
+        )
+
+
 class CaptureAvailablePlanner:
     def __init__(self):
         self.available_actions = None
@@ -922,8 +2166,13 @@ class RuntimeScanExecutor:
         self.touch_after_turn = touch_after_turn
 
     def execute(self, request, cancel_requested):
-        rig = FakeScanRig(touch_after_turn=self.touch_after_turn)
-        rig.now = request.created_at_ms
+        rig = FakeScanRig(
+            touch_after_turn=self.touch_after_turn,
+            evidence_offset_ms=(
+                request.created_at_ms - request.created_monotonic_ms
+            ),
+        )
+        rig.now = request.created_monotonic_ms
         result = ActiveIrScanExecutor(
             rig=rig,
             clock_ms=lambda: rig.now,
@@ -933,7 +2182,394 @@ class RuntimeScanExecutor:
         return result
 
 
+class RestoredCancelledRuntimeScanExecutor:
+    def __init__(self, transport):
+        self.transport = transport
+
+    def execute(self, request, cancel_requested):
+        self.transport.left += 7
+        self.transport.right -= 6
+        return ActiveIrScanResult(
+            scan_id=request.scan_id,
+            target_hypothesis_id=request.target_hypothesis_id,
+            frame_id=request.frame_id,
+            map_generation_id=request.map_generation_id,
+            based_on_map_version=request.based_on_map_version,
+            started_at_ms=request.created_at_ms,
+            completed_at_ms=request.created_at_ms + 1,
+            status="CANCELLED",
+            reason="scan_deadline_exceeded",
+            stop_confirmed=True,
+            restored_start_heading=True,
+            rays=(),
+            left_boundary_mdeg=None,
+            right_boundary_mdeg=None,
+        )
+
+
+class ScanThenObservePlanner(SingleScanPlanner):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+        self.feedback = None
+
+    def decide(self, **context):
+        self.calls += 1
+        if self.calls == 1:
+            return super().decide(**context)
+        self.feedback = copy.deepcopy(context["last_tool_result"])
+        return NavigationDecision.from_mapping(
+            decision_mapping(
+                episode_id=context["episode_id"],
+                turn=context["turn"],
+                state_version=context["observation"]["state_version"],
+                action=OBSERVE,
+                plan=[OBSERVE],
+                reason_code="VERIFY_RESULT",
+            ),
+            episode_id=context["episode_id"],
+            turn=context["turn"],
+            state_version=context["observation"]["state_version"],
+            available_actions=context["available_actions"],
+            published_target_ids=tuple(
+                item["hypothesis_id"]
+                for item in context["navigation"][
+                    "navigation_hazard_hypotheses"
+                ]
+            ),
+        )
+
+
 class PhysicalNavigationRuntimeTests(unittest.TestCase):
+    def test_adapter_exposes_bridge_and_passes_only_its_offer_to_runtime(self):
+        class Bridge:
+            def offer(self, **_kwargs):
+                return True
+
+            def snapshot(self):
+                return {"schema": "robot-spatial-map/v1"}
+
+        bridge = Bridge()
+        adapter = PhysicalNavigationRuntimeAdapter(
+            transport_factory=object,
+            planner_factory=lambda _model: object(),
+            memory_factory=object,
+            spatial_map_bridge=bridge,
+        )
+        context = SimpleNamespace(
+            episode_id="episode-map-bridge",
+            request=SimpleNamespace(goal="Observe", locale="en"),
+            settings=SimpleNamespace(
+                model="test-model",
+                max_episode_ms=60_000,
+                speech_enabled=False,
+            ),
+            stop_requested=threading.Event(),
+            emergency_stop_requested=threading.Event(),
+            publish=lambda _update: None,
+        )
+
+        with mock.patch(
+            "robot_agent.physical_navigation_adapter."
+            "PhysicalNavigationRuntime"
+        ) as runtime_type:
+            runtime_type.return_value.run.return_value = SimpleNamespace(
+                terminal_reason="goal_completed",
+                completed=True,
+                model_latency_ms=0,
+            )
+            adapter.run(context)
+
+        offered = runtime_type.call_args.kwargs["observation_sink"]
+        self.assertIs(adapter.spatial_map_provider, bridge)
+        self.assertIs(adapter.spatial_map_bridge, bridge)
+        self.assertIs(offered.__self__, bridge)
+        self.assertIs(offered.__func__, bridge.offer.__func__)
+        self.assertIsNone(
+            adapter._dashboard_update({
+                "event": "spatial_map_observation_failed",
+                "publication_stage": "motion_result",
+                "error_type": "RuntimeError",
+            })
+        )
+        for invalid in (object(), SimpleNamespace(offer=lambda **_kw: True)):
+            with self.subTest(invalid=type(invalid).__name__):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "spatial map bridge is invalid",
+                ):
+                    PhysicalNavigationRuntimeAdapter(
+                        transport_factory=object,
+                        planner_factory=lambda _model: object(),
+                        memory_factory=object,
+                        spatial_map_bridge=invalid,
+                    )
+
+    def test_adapter_propagates_profile_specific_scan_timeout(self):
+        adapter = PhysicalNavigationRuntimeAdapter(
+            transport_factory=object,
+            planner_factory=lambda _model: object(),
+            memory_factory=object,
+            request_timeout_seconds=25.0,
+            scan_timeout_seconds=30.0,
+        )
+        context = SimpleNamespace(
+            episode_id="episode-profile-scan-timeout",
+            request=SimpleNamespace(goal="Scan obstacle", locale="en"),
+            settings=SimpleNamespace(
+                model="test-model",
+                max_episode_ms=60_000,
+                speech_enabled=False,
+            ),
+            stop_requested=threading.Event(),
+            emergency_stop_requested=threading.Event(),
+            publish=lambda _update: None,
+        )
+
+        with mock.patch(
+            "robot_agent.physical_navigation_adapter."
+            "PhysicalNavigationRuntime"
+        ) as runtime_type:
+            runtime_type.return_value.run.return_value = SimpleNamespace(
+                terminal_reason="goal_completed",
+                completed=True,
+                model_latency_ms=0,
+            )
+            adapter.run(context)
+
+        config = runtime_type.call_args.kwargs["config"]
+        self.assertEqual(config.request_timeout_seconds, 25.0)
+        self.assertEqual(config.scan_timeout_seconds, 30.0)
+
+    def test_committed_start_and_motion_observations_are_detached_offers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "map-publication-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=301),
+            )
+            offers = []
+
+            def offer(**value):
+                offers.append({
+                    "memory": value["memory"],
+                    "episode_id": value["episode_id"],
+                    "captured_at_ms": value["captured_at_ms"],
+                    "memory_updated_at_ms": value["memory"].updated_at_ms,
+                    "map_version": value["memory"].hazard_map.revision,
+                    "state_version": value["observation"]["state_version"],
+                })
+                # The planner and safety gates must retain the original clear
+                # observation after a telemetry consumer mutates its copy.
+                value["observation"]["infrared"]["blocked"] = True
+                return True
+
+            runtime_times = iter((2_001, 2_002, 2_003))
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-map-publication",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Move forward",
+                    locale="en",
+                    minimum_forward_progress_mm=100,
+                    max_turns=3,
+                    max_episode_seconds=10,
+                ),
+                transport=FakeRuntimeTransport(),
+                planner=FakeRuntimePlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: next(runtime_times),
+                observation_sink=offer,
+            )
+
+            result = runtime.run()
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.actions, (ADVANCE, ADVANCE, FINISH))
+        self.assertEqual(
+            [item["captured_at_ms"] for item in offers],
+            [2_001, 2_002, 2_003],
+        )
+        self.assertEqual(
+            [item["memory_updated_at_ms"] for item in offers],
+            [2_001, 2_002, 2_003],
+        )
+        self.assertEqual(
+            [item["map_version"] for item in offers],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            [item["state_version"] for item in offers],
+            [1, 2, 3],
+        )
+        self.assertTrue(all(item["memory"] is memory for item in offers))
+        self.assertTrue(all(
+            item["episode_id"] == "episode-map-publication"
+            for item in offers
+        ))
+
+    def test_persisted_anchor_mismatch_publishes_invalid_localization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "stale-anchor-map.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=303),
+            )
+            memory.bind_drive_roles(
+                DriveMotorRoles(left="drive_b", right="drive_c")
+            )
+            memory.begin_episode(
+                observation(
+                    1,
+                    left_position=12,
+                    right_position=12,
+                    left_role="drive_b",
+                    right_role="drive_c",
+                ),
+                1_001,
+            )
+            offers = []
+
+            def offer(**value):
+                offers.append({
+                    "localization_valid": value[
+                        "memory"
+                    ].localization_valid,
+                    "map_version": value["memory"].hazard_map.revision,
+                    "captured_at_ms": value["captured_at_ms"],
+                    "state_version": value["observation"]["state_version"],
+                })
+                return True
+
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-stale-anchor-map",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Continue",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=FakeRuntimeTransport(),
+                planner=FakeRuntimePlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                observation_sink=offer,
+            )
+
+            with self.assertRaises(NavigationMemoryError):
+                runtime.run()
+
+        self.assertFalse(memory.localization_valid)
+        self.assertEqual(offers, [{
+            "localization_valid": False,
+            "map_version": 2,
+            "captured_at_ms": 2_000,
+            "state_version": 1,
+        }])
+
+    def test_stationary_observation_offer_failure_and_rejection_are_advisory(self):
+        for disposition in ("failed", "rejected"):
+            with self.subTest(disposition=disposition):
+                with tempfile.TemporaryDirectory() as directory:
+                    memory = NavigationMemoryStore.load(
+                        path=Path(directory) / "map-advisory.json",
+                        robot_id="ev3rstorm-01",
+                        controller_instance_id="ev3-main",
+                        reset=True,
+                        clock_ms=lambda: 1_000,
+                        uuid_factory=lambda: uuid.UUID(int=302),
+                    )
+                    events = []
+
+                    def offer(**_value):
+                        if disposition == "failed":
+                            raise RuntimeError("map worker unavailable")
+                        return False
+
+                    runtime = PhysicalNavigationRuntime(
+                        episode_id="episode-map-advisory",
+                        config=PhysicalNavigationRuntimeConfig(
+                            goal="Observe",
+                            locale="en",
+                            max_turns=1,
+                            max_episode_seconds=10,
+                        ),
+                        transport=FakeRuntimeTransport(),
+                        planner=CaptureAvailablePlanner(),
+                        memory=memory,
+                        monotonic=lambda: 0.0,
+                        unix_ms=lambda: 2_000,
+                        event_sink=events.append,
+                        observation_sink=offer,
+                    )
+
+                    result = runtime.run()
+
+                self.assertEqual(result.actions, (OBSERVE,))
+                event_name = "spatial_map_observation_{}".format(
+                    disposition
+                )
+                telemetry = [
+                    event for event in events if event["event"] == event_name
+                ]
+                self.assertEqual(
+                    [event["publication_stage"] for event in telemetry],
+                    ["worker_session_started", "stationary_observation"],
+                )
+                if disposition == "failed":
+                    self.assertTrue(all(
+                        event["error_type"] == "RuntimeError"
+                        for event in telemetry
+                    ))
+
+    def test_unchanged_observe_is_removed_until_another_action_progresses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "observe-liveness.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=304),
+            )
+            transport = FakeRuntimeTransport(blocked=True)
+            planner = ObserveThenScanPlanner()
+            runtime_times = iter((1_500, 1_800, 2_000, 10_000))
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-observe-liveness",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Inspect and pass the obstacle",
+                    locale="en",
+                    max_turns=2,
+                    max_episode_seconds=60,
+                ),
+                transport=transport,
+                planner=planner,
+                memory=memory,
+                active_scan_executor=RuntimeScanExecutor(transport),
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: next(runtime_times),
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.actions, (OBSERVE, SCAN_FRONT_ARC))
+        self.assertIn(OBSERVE, planner.available_history[0])
+        self.assertNotIn(OBSERVE, planner.available_history[1])
+        self.assertEqual(
+            planner.second_feedback["information_gain"],
+            "NONE",
+        )
+        self.assertEqual(planner.second_feedback["changed_facts"], [])
+        self.assertTrue(memory.localization_valid)
+
     def test_runtime_requires_both_worker_interrupt_capabilities(self):
         response = FakeRuntimeTransport().request("describe", {}, 1.0)
         for capability in (
@@ -1000,6 +2636,1048 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             [("shutdown", {})],
         )
 
+    def test_invalid_model_output_gets_bounded_feedback_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "model-output-retry-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=25),
+            )
+            planner = InvalidModelOutputThenValidPlanner()
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-model-output-retry",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Observe and correct an invalid proposal",
+                    locale="en",
+                    minimum_forward_progress_mm=100,
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=FakeRuntimeTransport(),
+                planner=planner,
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=lambda event: events.append(dict(event)),
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.actions, (OBSERVE,))
+        self.assertEqual(result.model_calls, 2)
+        self.assertEqual(result.model_latency_ms, 17)
+        self.assertEqual(planner.calls, 2)
+        self.assertEqual(
+            planner.feedback,
+            {
+                "code": "unexpected_perception_target",
+                "message": (
+                    "Only SCAN_FRONT_ARC may name a perception target"
+                ),
+                "host_selected_alternative_action": False,
+            },
+        )
+        veto = next(
+            event for event in events if event["event"] == "decision_vetoed"
+        )
+        self.assertEqual(veto["attempt"], 1)
+        self.assertEqual(veto["validation_feedback"], planner.feedback)
+
+    def test_transport_planner_error_is_not_treated_as_model_feedback(self):
+        class TransportFailurePlanner:
+            def __init__(self):
+                self.calls = 0
+
+            def decide(self, **_context):
+                self.calls += 1
+                raise LMStudioNavigationError(
+                    "LM Studio navigation request failed: offline",
+                    code="planner_transport_failed",
+                    latency_ms=23,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "transport-failure-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=26),
+            )
+            planner = TransportFailurePlanner()
+            transport = FakeRuntimeTransport()
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-transport-failure",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Observe",
+                    locale="en",
+                    minimum_forward_progress_mm=100,
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=transport,
+                planner=planner,
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=events.append,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(planner.calls, 2)
+        self.assertEqual(result.terminal_reason, "planner_unavailable")
+        self.assertFalse(result.completed)
+        self.assertTrue(result.shutdown_clean)
+        self.assertEqual(result.model_calls, 2)
+        self.assertEqual(result.model_latency_ms, 46)
+        self.assertEqual(result.actions, ())
+        self.assertEqual(
+            [operation for operation, _arguments in transport.calls],
+            ["start", "describe", "shutdown", "close"],
+        )
+        termination = next(
+            event
+            for event in events
+            if event["event"] == "planner_termination"
+        )
+        self.assertEqual(
+            termination["terminal_reason"],
+            "planner_unavailable",
+        )
+        self.assertEqual(
+            termination["planner_error_code"],
+            "planner_transport_failed",
+        )
+        self.assertEqual(
+            [
+                event["attempt"]
+                for event in events
+                if event["event"] == "planner_attempt_failed"
+            ],
+            [1, 2],
+        )
+        self.assertFalse(
+            any(event["event"] == "decision_vetoed" for event in events)
+        )
+
+    def test_single_planner_timeout_retries_then_dispatches_valid_decision(self):
+        class TimeoutThenObservePlanner:
+            def __init__(self):
+                self.calls = 0
+                self.retry_feedback = object()
+
+            def decide(self, **context):
+                self.calls += 1
+                if self.calls == 1:
+                    raise LMStudioNavigationError(
+                        "LM Studio navigation request failed: timed out",
+                        code="planner_transport_failed",
+                        latency_ms=19,
+                    )
+                self.retry_feedback = context["validation_feedback"]
+                return NavigationDecision.from_mapping(
+                    decision_mapping(
+                        episode_id=context["episode_id"],
+                        turn=context["turn"],
+                        state_version=context["observation"]["state_version"],
+                        action=OBSERVE,
+                        plan=[OBSERVE],
+                        reason_code="VERIFY_RESULT",
+                    ),
+                    episode_id=context["episode_id"],
+                    turn=context["turn"],
+                    state_version=context["observation"]["state_version"],
+                    available_actions=context["available_actions"],
+                    published_target_ids=(),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "planner-timeout-retry-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=260),
+            )
+            planner = TimeoutThenObservePlanner()
+            transport = FakeRuntimeTransport()
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-planner-timeout-retry",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Observe",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=10,
+                    max_validation_attempts=2,
+                ),
+                transport=transport,
+                planner=planner,
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=events.append,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(planner.calls, 2)
+        self.assertIsNone(planner.retry_feedback)
+        self.assertEqual(result.actions, (OBSERVE,))
+        self.assertEqual(result.model_calls, 2)
+        self.assertEqual(result.model_latency_ms, 19)
+        self.assertTrue(result.shutdown_clean)
+        self.assertEqual(
+            [operation for operation, _arguments in transport.calls],
+            ["start", "describe", "observe", "shutdown", "close"],
+        )
+        self.assertEqual(
+            [
+                event["attempt"]
+                for event in events
+                if event["event"] == "planner_attempt_failed"
+            ],
+            [1],
+        )
+        self.assertFalse(
+            any(event["event"] == "planner_termination" for event in events)
+        )
+
+    def test_exhausted_invalid_decisions_end_as_reasoning_unavailable(self):
+        class AlwaysInvalidPlanner:
+            def __init__(self):
+                self.calls = 0
+
+            def decide(self, **_context):
+                self.calls += 1
+                raise LMStudioNavigationDecisionError(
+                    "invalid_action_reason",
+                    "Action and reason disagree",
+                    latency_ms=7,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "invalid-exhausted-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=261),
+            )
+            planner = AlwaysInvalidPlanner()
+            transport = FakeRuntimeTransport()
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-invalid-exhausted",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Observe",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=10,
+                    max_validation_attempts=2,
+                ),
+                transport=transport,
+                planner=planner,
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=events.append,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.terminal_reason, "reasoning_unavailable")
+        self.assertFalse(result.completed)
+        self.assertTrue(result.shutdown_clean)
+        self.assertEqual(result.model_calls, 2)
+        self.assertEqual(result.model_latency_ms, 14)
+        self.assertEqual(planner.calls, 2)
+        self.assertEqual(result.actions, ())
+        self.assertEqual(
+            [operation for operation, _arguments in transport.calls],
+            ["start", "describe", "shutdown", "close"],
+        )
+        self.assertEqual(
+            [
+                event["attempt"]
+                for event in events
+                if event["event"] == "decision_vetoed"
+            ],
+            [1, 2],
+        )
+        termination = next(
+            event
+            for event in events
+            if event["event"] == "planner_termination"
+        )
+        self.assertEqual(
+            termination["terminal_reason"],
+            "reasoning_unavailable",
+        )
+
+    def test_late_planner_output_cannot_dispatch_a_physical_operation(self):
+        class LateObservePlanner:
+            def __init__(self, clock):
+                self.clock = clock
+
+            def decide(self, **context):
+                self.clock[0] = 11.0
+                return NavigationDecision.from_mapping(
+                    decision_mapping(
+                        episode_id=context["episode_id"],
+                        turn=context["turn"],
+                        state_version=context["observation"]["state_version"],
+                        action=OBSERVE,
+                        plan=[OBSERVE],
+                        reason_code="VERIFY_RESULT",
+                    ),
+                    episode_id=context["episode_id"],
+                    turn=context["turn"],
+                    state_version=context["observation"]["state_version"],
+                    available_actions=context["available_actions"],
+                    published_target_ids=(),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "late-planner-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=262),
+            )
+            clock = [0.0]
+            transport = FakeRuntimeTransport()
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-late-planner",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Observe",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=transport,
+                planner=LateObservePlanner(clock),
+                memory=memory,
+                monotonic=lambda: clock[0],
+                unix_ms=lambda: 2_000,
+                event_sink=events.append,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.terminal_reason, "episode_deadline_elapsed")
+        self.assertFalse(result.completed)
+        self.assertTrue(result.shutdown_clean)
+        self.assertEqual(result.model_calls, 1)
+        self.assertEqual(result.actions, ())
+        self.assertEqual(
+            [operation for operation, _arguments in transport.calls],
+            ["start", "describe", "shutdown", "close"],
+        )
+        discarded = next(
+            event
+            for event in events
+            if event["event"] == "planner_output_discarded"
+        )
+        self.assertEqual(discarded["reason"], "episode_deadline_elapsed")
+
+    def test_unverified_final_shutdown_is_a_typed_physical_fault(self):
+        class UnverifiedShutdownTransport(FakeRuntimeTransport):
+            def request(
+                self,
+                operation,
+                arguments,
+                timeout,
+                cancel_requested=None,
+            ):
+                if operation != "shutdown":
+                    return super().request(
+                        operation,
+                        arguments,
+                        timeout,
+                        cancel_requested=cancel_requested,
+                    )
+                self.calls.append((operation, copy.deepcopy(arguments)))
+                return {
+                    "state_version": self.version + 1,
+                    "result": {
+                        "outcome": {
+                            "kind": "shutdown",
+                            "status": "completed",
+                            "completed_monotonic_ms": 5,
+                            "stop_confirmed": False,
+                            "motor_owner_closed": True,
+                        }
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "shutdown-fault-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=263),
+            )
+            transport = UnverifiedShutdownTransport()
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-shutdown-fault",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Observe",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=transport,
+                planner=CaptureAvailablePlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=events.append,
+            )
+
+            with self.assertRaises(
+                PhysicalNavigationRuntimeError
+            ) as caught:
+                runtime.run()
+
+        self.assertEqual(
+            caught.exception.code,
+            "physical_shutdown_unverified",
+        )
+        self.assertEqual(
+            [operation for operation, _arguments in transport.calls],
+            ["start", "describe", "observe", "shutdown", "close"],
+        )
+        stopped = next(
+            event for event in events if event["event"] == "episode_stopped"
+        )
+        self.assertEqual(
+            stopped["terminal_reason"],
+            "physical_shutdown_unverified",
+        )
+        self.assertFalse(stopped["shutdown_clean"])
+
+    def test_unverified_shutdown_retains_primary_scan_transport_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "masked-scan-fault-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=305),
+            )
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-masked-scan-fault",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Inspect obstacle",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=FakeRuntimeTransport(),
+                planner=CaptureAvailablePlanner(),
+                memory=memory,
+            )
+            scan_error = PhysicalNavigationRuntimeError(
+                "scan_transport_failed",
+                "Physical scan transport failed while awaiting worker receipt",
+            )
+            with mock.patch.object(
+                runtime,
+                "_start_worker_session",
+                side_effect=scan_error,
+            ), mock.patch.object(runtime, "_cleanup", return_value=False):
+                with self.assertRaises(
+                    PhysicalNavigationRuntimeError
+                ) as caught:
+                    runtime.run()
+
+        self.assertEqual(
+            caught.exception.code,
+            "physical_shutdown_unverified",
+        )
+        self.assertIs(caught.exception.primary_error, scan_error)
+        self.assertEqual(
+            caught.exception.primary_error.code,
+            "scan_transport_failed",
+        )
+
+    def test_verified_shutdown_survives_local_transport_reap_failure(self):
+        class ReapFailureTransport(FakeRuntimeTransport):
+            def close(self):
+                super().close()
+                raise EV3NavigationTransportError(
+                    "SSH process exited nonzero after verified shutdown"
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "shutdown-reap-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=264),
+            )
+            transport = ReapFailureTransport()
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-shutdown-reap",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Observe",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=transport,
+                planner=CaptureAvailablePlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=events.append,
+            )
+
+            result = runtime.run()
+
+        self.assertTrue(result.shutdown_clean)
+        degraded = next(
+            event
+            for event in events
+            if event["event"] == "transport_cleanup_degraded"
+        )
+        self.assertTrue(degraded["physical_shutdown_verified"])
+        self.assertEqual(
+            degraded["error_type"],
+            "EV3NavigationTransportError",
+        )
+        stopped = next(
+            event for event in events if event["event"] == "episode_stopped"
+        )
+        self.assertTrue(stopped["shutdown_clean"])
+
+    def test_degraded_motion_cancels_tail_and_replans_from_encoder_pose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "degraded-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=24),
+            )
+            transport = DegradedFirstPulseTransport()
+            planner = DegradedFeedbackPlanner()
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-degraded-motion",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Move forward and adapt to wheel undertravel",
+                    locale="en",
+                    minimum_forward_progress_mm=100,
+                    max_turns=2,
+                    max_episode_seconds=10,
+                ),
+                transport=transport,
+                planner=planner,
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.actions, (ADVANCE, OBSERVE))
+        self.assertEqual(result.plan_tails_cancelled, 1)
+        self.assertEqual(planner.calls, 2)
+        self.assertEqual(planner.feedback["status"], "verification_failed")
+        self.assertEqual(
+            planner.feedback["encoder_observation"],
+            {
+                "action": ADVANCE,
+                "left_encoder_delta_degrees": 174,
+                "right_encoder_delta_degrees": 0,
+                "verified_slice_count": 0,
+                "observed_slice_count": 1,
+                "requested_slice_count": 1,
+                "command_completed": False,
+            },
+        )
+        self.assertEqual(
+            planner.feedback["resulting_pose"]["heading_mdeg"],
+            -11_484,
+        )
+        self.assertTrue(memory.localization_valid)
+        pulse_actions = [
+            arguments["action"]
+            for operation, arguments in transport.calls
+            if operation == "pulse"
+        ]
+        self.assertEqual(pulse_actions, [ADVANCE])
+
+    def test_only_host_committed_decision_can_offer_utterance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "speech-validation-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=18),
+            )
+            offered = []
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-speech-validation",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Move forward",
+                    locale="sv",
+                    minimum_forward_progress_mm=100,
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=FakeRuntimeTransport(),
+                planner=InvalidThenValidSpeechPlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=lambda event: events.append(dict(event)),
+                validated_utterance_sink=offered.append,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.actions, (ADVANCE, ADVANCE))
+        self.assertEqual(offered, ["Nu kör jag framåt."])
+        proposals = [
+            event
+            for event in events
+            if event["event"] == "model_decision"
+        ]
+        committed = [
+            event
+            for event in events
+            if event["event"] == "model_decision_committed"
+        ]
+        self.assertEqual(len(proposals), 2)
+        self.assertTrue(
+            all(
+                event["decision_status"] == "proposed"
+                for event in proposals
+            )
+        )
+        self.assertEqual(
+            [event["utterance"] for event in committed],
+            ["Nu kör jag framåt."],
+        )
+        self.assertEqual(committed[0]["decision_status"], "committed")
+
+    def test_execution_veto_never_offers_utterance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "speech-veto-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=19),
+            )
+            offered = []
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-speech-veto",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Move forward",
+                    locale="en",
+                    minimum_forward_progress_mm=100,
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=FakeRuntimeTransport(blocked=True),
+                planner=VetoedSpeechPlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=lambda event: events.append(dict(event)),
+                validated_utterance_sink=offered.append,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.actions, ())
+        self.assertEqual(offered, [])
+        self.assertTrue(
+            any(event["event"] == "execution_vetoed" for event in events)
+        )
+        self.assertFalse(
+            any(
+                event["event"] == "model_decision_committed"
+                for event in events
+            )
+        )
+
+    def test_adapter_scopes_speech_deduplication_to_action_progress(self):
+        class SpeechRecorder:
+            def __init__(self):
+                self.offers = []
+
+            def start(self):
+                return None
+
+            def offer(self, **value):
+                self.offers.append(dict(value))
+                return len(self.offers)
+
+            def cancel_episode(self, _episode_id):
+                return None
+
+            def close(self, **_kwargs):
+                return True
+
+        speech = SpeechRecorder()
+        adapter = PhysicalNavigationRuntimeAdapter(
+            transport_factory=object,
+            planner_factory=lambda _model: object(),
+            memory_factory=object,
+            speech_runtime_factory=lambda **_kwargs: speech,
+        )
+        context = SimpleNamespace(
+            episode_id="episode-speech-progress",
+            request=SimpleNamespace(goal="Observe", locale="en"),
+            settings=SimpleNamespace(
+                model="test-model",
+                max_episode_ms=10_000,
+                speech_enabled=True,
+            ),
+            stop_requested=threading.Event(),
+            emergency_stop_requested=threading.Event(),
+            publish=lambda _update: None,
+        )
+
+        with mock.patch(
+            "robot_agent.physical_navigation_adapter."
+            "PhysicalNavigationRuntime"
+        ) as runtime_type:
+            def run_runtime():
+                runtime = runtime_type.call_args.kwargs
+                publish = runtime["event_sink"]
+                offer = runtime["validated_utterance_sink"]
+
+                def commit(action):
+                    publish({
+                        "event": "model_decision_committed",
+                        "action": action,
+                        "plan": [action],
+                        "assessment": "test",
+                        "utterance": "Status ready",
+                    })
+
+                commit(OBSERVE)
+                offer("Status: READY!")
+                commit(OBSERVE)
+                offer("status ready")
+                commit(ADVANCE)
+                offer("STATUS READY")
+                publish({
+                    "event": "motion_result",
+                    "action": ADVANCE,
+                    "navigation": {
+                        "navigation_hazard_hypotheses": [],
+                    },
+                })
+                offer("Status ready.")
+                return SimpleNamespace(
+                    terminal_reason="goal_completed",
+                    completed=True,
+                    model_latency_ms=0,
+                )
+
+            runtime_type.return_value.run.side_effect = run_runtime
+            adapter.run(context)
+
+        self.assertEqual(
+            [item["progress_revision"] for item in speech.offers],
+            [1, 1, 2, 3],
+        )
+
+    def test_adapter_speech_overlaps_motion_and_close_cancels_it(self):
+        speech_started = threading.Event()
+        speech_cancelled = threading.Event()
+        updates = []
+
+        class SpeechAwareTransport(FakeRuntimeTransport):
+            def request(
+                self,
+                operation,
+                arguments,
+                timeout,
+                cancel_requested=None,
+            ):
+                if operation == "pulse":
+                    if not speech_started.wait(1):
+                        raise AssertionError("motion waited for no speech")
+                    self.assert_speech_still_active = (
+                        not speech_cancelled.is_set()
+                    )
+                return super().request(
+                    operation,
+                    arguments,
+                    timeout,
+                    cancel_requested=cancel_requested,
+                )
+
+        transport = SpeechAwareTransport()
+
+        def speaker(_text, _locale, cancel_event):
+            speech_started.set()
+            if cancel_event.wait(2):
+                speech_cancelled.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            def memory_factory():
+                return NavigationMemoryStore.load(
+                    path=Path(directory) / "adapter-speech-memory.json",
+                    robot_id="ev3rstorm-01",
+                    controller_instance_id="ev3-main",
+                    reset=True,
+                    clock_ms=lambda: 1_000,
+                    uuid_factory=lambda: uuid.UUID(int=20),
+                )
+
+            adapter = PhysicalNavigationRuntimeAdapter(
+                transport_factory=lambda: transport,
+                planner_factory=lambda _model: SpeechRuntimePlanner(),
+                memory_factory=memory_factory,
+                speech_runtime_factory=(
+                    lambda *, event_sink: RobotSpeechRuntime(
+                        speaker=speaker,
+                        event_sink=event_sink,
+                    )
+                ),
+                minimum_forward_progress_mm=100,
+            )
+            context = SimpleNamespace(
+                episode_id="episode-adapter-speech",
+                request=SimpleNamespace(
+                    goal="Move forward while speaking",
+                    locale="sv",
+                ),
+                settings=SimpleNamespace(
+                    model="test-model",
+                    max_episode_ms=10_000,
+                    speech_enabled=True,
+                ),
+                stop_requested=threading.Event(),
+                emergency_stop_requested=threading.Event(),
+                publish=updates.append,
+            )
+
+            result = adapter.run(context)
+
+        self.assertEqual(result["message"], "goal_completed")
+        self.assertTrue(transport.assert_speech_still_active)
+        self.assertTrue(speech_cancelled.wait(1))
+        statuses = [
+            update["speech_status"]
+            for update in updates
+            if "speech_status" in update
+        ]
+        self.assertIn("queued", statuses)
+        self.assertIn("playing", statuses)
+        self.assertIn("cancelled", statuses)
+
+    def test_adapter_speech_disabled_constructs_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            factory_calls = []
+
+            def memory_factory():
+                return NavigationMemoryStore.load(
+                    path=Path(directory) / "adapter-muted-memory.json",
+                    robot_id="ev3rstorm-01",
+                    controller_instance_id="ev3-main",
+                    reset=True,
+                    clock_ms=lambda: 1_000,
+                    uuid_factory=lambda: uuid.UUID(int=21),
+                )
+
+            def speech_runtime_factory(**_kwargs):
+                factory_calls.append(True)
+                raise AssertionError("muted episode created speech")
+
+            adapter = PhysicalNavigationRuntimeAdapter(
+                transport_factory=FakeRuntimeTransport,
+                planner_factory=lambda _model: FakeRuntimePlanner(),
+                memory_factory=memory_factory,
+                speech_runtime_factory=speech_runtime_factory,
+                minimum_forward_progress_mm=100,
+            )
+            context = SimpleNamespace(
+                episode_id="episode-adapter-muted",
+                request=SimpleNamespace(goal="Move forward", locale="en"),
+                settings=SimpleNamespace(
+                    model="test-model",
+                    max_episode_ms=10_000,
+                    speech_enabled=False,
+                ),
+                stop_requested=threading.Event(),
+                emergency_stop_requested=threading.Event(),
+                publish=lambda _update: None,
+            )
+
+            result = adapter.run(context)
+
+        self.assertEqual(result["message"], "goal_completed")
+        self.assertEqual(factory_calls, [])
+
+    def test_adapter_blocks_next_episode_when_speech_cannot_close(self):
+        class UnreapedSpeech:
+            def start(self):
+                return None
+
+            def offer(self, **_kwargs):
+                return 1
+
+            def cancel_episode(self, _episode_id):
+                return None
+
+            def close(self, **_kwargs):
+                return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            factory_calls = []
+
+            def memory_factory():
+                factory_calls.append("memory")
+                return NavigationMemoryStore.load(
+                    path=Path(directory) / "adapter-orphan-memory.json",
+                    robot_id="ev3rstorm-01",
+                    controller_instance_id="ev3-main",
+                    reset=True,
+                    clock_ms=lambda: 1_000,
+                    uuid_factory=lambda: uuid.UUID(int=23),
+                )
+
+            adapter = PhysicalNavigationRuntimeAdapter(
+                transport_factory=FakeRuntimeTransport,
+                planner_factory=lambda _model: FakeRuntimePlanner(),
+                memory_factory=memory_factory,
+                speech_runtime_factory=(
+                    lambda *, event_sink: UnreapedSpeech()
+                ),
+                minimum_forward_progress_mm=100,
+            )
+            context = SimpleNamespace(
+                episode_id="episode-adapter-orphan",
+                request=SimpleNamespace(goal="Move forward", locale="en"),
+                settings=SimpleNamespace(
+                    model="test-model",
+                    max_episode_ms=10_000,
+                    speech_enabled=True,
+                ),
+                stop_requested=threading.Event(),
+                emergency_stop_requested=threading.Event(),
+                publish=lambda _update: None,
+            )
+
+            result = adapter.run(context)
+            with self.assertRaises(PhysicalNavigationRuntimeError) as caught:
+                adapter.run(context)
+
+        self.assertEqual(result["message"], "goal_completed")
+        self.assertEqual(caught.exception.code, "runtime_already_active")
+        self.assertEqual(factory_calls, ["memory"])
+
+    def test_adapter_emergency_cancels_active_speech_and_motion(self):
+        speech_started = threading.Event()
+        speech_cancelled = threading.Event()
+        updates = []
+        returned = []
+        failures = []
+        transport = BlockingPulseTransport()
+
+        def speaker(_text, _locale, cancel_event):
+            speech_started.set()
+            if cancel_event.wait(2):
+                speech_cancelled.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            def memory_factory():
+                return NavigationMemoryStore.load(
+                    path=Path(directory) / "adapter-emergency-memory.json",
+                    robot_id="ev3rstorm-01",
+                    controller_instance_id="ev3-main",
+                    reset=True,
+                    clock_ms=lambda: 1_000,
+                    uuid_factory=lambda: uuid.UUID(int=22),
+                )
+
+            adapter = PhysicalNavigationRuntimeAdapter(
+                transport_factory=lambda: transport,
+                planner_factory=lambda _model: SpeechRuntimePlanner(),
+                memory_factory=memory_factory,
+                speech_runtime_factory=(
+                    lambda *, event_sink: RobotSpeechRuntime(
+                        speaker=speaker,
+                        event_sink=event_sink,
+                    )
+                ),
+                minimum_forward_progress_mm=100,
+            )
+            context = SimpleNamespace(
+                episode_id="episode-adapter-emergency",
+                request=SimpleNamespace(goal="Move forward", locale="en"),
+                settings=SimpleNamespace(
+                    model="test-model",
+                    max_episode_ms=60_000,
+                    speech_enabled=True,
+                ),
+                stop_requested=threading.Event(),
+                emergency_stop_requested=threading.Event(),
+                publish=updates.append,
+            )
+
+            def run_adapter():
+                try:
+                    returned.append(adapter.run(context))
+                except BaseException as error:
+                    failures.append(error)
+
+            thread = threading.Thread(target=run_adapter, daemon=True)
+            thread.start()
+            self.assertTrue(speech_started.wait(1))
+            self.assertTrue(transport.pulse_entered.wait(1))
+            context.emergency_stop_requested.set()
+            adapter.emergency_stop()
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(returned[0]["message"], "emergency_stopped")
+        self.assertTrue(transport.cancel_observed)
+        self.assertTrue(speech_cancelled.wait(1))
+        self.assertIn(
+            "cancelled",
+            [
+                update["speech_status"]
+                for update in updates
+                if "speech_status" in update
+            ],
+        )
+
     def test_successful_scan_reanchors_changed_encoders_without_moving_pose(self):
         with tempfile.TemporaryDirectory() as directory:
             memory = NavigationMemoryStore.load(
@@ -1012,6 +3690,21 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             )
             transport = FakeRuntimeTransport(blocked=True)
             planner = SingleScanPlanner()
+            runtime_times = iter((1_500, 2_000, 10_000))
+            offers = []
+
+            def offer(**value):
+                hazards = value["memory"].hazard_map.hazards
+                offers.append({
+                    "captured_at_ms": value["captured_at_ms"],
+                    "map_version": value["memory"].hazard_map.revision,
+                    "scan_complete": bool(
+                        hazards and hazards[-1].bilateral_scan_complete
+                    ),
+                    "state_version": value["observation"]["state_version"],
+                })
+                return True
+
             runtime = PhysicalNavigationRuntime(
                 episode_id="episode-scan-reanchor",
                 config=PhysicalNavigationRuntimeConfig(
@@ -1025,7 +3718,8 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 memory=memory,
                 active_scan_executor=RuntimeScanExecutor(transport),
                 monotonic=lambda: 0.0,
-                unix_ms=lambda: 2_000,
+                unix_ms=lambda: next(runtime_times),
+                observation_sink=offer,
             )
             initial_pose = memory.pose
 
@@ -1039,11 +3733,145 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             {"drive_b": 7, "drive_c": -6},
         )
         self.assertIn(SCAN_FRONT_ARC, planner.available_actions)
+        hazard = memory.hazard_map.hazards[0]
+        self.assertGreater(
+            hazard.last_seen_at_ms,
+            hazard.scan_completed_at_ms,
+        )
+        self.assertTrue(hazard.bilateral_scan_complete)
         self.assertEqual(
             [operation for operation, _arguments in transport.calls].count(
                 "observe"
             ),
             1,
+        )
+        self.assertEqual(offers, [
+            {
+                "captured_at_ms": 1_500,
+                "map_version": 1,
+                "scan_complete": False,
+                "state_version": 1,
+            },
+            {
+                "captured_at_ms": 10_000,
+                "map_version": 3,
+                "scan_complete": True,
+                "state_version": 2,
+            },
+        ])
+
+    def test_restored_soft_scan_timeout_reanchors_and_replans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "scan-timeout-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=151),
+            )
+            transport = FakeRuntimeTransport(blocked=True)
+            planner = ScanThenObservePlanner()
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-scan-soft-timeout",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Inspect the obstacle",
+                    locale="en",
+                    max_turns=2,
+                    max_episode_seconds=60,
+                ),
+                transport=transport,
+                planner=planner,
+                memory=memory,
+                active_scan_executor=(
+                    RestoredCancelledRuntimeScanExecutor(transport)
+                ),
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=events.append,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(
+            result.actions,
+            (SCAN_FRONT_ARC, OBSERVE),
+        )
+        self.assertTrue(memory.localization_valid)
+        self.assertEqual(
+            memory.motor_positions,
+            {"drive_b": 7, "drive_c": -6},
+        )
+        self.assertEqual(planner.calls, 2)
+        self.assertEqual(planner.feedback["status"], "CANCELLED")
+        self.assertEqual(
+            planner.feedback["reason"],
+            "scan_deadline_exceeded",
+        )
+        scan_event = next(
+            event for event in events if event["event"] == "scan_result"
+        )
+        self.assertEqual(scan_event["scan"]["status"], "CANCELLED")
+        self.assertTrue(scan_event["scan"]["restored_start_heading"])
+
+    def test_rejected_scan_map_fusion_replans_without_physical_fault(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "scan-fusion-rejected.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=152),
+            )
+            transport = FakeRuntimeTransport(blocked=True)
+            planner = ScanThenObservePlanner()
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-scan-fusion-rejected",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Inspect the obstacle",
+                    locale="en",
+                    max_turns=2,
+                    max_episode_seconds=60,
+                ),
+                transport=transport,
+                planner=planner,
+                memory=memory,
+                active_scan_executor=RuntimeScanExecutor(transport),
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=events.append,
+            )
+
+            with mock.patch.object(
+                memory.hazard_map,
+                "record_scan_boundaries",
+                side_effect=ValueError("simulated stale basis"),
+            ):
+                result = runtime.run()
+
+        self.assertEqual(result.actions, (SCAN_FRONT_ARC, OBSERVE))
+        self.assertTrue(memory.localization_valid)
+        self.assertEqual(planner.feedback["status"], "CANCELLED")
+        self.assertEqual(
+            planner.feedback["reason"],
+            "scan_boundary_map_integration_rejected",
+        )
+        self.assertEqual(
+            planner.feedback["evidence_disposition"],
+            "DISCARDED",
+        )
+        scan_event = next(
+            event
+            for event in events
+            if event["event"] == "scan_result"
+        )
+        self.assertEqual(scan_event["evidence_disposition"], "DISCARDED")
+        self.assertEqual(
+            scan_event["map_integration"]["status"],
+            "rejected",
         )
 
     def test_partial_turn_touch_invalidates_localization_before_more_motion(self):
@@ -1057,6 +3885,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 uuid_factory=lambda: uuid.UUID(int=16),
             )
             transport = FakeRuntimeTransport(blocked=True)
+            events = []
             runtime = PhysicalNavigationRuntime(
                 episode_id="episode-scan-touch",
                 config=PhysicalNavigationRuntimeConfig(
@@ -1074,6 +3903,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 ),
                 monotonic=lambda: 0.0,
                 unix_ms=lambda: 2_000,
+                event_sink=events.append,
             )
 
             with self.assertRaises(PhysicalNavigationRuntimeError) as caught:
@@ -1082,6 +3912,16 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "scan_heading_unrestored")
         self.assertFalse(memory.localization_valid)
         self.assertIn("restoration", memory.localization_error)
+        scan_event = next(
+            event for event in events if event["event"] == "scan_result"
+        )
+        self.assertEqual(scan_event["scan"]["status"], "CANCELLED")
+        self.assertEqual(
+            scan_event["scan"]["reason"],
+            "scan_touch_cancelled",
+        )
+        self.assertGreater(len(scan_event["scan"]["rays"]), 0)
+        self.assertFalse(scan_event["scan"]["restored_start_heading"])
         task_operations = [
             operation
             for operation, _arguments in transport.calls
@@ -1264,6 +4104,105 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         ]
         self.assertEqual(pulse_actions, [ADVANCE])
 
+    def test_stop_during_observe_preserves_verified_shutdown_channel(self):
+        class StopDuringObserveTransport(FakeRuntimeTransport):
+            def __init__(self):
+                super().__init__()
+                self.observe_entered = threading.Event()
+                self.release_observe = threading.Event()
+                self.observe_cancel_probe = object()
+                self.aborted = False
+
+            def request(
+                self,
+                operation,
+                arguments,
+                timeout,
+                cancel_requested=None,
+            ):
+                if self.aborted:
+                    raise EV3NavigationTransportError(
+                        "aborted navigation transport cannot be reused"
+                    )
+                if operation != "observe":
+                    return super().request(
+                        operation,
+                        arguments,
+                        timeout,
+                        cancel_requested=cancel_requested,
+                    )
+                self.calls.append((operation, copy.deepcopy(arguments)))
+                self.observe_cancel_probe = cancel_requested
+                self.observe_entered.set()
+                if not self.release_observe.wait(1.0):
+                    raise AssertionError("observe response was not released")
+                if (
+                    callable(cancel_requested)
+                    and cancel_requested() is True
+                ):
+                    # Match the SSH transport: cancelling a written request
+                    # closes the channel, so no shutdown receipt is possible.
+                    self.aborted = True
+                    raise EV3NavigationTransportError(
+                        "worker request cancelled; SSH channel closed"
+                    )
+                self.version += 1
+                return {
+                    "state_version": self.version,
+                    "result": {"observation": self._observation()},
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "stop-during-observe.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=265),
+            )
+            transport = StopDuringObserveTransport()
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-stop-during-observe",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Observe",
+                    locale="en",
+                    max_turns=3,
+                    max_episode_seconds=60,
+                ),
+                transport=transport,
+                planner=CaptureAvailablePlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+            )
+            returned = []
+            failures = []
+
+            def run_runtime():
+                try:
+                    returned.append(runtime.run())
+                except BaseException as error:
+                    failures.append(error)
+
+            thread = threading.Thread(target=run_runtime, daemon=True)
+            thread.start()
+            self.assertTrue(transport.observe_entered.wait(1.0))
+            runtime.request_stop()
+            transport.release_observe.set()
+            thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(len(returned), 1)
+        self.assertEqual(returned[0].terminal_reason, "cancelled")
+        self.assertTrue(returned[0].shutdown_clean)
+        self.assertIsNone(transport.observe_cancel_probe)
+        self.assertEqual(
+            [operation for operation, _arguments in transport.calls],
+            ["start", "describe", "observe", "shutdown", "close"],
+        )
+
     def test_inflight_motion_request_observes_stop_callback(self):
         with tempfile.TemporaryDirectory() as directory:
             memory = NavigationMemoryStore.load(
@@ -1276,6 +4215,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             )
             cancelled = threading.Event()
             transport = BlockingPulseTransport()
+            offers = []
             runtime = PhysicalNavigationRuntime(
                 episode_id="episode-inflight-cancel",
                 config=PhysicalNavigationRuntimeConfig(
@@ -1289,6 +4229,13 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 planner=FakeRuntimePlanner(),
                 memory=memory,
                 cancel_event=cancelled,
+                observation_sink=lambda **value: offers.append({
+                    "localization_valid": value[
+                        "memory"
+                    ].localization_valid,
+                    "map_version": value["memory"].hazard_map.revision,
+                    "state_version": value["observation"]["state_version"],
+                }) or True,
             )
             returned = []
             failures = []
@@ -1311,10 +4258,30 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         self.assertEqual(returned[0].terminal_reason, "cancelled")
         self.assertTrue(transport.cancel_observed)
         self.assertEqual(returned[0].actions, ())
+        self.assertFalse(memory.localization_valid)
+        self.assertEqual(
+            memory.localization_error,
+            "Pulse cancellation lost its correlated encoder receipt",
+        )
+        self.assertFalse(
+            returned[0].final_navigation["localization_valid"]
+        )
         self.assertEqual(
             [operation for operation, _arguments in transport.calls],
             ["start", "describe", "pulse", "shutdown", "close"],
         )
+        self.assertEqual(offers, [
+            {
+                "localization_valid": True,
+                "map_version": 1,
+                "state_version": 1,
+            },
+            {
+                "localization_valid": False,
+                "map_version": 2,
+                "state_version": 1,
+            },
+        ])
 
     def test_long_episode_renews_bounded_worker_between_plans(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1330,6 +4297,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             second = FakeRuntimeTransport()
             replacements = [second]
             scan_bindings = []
+            offers = []
 
             def transport_factory():
                 return replacements.pop(0)
@@ -1354,6 +4322,10 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 active_scan_executor_factory=scan_executor_factory,
                 monotonic=lambda: 0.0,
                 unix_ms=lambda: 2_000,
+                observation_sink=lambda **value: offers.append({
+                    "state_version": value["observation"]["state_version"],
+                    "map_version": value["memory"].hazard_map.revision,
+                }),
             )
             result = runtime.run()
 
@@ -1373,24 +4345,235 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             ],
             [ADVANCE, ADVANCE],
         )
+        self.assertEqual(offers, [
+            {"state_version": 1, "map_version": 1},
+            {"state_version": 1, "map_version": 2},
+            {"state_version": 2, "map_version": 3},
+            {"state_version": 3, "map_version": 4},
+        ])
 
     def test_runtime_accepts_full_dashboard_episode_duration_range(self):
         configured = PhysicalNavigationRuntimeConfig(
             goal="Explore",
             locale="en",
             max_episode_seconds=3_600,
+            scan_timeout_seconds=120.0,
         )
         self.assertEqual(configured.max_episode_seconds, 3_600)
         self.assertEqual(configured.max_turns, 14_400)
+        self.assertEqual(configured.scan_timeout_seconds, 120.0)
         with self.assertRaises(ValueError):
             PhysicalNavigationRuntimeConfig(
                 goal="Explore",
                 locale="en",
                 max_episode_seconds=3_601,
             )
+        with self.assertRaises(ValueError):
+            PhysicalNavigationRuntimeConfig(
+                goal="Explore",
+                locale="en",
+                scan_timeout_seconds=120.001,
+            )
 
 
 class LMStudioNavigationLocaleTests(unittest.TestCase):
+    def test_structured_schema_makes_none_commitment_an_exact_sentinel(self):
+        schema = _maneuver_schema()
+
+        self.assertEqual(set(schema), {"anyOf"})
+        self.assertEqual(len(schema["anyOf"]), 2)
+        none_branch, active_branch = schema["anyOf"]
+        none = none_branch["properties"]
+        active = active_branch["properties"]
+
+        self.assertEqual(none["transition"], {
+            "type": "string",
+            "const": "NONE",
+        })
+        self.assertEqual(none["target_hypothesis_id"], {"type": "null"})
+        self.assertEqual(none["current_focus_fact_key"], {"type": "null"})
+        self.assertEqual(none["success_fact_keys"]["maxItems"], 0)
+        self.assertNotIn("NONE", active["transition"]["enum"])
+        self.assertEqual(active["target_hypothesis_id"]["type"], "string")
+
+    def test_commitment_schema_opens_only_after_bilateral_scan_evidence(self):
+        for scanned in (False, True):
+            with self.subTest(scanned=scanned):
+                captured = {}
+
+                def transport(_url, body, _headers, _timeout, _maximum):
+                    captured["payload"] = json.loads(body.decode("utf-8"))
+                    response_decision = decision_mapping(
+                        episode_id="episode-scan-schema",
+                        turn=1,
+                        state_version=1,
+                        action=OBSERVE,
+                        plan=[OBSERVE],
+                        reason_code="VERIFY_RESULT",
+                    )
+                    return json.dumps({
+                        "choices": [{
+                            "message": {
+                                "content": json.dumps(response_decision),
+                            },
+                        }],
+                    }).encode("utf-8")
+
+                planner = LMStudioNavigationPlanner(
+                    base_url="http://127.0.0.1:1234",
+                    model="test-model",
+                    transport=transport,
+                    clock=lambda: 1.0,
+                )
+                planner.decide(
+                    episode_id="episode-scan-schema",
+                    turn=1,
+                    locale="en",
+                    observation=observation(1),
+                    mission={"completed": False},
+                    navigation={
+                        "navigation_hazard_hypotheses": [{
+                            "hypothesis_id": "hazard-1",
+                            "scan_completed_at_ms": 2_000 if scanned else None,
+                            "scan_left_boundary_mdeg": 30_000 if scanned else None,
+                            "scan_right_boundary_mdeg": -30_000 if scanned else None,
+                        }],
+                    },
+                    maneuver_state={"active": None},
+                    available_actions=[OBSERVE],
+                    last_tool_result=None,
+                )
+                decision_schema = captured["payload"]["response_format"][
+                    "json_schema"
+                ]["schema"]
+                schema = decision_schema["oneOf"][0]["properties"][
+                    "maneuver_commitment"
+                ]
+                if scanned:
+                    self.assertEqual(set(schema), {"anyOf"})
+                else:
+                    self.assertEqual(
+                        schema["properties"]["transition"]["const"],
+                        "NONE",
+                    )
+
+    def test_schema_binds_perception_target_to_scan_action(self):
+        captured = {}
+
+        def transport(_url, body, _headers, _timeout, _maximum):
+            captured["payload"] = json.loads(body.decode("utf-8"))
+            response_decision = decision_mapping(
+                episode_id="episode-action-target-schema",
+                turn=1,
+                state_version=1,
+                action=OBSERVE,
+                plan=[OBSERVE],
+                reason_code="VERIFY_RESULT",
+            )
+            return json.dumps({
+                "choices": [{
+                    "message": {
+                        "content": json.dumps(response_decision),
+                    },
+                }],
+            }).encode("utf-8")
+
+        planner = LMStudioNavigationPlanner(
+            base_url="http://127.0.0.1:1234",
+            model="test-model",
+            transport=transport,
+            clock=lambda: 1.0,
+        )
+        planner.decide(
+            episode_id="episode-action-target-schema",
+            turn=1,
+            locale="en",
+            observation=observation(1, blocked=True),
+            mission={"completed": False},
+            navigation={
+                "navigation_hazard_hypotheses": [{
+                    "hypothesis_id": "hazard-1",
+                }],
+            },
+            maneuver_state={"active": None},
+            available_actions=[OBSERVE, SCAN_FRONT_ARC],
+            last_tool_result=None,
+        )
+
+        schema = captured["payload"]["response_format"]["json_schema"][
+            "schema"
+        ]
+        self.assertEqual(set(schema), {"oneOf"})
+        self.assertEqual(len(schema["oneOf"]), 2)
+        scan, non_scan = schema["oneOf"]
+        self.assertEqual(
+            scan["properties"]["action"]["const"],
+            SCAN_FRONT_ARC,
+        )
+        self.assertEqual(
+            scan["properties"]["perception_target_hypothesis_id"],
+            {"type": "string", "enum": ["hazard-1"]},
+        )
+        self.assertEqual(
+            non_scan["properties"]["action"]["enum"],
+            [OBSERVE],
+        )
+        self.assertEqual(
+            non_scan["properties"]["perception_target_hypothesis_id"],
+            {"type": "null"},
+        )
+
+    def test_invalid_decision_is_typed_for_runtime_feedback(self):
+        def transport(_url, _body, _headers, _timeout, _maximum):
+            invalid = decision_mapping(
+                episode_id="episode-invalid-target",
+                turn=1,
+                state_version=1,
+                action=OBSERVE,
+                plan=[OBSERVE],
+                reason_code="VERIFY_RESULT",
+                target="hazard-1",
+            )
+            return json.dumps({
+                "choices": [{
+                    "message": {"content": json.dumps(invalid)},
+                }],
+            }).encode("utf-8")
+
+        times = iter((1.0, 1.017))
+        planner = LMStudioNavigationPlanner(
+            base_url="http://127.0.0.1:1234",
+            model="test-model",
+            transport=transport,
+            clock=lambda: next(times),
+        )
+
+        with self.assertRaises(
+            LMStudioNavigationDecisionError
+        ) as caught:
+            planner.decide(
+                episode_id="episode-invalid-target",
+                turn=1,
+                locale="en",
+                observation=observation(1, blocked=True),
+                mission={"completed": False},
+                navigation={
+                    "navigation_hazard_hypotheses": [{
+                        "hypothesis_id": "hazard-1",
+                    }],
+                },
+                maneuver_state={"active": None},
+                available_actions=[OBSERVE, SCAN_FRONT_ARC],
+                last_tool_result=None,
+            )
+
+        self.assertEqual(caught.exception.code, "unexpected_perception_target")
+        self.assertEqual(caught.exception.latency_ms, 17)
+        self.assertEqual(
+            caught.exception.feedback_message,
+            "Only SCAN_FRONT_ARC may name a perception target",
+        )
+
     def test_episode_locale_is_forwarded_without_language_heuristics(self):
         for locale, expected_language in (
             ("sv", "Swedish or null"),
@@ -1465,6 +4648,16 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
                 self.assertEqual(
                     captured["payload"]["model"],
                     "injected-model",
+                )
+                decision_schema = captured["payload"][
+                    "response_format"
+                ]["json_schema"]["schema"]
+                commitment_schema = decision_schema["oneOf"][0][
+                    "properties"
+                ]["maneuver_commitment"]
+                self.assertEqual(
+                    commitment_schema["properties"]["transition"],
+                    {"type": "string", "const": "NONE"},
                 )
                 self.assertEqual(
                     captured["url"],

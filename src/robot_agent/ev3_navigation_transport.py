@@ -6,6 +6,10 @@ import threading
 import time
 from typing import Callable, Mapping, Optional
 
+from .ev3_pulse_contract import (
+    EV3PulseContractError,
+    validate_pulse_result,
+)
 from .physical_navigation_contract import (
     EXPECTED_WORKER_SAFETY,
     MOTION_ACTIONS,
@@ -56,6 +60,28 @@ class EV3NavigationRemoteError(EV3NavigationTransportError):
         self.fatal = fatal
         self.observation = observation
         self.stop = stop
+        super().__init__(message)
+
+
+class EV3NavigationOperationError(EV3NavigationTransportError):
+    """A correlated worker result that safely reports non-completion."""
+
+    def __init__(
+        self,
+        operation: str,
+        code: str,
+        message: str,
+        *,
+        observation,
+        stop,
+        result,
+    ):
+        self.operation = operation
+        self.code = code
+        self.fatal = False
+        self.observation = observation
+        self.stop = stop
+        self.result = result
         super().__init__(message)
 
 
@@ -273,6 +299,8 @@ class EV3NavigationSSHTransport:
         *,
         ordinal: int,
         expected_count: int,
+        expected_status: str = "completed",
+        allow_failed_encoder: bool = False,
     ) -> None:
         fields = {
             "slice_index",
@@ -289,13 +317,25 @@ class EV3NavigationSSHTransport:
         if (
             not isinstance(value, dict)
             or set(value) != fields
+            or isinstance(value["slice_index"], bool)
+            or not isinstance(value["slice_index"], int)
             or value["slice_index"] != ordinal
+            or isinstance(value["slice_count"], bool)
+            or not isinstance(value["slice_count"], int)
             or value["slice_count"] != expected_count
             or isinstance(value["duration_ms"], bool)
             or not isinstance(value["duration_ms"], int)
             or not 1 <= value["duration_ms"] <= 800
-            or value["status"] != "completed"
-            or value["reason"] != "duration_elapsed"
+            or value["status"] != expected_status
+            or not isinstance(value["reason"], str)
+            or not value["reason"]
+            or (
+                expected_status == "completed"
+                and value["reason"] not in (
+                    "duration_elapsed",
+                    "motor_fault_encoder_verified",
+                )
+            )
             or isinstance(value["started_monotonic_ms"], bool)
             or not isinstance(value["started_monotonic_ms"], int)
             or isinstance(value["completed_monotonic_ms"], bool)
@@ -307,18 +347,46 @@ class EV3NavigationSSHTransport:
                 "scan-turn slice receipt is invalid"
             )
         verification = value["encoder_verification"]
+        checks = (
+            verification.get("checks")
+            if isinstance(verification, dict)
+            else None
+        )
+        passed = (
+            verification.get("passed")
+            if isinstance(verification, dict)
+            else None
+        )
+        valid_checks = (
+            isinstance(checks, list)
+            and bool(checks)
+            and all(
+                isinstance(check, dict)
+                and type(check.get("passed")) is bool
+                for check in checks
+            )
+        )
+        valid_success = (
+            valid_checks
+            and isinstance(verification, dict)
+            and passed is True
+            and verification.get("error") is None
+            and all(check["passed"] is True for check in checks)
+        )
+        valid_failure = (
+            allow_failed_encoder
+            and valid_checks
+            and isinstance(verification, dict)
+            and passed is False
+            and isinstance(verification.get("error"), str)
+            and bool(verification["error"])
+            and any(check["passed"] is False for check in checks)
+        )
         if (
             not isinstance(verification, dict)
             or set(verification) != {"passed", "error", "checks"}
-            or verification["passed"] is not True
-            or verification["error"] is not None
-            or not isinstance(verification["checks"], list)
-            or not verification["checks"]
-            or any(
-                not isinstance(check, dict)
-                or check.get("passed") is not True
-                for check in verification["checks"]
-            )
+            or not valid_checks
+            or not (valid_success or valid_failure)
         ):
             raise EV3NavigationTransportError(
                 "scan-turn slice encoder proof is invalid"
@@ -352,7 +420,7 @@ class EV3NavigationSSHTransport:
                         "position_before",
                         "position_after",
                         "position_delta",
-                    )
+                )
                 )
                 or motor["position_delta"]
                 != motor["position_after"] - motor["position_before"]
@@ -367,6 +435,206 @@ class EV3NavigationSSHTransport:
                 "scan-turn motor sides are invalid"
             )
         EV3NavigationSSHTransport._validate_stop_proof(value["stop"])
+
+    def _validate_pulse_result(
+        self,
+        arguments: Mapping[str, object],
+        response: Mapping[str, object],
+    ) -> None:
+        try:
+            validate_pulse_result(
+                arguments,
+                response,
+                worker_description=self._worker_description,
+                stop_validator=self._validate_stop_proof,
+            )
+        except EV3PulseContractError as error:
+            raise EV3NavigationTransportError(str(error)) from None
+
+    def _raise_validated_scan_turn_noncompletion(
+        self,
+        *,
+        relative_delta_mdeg: int,
+        response: Mapping[str, object],
+        expected_profile: Mapping[str, object],
+        expected_spec: Mapping[str, object],
+    ) -> None:
+        """Preserve only fully correlated, stopped non-completion evidence."""
+        result = response["result"]
+        outcome = result["outcome"]
+        status = outcome.get("status")
+        reason = outcome.get("reason")
+        slices = outcome.get("slices")
+        encoder = outcome.get("encoder_verification")
+        encoder_fields = {
+            "passed",
+            "verified_slice_count",
+            "requested_slice_count",
+            "left_delta_degrees",
+            "right_delta_degrees",
+            "mean_abs_encoder_degrees",
+            "target_mean_abs_encoder_degrees",
+            "max_side_divergence_degrees",
+        }
+        common_valid = (
+            set(result)
+            == {"relative_delta_mdeg", "outcome", "observation", "stop"}
+            and result["relative_delta_mdeg"] == relative_delta_mdeg
+            and isinstance(reason, str)
+            and bool(reason)
+            and outcome.get("kind") == "scan_turn"
+            and outcome.get("requested_relative_delta_mdeg")
+            == relative_delta_mdeg
+            and outcome.get("profile_id")
+            == expected_profile["profile_id"]
+            and outcome.get("calibration")
+            == expected_profile["calibration"]
+            and outcome.get("stop_confirmed") is True
+            and outcome.get("requested_slice_count")
+            == expected_spec["slice_count"]
+            and isinstance(slices, list)
+            and isinstance(encoder, dict)
+            and set(encoder) == encoder_fields
+            and encoder["passed"] is False
+            and encoder["requested_slice_count"]
+            == expected_spec["slice_count"]
+            and encoder["target_mean_abs_encoder_degrees"]
+            == expected_spec["target_mean_abs_encoder_degrees"]
+            and encoder["max_side_divergence_degrees"]
+            == expected_profile["max_side_divergence_degrees"]
+        )
+        if not common_valid:
+            raise EV3NavigationTransportError(
+                "worker scan-turn non-completion is invalid"
+            )
+        if status == "denied":
+            valid_status_evidence = (
+                outcome.get("started_monotonic_ms") is None
+                and isinstance(outcome.get("completed_monotonic_ms"), int)
+                and outcome.get("completed_slice_count") == 0
+                and slices == []
+                and encoder["verified_slice_count"] == 0
+                and encoder["left_delta_degrees"] is None
+                and encoder["right_delta_degrees"] is None
+                and encoder["mean_abs_encoder_degrees"] is None
+            )
+        elif status in ("interrupted", "verification_failed"):
+            requested_count = expected_spec["slice_count"]
+            completed_count = outcome.get("completed_slice_count")
+            aggregate_failure = (
+                status == "verification_failed"
+                and completed_count == requested_count
+                and len(slices) == requested_count
+            )
+            terminal_failure = (
+                isinstance(completed_count, int)
+                and not isinstance(completed_count, bool)
+                and 0 <= completed_count < requested_count
+                and len(slices) == completed_count + 1
+                and slices[-1].get("status") == status
+                and slices[-1].get("reason") == reason
+            )
+            valid_status_evidence = (
+                (aggregate_failure or terminal_failure)
+                and isinstance(outcome.get("started_monotonic_ms"), int)
+                and isinstance(outcome.get("completed_monotonic_ms"), int)
+                and outcome["completed_monotonic_ms"]
+                >= outcome["started_monotonic_ms"]
+            )
+            totals = {"left": 0, "right": 0}
+            verified_count = 0
+            if valid_status_evidence:
+                for ordinal, receipt in enumerate(slices, 1):
+                    is_terminal_failure = (
+                        terminal_failure and ordinal == len(slices)
+                    )
+                    self._validate_scan_slice(
+                        receipt,
+                        ordinal=ordinal,
+                        expected_count=requested_count,
+                        expected_status=(
+                            status
+                            if is_terminal_failure
+                            else "completed"
+                        ),
+                        allow_failed_encoder=is_terminal_failure,
+                    )
+                    if receipt["duration_ms"] != expected_spec[
+                        "slice_durations_ms"
+                    ][ordinal - 1]:
+                        valid_status_evidence = False
+                        break
+                    if receipt["encoder_verification"]["passed"] is True:
+                        verified_count += 1
+                    for motor in receipt["motors"]:
+                        totals[motor["side"]] += motor["position_delta"]
+            if valid_status_evidence:
+                mean_abs = int(
+                    round(
+                        (
+                            abs(totals["left"])
+                            + abs(totals["right"])
+                        )
+                        / 2.0
+                    )
+                )
+                valid_status_evidence = (
+                    valid_status_evidence
+                    and outcome["started_monotonic_ms"]
+                    == slices[0]["started_monotonic_ms"]
+                    and outcome["completed_monotonic_ms"]
+                    == slices[-1]["completed_monotonic_ms"]
+                    and encoder["verified_slice_count"] == verified_count
+                    and encoder["left_delta_degrees"] == totals["left"]
+                    and encoder["right_delta_degrees"] == totals["right"]
+                    and encoder["mean_abs_encoder_degrees"] == mean_abs
+                )
+                if aggregate_failure:
+                    direction = 1 if relative_delta_mdeg > 0 else -1
+                    aggregate_geometry_passed = (
+                        totals["left"] * direction < 0
+                        and totals["right"] * direction > 0
+                        and abs(
+                            abs(totals["left"])
+                            - abs(totals["right"])
+                        )
+                        <= expected_profile[
+                            "max_side_divergence_degrees"
+                        ]
+                    )
+                    valid_status_evidence = (
+                        valid_status_evidence
+                        and reason
+                        == "scan_turn_encoder_verification_failed"
+                        and not aggregate_geometry_passed
+                    )
+        else:
+            valid_status_evidence = False
+        if not valid_status_evidence:
+            raise EV3NavigationTransportError(
+                "worker scan-turn non-completion evidence is invalid"
+            )
+        observation = validate_observation(result["observation"])
+        if (
+            observation["state_version"] != response["state_version"]
+            or observation["last_outcome"] != outcome
+            or any(
+                frozenset(motor["state"].split()) & ACTIVE_MOTOR_STATES
+                for motor in observation["motors"]
+            )
+        ):
+            raise EV3NavigationTransportError(
+                "worker scan-turn non-completion is uncorrelated"
+            )
+        stop = self._validate_stop_proof(result["stop"])
+        raise EV3NavigationOperationError(
+            SCAN_TURN_OPERATION,
+            reason,
+            "Worker scan turn did not complete: {}".format(reason),
+            observation=observation,
+            stop=stop,
+            result=result,
+        )
 
     def _validate_success_result(
         self,
@@ -425,7 +693,10 @@ class EV3NavigationSSHTransport:
                 )
             observation = validate_observation(result["observation"])
             infrared = observation["infrared"]
-            ordered_samples = sorted(result["raw_samples"])
+            filter_window = profile["filter_window_samples"]
+            ordered_samples = sorted(
+                result["raw_samples"][-filter_window:]
+            )
             expected_median = ordered_samples[len(ordered_samples) // 2]
             if (
                 observation["state_version"] != response["state_version"]
@@ -460,6 +731,9 @@ class EV3NavigationSSHTransport:
                 raise EV3NavigationTransportError(
                     "worker observe version is invalid"
                 )
+            return
+        if operation == "pulse":
+            self._validate_pulse_result(arguments, response)
             return
         if operation == "stop":
             if (
@@ -530,6 +804,16 @@ class EV3NavigationSSHTransport:
             for item in expected_profile["turns"]
             if item["relative_delta_mdeg"] == relative_delta_mdeg
         )
+        if (
+            isinstance(outcome, dict)
+            and outcome.get("status") != "completed"
+        ):
+            self._raise_validated_scan_turn_noncompletion(
+                relative_delta_mdeg=relative_delta_mdeg,
+                response=response,
+                expected_profile=expected_profile,
+                expected_spec=expected_spec,
+            )
         if (
             not isinstance(outcome, dict)
             or set(outcome) != outcome_fields
@@ -815,7 +1099,10 @@ class EV3NavigationSSHTransport:
             if operation == "shutdown":
                 self.shutdown_complete = True
             return response
-        except EV3NavigationRemoteError as error:
+        except (
+            EV3NavigationRemoteError,
+            EV3NavigationOperationError,
+        ) as error:
             if error.fatal:
                 self.abort()
             raise

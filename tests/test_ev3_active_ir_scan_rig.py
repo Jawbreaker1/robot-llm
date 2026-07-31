@@ -9,13 +9,17 @@ from robot_agent.active_ir_scan_contract import (
     ActiveIrScanContractError,
     ModelScanChoice,
     build_scan_request,
+    validate_scan_result,
     worst_case_scan_budget,
 )
 from robot_agent.ev3_active_ir_scan_rig import (
     EV3ActiveIrScanRig,
+    EV3ActiveIrScanWorkerError,
     build_ev3_active_ir_scan_executor,
 )
 from robot_agent.ev3_navigation_transport import (
+    EV3NavigationOperationError,
+    EV3NavigationRemoteError,
     EV3NavigationSSHTransport,
     EV3NavigationTransportError,
 )
@@ -325,6 +329,52 @@ class FakeScanTransport:
         raise AssertionError("unexpected operation {}".format(operation))
 
 
+class StrictValidatingScanTransport(FakeScanTransport):
+    """Run fake scan receipts through the real host wire validator."""
+
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.validator = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+        self.sample_count = 0
+
+    def request(
+        self,
+        operation,
+        arguments,
+        timeout_seconds,
+        cancel_requested=None,
+    ):
+        response = super().request(
+            operation,
+            arguments,
+            timeout_seconds,
+            cancel_requested=cancel_requested,
+        )
+        if operation == "scan_sample":
+            self.sample_count += 1
+            if self.sample_count == 1:
+                result = response["result"]
+                result["raw_samples"] = [33, 33, 34, 34, 33]
+                result["observation"]["infrared"].update(
+                    raw=33,
+                    filtered=34,
+                    blocked=True,
+                    reason="blocked_hysteresis_hold",
+                )
+        self.validator._validate_success_result(
+            operation,
+            arguments,
+            response,
+        )
+        return response
+
+
 class BlockingScanTransport(FakeScanTransport):
     def __init__(self, clock, block_operation):
         super().__init__(clock)
@@ -357,6 +407,87 @@ class BlockingScanTransport(FakeScanTransport):
         raise EV3NavigationTransportError("cancelled")
 
 
+class LongScanTurnTransport(FakeScanTransport):
+    """Reproduce one valid worker response that needs more than 8 seconds."""
+
+    def __init__(self, clock):
+        super().__init__(clock, use_profile_timing=True)
+        self.long_turn_timeouts = []
+        self.long_turn_completed = False
+
+    def request(
+        self,
+        operation,
+        arguments,
+        timeout_seconds,
+        cancel_requested=None,
+    ):
+        is_long_turn = (
+            operation == "scan_turn"
+            and abs(arguments["relative_delta_mdeg"]) == 90_000
+            and not self.long_turn_completed
+        )
+        if not is_long_turn:
+            return super().request(
+                operation,
+                arguments,
+                timeout_seconds,
+                cancel_requested=cancel_requested,
+            )
+        self.long_turn_timeouts.append(timeout_seconds)
+        if timeout_seconds <= 8.0:
+            self.calls.append((operation, copy.deepcopy(arguments)))
+            self.abort()
+            raise EV3NavigationTransportError(
+                "worker response timed out"
+            )
+        response = super().request(
+            operation,
+            arguments,
+            timeout_seconds,
+            cancel_requested=cancel_requested,
+        )
+        self.clock.advance(9_000)
+        self.long_turn_completed = True
+        return response
+
+
+class RemoteSampleErrorTransport(FakeScanTransport):
+    def __init__(self, clock, *, code="sensor_read_failed"):
+        super().__init__(clock)
+        self.code = code
+        self.sample_count = 0
+
+    def request(
+        self,
+        operation,
+        arguments,
+        timeout_seconds,
+        cancel_requested=None,
+    ):
+        if operation == "scan_sample":
+            self.sample_count += 1
+            if self.sample_count == 2:
+                self.calls.append((operation, copy.deepcopy(arguments)))
+                self.last_state_version += 1
+                observation = self._observation(
+                    self.last_state_version
+                )
+                raise EV3NavigationRemoteError(
+                    self.code,
+                    "simulated worker sample error",
+                    False,
+                    observation=observation,
+                    stop=stop_proof(),
+                )
+        return super().request(
+            operation,
+            arguments,
+            timeout_seconds,
+            cancel_requested=cancel_requested,
+        )
+
+
 def scan_request(
     clock,
     *,
@@ -380,6 +511,284 @@ def scan_request(
 
 
 class EV3ActiveIrScanRigTests(unittest.TestCase):
+    def test_transport_types_verified_stopped_scan_turn_denial(self):
+        clock = FakeClock()
+        worker = FakeScanTransport(clock)
+        response = worker._scan_turn(30_000)
+        outcome = response["result"]["outcome"]
+        outcome.update(
+            {
+                "status": "denied",
+                "reason": "policy_denied",
+                "started_monotonic_ms": None,
+                "completed_slice_count": 0,
+                "slices": [],
+                "encoder_verification": {
+                    "passed": False,
+                    "verified_slice_count": 0,
+                    "requested_slice_count": outcome[
+                        "requested_slice_count"
+                    ],
+                    "left_delta_degrees": None,
+                    "right_delta_degrees": None,
+                    "mean_abs_encoder_degrees": None,
+                    "target_mean_abs_encoder_degrees": outcome[
+                        "encoder_verification"
+                    ]["target_mean_abs_encoder_degrees"],
+                    "max_side_divergence_degrees": outcome[
+                        "encoder_verification"
+                    ]["max_side_divergence_degrees"],
+                },
+            }
+        )
+        response["result"]["observation"]["last_outcome"] = copy.deepcopy(
+            outcome
+        )
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+
+        with self.assertRaises(EV3NavigationOperationError) as caught:
+            transport._validate_success_result(
+                "scan_turn",
+                {"relative_delta_mdeg": 30_000},
+                response,
+            )
+
+        self.assertEqual(caught.exception.code, "policy_denied")
+        self.assertEqual(caught.exception.observation["state_version"], 2)
+        self.assertTrue(caught.exception.stop["stop_confirmed"])
+        self.assertIs(caught.exception.result, response["result"])
+
+    def test_transport_preserves_interrupted_turn_encoder_and_stop_proof(self):
+        clock = FakeClock()
+        worker = FakeScanTransport(clock)
+        response = worker._scan_turn(-30_000)
+        outcome = response["result"]["outcome"]
+        terminal = outcome["slices"][0]
+        terminal["status"] = "interrupted"
+        terminal["reason"] = "motor_fault"
+        totals = {
+            motor["side"]: motor["position_delta"]
+            for motor in terminal["motors"]
+        }
+        outcome.update(
+            {
+                "status": "interrupted",
+                "reason": "motor_fault",
+                "completed_monotonic_ms": terminal[
+                    "completed_monotonic_ms"
+                ],
+                "completed_slice_count": 0,
+                "slices": [terminal],
+            }
+        )
+        outcome["encoder_verification"].update(
+            {
+                "passed": False,
+                "verified_slice_count": 1,
+                "left_delta_degrees": totals["left"],
+                "right_delta_degrees": totals["right"],
+                "mean_abs_encoder_degrees": int(
+                    round(
+                        (
+                            abs(totals["left"])
+                            + abs(totals["right"])
+                        )
+                        / 2.0
+                    )
+                ),
+            }
+        )
+        response["result"]["observation"]["last_outcome"] = copy.deepcopy(
+            outcome
+        )
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+
+        with self.assertRaises(EV3NavigationOperationError) as caught:
+            transport._validate_success_result(
+                "scan_turn",
+                {"relative_delta_mdeg": -30_000},
+                response,
+            )
+
+        self.assertEqual(caught.exception.code, "motor_fault")
+        self.assertEqual(
+            caught.exception.result["outcome"]["encoder_verification"][
+                "mean_abs_encoder_degrees"
+            ],
+            outcome["encoder_verification"]["mean_abs_encoder_degrees"],
+        )
+        self.assertTrue(caught.exception.stop["stop_confirmed"])
+
+    def test_transport_preserves_stopped_scan_slice_undertravel(self):
+        clock = FakeClock()
+        worker = FakeScanTransport(clock)
+        response = worker._scan_turn(-30_000)
+        outcome = response["result"]["outcome"]
+        terminal = outcome["slices"][0]
+        terminal["status"] = "verification_failed"
+        terminal["reason"] = "encoder_verification_failed"
+        terminal["encoder_verification"] = {
+            "passed": False,
+            "error": "right motor did not make minimum progress",
+            "checks": [
+                {"passed": True},
+                {"passed": False},
+            ],
+        }
+        totals = {
+            motor["side"]: motor["position_delta"]
+            for motor in terminal["motors"]
+        }
+        outcome.update(
+            {
+                "status": "verification_failed",
+                "reason": "encoder_verification_failed",
+                "started_monotonic_ms": terminal["started_monotonic_ms"],
+                "completed_monotonic_ms": terminal[
+                    "completed_monotonic_ms"
+                ],
+                "completed_slice_count": 0,
+                "slices": [terminal],
+            }
+        )
+        outcome["encoder_verification"].update(
+            {
+                "passed": False,
+                "verified_slice_count": 0,
+                "left_delta_degrees": totals["left"],
+                "right_delta_degrees": totals["right"],
+                "mean_abs_encoder_degrees": int(
+                    round(
+                        (
+                            abs(totals["left"])
+                            + abs(totals["right"])
+                        )
+                        / 2.0
+                    )
+                ),
+            }
+        )
+        response["result"]["observation"]["last_outcome"] = copy.deepcopy(
+            outcome
+        )
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+
+        with self.assertRaises(EV3NavigationOperationError) as caught:
+            transport._validate_success_result(
+                "scan_turn",
+                {"relative_delta_mdeg": -30_000},
+                response,
+            )
+
+        self.assertEqual(
+            caught.exception.code,
+            "encoder_verification_failed",
+        )
+        self.assertTrue(caught.exception.stop["stop_confirmed"])
+        self.assertFalse(caught.exception.fatal)
+
+    def test_remote_worker_stop_and_code_survive_scan_adapter(self):
+        clock = FakeClock()
+        transport = RemoteSampleErrorTransport(clock)
+        request = scan_request(clock)
+
+        result = build_ev3_active_ir_scan_executor(
+            transport,
+            clock_ms=clock,
+        ).execute(request)
+
+        self.assertEqual(result.status, "CANCELLED")
+        self.assertEqual(
+            result.reason,
+            "scan_worker_error:sensor_read_failed",
+        )
+        self.assertTrue(result.stop_confirmed)
+        self.assertTrue(result.restored_start_heading)
+        self.assertFalse(transport.aborted)
+
+    def test_remote_turn_without_delta_keeps_heading_conservative(self):
+        clock = FakeClock()
+        transport = FakeScanTransport(clock)
+        rig = EV3ActiveIrScanRig(
+            transport=transport,
+            clock_ms=clock,
+        )
+        request = scan_request(clock)
+        rig.begin_scan(request)
+
+        def rejected_request(*_args, **_kwargs):
+            raise EV3NavigationRemoteError(
+                "worker_failure",
+                "simulated turn error",
+                False,
+                observation=transport._observation(2),
+                stop=stop_proof(),
+            )
+
+        transport.request = rejected_request
+        with self.assertRaises(EV3ActiveIrScanWorkerError) as caught:
+            rig.turn_relative_mdeg(
+                -30_000,
+                request.calibration,
+                request.deadline_ms,
+            )
+
+        self.assertTrue(caught.exception.stop_confirmed)
+        self.assertIsNone(
+            caught.exception.verified_actual_delta_mdeg
+        )
+        self.assertTrue(caught.exception.restoration_prohibited)
+        self.assertTrue(rig.stop()["stop_confirmed"])
+
+    def test_transport_accepts_encoder_verified_transient_scan_slice(self):
+        clock = FakeClock()
+        worker = FakeScanTransport(clock)
+        response = worker._scan_turn(30_000)
+        receipt = response["result"]["outcome"]["slices"][0]
+        receipt["reason"] = "motor_fault_encoder_verified"
+        response["result"]["observation"]["last_outcome"]["slices"][
+            0
+        ]["reason"] = "motor_fault_encoder_verified"
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+
+        transport._validate_success_result(
+            "scan_turn",
+            {"relative_delta_mdeg": 30_000},
+            response,
+        )
+
+        receipt["encoder_verification"]["passed"] = False
+        with self.assertRaises(EV3NavigationTransportError):
+            transport._validate_success_result(
+                "scan_turn",
+                {"relative_delta_mdeg": 30_000},
+                response,
+            )
+
     def test_partial_turn_touch_never_claims_heading_restoration(self):
         clock = FakeClock()
         transport = FakeScanTransport(clock, touch_after_turn=True)
@@ -435,7 +844,8 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
         budget = worst_case_scan_budget()
         self.assertEqual(budget["turn_duration_ms"], 11_945)
         self.assertEqual(budget["turn_slice_count"], 22)
-        self.assertGreater(budget["minimum_deadline_ms"], 12_000)
+        self.assertEqual(budget["request_round_trip_headroom_ms"], 250)
+        self.assertEqual(budget["minimum_deadline_ms"], 19_145)
         clock = FakeClock()
         transport = FakeScanTransport(clock, use_profile_timing=True)
         executor = build_ev3_active_ir_scan_executor(
@@ -456,6 +866,151 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
         self.assertTrue(result.stop_confirmed)
         self.assertLessEqual(result.completed_at_ms, deadline_ms)
 
+    def test_wifi_ev3_budget_outlives_observed_twenty_second_scan(self):
+        budget = worst_case_scan_budget(
+            request_round_trip_headroom_ms=750,
+        )
+
+        self.assertEqual(budget["worker_request_count"], 20)
+        self.assertEqual(budget["request_round_trip_headroom_ms"], 750)
+        self.assertEqual(budget["minimum_deadline_ms"], 29_145)
+        self.assertGreater(budget["minimum_deadline_ms"], 20_071)
+
+    def test_live_wifi_latency_needs_ev3_profile_scan_deadline(self):
+        def execute_with_deadline(window_ms):
+            clock = FakeClock()
+            transport = FakeScanTransport(
+                clock,
+                use_profile_timing=True,
+                # Keep the 20-second regression meaningful after shortening
+                # the fine-ray route while retaining a bounded 30-second run.
+                late_by_ms=750,
+            )
+            request = scan_request(
+                clock,
+                deadline_ms=clock() + window_ms,
+                estimated_turn_ms_per_degree=30,
+            )
+            result = build_ev3_active_ir_scan_executor(
+                transport,
+                clock_ms=clock,
+            ).execute(request)
+            return request, result
+
+        short_request, short_result = execute_with_deadline(20_000)
+        with self.assertRaises(ActiveIrScanContractError) as caught:
+            validate_scan_result(
+                short_result,
+                short_request,
+                current_frame_id=short_request.frame_id,
+                current_map_generation_id=(
+                    short_request.map_generation_id
+                ),
+                current_map_version=short_request.based_on_map_version,
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "scan_deadline_or_chronology",
+        )
+        self.assertEqual(short_result.reason, "scan_deadline_exceeded")
+        self.assertGreater(
+            short_result.completed_at_ms,
+            short_request.deadline_ms,
+        )
+
+        long_request, long_result = execute_with_deadline(30_000)
+        checked = validate_scan_result(
+            long_result,
+            long_request,
+            current_frame_id=long_request.frame_id,
+            current_map_generation_id=long_request.map_generation_id,
+            current_map_version=long_request.based_on_map_version,
+        )
+        self.assertIs(checked, long_result)
+        self.assertTrue(long_result.bilateral_complete)
+        self.assertLessEqual(
+            long_result.completed_at_ms,
+            long_request.deadline_ms,
+        )
+
+    def test_soft_scan_timeout_restores_inside_hard_cleanup_window(self):
+        clock = FakeClock()
+        transport = FakeScanTransport(
+            clock,
+            use_profile_timing=True,
+            late_by_ms=750,
+        )
+        request = scan_request(
+            clock,
+            deadline_ms=clock() + 30_000,
+            estimated_turn_ms_per_degree=30,
+        )
+
+        result = build_ev3_active_ir_scan_executor(
+            transport,
+            clock_ms=clock,
+            restoration_headroom_ms=15_000,
+        ).execute(request)
+        checked = validate_scan_result(
+            result,
+            request,
+            current_frame_id=request.frame_id,
+            current_map_generation_id=request.map_generation_id,
+            current_map_version=request.based_on_map_version,
+        )
+
+        self.assertIs(checked, result)
+        self.assertEqual(result.status, "CANCELLED")
+        self.assertEqual(result.reason, "scan_deadline_exceeded")
+        self.assertTrue(result.stop_confirmed)
+        self.assertTrue(result.restored_start_heading)
+        self.assertGreater(len(result.rays), 0)
+        self.assertLessEqual(result.completed_at_ms, request.deadline_ms)
+        self.assertLessEqual(
+            abs(transport.relative_heading_mdeg),
+            request.calibration.alignment_tolerance_mdeg,
+        )
+        self.assertFalse(transport.aborted)
+
+    def test_ev3_request_timeout_outlives_long_valid_scan_turn(self):
+        def execute(request_timeout_seconds):
+            clock = FakeClock()
+            transport = LongScanTurnTransport(clock)
+            request = scan_request(
+                clock,
+                deadline_ms=clock() + 50_000,
+                estimated_turn_ms_per_degree=30,
+            )
+            result = build_ev3_active_ir_scan_executor(
+                transport,
+                clock_ms=clock,
+                request_timeout_seconds=request_timeout_seconds,
+                restoration_headroom_ms=10_000,
+            ).execute(request)
+            checked = validate_scan_result(
+                result,
+                request,
+                current_frame_id=request.frame_id,
+                current_map_generation_id=request.map_generation_id,
+                current_map_version=request.based_on_map_version,
+            )
+            return transport, checked
+
+        short_transport, short_result = execute(8.0)
+        self.assertEqual(short_result.status, "CANCELLED")
+        self.assertEqual(short_result.reason, "scan_transport_failed")
+        self.assertFalse(short_result.stop_confirmed)
+        self.assertFalse(short_result.restored_start_heading)
+        self.assertTrue(short_transport.aborted)
+
+        long_transport, long_result = execute(30.0)
+        self.assertTrue(long_result.bilateral_complete)
+        self.assertTrue(long_result.stop_confirmed)
+        self.assertTrue(long_result.restored_start_heading)
+        self.assertTrue(long_transport.long_turn_completed)
+        self.assertGreater(long_transport.long_turn_timeouts[0], 8.0)
+        self.assertFalse(long_transport.aborted)
+
     def test_executor_uses_fixed_lattice_and_restores_encoder_heading(self):
         clock = FakeClock()
         transport = FakeScanTransport(clock)
@@ -463,7 +1018,8 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
             transport,
             clock_ms=clock,
         )
-        result = executor.execute(scan_request(clock))
+        request = scan_request(clock)
+        result = executor.execute(request)
 
         self.assertTrue(result.bilateral_complete)
         self.assertTrue(result.restored_start_heading)
@@ -479,7 +1035,10 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
                 for delta in deltas
             )
         )
-        self.assertEqual(transport.relative_heading_mdeg, 0)
+        self.assertLessEqual(
+            abs(transport.relative_heading_mdeg),
+            request.calibration.alignment_tolerance_mdeg,
+        )
         self.assertTrue(
             all(
                 set(arguments) == {"relative_delta_mdeg"}
@@ -487,6 +1046,24 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
                 if operation == "scan_turn"
             )
         )
+
+    def test_center_ray_jitter_survives_strict_transport_and_full_scan(self):
+        clock = FakeClock()
+        transport = StrictValidatingScanTransport(clock)
+        request = scan_request(clock)
+
+        result = build_ev3_active_ir_scan_executor(
+            transport,
+            clock_ms=clock,
+        ).execute(request)
+
+        self.assertTrue(result.bilateral_complete)
+        self.assertTrue(result.stop_confirmed)
+        self.assertTrue(result.restored_start_heading)
+        self.assertEqual(result.rays[0].requested_relative_bearing_mdeg, 0)
+        self.assertEqual(result.rays[0].raw, 33)
+        self.assertEqual(result.rays[0].filtered, 34)
+        self.assertFalse(transport.aborted)
 
     def test_required_individual_turns_are_encoder_derived(self):
         for delta in (-60_000, -30_000, -15_000, 15_000, 30_000, 60_000):
@@ -651,7 +1228,7 @@ class EV3NavigationCancellationTests(unittest.TestCase):
 
     def test_invalid_worker_output_aborts_channel_and_prohibits_reuse(self):
         invalid_success = {
-            "schema": "ev3-agent-worker-response/v1",
+            "schema": "ev3-agent-worker-response/v2",
             "controller_id": "ev3-main",
             "request_id": "host-0001",
             "ok": True,
@@ -675,7 +1252,7 @@ class EV3NavigationCancellationTests(unittest.TestCase):
         clock = FakeClock()
         worker = FakeScanTransport(clock)
         wrong = {
-            "schema": "ev3-agent-worker-response/v1",
+            "schema": "ev3-agent-worker-response/v2",
             "controller_id": "ev3-main",
             "request_id": "host-wrong",
             "ok": True,

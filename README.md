@@ -145,15 +145,16 @@ but the complete path has not yet run as one physical autonomous episode.
 |---|---|---|
 | Simulator agent | Fully exercised closed loops for waypoint navigation, idle exploration, obstacle avoidance, concurrent expression, and mapping | Simulator measurements are not physical calibration evidence |
 | Physical EV3 baseline | Live-verified ev3dev boot, USB and Wi-Fi SSH, motors A/B/C, encoders, touch, relative IR, reflected light, manual bounded movement, and Swedish TTS | Historical measurements are listed below; they do not validate the new complete autonomous runtime |
-| EV3 navigation worker | Production bounded JSONL worker and persistent Wi-Fi SSH transport are implemented and hardware-free tested, including exclusive motor ownership, strict identity/sequencing, interruptible slices, verified stop, EOF/signal handling, and bounded session renewal | The worker has not yet completed a live autonomous episode on the EV3 |
-| Physical closed loop | Goal → structured model plan → short semantic action → observe/verify → replan is implemented on the host with fixed action profiles and cumulative budgets | End-to-end model + Wi-Fi + worker + moving EV3 validation is still pending |
+| EV3 navigation worker | The production JSONL worker now runs on the assembled EV3 over persistent Wi-Fi SSH; live sessions have exercised observations, bounded pulses, turns, stop proofs, and active-scan slices | A complete autonomous obstacle-navigation episode still needs a clean acceptance run |
+| Physical closed loop | Goal → structured model plan → short semantic action → observe/verify → replan has begun live validation on the moving EV3, including obstacle approach and reaction | Reliable obstacle analysis and a complete route around or away from the obstacle remain the current acceptance target |
+| Encoder-aware degraded motion | Failed or asymmetric drive attempts retain their actual left/right encoder movement; temporal differential-drive odometry updates the estimated pose, cancels stale plan tails, and can apply a bounded EV3-specific catch-up or retry | Live recovery sequences have looked correct, but repeatability still needs measurement; encoders cannot see wheel slip or revive broken hardware |
 | Gemma 4 planner comparison | In one matched-load run, QAT Q4_0 produced `106.633 tok/s` single-flight median server decode versus Q8_0's `91.112 tok/s` (`+17.0%`), with `3.017` versus `3.312 s` median latency; both produced 45/45 schema-valid expected actions | This is one hardware-free planner run, not a moving-robot run or a general model-quality claim; four-way aggregate throughput was effectively tied |
-| Active IR investigation | Bilateral coarse-to-fine front-arc scanning, encoder-derived headings, boundary observations, and restoration to the starting heading are implemented | The current `682°` mean wheel-encoder estimate for an approximately `90°` body turn is provisional and must be live-calibrated |
+| Active IR investigation | Bilateral coarse-to-fine front-arc scanning, encoder-derived headings, boundary observations, and restoration to the starting heading are implemented and the first physical scan/restoration has run | The current `682°` mean wheel-encoder estimate for an approximately `90°` body turn is provisional and needs repeated calibration |
 | Obstacle memory | Physical navigation retains qualitative IR hazard hypotheses after turning and applies swept-path vetoes instead of assuming “not in front” means “gone” | IR-PROX is not metric distance or object identity; the physical map is deliberately qualitative |
-| Robot speech | A bounded asynchronous speech runtime and fixed EV3 `speak-stdin --voice sv|en` path are implemented; speech failures are isolated from navigation | Runtime integration is in progress and English physical TTS has not had a live acceptance run |
+| Robot speech | The host asynchronously asks loopback Piper for bounded Swedish `nst-deep` WAV audio, validates it, and streams it through one persistent audio-only SSH worker per episode; speech failures and cancellation remain isolated from navigation | Swedish host TTS awaits a physical acceptance run; English needs its own configured voice/model and is deliberately not sent through the Swedish NST voice |
 | Robot control GUI | A distinct Robot view and Workbench view, opt-in runtime adapter, episode start, settings, normal stop, emergency stop, snapshots, and technical event streams are implemented and hardware-free tested | Ordinary console startup injects no physical adapter and therefore reports `DISABLED`; the complete production path has not yet been live-validated |
 | Lab Console dialogue and STT | Local Gemma chat, local whisper.cpp STT, microphone selection and sensitivity controls, context, read-only weather, evidence, and English/Swedish UI and text responses | STT text reaches the agent; always-listening robot conversation remains future work |
-| Spatial UI map | The simulator occupancy map and opaque object hypotheses are available in the read-only Map view | Physical qualitative hazard memory is implemented in the runtime but is not yet rendered as the metric simulator map |
+| Spatial UI map | The read-only Map view supports both the simulator occupancy map and a live physical LOCAL_ODOMETRY layer fed by the same EV3 pose and hazard hypotheses used for navigation | The EV3 layer is deliberately qualitative: it draws provisional screen-space IR sectors, never invented centimetres, free cells, or object surfaces; its first live acceptance run is pending |
 | Multi-controller architecture | Identity, proposal, and authority contracts are designed to grow to EV3, Robot Inventor 51515, BOOST, cameras, and microphones | Only the EV3 path has a production physical worker today |
 
 On the operator-confirmed `lmlink` path to the gaming computer, matched-load
@@ -306,9 +307,12 @@ implementation and failure paths are tested, but the conversion, alignment
 tolerance, and scan timing must be measured on the physical build before the
 result is treated as calibrated.
 
-The existing dashboard occupancy map remains a simulator metric map. A future
-adapter may visualize the physical qualitative hypotheses, confidence, and
-evidence age without pretending they are SLAM coordinates.
+The dashboard now keeps those two trust levels visibly separate. Simulator
+ranges can populate the metric occupancy layer. Physical EV3 observations feed
+a dedicated `LOCAL_ODOMETRY` layer with the encoder-derived robot pose and the
+same opaque hazard IDs used by navigation. IR reflections appear as fixed
+screen-space qualitative sectors anchored at the observing pose, never as
+invented centimetre ranges, cleared cells, or object surfaces.
 
 ## Safety and authority boundaries
 
@@ -323,6 +327,9 @@ Enforced in code today:
   at a time;
 - every action is bounded, sliced, observable, and followed by verified stop
   and encoder/sensor evidence;
+- direction-consistent EV3 undertravel may trigger only a fixed, bounded
+  single-wheel catch-up or paired retry budget; wrong-direction movement still
+  latches a motion fault;
 - touch, worker cancellation, signal, SSH EOF, request/session budgets, and
   emergency stop do not wait for an LLM response;
 - strict schemas bind controller, request, state version, sequence, and result;
@@ -331,6 +338,9 @@ Enforced in code today:
 - session renewal occurs only through bounded cleanup and re-observation;
 - speech text is length-bounded and passed through stdin, never interpolated
   into a remote shell command;
+- Swedish physical speech uses the explicit loopback Piper profile
+  `piper-sv` / `nst-deep`, then streams bounded mono PCM16 WAV to the EV3
+  without creating a remote temporary file;
 - the local GUI has bounded request sizes, a unique loopback session URL,
   Host/Origin checks, strict route and asset allowlists, and no physical
   runtime unless one is explicitly injected; and
@@ -365,6 +375,16 @@ loaded, run:
 
 ```sh
 scripts/start_lab_console.sh
+```
+
+The canonical runtime default is the exact LM Studio model ID
+`google/gemma-4-26b-a4b-qat`. The start command does not load or switch a
+model; that exact ID must already be exposed by the intended LM Studio server.
+An explicit alternative applies consistently to both Workbench and Robot
+settings for that process:
+
+```sh
+scripts/start_lab_console.sh --model 'EXACT-MODEL-ID-FROM-LM-STUDIO'
 ```
 
 Open the unique loopback session URL printed by the server:
@@ -496,6 +516,22 @@ The preflight checks exact files, SHA-256 hashes, Python 3.5 grammar, fixed
 remote paths, and remote compilation. It does not import the worker, generate
 speech, or enable motion.
 
+Then validate the live foreground worker protocol without requesting
+movement:
+
+```sh
+PYTHONPATH=src python3 -m robot_agent.ev3_navigation_preflight_cli \
+  --ssh-target 'robot@<EV3-host>' \
+  --pretty
+```
+
+This runs only `start → describe → observe → stop → shutdown → close`, checks
+that no movement budget was consumed, and emits sanitized JSON without the SSH
+target, remote path, or raw transport errors. A failure aborts the channel and
+attempts final cleanup before exiting non-zero. Cold worker startup gets a
+separate 30-second `describe` deadline; later requests retain an 8-second
+deadline.
+
 Motion-free checks remain available on the EV3:
 
 ```sh
@@ -602,11 +638,16 @@ matched-load records in
   reactions, and serialized wheel ownership
 - [x] Simulator occupancy map and persistent opaque object hypotheses in the
   read-only GUI map
+- [x] Live physical-map pipeline with local odometry and non-metric,
+  provisional EV3 IR hypotheses in a separate read-only GUI layer
 - [x] Bounded EV3 navigation worker with persistent SSH transport, exclusive
   motor ownership, verified stop, interruption, and safe session renewal
 - [x] Host physical goal → structured plan → semantic action → observe →
   verify → replan runtime with qualitative obstacle memory and swept-path
   checks
+- [x] Preserve degraded encoder evidence, integrate temporal differential
+  odometry, cancel stale plan tails, and apply bounded EV3 undertravel recovery
+  in hardware-free tests
 - [x] Deterministic bilateral IR scan implementation with encoder-derived
   headings and start-heading restoration
 - [x] Robot/Workbench GUI split with opt-in runtime, episode controls,
@@ -617,11 +658,11 @@ matched-load records in
   TTS acceptance
 - [ ] Calibrate advance, reverse, 90-degree turn, and active IR scan on the
   assembled EV3RSTORM
+- [ ] Live-validate intermittent motor catch-up and record how often each EV3
+  drive side misses or under-runs a command
 - [ ] Run and publish the first complete autonomous physical obstacle episode
-- [ ] Expose the validated physical composition as an explicit opt-in launch
-  profile
-- [ ] Render qualitative physical obstacle hypotheses in the GUI without
-  inventing metric certainty
+- [ ] Complete live acceptance of the explicit opt-in physical launch profile,
+  including simultaneous motion and speech
 - [ ] Add continuous hands-free STT with turn-taking and echo handling
 - [ ] Add robot-mounted camera and microphone transport
 - [ ] Add vision, object research, and sound-source localization

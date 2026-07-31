@@ -43,7 +43,30 @@ UTTERANCE_LANGUAGE_BY_LOCALE = {
 
 
 class LMStudioNavigationError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "lm_studio_navigation_failed",
+        latency_ms: int = 0,
+    ):
+        self.code = code
+        self.latency_ms = latency_ms
+        super().__init__(message)
+
+
+class LMStudioNavigationDecisionError(LMStudioNavigationError):
+    """A completed model call whose proposed decision violated the contract."""
+
+    def __init__(self, code: str, message: str, *, latency_ms: int):
+        self.feedback_message = message
+        super().__init__(
+            "LM Studio returned an invalid navigation decision: {}".format(
+                message
+            ),
+            code=code,
+            latency_ms=latency_ms,
+        )
 
 
 _RFC1918_NETWORKS = tuple(
@@ -118,26 +141,57 @@ class NavigationPlannerResult:
     stats: Optional[Mapping[str, object]] = None
 
 
-def _maneuver_schema() -> Mapping[str, object]:
-    properties = {
-        "id": {"type": ["string", "null"], "maxLength": 64},
-        "revision": {"type": "integer", "minimum": 0},
+def _empty_maneuver_schema() -> Mapping[str, object]:
+    none_properties = {
+        "id": {"type": "null"},
+        "revision": {"type": "integer", "const": 0},
+        "transition": {"type": "string", "const": "NONE"},
+        "objective": {"type": "null"},
+        "target_hypothesis_id": {"type": "null"},
+        "detour_side": {"type": "null"},
+        "success_fact_keys": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 0,
+            "maxItems": 0,
+        },
+        "current_focus_fact_key": {"type": "null"},
+        "revision_reason": {"type": "null"},
+    }
+    return {
+        "type": "object",
+        "properties": none_properties,
+        "required": sorted(MANEUVER_FIELDS),
+        "additionalProperties": False,
+    }
+
+
+def _active_maneuver_schema() -> Mapping[str, object]:
+    active_properties = {
+        "id": {"type": "string", "minLength": 1, "maxLength": 64},
+        "revision": {"type": "integer", "minimum": 1},
         "transition": {
             "type": "string",
-            "enum": sorted(TRANSITIONS),
+            "enum": sorted(TRANSITIONS - {"NONE"}),
         },
-        "objective": {"type": ["string", "null"], "maxLength": 160},
+        "objective": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+        },
         "target_hypothesis_id": {
-            "type": ["string", "null"],
+            "type": "string",
+            "minLength": 1,
             "maxLength": 128,
         },
         "detour_side": {
-            "type": ["string", "null"],
-            "enum": [None] + sorted(DETOUR_SIDES),
+            "type": "string",
+            "enum": sorted(DETOUR_SIDES),
         },
         "success_fact_keys": {
             "type": "array",
             "items": {"type": "string", "enum": sorted(FACT_KEYS)},
+            "minItems": 1,
             "maxItems": len(FACT_KEYS),
             "uniqueItems": True,
         },
@@ -152,9 +206,18 @@ def _maneuver_schema() -> Mapping[str, object]:
     }
     return {
         "type": "object",
-        "properties": properties,
+        "properties": active_properties,
         "required": sorted(MANEUVER_FIELDS),
         "additionalProperties": False,
+    }
+
+
+def _maneuver_schema() -> Mapping[str, object]:
+    return {
+        "anyOf": [
+            _empty_maneuver_schema(),
+            _active_maneuver_schema(),
+        ]
     }
 
 
@@ -165,6 +228,7 @@ def _response_schema(
     state_version: int,
     available_actions: Sequence[str],
     target_ids: Sequence[str],
+    empty_maneuver_required: bool,
 ) -> Mapping[str, object]:
     actions = tuple(dict.fromkeys(available_actions))
     motion = [item for item in actions if item in MOTION_ACTIONS]
@@ -189,16 +253,6 @@ def _response_schema(
             }
         )
     target_values = sorted(set(target_ids))
-    target_schema = (
-        {
-            "anyOf": [
-                {"type": "null"},
-                {"type": "string", "enum": target_values},
-            ]
-        }
-        if target_values
-        else {"type": "null"}
-    )
     properties = {
         "schema": {"type": "string", "const": DECISION_SCHEMA},
         "episode_id": {"type": "string", "const": episode_id},
@@ -228,15 +282,50 @@ def _response_schema(
                 },
             ]
         },
-        "perception_target_hypothesis_id": target_schema,
-        "maneuver_commitment": _maneuver_schema(),
+        "perception_target_hypothesis_id": {"type": "null"},
+        "maneuver_commitment": (
+            _empty_maneuver_schema()
+            if empty_maneuver_required
+            else _maneuver_schema()
+        ),
     }
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": sorted(properties),
-        "additionalProperties": False,
-    }
+    variants = []
+    if SCAN_FRONT_ARC in actions:
+        scan_properties = dict(properties)
+        scan_properties["action"] = {
+            "type": "string",
+            "const": SCAN_FRONT_ARC,
+        }
+        scan_properties["perception_target_hypothesis_id"] = {
+            "type": "string",
+            "enum": target_values,
+        }
+        variants.append(
+            {
+                "type": "object",
+                "properties": scan_properties,
+                "required": sorted(scan_properties),
+                "additionalProperties": False,
+            }
+        )
+    non_scan_actions = [
+        action for action in actions if action != SCAN_FRONT_ARC
+    ]
+    if non_scan_actions:
+        non_scan_properties = dict(properties)
+        non_scan_properties["action"] = {
+            "type": "string",
+            "enum": non_scan_actions,
+        }
+        variants.append(
+            {
+                "type": "object",
+                "properties": non_scan_properties,
+                "required": sorted(non_scan_properties),
+                "additionalProperties": False,
+            }
+        )
+    return {"oneOf": variants}
 
 
 SYSTEM_PROMPT = """You choose goal-directed semantic actions for a harmless LEGO robot.
@@ -246,6 +335,10 @@ author an exact two- or three-motion plan whose first entry equals action.
 After every step the host takes a fresh observation and cancels the remaining
 tail if safety, map generation, hazard identities, commitment, focus truth, or
 localization changed. OBSERVE, SCAN_FRONT_ARC, and FINISH are singleton plans.
+The host classifies whether a fresh OBSERVE changed any decision-relevant
+physical fact. If latest_tool_result reports information_gain NONE, OBSERVE is
+temporarily removed from available_actions; choose another listed action or
+finish only when the mission facts permit it.
 
 Infrared is qualitative reflection evidence: do not invent distance, object
 identity, or a measured surface. A remembered provisional hazard remains after
@@ -254,6 +347,10 @@ side around a target, request SCAN_FRONT_ARC for that published target while
 keeping maneuver_commitment at the exact NONE sentinel. The deterministic scan
 samples both sides but does not choose a route. START a route only after the
 context reports completed bilateral evidence for that same target.
+
+perception_target_hypothesis_id names what SCAN_FRONT_ARC will scan. It must
+name one published target for SCAN_FRONT_ARC and must be null for every other
+action.
 
 Treat the frozen directional mission and signed progress arithmetic as facts.
 Temporary regression is justified only by concrete obstacle clearance. FINISH
@@ -328,6 +425,19 @@ class LMStudioNavigationPlanner:
             item["hypothesis_id"]
             for item in navigation["navigation_hazard_hypotheses"]
         )
+        bilateral_target_ids = {
+            item["hypothesis_id"]
+            for item in navigation["navigation_hazard_hypotheses"]
+            if item.get("scan_completed_at_ms") is not None
+            and item.get("scan_left_boundary_mdeg") is not None
+            and item.get("scan_right_boundary_mdeg") is not None
+            and item["scan_left_boundary_mdeg"] > 0
+            and item["scan_right_boundary_mdeg"] < 0
+        }
+        empty_maneuver_required = (
+            maneuver_state.get("active") is None
+            and not bilateral_target_ids
+        )
         actions = [
             item
             for item in available_actions
@@ -343,6 +453,7 @@ class LMStudioNavigationPlanner:
             state_version=observation["state_version"],
             available_actions=actions,
             target_ids=target_ids,
+            empty_maneuver_required=empty_maneuver_required,
         )
         context = {
             "episode_id": episode_id,
@@ -402,8 +513,11 @@ class LMStudioNavigationPlanner:
                 MAX_MODEL_RESPONSE_BYTES,
             )
         except Exception as error:
+            elapsed_ms = int(round((self.clock() - started) * 1000))
             raise LMStudioNavigationError(
-                "LM Studio navigation request failed: {}".format(error)
+                "LM Studio navigation request failed: {}".format(error),
+                code="planner_transport_failed",
+                latency_ms=max(0, elapsed_ms),
             ) from error
         elapsed_ms = int(round((self.clock() - started) * 1000))
         try:
@@ -416,6 +530,17 @@ class LMStudioNavigationPlanner:
             content = choices[0]["message"]["content"]
             if not isinstance(content, str):
                 raise KeyError
+        except (
+            KeyError,
+            TypeError,
+            PhysicalNavigationContractError,
+        ) as error:
+            raise LMStudioNavigationError(
+                "LM Studio returned an invalid navigation response",
+                code="planner_response_invalid",
+                latency_ms=max(0, elapsed_ms),
+            ) from error
+        try:
             decoded = strict_json_loads(
                 content.encode("utf-8"),
                 MAX_MODEL_RESPONSE_BYTES,
@@ -428,15 +553,11 @@ class LMStudioNavigationPlanner:
                 available_actions=actions,
                 published_target_ids=target_ids,
             )
-        except (
-            KeyError,
-            TypeError,
-            PhysicalNavigationContractError,
-        ) as error:
-            raise LMStudioNavigationError(
-                "LM Studio returned an invalid navigation decision: {}".format(
-                    error
-                )
+        except PhysicalNavigationContractError as error:
+            raise LMStudioNavigationDecisionError(
+                error.code,
+                str(error),
+                latency_ms=elapsed_ms,
             ) from error
         served_model = wire.get("model")
         if served_model is not None and not isinstance(served_model, str):

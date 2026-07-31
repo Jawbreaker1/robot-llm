@@ -8,12 +8,14 @@ from ev3.infrared_safety import (
     InfraredGatePolicy,
     InfraredObstacleGate,
 )
+from ev3.encoder_recovery import EncoderRecoveryPolicy
 from ev3.navigation_profile import (
     ACTION_SPECS,
     MAX_PULSES,
     REQUEST_SCHEMA,
     RESPONSE_SCHEMA,
     SCAN_SAMPLE_COUNT,
+    SCAN_SAMPLE_FILTER_WINDOW,
     SCAN_SAMPLE_SETTLED_DURATION_MS,
     SCAN_TURN_ALLOWED_DELTAS_MDEG,
     WORKER_ID,
@@ -75,12 +77,70 @@ class FakeOwner(object):
         self.finish_count = 0
         self.close_count = 0
         self.force_verification_error = False
+        self.blocked_roles = set()
+        self.wrong_direction_roles = set()
+        self.transient_fault_roles = set()
+        self.transient_fault_token = "stalled"
+        self.transient_fault_after_leader_degrees = None
         self.fail_reads = False
         self.closed = False
         self.validated = []
         self.position_before = {
             "drive_b": 0,
             "drive_c": 0,
+        }
+        self.active_sides = ("left", "right")
+        self.after_first_start = None
+        self.after_single_start = None
+
+    def _attach_start_evidence(
+        self,
+        error,
+        duration_ms,
+        target_sides,
+        started_sides,
+        started_ms,
+    ):
+        roles = {"left": "drive_b", "right": "drive_c"}
+        stop = {
+            "stop_confirmed": True,
+            "errors": [],
+            "fault_tokens": {},
+        }
+        error.supervisor_start_cleanup = stop
+        error.supervisor_start_evidence = {
+            "complete": True,
+            "duration_ms": duration_ms,
+            "started_at_ms": started_ms if started_sides else None,
+            "completed_at_ms": int(self.clock.value * 1000),
+            "started_sides": list(started_sides),
+            "start_write_windows": [
+                {
+                    "side": side,
+                    "role": roles[side],
+                    "begin_ms": started_ms,
+                    "end_ms": started_ms,
+                }
+                for side in started_sides
+            ],
+            "motors": [
+                {
+                    "side": side,
+                    "role": roles[side],
+                    "physical_speed_dps": (
+                        self.speeds[0] if side == "left" else self.speeds[1]
+                    ),
+                    "position_before": self.position_before[roles[side]],
+                    "position_after": self.positions[roles[side]],
+                    "position_delta": (
+                        self.positions[roles[side]]
+                        - self.position_before[roles[side]]
+                    ),
+                    "state": "",
+                }
+                for side in target_sides
+            ],
+            "stop": stop,
         }
 
     def read_touch_value(self):
@@ -96,11 +156,32 @@ class FakeOwner(object):
     def snapshot_all(self):
         if self.fail_reads:
             raise IOError("reads disabled")
+        leader_progress = max(
+            abs(
+                self.positions[role]
+                - self.position_before.get(role, self.positions[role])
+            )
+            for role in ("drive_b", "drive_c")
+        )
+        transient_fault_active = (
+            self.state
+            and self.transient_fault_after_leader_degrees is not None
+            and leader_progress
+            >= self.transient_fault_after_leader_degrees
+        )
         return [
             {
                 "role": role,
                 "position": position,
-                "state": self.state if role != "arm" else "",
+                "state": (
+                    "{} {}".format(
+                        self.state,
+                        self.transient_fault_token,
+                    ).strip()
+                    if role in self.transient_fault_roles
+                    and transient_fault_active
+                    else self.state if role != "arm" else ""
+                ),
             }
             for role, position in sorted(self.positions.items())
         ]
@@ -117,78 +198,179 @@ class FakeOwner(object):
         duration_ms,
         pre_each_start=None,
     ):
-        if pre_each_start is not None:
-            pre_each_start({}, ())
-            pre_each_start(
-                {},
-                ({"begin_ms": int(self.clock.value * 1000)},),
-            )
-        self.speeds = (left_speed, right_speed)
         self.position_before = {
             "drive_b": self.positions["drive_b"],
             "drive_c": self.positions["drive_c"],
         }
-        self.state = "running"
+        self.speeds = (left_speed, right_speed)
         started = int(self.clock.value * 1000)
+        if pre_each_start is not None:
+            try:
+                pre_each_start({}, ())
+            except Exception as error:
+                self._attach_start_evidence(
+                    error, duration_ms, ("left", "right"), (), started
+                )
+                raise
+            try:
+                if self.after_first_start is not None:
+                    self.after_first_start()
+                pre_each_start(
+                    {},
+                    ({"begin_ms": started},),
+                )
+            except Exception as error:
+                self._attach_start_evidence(
+                    error,
+                    duration_ms,
+                    ("left", "right"),
+                    ("left",),
+                    started,
+                )
+                raise
+        self.active_sides = ("left", "right")
+        self.state = "running"
         return {
             "started_at_ms": started,
             "deadline_ms": started + duration_ms,
             "duration_ms": duration_ms,
             "motors": [
-                {"role": "drive_b"},
-                {"role": "drive_c"},
+                {
+                    "side": "left",
+                    "role": "drive_b",
+                    "physical_speed_dps": left_speed,
+                    "position_before": self.position_before["drive_b"],
+                },
+                {
+                    "side": "right",
+                    "role": "drive_c",
+                    "physical_speed_dps": right_speed,
+                    "position_before": self.position_before["drive_c"],
+                },
+            ],
+        }
+
+    def start_drive_side(
+        self,
+        side,
+        speed,
+        duration_ms,
+        pre_each_start=None,
+    ):
+        self.position_before = {
+            "drive_b": self.positions["drive_b"],
+            "drive_c": self.positions["drive_c"],
+        }
+        if side == "left":
+            self.speeds = (speed, 0)
+            role = "drive_b"
+        else:
+            self.speeds = (0, speed)
+            role = "drive_c"
+        started = int(self.clock.value * 1000)
+        if pre_each_start is not None:
+            try:
+                pre_each_start({}, ())
+            except Exception as error:
+                self._attach_start_evidence(
+                    error, duration_ms, (side,), (), started
+                )
+                raise
+        if self.after_single_start is not None:
+            try:
+                self.after_single_start()
+            except Exception as error:
+                self._attach_start_evidence(
+                    error, duration_ms, (side,), (side,), started
+                )
+                raise
+        self.active_sides = (side,)
+        self.state = "running"
+        return {
+            "started_at_ms": started,
+            "deadline_ms": started + duration_ms,
+            "duration_ms": duration_ms,
+            "motors": [
+                {
+                    "side": side,
+                    "role": role,
+                    "physical_speed_dps": speed,
+                    "position_before": self.position_before[role],
+                }
             ],
         }
 
     def advance(self, seconds):
-        self.positions["drive_b"] += int(
-            round(self.speeds[0] * seconds)
-        )
-        self.positions["drive_c"] += int(
-            round(self.speeds[1] * seconds)
-        )
+        for role, speed in zip(
+            ("drive_b", "drive_c"),
+            self.speeds,
+        ):
+            if role in self.blocked_roles:
+                continue
+            direction = -1 if role in self.wrong_direction_roles else 1
+            self.positions[role] += direction * int(
+                round(speed * seconds)
+            )
 
     def finish_active(self, verify_motion):
         self.finish_count += 1
         self.state = ""
+        all_motors = [
+            {
+                "side": "left",
+                "role": "drive_b",
+                "position_before": self.position_before["drive_b"],
+                "position_after": self.positions["drive_b"],
+                "position_delta": (
+                    self.positions["drive_b"]
+                    - self.position_before["drive_b"]
+                ),
+                "state": "",
+            },
+            {
+                "side": "right",
+                "role": "drive_c",
+                "position_before": self.position_before["drive_c"],
+                "position_after": self.positions["drive_c"],
+                "position_delta": (
+                    self.positions["drive_c"]
+                    - self.position_before["drive_c"]
+                ),
+                "state": "",
+            },
+        ]
+        side_speeds = {
+            "left": self.speeds[0],
+            "right": self.speeds[1],
+        }
+        motors = [
+            motor
+            for motor in all_motors
+            if motor["side"] in self.active_sides
+        ]
+        checks = []
+        for motor in motors:
+            speed = side_speeds[motor["side"]]
+            passed = (
+                motor["position_delta"] * speed > 0
+                and abs(motor["position_delta"]) >= 3
+                and not self.force_verification_error
+            )
+            checks.append({"passed": passed})
         result = {
             "stop": {
                 "stop_confirmed": True,
                 "errors": [],
                 "fault_tokens": {},
             },
-            "motors": [
-                {
-                    "side": "left",
-                    "role": "drive_b",
-                    "position_before": self.position_before["drive_b"],
-                    "position_after": self.positions["drive_b"],
-                    "position_delta": (
-                        self.positions["drive_b"]
-                        - self.position_before["drive_b"]
-                    ),
-                    "state": "",
-                },
-                {
-                    "side": "right",
-                    "role": "drive_c",
-                    "position_before": self.position_before["drive_c"],
-                    "position_after": self.positions["drive_c"],
-                    "position_delta": (
-                        self.positions["drive_c"]
-                        - self.position_before["drive_c"]
-                    ),
-                    "state": "",
-                },
-            ],
-            "checks": [
-                {"passed": not self.force_verification_error}
-            ],
+            "motors": motors,
+            "checks": checks,
         }
-        if verify_motion and self.force_verification_error:
+        if verify_motion and any(not check["passed"] for check in checks):
             result["verification_error"] = (
                 "simulated encoder mismatch"
             )
+        self.speeds = (0, 0)
         return result
 
     def close(self):
@@ -381,8 +563,10 @@ class EV3NavigationProfileTests(unittest.TestCase):
         )
         self.assertEqual(
             ACTION_SPECS["ADVANCE"]["slice_durations_ms"],
-            [800],
+            [250],
         )
+        self.assertEqual(ACTION_SPECS["ADVANCE"]["left_speed_dps"], 800)
+        self.assertEqual(ACTION_SPECS["ADVANCE"]["right_speed_dps"], 800)
         self.assertEqual(
             ACTION_SPECS["TURN_LEFT_90"]["slice_durations_ms"],
             [800, 800, 800, 160],
@@ -416,6 +600,10 @@ class EV3NavigationProfileTests(unittest.TestCase):
         self.assertEqual(
             profile["allowed_relative_deltas_mdeg"],
             list(SCAN_TURN_ALLOWED_DELTAS_MDEG),
+        )
+        self.assertEqual(
+            scan_turn_spec(30_000)["slice_durations_ms"],
+            [427, 426],
         )
         for delta in SCAN_TURN_ALLOWED_DELTAS_MDEG:
             spec = scan_turn_spec(delta)
@@ -474,6 +662,18 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         worker.request_count = 0
         worker.pulse_count = 0
         worker.pulse_duration_ms = 0
+        worker.encoder_recovery_policy = EncoderRecoveryPolicy(
+            minimum_progress_degrees=3,
+            catch_up_leader_minimum_degrees=12,
+            acceptable_completion_percent=75,
+            maximum_progress_skew_percent=15,
+            maximum_catch_up_attempts=2,
+            maximum_pair_retry_attempts=1,
+            maximum_total_attempts=3,
+            maximum_step_duration_ms=800,
+            maximum_total_recovery_duration_ms=1600,
+            maximum_total_recovery_encoder_degrees=400,
+        )
         worker.motion_fault_latched = False
         worker.last_outcome = {
             "kind": "startup",
@@ -547,6 +747,21 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         )
         self.assertTrue(result["stop"]["stop_confirmed"])
 
+    def test_scan_sample_filtered_value_uses_published_tail_window(self):
+        raw_samples = [33, 33, 34, 34, 33]
+        remaining = iter(raw_samples)
+        self.owner.read_infrared_value = lambda: next(remaining)
+
+        result = self.worker._scan_sample()
+
+        self.assertEqual(result["raw_samples"], raw_samples)
+        self.assertEqual(SCAN_SAMPLE_FILTER_WINDOW, 3)
+        self.assertEqual(
+            scan_sample_profile()["filter_window_samples"],
+            SCAN_SAMPLE_FILTER_WINDOW,
+        )
+        self.assertEqual(result["observation"]["infrared"]["filtered"], 34)
+
     def test_scan_turn_uses_fixed_slices_for_required_angles(self):
         for delta in (-60_000, -30_000, -15_000, 15_000, 30_000, 60_000):
             with self.subTest(delta=delta):
@@ -565,6 +780,27 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
                     spec["slice_count"],
                 )
                 self.assertEqual(owner.state, "")
+
+    def test_scan_turn_undertravel_is_a_canonical_stopped_failure(self):
+        self.owner.blocked_roles.add("drive_c")
+
+        result = self.worker._scan_turn(-30_000)
+
+        self.assertEqual(result["outcome"]["status"], "verification_failed")
+        self.assertEqual(
+            result["outcome"]["reason"],
+            "encoder_verification_failed",
+        )
+        self.assertEqual(result["outcome"]["completed_slice_count"], 0)
+        self.assertEqual(len(result["outcome"]["slices"]), 1)
+        self.assertFalse(
+            result["outcome"]["slices"][0]["encoder_verification"][
+                "passed"
+            ]
+        )
+        self.assertTrue(result["stop"]["stop_confirmed"])
+        self.assertTrue(self.worker.motion_fault_latched)
+        self.assertEqual(self.owner.state, "")
 
     def test_touch_and_cancellation_interrupt_scan_turn(self):
         self.owner.touch = 1
@@ -606,7 +842,7 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         )
         self.assertTrue(completed["stop"]["stop_confirmed"])
         self.assertEqual(self.worker.pulse_count, 1)
-        self.assertEqual(self.worker.pulse_duration_ms, 800)
+        self.assertEqual(self.worker.pulse_duration_ms, 250)
 
     def test_turn_runs_exact_slices_and_counts_each_slice(self):
         result = self.worker._pulse("TURN_RIGHT_90")
@@ -643,6 +879,55 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         self.assertEqual(self.worker.pulse_count, 1)
         self.assertEqual(self.owner.state, "")
 
+    def test_partial_primary_start_preserves_encoder_motion(self):
+        cancelled = [False]
+        self.worker._cancel_requested = lambda: cancelled[0]
+
+        def move_left_then_cancel():
+            self.owner.positions["drive_b"] += 24
+            cancelled[0] = True
+
+        self.owner.after_first_start = move_left_then_cancel
+        result = self.worker._pulse("ADVANCE")
+
+        receipt = result["outcome"]["slices"][0]
+        self.assertEqual(result["outcome"]["status"], "interrupted")
+        self.assertEqual(receipt["status"], "interrupted")
+        self.assertEqual(
+            [motor["position_delta"] for motor in receipt["motors"]],
+            [24, 0],
+        )
+        self.assertEqual(len(receipt["segments"]), 1)
+        self.assertEqual(receipt["segments"][0]["kind"], "partial_start")
+        self.assertEqual(
+            receipt["segments"][0]["commanded_sides"], ["left"]
+        )
+        self.assertTrue(receipt["stop"]["stop_confirmed"])
+        self.assertEqual(self.worker.pulse_count, 1)
+
+    def test_partial_start_wrong_direction_latches_motion(self):
+        cancelled = [False]
+        self.worker._cancel_requested = lambda: cancelled[0]
+
+        def move_left_backwards_then_cancel():
+            self.owner.positions["drive_b"] -= 7
+            cancelled[0] = True
+
+        self.owner.after_first_start = move_left_backwards_then_cancel
+        result = self.worker._pulse("ADVANCE")
+
+        self.assertEqual(
+            result["outcome"]["reason"],
+            "encoder_direction_mismatch",
+        )
+        self.assertTrue(self.worker.motion_fault_latched)
+        self.assertEqual(
+            result["outcome"]["slices"][0]["motors"][0][
+                "position_delta"
+            ],
+            -7,
+        )
+
     def test_cancellation_between_turn_slices_starts_no_later_slice(self):
         cancelled = [False]
         self.worker._cancel_requested = lambda: cancelled[0]
@@ -672,8 +957,269 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         self.assertTrue(self.worker.shutdown_requested)
         self.assertEqual(self.owner.state, "")
 
-    def test_encoder_failure_latches_motion(self):
-        self.owner.force_verification_error = True
+    def test_clean_encoder_undertravel_is_recoverable(self):
+        self.owner.blocked_roles.add("drive_c")
+        failed = self.worker._pulse("ADVANCE")
+        self.assertEqual(
+            failed["outcome"]["status"],
+            "verification_failed",
+        )
+        self.assertEqual(
+            failed["outcome"]["reason"],
+            "encoder_recovery_exhausted",
+        )
+        self.assertEqual(
+            [
+                segment["kind"]
+                for segment in failed["outcome"]["slices"][0]["segments"]
+            ],
+            ["paired", "right_catch_up", "right_catch_up"],
+        )
+        self.assertFalse(self.worker.motion_fault_latched)
+
+        self.owner.blocked_roles.clear()
+        recovered = self.worker._pulse("ADVANCE")
+        self.assertEqual(recovered["outcome"]["status"], "completed")
+
+    def test_transient_motor_fault_with_verified_pair_does_not_latch(self):
+        for token in ("stalled", "overloaded"):
+            with self.subTest(token=token):
+                worker, owner = self.build_worker()
+                owner.transient_fault_roles.add("drive_c")
+                owner.transient_fault_token = token
+                owner.transient_fault_after_leader_degrees = 160
+
+                result = worker._pulse("ADVANCE")
+
+                self.assertEqual(result["outcome"]["status"], "completed")
+                receipt = result["outcome"]["slices"][0]
+                self.assertEqual(
+                    [segment["kind"] for segment in receipt["segments"]],
+                    ["paired"],
+                )
+                self.assertEqual(
+                    receipt["segments"][0]["reason"],
+                    "motor_fault_encoder_verified",
+                )
+                self.assertTrue(receipt["encoder_verification"]["passed"])
+                self.assertFalse(worker.motion_fault_latched)
+
+    def test_transient_one_wheel_fault_gets_bounded_catch_up(self):
+        self.owner.blocked_roles.add("drive_c")
+        self.owner.transient_fault_roles.add("drive_c")
+        self.owner.transient_fault_after_leader_degrees = 160
+        original_finish = self.owner.finish_active
+        finish_calls = [0]
+
+        def release_after_faulted_primary(verify_motion):
+            result = original_finish(verify_motion)
+            finish_calls[0] += 1
+            if finish_calls[0] == 1:
+                self.owner.blocked_roles.clear()
+                self.owner.transient_fault_roles.clear()
+            return result
+
+        self.owner.finish_active = release_after_faulted_primary
+
+        result = self.worker._pulse("ADVANCE")
+
+        self.assertEqual(result["outcome"]["status"], "completed")
+        receipt = result["outcome"]["slices"][0]
+        self.assertEqual(
+            [segment["kind"] for segment in receipt["segments"]],
+            ["paired", "right_catch_up"],
+        )
+        self.assertEqual(
+            receipt["segments"][0]["reason"],
+            "transient_motor_fault_undertravel",
+        )
+        self.assertEqual(
+            [motor["position_delta"] for motor in receipt["motors"]],
+            [160, 160],
+        )
+        self.assertTrue(receipt["encoder_verification"]["passed"])
+        self.assertFalse(self.worker.motion_fault_latched)
+        self.assertEqual(self.worker.pulse_count, 2)
+        self.assertEqual(self.worker.pulse_duration_ms, 450)
+
+    def test_failed_catch_up_after_transient_motor_fault_latches(self):
+        self.owner.blocked_roles.add("drive_c")
+        self.owner.transient_fault_roles.add("drive_c")
+        self.owner.transient_fault_after_leader_degrees = 160
+
+        failed = self.worker._pulse("ADVANCE")
+
+        self.assertEqual(
+            failed["outcome"]["status"],
+            "verification_failed",
+        )
+        self.assertEqual(
+            failed["outcome"]["reason"],
+            "encoder_recovery_exhausted",
+        )
+        self.assertEqual(
+            [
+                segment["kind"]
+                for segment in failed["outcome"]["slices"][0]["segments"]
+            ],
+            ["paired", "right_catch_up", "right_catch_up"],
+        )
+        self.assertTrue(self.worker.motion_fault_latched)
+        with self.assertRaises(WorkerError) as raised:
+            self.worker._pulse("ADVANCE")
+        self.assertEqual(raised.exception.code, "motion_fault_latched")
+
+    def test_transient_pair_fault_without_a_leader_latches_immediately(self):
+        self.owner.blocked_roles.update(("drive_b", "drive_c"))
+        self.owner.transient_fault_roles.add("drive_c")
+        self.owner.transient_fault_after_leader_degrees = 0
+
+        failed = self.worker._pulse("REVERSE")
+
+        self.assertEqual(failed["outcome"]["status"], "interrupted")
+        self.assertEqual(
+            failed["outcome"]["reason"],
+            "encoder_verification_failed",
+        )
+        self.assertEqual(
+            [
+                segment["kind"]
+                for segment in failed["outcome"]["slices"][0]["segments"]
+            ],
+            ["paired"],
+        )
+        self.assertTrue(self.worker.motion_fault_latched)
+
+    def test_undertravel_gate_uses_physical_motor_direction(self):
+        self.worker.robot.config["drive_geometry"][
+            "forward_speed_sign"
+        ]["drive_c"] = -1
+        runtime = self.worker._encoder_recovery_runtime()
+        finish = {
+            "stop": {
+                "stop_confirmed": True,
+                "errors": [],
+                "fault_tokens": [],
+            },
+            "motors": [
+                {
+                    "side": "left",
+                    "role": "drive_b",
+                    "position_before": 0,
+                    "position_after": 100,
+                    "position_delta": 100,
+                    "state": "",
+                },
+                {
+                    "side": "right",
+                    "role": "drive_c",
+                    "position_before": 0,
+                    "position_after": -100,
+                    "position_delta": -100,
+                    "state": "",
+                },
+            ],
+        }
+
+        self.assertTrue(
+            runtime.undertravel_is_recoverable(
+                ACTION_SPECS["ADVANCE"],
+                finish,
+            )
+        )
+        finish["motors"][1]["position_after"] = 100
+        finish["motors"][1]["position_delta"] = 100
+        self.assertFalse(
+            runtime.undertravel_is_recoverable(
+                ACTION_SPECS["ADVANCE"],
+                finish,
+            )
+        )
+
+    def test_lagging_wheel_is_caught_up_inside_the_same_semantic_slice(self):
+        self.owner.blocked_roles.add("drive_c")
+        original_finish = self.owner.finish_active
+        finish_calls = [0]
+
+        def release_after_primary(verify_motion):
+            result = original_finish(verify_motion)
+            finish_calls[0] += 1
+            if finish_calls[0] == 1:
+                self.owner.blocked_roles.clear()
+            return result
+
+        self.owner.finish_active = release_after_primary
+
+        result = self.worker._pulse("ADVANCE")
+
+        self.assertEqual(result["outcome"]["status"], "completed")
+        receipt = result["outcome"]["slices"][0]
+        self.assertEqual(receipt["reason"], "encoder_recovered")
+        self.assertEqual(
+            [segment["kind"] for segment in receipt["segments"]],
+            ["paired", "right_catch_up"],
+        )
+        self.assertEqual(
+            [motor["position_delta"] for motor in receipt["motors"]],
+            [201, 202],
+        )
+        self.assertTrue(receipt["encoder_verification"]["passed"])
+        self.assertFalse(self.worker.motion_fault_latched)
+        self.assertEqual(self.worker.pulse_count, 2)
+        self.assertEqual(self.worker.pulse_duration_ms, 502)
+
+    def test_partial_single_wheel_recovery_preserves_encoder_motion(self):
+        self.owner.blocked_roles.add("drive_c")
+
+        def move_right_then_cancel():
+            self.owner.positions["drive_c"] += 11
+            raise WorkerError("cancel_requested", "cancel recovery")
+
+        self.owner.after_single_start = move_right_then_cancel
+        result = self.worker._pulse("ADVANCE")
+
+        receipt = result["outcome"]["slices"][0]
+        self.assertEqual(receipt["status"], "interrupted")
+        self.assertEqual(
+            [segment["kind"] for segment in receipt["segments"]],
+            ["paired", "partial_start"],
+        )
+        self.assertEqual(
+            receipt["segments"][1]["commanded_sides"], ["right"]
+        )
+        self.assertEqual(
+            [motor["position_delta"] for motor in receipt["motors"]],
+            [201, 11],
+        )
+        self.assertTrue(receipt["stop"]["stop_confirmed"])
+
+    def test_partial_paired_recovery_preserves_encoder_motion(self):
+        self.owner.blocked_roles.update(("drive_b", "drive_c"))
+
+        def fail_only_after_primary():
+            if self.owner.finish_count:
+                self.owner.positions["drive_b"] += 13
+                raise WorkerError("touch_pressed", "stop retry")
+
+        self.owner.after_first_start = fail_only_after_primary
+        result = self.worker._pulse("ADVANCE")
+
+        receipt = result["outcome"]["slices"][0]
+        self.assertEqual(receipt["status"], "interrupted")
+        self.assertEqual(
+            [segment["kind"] for segment in receipt["segments"]],
+            ["paired", "partial_start"],
+        )
+        self.assertEqual(
+            receipt["segments"][1]["commanded_sides"], ["left"]
+        )
+        self.assertEqual(
+            [motor["position_delta"] for motor in receipt["motors"]],
+            [13, 0],
+        )
+
+    def test_wrong_direction_encoder_failure_latches_motion(self):
+        self.owner.wrong_direction_roles.add("drive_c")
         failed = self.worker._pulse("TURN_LEFT_90")
         self.assertEqual(
             failed["outcome"]["status"],

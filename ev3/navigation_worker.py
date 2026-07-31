@@ -17,9 +17,18 @@ if __package__:
         InfraredGatePolicy,
         InfraredObstacleGate,
     )
+    from .encoder_recovery_runtime import (
+        EncoderRecoveryRuntime,
+        build_encoder_recovery_policy,
+        partial_start_direction_mismatch,
+        partial_start_motor_receipts,
+        partial_start_segment,
+        validated_start_failure_evidence,
+    )
     from .navigation_profile import (
         ACTION_SPECS,
         ALLOWED_OPERATIONS,
+        ENCODER_RECOVERY_ACTIONS,
         MAX_PROCESS_SECONDS,
         MAX_PULSES,
         MAX_PULSE_DURATION_MS,
@@ -30,6 +39,7 @@ if __package__:
         RESPONSE_SCHEMA,
         SCAN_TURN_MAX_SIDE_DIVERGENCE_DEGREES,
         SCAN_SAMPLE_COUNT,
+        SCAN_SAMPLE_FILTER_WINDOW,
         SCAN_SAMPLE_INTERVAL_MS,
         WORKER_ID,
         scan_turn_profile,
@@ -52,9 +62,18 @@ else:
         InfraredGatePolicy,
         InfraredObstacleGate,
     )
+    from encoder_recovery_runtime import (
+        EncoderRecoveryRuntime,
+        build_encoder_recovery_policy,
+        partial_start_direction_mismatch,
+        partial_start_motor_receipts,
+        partial_start_segment,
+        validated_start_failure_evidence,
+    )
     from navigation_profile import (
         ACTION_SPECS,
         ALLOWED_OPERATIONS,
+        ENCODER_RECOVERY_ACTIONS,
         MAX_PROCESS_SECONDS,
         MAX_PULSES,
         MAX_PULSE_DURATION_MS,
@@ -65,6 +84,7 @@ else:
         RESPONSE_SCHEMA,
         SCAN_TURN_MAX_SIDE_DIVERGENCE_DEGREES,
         SCAN_SAMPLE_COUNT,
+        SCAN_SAMPLE_FILTER_WINDOW,
         SCAN_SAMPLE_INTERVAL_MS,
         WORKER_ID,
         scan_turn_profile,
@@ -128,6 +148,7 @@ class NavigationWorker(object):
         self.robot = RobotHAL(config_path)
         self.limits = EV3Supervisor._validated_limits(self.robot.config)
         self.limits["max_start_skew_ms"] = MAX_START_SKEW_MS
+        self.encoder_recovery_policy = build_encoder_recovery_policy()
         self.owner = SupervisorMotorOwner(self.robot, self.limits)
         self.controller_id = validate_identifier(
             "controller_id",
@@ -329,66 +350,12 @@ class NavigationWorker(object):
                 fatal=True,
             )
 
-    def _execute_slice(
+    def _wait_for_active(
         self,
         action,
-        spec,
-        duration_ms,
-        slice_index,
+        active,
+        defer_paired_motor_fault=False,
     ):
-        try:
-            active = self.owner.start_drive(
-                spec["left_speed_dps"],
-                spec["right_speed_dps"],
-                duration_ms,
-                pre_each_start=lambda _motor, windows: (
-                    self._start_guard(action, windows)
-                ),
-            )
-        except WorkerError as error:
-            start_cleanup = getattr(
-                error,
-                "supervisor_start_cleanup",
-                None,
-            )
-            if stop_is_verified(start_cleanup):
-                finish = {
-                    "stop": start_cleanup,
-                    "motors": [],
-                }
-            else:
-                finish = self._require_verified_finish()
-            self.last_outcome = {
-                "kind": "pulse",
-                "action": action,
-                "status": "denied",
-                "reason": error.code,
-                "started_monotonic_ms": None,
-                "completed_monotonic_ms": self._now_ms(),
-                "stop_confirmed": True,
-            }
-            if error.fatal:
-                raise
-            return {
-                "slice_index": slice_index,
-                "slice_count": spec["slice_count"],
-                "duration_ms": duration_ms,
-                "status": "denied",
-                "reason": error.code,
-                "started_monotonic_ms": None,
-                "completed_monotonic_ms": self._now_ms(),
-                "motors": [],
-                "encoder_verification": {
-                    "passed": False,
-                    "error": None,
-                    "checks": [],
-                },
-                "stop": finish["stop"],
-            }
-
-        self.pulse_count += 1
-        self.pulse_duration_ms += duration_ms
-        started_ms = active["started_at_ms"]
         reason = "duration_elapsed"
         status = "completed"
         active_roles = frozenset(
@@ -428,7 +395,16 @@ class NavigationWorker(object):
             if motor_fault:
                 reason = "motor_fault"
                 status = "interrupted"
-                self.motion_fault_latched = True
+                # A paired ADVANCE/REVERSE gets one opportunity to prove that
+                # a transient kernel fault token was harmless, or to perform
+                # the existing bounded encoder catch-up after a verified stop.
+                # Recovery motions and turns never defer their own faults.
+                if not (
+                    defer_paired_motor_fault
+                    and action in ENCODER_RECOVERY_ACTIONS
+                    and len(active["motors"]) == 2
+                ):
+                    self.motion_fault_latched = True
                 break
             now_ms = self._now_ms()
             if now_ms >= active["deadline_ms"]:
@@ -437,21 +413,268 @@ class NavigationWorker(object):
             self.robot.sleep_fn(
                 min(POLL_INTERVAL_MS, remaining_ms) / 1000.0
             )
+        return status, reason
 
-        finish = self._require_verified_finish(verify_motion=True)
+    def _consume_recovery_motion_budget(self, duration_ms):
+        self.pulse_count += 1
+        self.pulse_duration_ms += duration_ms
+
+    def _latch_motion_fault(self):
+        self.motion_fault_latched = True
+
+    def _encoder_recovery_runtime(self):
+        geometry = self.robot.config["drive_geometry"]
+        roles = {
+            "left": geometry["left_motor_role"],
+            "right": geometry["right_motor_role"],
+        }
+        forward_signs = geometry["forward_speed_sign"]
+        return EncoderRecoveryRuntime(
+            policy=self.encoder_recovery_policy,
+            owner=self.owner,
+            observe=self._observe,
+            start_guard=self._start_guard,
+            wait_for_active=lambda action, active: self._wait_for_active(
+                action,
+                active,
+                defer_paired_motor_fault=False,
+            ),
+            require_verified_finish=self._require_verified_finish,
+            now_ms=self._now_ms,
+            monotonic=time.monotonic,
+            deadline=lambda: self.deadline,
+            motion_budget=lambda: (
+                self.pulse_count,
+                self.pulse_duration_ms,
+            ),
+            consume_motion_budget=(
+                self._consume_recovery_motion_budget
+            ),
+            latch_motion_fault=self._latch_motion_fault,
+            drive_roles_by_side=roles,
+            forward_speed_sign_by_side=dict(
+                (side, forward_signs[roles[side]])
+                for side in ("left", "right")
+            ),
+            fault_states=FAULT_STATES,
+            stop_is_verified=stop_is_verified,
+        )
+
+    def _execute_slice(
+        self,
+        action,
+        spec,
+        duration_ms,
+        slice_index,
+    ):
+        try:
+            active = self.owner.start_drive(
+                spec["left_speed_dps"],
+                spec["right_speed_dps"],
+                duration_ms,
+                pre_each_start=lambda _motor, windows: (
+                    self._start_guard(action, windows)
+                ),
+            )
+        except Exception as error:
+            roles = {
+                "left": self.robot.config["drive_geometry"][
+                    "left_motor_role"
+                ],
+                "right": self.robot.config["drive_geometry"][
+                    "right_motor_role"
+                ],
+            }
+            evidence = validated_start_failure_evidence(
+                error,
+                duration_ms,
+                ("left", "right"),
+                roles,
+                stop_is_verified,
+            )
+            error_code = getattr(error, "code", "motion_start_failed")
+            if evidence["started_sides"]:
+                self._consume_recovery_motion_budget(duration_ms)
+                motors = partial_start_motor_receipts(evidence)
+                if partial_start_direction_mismatch(evidence):
+                    error_code = "encoder_direction_mismatch"
+                    self.motion_fault_latched = True
+                if not isinstance(error, WorkerError):
+                    self.motion_fault_latched = True
+                segment = partial_start_segment(
+                    evidence,
+                    motors,
+                    duration_ms,
+                    1,
+                    error_code,
+                )
+                receipt = {
+                    "slice_index": slice_index,
+                    "slice_count": spec["slice_count"],
+                    "duration_ms": duration_ms,
+                    "status": "interrupted",
+                    "reason": error_code,
+                    "started_monotonic_ms": evidence["started_at_ms"],
+                    "completed_monotonic_ms": evidence[
+                        "completed_at_ms"
+                    ],
+                    "motors": motors,
+                    "encoder_verification": segment[
+                        "encoder_verification"
+                    ],
+                    "stop": evidence["stop"],
+                }
+                if action != "SCAN_TURN":
+                    receipt["segments"] = [segment]
+                return receipt
+            if not isinstance(error, WorkerError):
+                self.motion_fault_latched = True
+                raise WorkerError(
+                    "motion_start_failed",
+                    "Motor setup failed before execution",
+                    fatal=True,
+                )
+            finish = {
+                "stop": evidence["stop"],
+                "motors": [],
+            }
+            self.last_outcome = {
+                "kind": "pulse",
+                "action": action,
+                "status": "denied",
+                "reason": error_code,
+                "started_monotonic_ms": None,
+                "completed_monotonic_ms": self._now_ms(),
+                "stop_confirmed": True,
+            }
+            if isinstance(error, WorkerError) and error.fatal:
+                raise
+            receipt = {
+                "slice_index": slice_index,
+                "slice_count": spec["slice_count"],
+                "duration_ms": duration_ms,
+                "status": "denied",
+                "reason": error_code,
+                "started_monotonic_ms": None,
+                "completed_monotonic_ms": self._now_ms(),
+                "motors": [],
+                "encoder_verification": {
+                    "passed": False,
+                    "error": None,
+                    "checks": [],
+                },
+                "stop": finish["stop"],
+            }
+            if action != "SCAN_TURN":
+                receipt["segments"] = []
+            return receipt
+
+        self.pulse_count += 1
+        self.pulse_duration_ms += duration_ms
+        started_ms = active["started_at_ms"]
+        status, reason = self._wait_for_active(
+            action,
+            active,
+            defer_paired_motor_fault=(
+                action in ENCODER_RECOVERY_ACTIONS
+            ),
+        )
+
+        deferred_motor_fault = (
+            status == "interrupted"
+            and reason == "motor_fault"
+            and action in ENCODER_RECOVERY_ACTIONS
+        )
+        try:
+            finish = self._require_verified_finish(verify_motion=True)
+        except BaseException:
+            if deferred_motor_fault:
+                self.motion_fault_latched = True
+            raise
         verification_error = finish.get("verification_error")
-        if status == "completed" and verification_error is not None:
+        recovery_runtime = None
+        if deferred_motor_fault:
+            recovery_runtime = self._encoder_recovery_runtime()
+            if verification_error is None:
+                # The kernel token disappeared under a verified stop and both
+                # encoder checks passed.  Let the stricter recovery policy
+                # decide whether the paired travel is already sufficient.
+                status = "completed"
+                reason = "motor_fault_encoder_verified"
+            elif recovery_runtime.transient_pair_fault_is_catch_up_candidate(
+                spec,
+                active,
+                finish,
+                duration_ms,
+            ):
+                status = "verification_failed"
+                reason = "transient_motor_fault_undertravel"
+            else:
+                reason = "encoder_verification_failed"
+                self.motion_fault_latched = True
+        elif status == "completed" and verification_error is not None:
             status = "verification_failed"
-            reason = "encoder_verification_failed"
-            self.motion_fault_latched = True
-        return {
+            recovery_runtime = (
+                self._encoder_recovery_runtime()
+                if action in ENCODER_RECOVERY_ACTIONS
+                else None
+            )
+            if (
+                recovery_runtime is not None
+                and recovery_runtime.undertravel_is_recoverable(spec, finish)
+            ):
+                reason = "encoder_undertravel_observed"
+            else:
+                reason = "encoder_verification_failed"
+                self.motion_fault_latched = True
+        if (
+            action in ENCODER_RECOVERY_ACTIONS
+            and status in ("completed", "verification_failed")
+            and not self.motion_fault_latched
+        ):
+            if recovery_runtime is None:
+                recovery_runtime = self._encoder_recovery_runtime()
+            recovered = recovery_runtime.recover_slice(
+                action,
+                spec,
+                duration_ms,
+                active,
+                finish,
+                status,
+                reason,
+                started_ms,
+            )
+            if (
+                deferred_motor_fault
+                and recovered["status"] != "completed"
+            ):
+                self.motion_fault_latched = True
+            return {
+                "slice_index": slice_index,
+                "slice_count": spec["slice_count"],
+                "duration_ms": duration_ms,
+                "status": recovered["status"],
+                "reason": recovered["reason"],
+                "started_monotonic_ms": started_ms,
+                "completed_monotonic_ms": recovered[
+                    "completed_monotonic_ms"
+                ],
+                "motors": recovered["motors"],
+                "segments": recovered["segments"],
+                "encoder_verification": recovered[
+                    "encoder_verification"
+                ],
+                "stop": recovered["stop"],
+            }
+        completed_ms = self._now_ms()
+        receipt = {
             "slice_index": slice_index,
             "slice_count": spec["slice_count"],
             "duration_ms": duration_ms,
             "status": status,
             "reason": reason,
             "started_monotonic_ms": started_ms,
-            "completed_monotonic_ms": self._now_ms(),
+            "completed_monotonic_ms": completed_ms,
             "motors": finish.get("motors", []),
             "encoder_verification": {
                 "passed": verification_error is None,
@@ -460,6 +683,27 @@ class NavigationWorker(object):
             },
             "stop": finish["stop"],
         }
+        if action != "SCAN_TURN":
+            receipt["segments"] = [
+                {
+                    "segment_index": 1,
+                    "kind": "paired",
+                    "commanded_sides": ["left", "right"],
+                    "duration_ms": duration_ms,
+                    "status": status,
+                    "reason": reason,
+                    "started_monotonic_ms": started_ms,
+                    "completed_monotonic_ms": completed_ms,
+                    "motors": finish.get("motors", []),
+                    "encoder_verification": {
+                        "passed": verification_error is None,
+                        "error": verification_error,
+                        "checks": finish.get("checks", []),
+                    },
+                    "stop": finish["stop"],
+                }
+            ]
+        return receipt
 
     def _pulse(self, action):
         if action not in ACTION_SPECS:
@@ -696,6 +940,16 @@ class NavigationWorker(object):
                 duration_ms,
                 slice_index,
             )
+            if (
+                receipt["status"] == "denied"
+                and receipt["started_monotonic_ms"] is None
+                and receipt["motors"] == []
+            ):
+                return self._deny_scan_turn(
+                    relative_delta_mdeg,
+                    spec,
+                    receipt["reason"],
+                )
             slices.append(receipt)
             if receipt["status"] != "completed":
                 break
@@ -815,6 +1069,12 @@ class NavigationWorker(object):
     def _scan_sample(self):
         """Build one fresh stationary IR batch at the current bearing."""
         finish = self._require_verified_finish()
+        if self.gate.policy.median_window != SCAN_SAMPLE_FILTER_WINDOW:
+            raise WorkerError(
+                "scan_sample_profile_mismatch",
+                "IR gate filter window does not match the scan profile",
+                fatal=True,
+            )
         self.gate = InfraredObstacleGate(self.gate.policy)
         raw_samples = []
         observation = None

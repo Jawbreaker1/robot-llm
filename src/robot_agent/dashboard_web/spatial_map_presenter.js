@@ -2,6 +2,12 @@
   "use strict";
 
   const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+  const LOCAL_ODOMETRY = "LOCAL_ODOMETRY";
+  const QUALITATIVE_FORWARD_ENVELOPE = (
+    "QUALITATIVE_FORWARD_ENVELOPE"
+  );
+  const SVG_WIDTH = 1000;
+  const SVG_HEIGHT = 620;
 
   function create(options = {}) {
     const documentApi = options.document;
@@ -103,8 +109,8 @@
     }
 
     function mapProjection(bounds) {
-      const width = 1000;
-      const height = 620;
+      const width = SVG_WIDTH;
+      const height = SVG_HEIGHT;
       const padding = 34;
       const worldWidth = bounds.maxX - bounds.minX;
       const worldHeight = bounds.maxY - bounds.minY;
@@ -125,6 +131,232 @@
           };
         },
       };
+    }
+
+    function localOdometryScene(map) {
+      const points = [];
+      const cues = [];
+      const cueKeys = new Set();
+
+      function addPoint(xMm, yMm) {
+        if (Number.isFinite(xMm) && Number.isFinite(yMm)) {
+          points.push({ xMm, yMm });
+        }
+      }
+
+      function addCue(anchorPose, evidence) {
+        if (
+          !anchorPose
+          || !Number.isFinite(anchorPose.xMm)
+          || !Number.isFinite(anchorPose.yMm)
+          || !Number.isFinite(anchorPose.headingMdeg)
+          || evidence.provisional !== true
+          || evidence.bearing !== "FORWARD"
+        ) {
+          return;
+        }
+        const key = [
+          anchorPose.xMm,
+          anchorPose.yMm,
+          anchorPose.headingMdeg,
+          evidence.relation,
+        ].join(":");
+        if (cueKeys.has(key)) {
+          return;
+        }
+        cueKeys.add(key);
+        addPoint(anchorPose.xMm, anchorPose.yMm);
+        cues.push({ anchorPose, evidence });
+      }
+
+      if (map.robotPose) {
+        addPoint(map.robotPose.xMm, map.robotPose.yMm);
+      }
+      map.objectHypotheses.forEach((hypothesis) => {
+        if (
+          hypothesis.provisional
+          && hypothesis.geometryKind === QUALITATIVE_FORWARD_ENVELOPE
+        ) {
+          addCue(hypothesis.anchorPose, hypothesis);
+        }
+      });
+      if (
+        map.robotPose
+        && map.qualitativeObservations.length > 0
+      ) {
+        addCue(
+          map.robotPose,
+          map.qualitativeObservations[
+            map.qualitativeObservations.length - 1
+          ],
+        );
+      }
+      return { points, cues };
+    }
+
+    function localOdometryProjection(points) {
+      const minX = Math.min(...points.map((point) => point.xMm));
+      const maxX = Math.max(...points.map((point) => point.xMm));
+      const minY = Math.min(...points.map((point) => point.yMm));
+      const maxY = Math.max(...points.map((point) => point.yMm));
+      const spanX = maxX - minX;
+      const spanY = maxY - minY;
+      const padding = 100;
+      const scaleCandidates = [];
+      if (spanX > 0) {
+        scaleCandidates.push((SVG_WIDTH - 2 * padding) / spanX);
+      }
+      if (spanY > 0) {
+        scaleCandidates.push((SVG_HEIGHT - 2 * padding) / spanY);
+      }
+      const scale = scaleCandidates.length > 0
+        ? Math.min(...scaleCandidates)
+        : 1;
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+      return {
+        point(xMm, yMm) {
+          return {
+            x: SVG_WIDTH / 2 + (xMm - centerX) * scale,
+            y: SVG_HEIGHT / 2 - (yMm - centerY) * scale,
+          };
+        },
+      };
+    }
+
+    function screenPoint(origin, headingRadians, length) {
+      return {
+        x: origin.x + Math.cos(headingRadians) * length,
+        y: origin.y - Math.sin(headingRadians) * length,
+      };
+    }
+
+    function renderLocalOdometryMap(map, scene, drawable) {
+      const layer = byId("map-local-odometry-layer");
+      layer.replaceChildren();
+      if (!drawable) {
+        return;
+      }
+      layer.setAttribute("data-provisional", "true");
+      layer.setAttribute("data-geometry", "screen-space-nonmetric");
+      const projection = localOdometryProjection(scene.points);
+
+      const layerLabel = createSvgElement("text", {
+        x: 32,
+        y: 42,
+        class: "map-local-layer-label",
+      });
+      layerLabel.textContent = t("map.local_odometry.layer_label");
+      layer.appendChild(layerLabel);
+      const layerNote = createSvgElement("text", {
+        x: 32,
+        y: 65,
+        class: "map-local-layer-note",
+      });
+      layerNote.textContent = t("map.local_odometry.layer_note");
+      layer.appendChild(layerNote);
+
+      scene.cues.forEach(({ anchorPose, evidence }) => {
+        const anchor = projection.point(
+          anchorPose.xMm,
+          anchorPose.yMm,
+        );
+        const heading = (
+          anchorPose.headingMdeg / 1000
+        ) * Math.PI / 180;
+        const halfAngle = Math.PI / 7;
+        const left = screenPoint(anchor, heading + halfAngle, 64);
+        const right = screenPoint(anchor, heading - halfAngle, 64);
+        const tickStart = screenPoint(anchor, heading, 46);
+        const tickEnd = screenPoint(anchor, heading, 68);
+        let relationClass = "is-unknown";
+        if (evidence.relation === "NEAR_OBSTACLE") {
+          relationClass = "is-near";
+        } else if (evidence.relation === "NO_NEAR_REFLECTION") {
+          relationClass = "is-no-near-reflection";
+        }
+        const group = createSvgElement("g", {
+          class: `map-local-ir-cue ${relationClass}`,
+          "data-provisional": "true",
+          "data-metric-distance": "none",
+        });
+        appendSvgTitle(group, [
+          t("map.local_odometry.ir_title", {
+            relation: relationLabel(evidence.relation),
+          }),
+          t("map.local_odometry.nonmetric"),
+          ...mapTooltipParts(evidence),
+        ]);
+        group.appendChild(createSvgElement("path", {
+          d: [
+            `M ${anchor.x} ${anchor.y}`,
+            `L ${left.x} ${left.y}`,
+            `L ${right.x} ${right.y}`,
+            "Z",
+          ].join(" "),
+          class: "map-local-ir-wedge",
+        }));
+        group.appendChild(createSvgElement("line", {
+          x1: tickStart.x,
+          y1: tickStart.y,
+          x2: tickEnd.x,
+          y2: tickEnd.y,
+          class: "map-local-ir-tick",
+        }));
+        group.appendChild(createSvgElement("circle", {
+          cx: anchor.x,
+          cy: anchor.y,
+          r: 7,
+          class: "map-local-ir-anchor",
+        }));
+        const cueLabel = createSvgElement("text", {
+          x: tickEnd.x + 10,
+          y: tickEnd.y - 8,
+          class: "map-local-ir-label",
+        });
+        cueLabel.textContent = t("map.local_odometry.ir_label");
+        group.appendChild(cueLabel);
+        layer.appendChild(group);
+      });
+
+      if (map.robotPose) {
+        const robot = projection.point(
+          map.robotPose.xMm,
+          map.robotPose.yMm,
+        );
+        const heading = (
+          map.robotPose.headingMdeg / 1000
+        ) * Math.PI / 180;
+        const headingEnd = screenPoint(robot, heading, 58);
+        const group = createSvgElement("g", {
+          class: "map-local-robot",
+          "data-provisional": "true",
+        });
+        appendSvgTitle(group, [
+          t("map.local_odometry.robot_title"),
+          ...mapTooltipParts(map.robotPose),
+        ]);
+        group.appendChild(createSvgElement("circle", {
+          cx: robot.x,
+          cy: robot.y,
+          r: 24,
+          class: "map-local-robot-boundary",
+        }));
+        group.appendChild(createSvgElement("line", {
+          x1: robot.x,
+          y1: robot.y,
+          x2: headingEnd.x,
+          y2: headingEnd.y,
+          class: "map-local-robot-heading",
+        }));
+        group.appendChild(createSvgElement("circle", {
+          cx: robot.x,
+          cy: robot.y,
+          r: 17,
+          class: "map-local-robot-body",
+        }));
+        layer.appendChild(group);
+      }
     }
 
     function mapCellClass(cellState) {
@@ -521,6 +753,17 @@
     function render(spatialMap, connection = "connected", nowUnixMs) {
       const map = normalizeSpatialMap(spatialMap, nowUnixMs);
       const status = byId("map-connection-status");
+      const localOdometrySceneValue = localOdometryScene(map);
+      const localOdometryDrawable = (
+        map.contractValid
+        && map.frameKind === LOCAL_ODOMETRY
+        && (
+          map.status === "pose_only"
+          || map.status === "qualitative_only"
+        )
+        && map.bounds === null
+        && localOdometrySceneValue.points.length > 0
+      );
       const mapDrawable = (
         map.contractValid
         && (
@@ -558,12 +801,19 @@
         map.frameId,
         t("map.frame.unavailable"),
       );
-      byId("map-empty-state").hidden = mapDrawable;
+      byId("map-empty-state").hidden = (
+        mapDrawable || localOdometryDrawable
+      );
       renderEmptyState(map);
       renderMapMetadata(map);
       renderQualitativeObservations(map);
       renderMapObjects(map);
       renderMetricMap(map, mapDrawable);
+      renderLocalOdometryMap(
+        map,
+        localOdometrySceneValue,
+        localOdometryDrawable,
+      );
       return map;
     }
 

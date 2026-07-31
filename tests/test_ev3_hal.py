@@ -176,8 +176,12 @@ class RobotHALTests(unittest.TestCase):
 
     def test_unsafe_motion_is_rejected_before_command_write(self):
         motor_path = self.sysfs.motors["outB"]
+        hal = self.hal()
+        unsafe_speed = (
+            hal.config["limits"]["drive"]["max_abs_speed_dps"] + 1
+        )
         with self.assertRaises(SafetyError):
-            self.hal().run_timed("drive_b", 251, 600)
+            hal.run_timed("drive_b", unsafe_speed, 600)
         self.assertEqual(read_text(str(motor_path / "command")), "")
 
     def test_wrong_motor_driver_is_rejected_before_motion(self):
@@ -233,9 +237,13 @@ class RobotHALTests(unittest.TestCase):
     def test_drive_timed_rejects_either_unsafe_speed_before_writes(self):
         left_path = self.sysfs.motors["outB"]
         right_path = self.sysfs.motors["outC"]
+        hal = self.hal()
+        unsafe_speed = (
+            hal.config["limits"]["drive"]["max_abs_speed_dps"] + 1
+        )
 
         with self.assertRaises(SafetyError):
-            self.hal().drive_timed(100, 251, 300)
+            hal.drive_timed(100, unsafe_speed, 300)
 
         self.assertEqual(read_text(str(left_path / "command")), "")
         self.assertEqual(read_text(str(right_path / "command")), "")
@@ -679,6 +687,36 @@ class RobotHALTests(unittest.TestCase):
             side_effect=[next_producer, next_consumer],
         ):
             self.hal().speak("Låset släpptes", amplitude=100)
+
+    def test_speak_signal_interrupt_kills_children_and_restores_handler(self):
+        producer, consumer = self._speech_processes()
+        producer.poll.return_value = None
+        consumer.poll.return_value = None
+        previous = robot_hal_module.signal.getsignal(
+            robot_hal_module.signal.SIGHUP
+        )
+
+        def interrupt_playback(timeout=None):
+            handler = robot_hal_module.signal.getsignal(
+                robot_hal_module.signal.SIGHUP
+            )
+            handler(robot_hal_module.signal.SIGHUP, None)
+
+        consumer.communicate.side_effect = interrupt_playback
+        with patch.object(
+            robot_hal_module.subprocess,
+            "Popen",
+            side_effect=[producer, consumer],
+        ):
+            with self.assertRaises(RuntimeError):
+                self.hal().speak("Avbryt mig", amplitude=100)
+
+        producer.kill.assert_called_once_with()
+        consumer.kill.assert_called_once_with()
+        self.assertIs(
+            robot_hal_module.signal.getsignal(robot_hal_module.signal.SIGHUP),
+            previous,
+        )
 
     def test_speech_lock_prevents_overlapping_audio(self):
         lock_handle = open(self.speech_lock_path, "a+")

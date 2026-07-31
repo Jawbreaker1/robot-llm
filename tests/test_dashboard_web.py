@@ -639,6 +639,18 @@ process.stdout.write(JSON.stringify({
 
         self.assertEqual(len(svg_elements), 1)
         self.assertEqual(svg_elements[0].get("role"), "img")
+        local_odometry_layers = [
+            attributes
+            for tag, attributes in self.parser.elements
+            if tag == "g"
+            and attributes.get("id") == "map-local-odometry-layer"
+        ]
+        self.assertEqual(len(local_odometry_layers), 1)
+        self.assertEqual(local_odometry_layers[0].get("role"), "group")
+        self.assertEqual(
+            local_odometry_layers[0].get("data-i18n-aria-label"),
+            "map.local_odometry.aria_label",
+        )
         self.assertIn("robot-spatial-map/v1", self.dashboard_logic)
         self.assertIn("normalizeSpatialMap", self.dashboard_logic)
         self.assertIn('api("/api/v1/map"', self.javascript)
@@ -670,11 +682,26 @@ process.stdout.write(JSON.stringify({
             'map.status === "qualitative_only"',
             self.spatial_map_presenter,
         )
+        self.assertIn(
+            "renderLocalOdometryMap",
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            '"data-geometry", "screen-space-nonmetric"',
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            '"data-metric-distance": "none"',
+            self.spatial_map_presenter,
+        )
+        self.assertIn(".map-local-ir-wedge", self.css)
+        self.assertIn(".map-local-robot-heading", self.css)
         self.assertLess(len(self.javascript.splitlines()), 1900)
         self.assertNotIn("function mapProjection", self.javascript)
         self.assertIn("map.reason.observation_gap", self.i18n)
         self.assertIn("SIMULATION", self.i18n)
         self.assertIn("PROVISIONAL IR", self.i18n)
+        self.assertIn("map.local_odometry.layer_label", self.i18n)
         self.assertIn("Ingen karta ännu", self.html)
         self.assertNotIn("map-drive", self.html)
         self.assertNotIn("map-waypoint", self.html)
@@ -882,6 +909,79 @@ process.stdout.write(JSON.stringify({
                 self.javascript.index("\n  function settingsChanges()")
             ],
         )
+
+    def test_conversation_target_is_clear_localized_and_shared_by_stt(self):
+        elements = [
+            (tag, attrs)
+            for tag, attrs in self.parser.elements
+            if attrs.get("id") == "composer-target"
+        ]
+        self.assertEqual(len(elements), 1)
+        self.assertEqual(elements[0][0], "select")
+        self.assertEqual(
+            elements[0][1].get("aria-describedby"),
+            "composer-target-help",
+        )
+        workbench_option = next(
+            attrs
+            for tag, attrs in self.parser.elements
+            if tag == "option"
+            and attrs.get("data-i18n") == "workbench.target.workbench"
+        )
+        robot_option = next(
+            attrs
+            for tag, attrs in self.parser.elements
+            if tag == "option"
+            and attrs.get("data-i18n") == "workbench.target.robot"
+        )
+        self.assertIn("selected", workbench_option)
+        self.assertNotIn("selected", robot_option)
+        values = self.i18n_contract["catalogs"]
+        self.assertEqual(
+            values["sv"]["values"]["workbench.target.label"],
+            "Vem pratar du med?",
+        )
+        self.assertEqual(
+            values["en"]["values"]["workbench.target.label"],
+            "Who are you talking to?",
+        )
+        for locale in ("sv", "en"):
+            self.assertIn(
+                "transkript"
+                if locale == "sv"
+                else "transcripts",
+                values[locale]["values"]["workbench.target.help"],
+            )
+        self.assertIn(
+            "await submitCurrentContent(selectedConversationTarget())",
+            self.javascript,
+        )
+        transcript_handler = self.javascript[
+            self.javascript.index("      onTranscript: (text, metadata) => {"):
+            self.javascript.index(
+                "\n      onError:",
+                self.javascript.index(
+                    "      onTranscript: (text, metadata) => {"
+                ),
+            )
+        ]
+        self.assertIn(
+            "const target = selectedConversationTarget()",
+            transcript_handler,
+        )
+        self.assertIn("void submitCurrentContent(target)", transcript_handler)
+        target_listener = self.javascript[
+            self.javascript.index(
+                'byId("composer-target").addEventListener("change"'
+            ):
+            self.javascript.index(
+                '\n    byId("message-input").addEventListener("keydown"',
+                self.javascript.index(
+                    'byId("composer-target").addEventListener("change"'
+                ),
+            )
+        ]
+        self.assertIn("microphoneInput.cancel()", target_listener)
 
     def test_microphone_capture_is_generic_pcm_and_uses_the_stt_contract(self):
         combined = "\n".join(
@@ -1197,11 +1297,13 @@ process.stdout.write(JSON.stringify({
                 self.javascript.index("  function renderTurn(turn) {"),
             )
         ]
-        submit_turn = self.javascript[
-            self.javascript.index("  async function submitTurn(event) {"):
+        submit_content = self.javascript[
+            self.javascript.index("  async function submitCurrentContent(target) {"):
             self.javascript.index(
-                "\n  function eventTime(",
-                self.javascript.index("  async function submitTurn(event) {"),
+                "\n  async function submitTurn(event) {",
+                self.javascript.index(
+                    "  async function submitCurrentContent(target) {"
+                ),
             )
         ]
         self.assertGreaterEqual(
@@ -1210,7 +1312,7 @@ process.stdout.write(JSON.stringify({
             ),
             2,
         )
-        self.assertIn("microphoneInput.cancel()", submit_turn)
+        self.assertIn("microphoneInput.cancel()", submit_content)
 
     def test_device_refresh_cannot_replace_an_active_capture_phase(self):
         render_devices = self.microphone_input[
@@ -1819,6 +1921,23 @@ const source = fs.readFileSync(process.argv[1], "utf8");
 const window = {};
 vm.runInNewContext(source, { window }, { filename: process.argv[1] });
 const api = window.RobotControlUI;
+const targetState = api.createConversationTargetState("workbench");
+const targetTransitions = {
+  workbenchDefault: targetState.selected(),
+};
+targetTransitions.workbenchOverride = targetState.override("robot");
+targetTransitions.robotDefault = targetState.selectView("robot");
+targetTransitions.robotOverride = targetState.override("workbench");
+targetTransitions.workbenchRestored = targetState.selectView("workbench");
+targetTransitions.workbenchCleared = targetState.clearOverride();
+targetTransitions.robotRestored = targetState.selectView("robot");
+targetTransitions.robotCleared = targetState.clearOverride();
+let invalidTargetRejected = false;
+try {
+  targetState.override("anything-else");
+} catch (error) {
+  invalidTargetRejected = error && error.name === "TypeError";
+}
 const idle = api.normalizeControl({
   state: "IDLE",
   enabled: true,
@@ -1861,6 +1980,8 @@ process.stdout.write(JSON.stringify({
     { sequence: 8 },
     { sequence: 9 },
   ),
+  invalidTargetRejected,
+  targetTransitions,
 }));
 """
         completed = subprocess.run(
@@ -1886,12 +2007,30 @@ process.stdout.write(JSON.stringify({
             [
                 "ACTIVE_STATES",
                 "CONTROL_STATES",
+                "CONVERSATION_TARGETS",
+                "CONVERSATION_VIEWS",
                 "composerPolicy",
                 "create",
+                "createConversationTargetState",
+                "defaultConversationTarget",
                 "normalizeControl",
                 "shouldApplySnapshot",
             ],
         )
+        self.assertEqual(
+            contract["targetTransitions"],
+            {
+                "workbenchDefault": "workbench",
+                "workbenchOverride": "robot",
+                "robotDefault": "robot",
+                "robotOverride": "workbench",
+                "workbenchRestored": "robot",
+                "workbenchCleared": "workbench",
+                "robotRestored": "workbench",
+                "robotCleared": "robot",
+            },
+        )
+        self.assertTrue(contract["invalidTargetRejected"])
         self.assertEqual(
             contract["states"],
             [
@@ -1945,16 +2084,18 @@ process.stdout.write(JSON.stringify({
             "bootstrap.physical_control_enabled === false",
             self.javascript,
         )
-        submit_turn = self.javascript[
-            self.javascript.index("  async function submitTurn(event) {"):
+        submit_content = self.javascript[
+            self.javascript.index("  async function submitCurrentContent(target) {"):
             self.javascript.index(
-                "\n  function eventTime(",
-                self.javascript.index("  async function submitTurn(event) {"),
+                "\n  async function submitTurn(event) {",
+                self.javascript.index(
+                    "  async function submitCurrentContent(target) {"
+                ),
             )
         ]
         self.assertLess(
-            submit_turn.index("robotControl.isRobotTarget()"),
-            submit_turn.index("!state.workbenchReadOnlyInvariant"),
+            submit_content.index('target === "robot"'),
+            submit_content.index("!state.workbenchReadOnlyInvariant"),
         )
 
     def test_css_has_responsive_accessible_motion_aware_layout(self):

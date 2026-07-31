@@ -10,8 +10,70 @@
     "FAULTED",
   ]);
   const ACTIVE_STATES = new Set(["STARTING", "RUNNING", "STOPPING"]);
+  const CONVERSATION_VIEWS = Object.freeze(["robot", "workbench"]);
+  const CONVERSATION_TARGETS = Object.freeze(["robot", "workbench"]);
   const POLL_ACTIVE_MS = 400;
   const POLL_IDLE_MS = 2000;
+
+  function checkedConversationValue(value, allowed, name) {
+    if (!allowed.includes(value)) {
+      throw new TypeError(`${name} is invalid`);
+    }
+    return value;
+  }
+
+  function defaultConversationTarget(view) {
+    return checkedConversationValue(
+      view,
+      CONVERSATION_VIEWS,
+      "Conversation view",
+    ) === "robot" ? "robot" : "workbench";
+  }
+
+  function createConversationTargetState(initialView = "workbench") {
+    let view = checkedConversationValue(
+      initialView,
+      CONVERSATION_VIEWS,
+      "Conversation view",
+    );
+    const overrides = {
+      robot: null,
+      workbench: null,
+    };
+
+    function selected() {
+      return overrides[view] || defaultConversationTarget(view);
+    }
+
+    return Object.freeze({
+      clearOverride: () => {
+        overrides[view] = null;
+        return selected();
+      },
+      override: (target) => {
+        overrides[view] = checkedConversationValue(
+          target,
+          CONVERSATION_TARGETS,
+          "Conversation target",
+        );
+        return selected();
+      },
+      selectView: (nextView) => {
+        view = checkedConversationValue(
+          nextView,
+          CONVERSATION_VIEWS,
+          "Conversation view",
+        );
+        return selected();
+      },
+      selected,
+      snapshot: () => Object.freeze({
+        overrides: Object.freeze({ ...overrides }),
+        selected: selected(),
+        view,
+      }),
+    });
+  }
 
   function safeObject(value) {
     return value && typeof value === "object" && !Array.isArray(value)
@@ -130,12 +192,30 @@
     let settingsDirty = false;
     let chatEnabled = false;
     let pollTimer = null;
+    const conversationTarget = createConversationTargetState(
+      options.initialConversationView || "workbench",
+    );
 
     function selectedTarget() {
-      const selector = byId("composer-target");
-      return selector && selector.value === "workbench"
-        ? "workbench"
-        : "robot";
+      return conversationTarget.selected();
+    }
+
+    function syncTargetSelector() {
+      byId("composer-target").value = selectedTarget();
+    }
+
+    function overrideTarget(target) {
+      conversationTarget.override(target);
+      syncTargetSelector();
+      renderComposer();
+      return selectedTarget();
+    }
+
+    function selectConversationView(view) {
+      conversationTarget.selectView(view);
+      syncTargetSelector();
+      renderComposer();
+      return selectedTarget();
     }
 
     function compactFact(value, preferredKeys) {
@@ -476,10 +556,13 @@
     }
 
     async function initialize() {
-      byId("composer-target").addEventListener("change", renderComposer);
+      syncTargetSelector();
+      byId("composer-target").addEventListener("change", (event) => {
+        overrideTarget(event.currentTarget.value);
+      });
       byId("message-input").addEventListener("input", renderComposer);
       byId("robot-start-button").addEventListener("click", () => {
-        byId("composer-target").value = "robot";
+        overrideTarget("robot");
         startGoal(byId("message-input").value, getLocale());
       });
       byId("robot-stop-button").addEventListener(
@@ -531,18 +614,25 @@
     return Object.freeze({
       initialize,
       isRobotTarget: () => selectedTarget() === "robot",
+      overrideTarget,
       reconcileComposer,
       refresh,
       renderLocale,
+      selectConversationView,
+      selectedTarget,
       startGoal,
     });
   }
 
   global.RobotControlUI = Object.freeze({
     ACTIVE_STATES,
+    CONVERSATION_TARGETS,
+    CONVERSATION_VIEWS,
     CONTROL_STATES,
     composerPolicy,
     create,
+    createConversationTargetState,
+    defaultConversationTarget,
     normalizeControl,
     shouldApplySnapshot,
   });

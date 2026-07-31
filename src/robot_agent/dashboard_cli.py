@@ -6,6 +6,7 @@ import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+from pathlib import Path
 import signal
 import socket
 import sys
@@ -18,7 +19,14 @@ from .dashboard_http import (
     new_session_token,
 )
 from .dashboard_service import DashboardService
+from .ev3rstorm_profile import (
+    DEFAULT_EV3RSTORM_MEMORY_PATH,
+    EV3RSTORM_PROFILE_ID,
+    EV3RSTORMProfile,
+    EV3SSHBinding,
+)
 from .lm_studio import DEFAULT_BASE_URL, DEFAULT_MODEL
+from .lm_studio_navigation import LMStudioNavigationPlanner
 from .robot_control_contract import RobotControlSettings
 from .robot_control_http import RobotControlHTTPRouter
 from .robot_control_service import RobotControlService
@@ -28,6 +36,11 @@ LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_HTTP_REQUEST_THREADS = 16
 HTTP_READ_TIMEOUT_SECONDS = 5.0
+ROBOT_PROFILE_DISABLED = "disabled"
+ROBOT_PROFILE_CHOICES = (
+    ROBOT_PROFILE_DISABLED,
+    EV3RSTORM_PROFILE_ID,
+)
 
 
 class _LoopbackThreadingHTTPServer(ThreadingHTTPServer):
@@ -305,6 +318,41 @@ def _parser() -> argparse.ArgumentParser:
             "och visa den skrivskyddat i GUI:t"
         ),
     )
+    parser.add_argument(
+        "--robot-profile",
+        choices=ROBOT_PROFILE_CHOICES,
+        default=ROBOT_PROFILE_DISABLED,
+        help=(
+            "Explicit physical controller profile; disabled by default "
+            "(choices: %(choices)s)"
+        ),
+    )
+    parser.add_argument(
+        "--robot-target",
+        help=(
+            "SSH target for ev3rstorm-01, for example robot@ev3dev.local; "
+            "required only when that physical profile is selected"
+        ),
+    )
+    parser.add_argument(
+        "--robot-memory-path",
+        default=str(DEFAULT_EV3RSTORM_MEMORY_PATH),
+        help=(
+            "Host-local physical navigation memory file "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--robot-reset-memory",
+        action="store_true",
+        help="Reset navigation memory once, at the next EV3 episode",
+    )
+    parser.add_argument(
+        "--robot-planner-timeout-seconds",
+        type=float,
+        default=30.0,
+        help="Structured physical planner timeout (default: %(default)s)",
+    )
     stt_source = parser.add_mutually_exclusive_group()
     stt_source.add_argument(
         "--stt-model",
@@ -362,6 +410,49 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configured_robot_runtime_adapter(args):
+    """Compose an opt-in adapter without connecting to physical hardware."""
+
+    if args.robot_profile == ROBOT_PROFILE_DISABLED:
+        if args.robot_target is not None or args.robot_reset_memory:
+            raise ValueError(
+                "EV3 target/reset options require --robot-profile "
+                "ev3rstorm-01"
+            )
+        return None
+    if args.robot_profile != EV3RSTORM_PROFILE_ID:
+        raise ValueError("physical robot profile is unsupported")
+    if args.robot_target is None:
+        raise ValueError(
+            "--robot-target is required with --robot-profile ev3rstorm-01"
+        )
+    if (
+        not math.isfinite(args.robot_planner_timeout_seconds)
+        or not 0.5 <= args.robot_planner_timeout_seconds <= 60.0
+    ):
+        raise ValueError("physical planner timeout is invalid")
+
+    profile = EV3RSTORMProfile()
+    binding = EV3SSHBinding(
+        profile_id=profile.descriptor.profile_id,
+        target=args.robot_target,
+        memory_path=Path(args.robot_memory_path),
+        reset_memory=args.robot_reset_memory,
+    )
+
+    def planner_factory(model):
+        return LMStudioNavigationPlanner(
+            base_url=args.lm_studio_url,
+            model=model,
+            timeout_seconds=args.robot_planner_timeout_seconds,
+        )
+
+    return profile.build_adapter(
+        binding,
+        planner_factory=planner_factory,
+    )
+
+
 def _close_resources(
     server,
     service,
@@ -399,12 +490,30 @@ def _run(
     robot_runtime_adapter=None,
 ) -> int:
     args = _parser().parse_args(argv)
+    injected_robot_runtime = robot_runtime_adapter is not None
     map_runtime = None
     whisper_runtime = None
     service = None
     robot_control_service = None
     server = None
     try:
+        if injected_robot_runtime:
+            if (
+                args.robot_profile != ROBOT_PROFILE_DISABLED
+                or args.robot_target is not None
+                or args.robot_reset_memory
+            ):
+                raise ValueError(
+                    "Injected robot runtime cannot be combined with CLI "
+                    "physical profile options"
+                )
+        else:
+            robot_runtime_adapter = _configured_robot_runtime_adapter(args)
+        if args.simulation_map_demo and robot_runtime_adapter is not None:
+            raise ValueError(
+                "--simulation-map-demo cannot be combined with a physical "
+                "robot runtime"
+            )
         if args.simulation_map_demo:
             from .spatial_mapping_demo import (
                 build_simulation_map_demo,
@@ -421,6 +530,23 @@ def _run(
                 raise RuntimeError(
                     "Simulator map demo did not complete safely"
                 )
+        elif robot_runtime_adapter is not None:
+            # Physical map publication is a separate, observation-only
+            # capability.  It never travels through RobotRuntimeUpdate and
+            # owns no motor authority.  Concrete adapters expose it as an
+            # instance attribute so generic injected test doubles cannot
+            # accidentally manufacture a provider through dynamic getattr.
+            try:
+                adapter_state = vars(robot_runtime_adapter)
+            except TypeError:
+                adapter_state = {}
+            candidate = adapter_state.get("spatial_map_provider")
+            if (
+                candidate is not None
+                and callable(getattr(candidate, "snapshot", None))
+                and callable(getattr(candidate, "close", None))
+            ):
+                map_runtime = candidate
         speech_transcriber = None
         if args.stt_model:
             from .stt_whisper_cpp import WhisperCppTranscriber
@@ -478,13 +604,22 @@ def _run(
                     "physical_control_enabled": (
                         robot_runtime_adapter is not None
                     ),
+                    "robot_profile": (
+                        "injected"
+                        if injected_robot_runtime
+                        else args.robot_profile
+                    ),
                     "speech_to_text_enabled": (
                         speech_transcriber is not None
                     ),
                     "spatial_map_mode": (
                         "simulation_demo"
-                        if map_runtime is not None
-                        else "unavailable"
+                        if args.simulation_map_demo
+                        else (
+                            "physical_live"
+                            if map_runtime is not None
+                            else "unavailable"
+                        )
                     ),
                 },
                 ensure_ascii=False,

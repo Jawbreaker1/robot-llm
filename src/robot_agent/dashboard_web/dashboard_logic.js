@@ -307,6 +307,7 @@
       reasonCode: text(map.reason_code),
       robotId: text(map.robot_id),
       frameId: text(map.frame_id),
+      frameKind: text(map.frame_kind),
       mapVersion: Number.isSafeInteger(map.map_version)
         ? map.map_version
         : null,

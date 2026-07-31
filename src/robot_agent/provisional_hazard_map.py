@@ -378,17 +378,40 @@ class ProvisionalHazardMap:
         self,
         hypothesis_id: str,
         *,
+        evidence_frame_id: str,
+        evidence_map_generation_id: str,
+        based_on_map_version: int,
         completed_at_ms: int,
         left_boundary_mdeg: int,
         right_boundary_mdeg: int,
     ) -> ProvisionalHazard:
+        """Fuse a validated scan after its one mandatory reanchor observe.
+
+        The post-scan observation intentionally advances the map once and may
+        refresh the same hypothesis after the scan's completion timestamp.
+        Freshness therefore comes from the scan's authoritative map basis and
+        the exact one-revision transition, not from rewriting physical time.
+        """
         hazard = self.get(hypothesis_id)
         if hazard is None:
             raise ValueError("scan target no longer exists")
         if (
+            evidence_frame_id != self.frame_id
+            or evidence_map_generation_id != self.map_generation_id
+            or hazard.frame_id != evidence_frame_id
+        ):
+            raise ValueError("scan boundaries belong to a foreign map")
+        if (
+            isinstance(based_on_map_version, bool)
+            or not isinstance(based_on_map_version, int)
+            or based_on_map_version < 0
+            or self.revision != based_on_map_version + 1
+        ):
+            raise ValueError("scan boundary map basis is stale")
+        if (
             isinstance(completed_at_ms, bool)
             or not isinstance(completed_at_ms, int)
-            or completed_at_ms < hazard.last_seen_at_ms
+            or completed_at_ms < hazard.first_seen_at_ms
             or isinstance(left_boundary_mdeg, bool)
             or not isinstance(left_boundary_mdeg, int)
             or isinstance(right_boundary_mdeg, bool)

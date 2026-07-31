@@ -8,14 +8,9 @@ and monitor already-typed, locally bounded motor primitives.
 
 from __future__ import print_function
 
-import binascii
 import copy
-from collections import deque
 import hashlib
-import io
-import json
 import os
-import stat
 import threading
 import time
 
@@ -31,6 +26,22 @@ if __package__:
         read_text,
         write_text,
     )
+    from .supervisor_support import (
+        AuditBuffer,
+        JSONLAuditLog,
+        KNOWN_MOTOR_STATES,
+        SupervisorError,
+        _BoundAttributeReader,
+        _combine_stop_results,
+        _copy_start_failure_evidence,
+        _default_session_id,
+        _failed_stop_result,
+        _is_int,
+        _state_tokens,
+        _stop_result_from_exception,
+        _validate_identifier,
+        _validate_positive_int,
+    )
 else:
     from infrared_safety import (
         InfraredGatePolicy,
@@ -42,6 +53,22 @@ else:
         SafetyError,
         read_text,
         write_text,
+    )
+    from supervisor_support import (
+        AuditBuffer,
+        JSONLAuditLog,
+        KNOWN_MOTOR_STATES,
+        SupervisorError,
+        _BoundAttributeReader,
+        _combine_stop_results,
+        _copy_start_failure_evidence,
+        _default_session_id,
+        _failed_stop_result,
+        _is_int,
+        _state_tokens,
+        _stop_result_from_exception,
+        _validate_identifier,
+        _validate_positive_int,
     )
 
 
@@ -55,301 +82,12 @@ STATE_CLOSED = "CLOSED"
 
 ACTIVE_MOTOR_STATES = frozenset(("running", "ramping", "holding"))
 FAULT_MOTOR_STATES = frozenset(("stalled", "overloaded"))
-KNOWN_MOTOR_STATES = frozenset(
-    ("running", "ramping", "holding", "stalled", "overloaded")
-)
 AUDIT_SCHEMA = "ev3-supervisor-audit/v1"
 IR_ROAMER_RUNTIME_PROFILE = "ir-roamer-v1"
 IR_ROAMER_POLL_INTERVAL_MS = 150
 IR_ROAMER_MAX_POLL_LATENESS_MS = 400
 
 
-def _is_int(value):
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _validate_positive_int(name, value, maximum=None):
-    if not _is_int(value) or value <= 0:
-        raise SupervisorError(
-            "invalid_{}".format(name),
-            "{} must be a positive integer".format(name),
-        )
-    if maximum is not None and value > maximum:
-        raise SupervisorError(
-            "invalid_{}".format(name),
-            "{} exceeds maximum {}".format(name, maximum),
-        )
-    return value
-
-
-def _validate_identifier(name, value, maximum):
-    if (
-        not isinstance(value, str)
-        or not value
-        or value != value.strip()
-        or len(value) > maximum
-        or "\x00" in value
-        or "\n" in value
-        or "\r" in value
-    ):
-        raise SupervisorError(
-            "invalid_{}".format(name),
-            "{} must contain 1..{} safe characters".format(name, maximum),
-        )
-    return value
-
-
-def _state_tokens(raw):
-    if not isinstance(raw, str):
-        raise SupervisorError(
-            "invalid_motor_state",
-            "Motor state must be text",
-        )
-    tokens = frozenset(raw.split())
-    unknown = tokens - KNOWN_MOTOR_STATES
-    if unknown:
-        raise SupervisorError(
-            "invalid_motor_state",
-            "Motor state contains unknown tokens: {}".format(
-                sorted(unknown)
-            ),
-        )
-    return tokens
-
-
-def _default_session_id():
-    return binascii.hexlify(os.urandom(16)).decode("ascii")
-
-
-class SupervisorError(SafetyError):
-    def __init__(self, code, message):
-        self.code = code
-        SafetyError.__init__(self, message)
-
-
-class _BoundAttributeReader(object):
-    """Read one immutable sysfs attribute without reopening it per tick."""
-
-    MAX_BYTES = 256
-
-    def __init__(self, path, kind):
-        self.path = path
-        self.kind = kind
-        self._descriptor = None
-        self._identity_token = None
-        flags = os.O_RDONLY
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            self._descriptor = os.open(path, flags)
-            metadata = os.fstat(self._descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_nlink <= 0
-            ):
-                raise OSError("attribute is not a linked regular file")
-            self._identity_token = (
-                metadata.st_dev,
-                metadata.st_ino,
-            )
-            self._verify_identity("hardware_topology_unreadable")
-        except BaseException:
-            try:
-                self.close()
-            except BaseException:
-                pass
-            raise
-
-    @property
-    def descriptor(self):
-        return self._descriptor
-
-    def _verify_identity(self, error_code):
-        if self._descriptor is None:
-            raise SupervisorError(
-                error_code,
-                "{} cached attribute is closed".format(self.kind),
-            )
-        try:
-            descriptor_metadata = os.fstat(self._descriptor)
-            path_metadata = os.stat(self.path)
-        except (IOError, OSError, ValueError) as error:
-            raise SupervisorError(
-                error_code,
-                "{} identity could not be read: {}".format(
-                    self.kind,
-                    error,
-                ),
-            )
-        descriptor_token = (
-            descriptor_metadata.st_dev,
-            descriptor_metadata.st_ino,
-        )
-        path_token = (
-            path_metadata.st_dev,
-            path_metadata.st_ino,
-        )
-        if (
-            not stat.S_ISREG(descriptor_metadata.st_mode)
-            or descriptor_metadata.st_nlink <= 0
-            or descriptor_token != self._identity_token
-            or path_token != self._identity_token
-        ):
-            raise SupervisorError(
-                error_code,
-                "{} identity changed after binding".format(self.kind),
-            )
-
-    def read(self, error_code):
-        self._verify_identity(error_code)
-        try:
-            raw = os.pread(
-                self._descriptor,
-                self.MAX_BYTES + 1,
-                0,
-            )
-        except (IOError, OSError, ValueError) as error:
-            raise SupervisorError(
-                error_code,
-                "{} could not be read: {}".format(self.kind, error),
-            )
-        if len(raw) > self.MAX_BYTES:
-            raise SupervisorError(
-                error_code,
-                "{} exceeded the read limit".format(self.kind),
-            )
-        try:
-            return raw.decode("ascii").strip()
-        except (AttributeError, UnicodeDecodeError):
-            raise SupervisorError(
-                error_code,
-                "{} was not valid ASCII".format(self.kind),
-            )
-
-    def close(self):
-        descriptor = self._descriptor
-        self._descriptor = None
-        if descriptor is not None:
-            os.close(descriptor)
-
-
-class JSONLAuditLog(object):
-    """Small append-only JSONL sink with durable transition writes."""
-
-    def __init__(self, path):
-        if not isinstance(path, str) or not path:
-            raise SupervisorError(
-                "invalid_audit_path",
-                "Audit path is invalid",
-            )
-        self.path = path
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(path, flags, 0o600)
-        os.fchmod(descriptor, 0o600)
-        self._handle = io.open(
-            descriptor,
-            "a",
-            encoding="utf-8",
-            closefd=True,
-        )
-        self._closed = False
-
-    def append(self, event):
-        if self._closed:
-            raise IOError("Audit log is closed")
-        encoded = json.dumps(
-            event,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        self._handle.write(encoded + "\n")
-        self._handle.flush()
-        os.fsync(self._handle.fileno())
-
-    def close(self):
-        if self._closed:
-            return
-        self._handle.close()
-        self._closed = True
-
-
-class AuditBuffer(object):
-    """Bounded in-memory audit queue that never performs external I/O."""
-
-    def __init__(self, maximum_events):
-        _validate_positive_int(
-            "audit_buffer_events",
-            maximum_events,
-            10000,
-        )
-        self.maximum_events = maximum_events
-        self._events = deque()
-
-    def append(self, event, terminal=False):
-        reserved = 0 if terminal else 1
-        if len(self._events) >= self.maximum_events - reserved:
-            raise SupervisorError(
-                "audit_buffer_full",
-                "Audit buffer is full",
-            )
-        self._events.append(copy.deepcopy(event))
-
-    def snapshot(self):
-        return [copy.deepcopy(event) for event in self._events]
-
-    def drain(self):
-        events = []
-        while self._events:
-            events.append(self._events.popleft())
-        return events
-
-
-def _failed_stop_result(error):
-    return {
-        "stop_attempts": [],
-        "stop_confirmed": False,
-        "states": {},
-        "positions": {},
-        "fault_tokens": {},
-        "errors": [str(error)],
-    }
-
-
-def _stop_result_from_exception(error):
-    attached = getattr(error, "supervisor_stop_result", None)
-    if isinstance(attached, dict):
-        return copy.deepcopy(attached)
-    return _failed_stop_result(error)
-
-
-def _combine_stop_results(labelled_results):
-    history = []
-    errors = []
-    latest = None
-    for label, result in labelled_results:
-        if result is None:
-            continue
-        snapshot = copy.deepcopy(result)
-        history.append(
-            {
-                "phase": label,
-                "result": snapshot,
-            }
-        )
-        for detail in snapshot.get("errors", []):
-            errors.append("{}: {}".format(label, detail))
-        latest = snapshot
-    if latest is None:
-        latest = _failed_stop_result("No stop result")
-    latest["errors"] = errors
-    latest["stop_history"] = history
-    return latest
 
 
 class SupervisorMotorOwner(object):
@@ -1241,6 +979,236 @@ class SupervisorMotorOwner(object):
             raise deferred_interrupt
         return result
 
+    def _start_bound_motors(
+        self,
+        motors,
+        duration_ms,
+        pre_each_start,
+        forward_motion,
+    ):
+        start_write_windows = []
+        try:
+            for motor in motors:
+                position = int(
+                    read_text(os.path.join(motor["path"], "position"))
+                )
+                motor["position_before"] = position
+                motor["checkpoint_position"] = position
+
+            for motor in motors:
+                write_text(
+                    os.path.join(motor["path"], "speed_sp"),
+                    motor["physical_speed_dps"],
+                )
+                write_text(
+                    os.path.join(motor["path"], "time_sp"),
+                    duration_ms,
+                )
+                write_text(
+                    os.path.join(motor["path"], "stop_action"),
+                    "brake",
+                )
+
+            for motor in motors:
+                if pre_each_start is not None:
+                    pre_each_start(
+                        copy.deepcopy(motor),
+                        tuple(copy.deepcopy(start_write_windows)),
+                    )
+                write_begin_ms = int(
+                    self.robot.monotonic_fn() * 1000
+                )
+                if (
+                    start_write_windows
+                    and write_begin_ms
+                    - start_write_windows[0]["begin_ms"]
+                    > self.limits["max_start_skew_ms"]
+                ):
+                    raise SupervisorError(
+                        "start_skew",
+                        "Second motor start missed the local skew limit",
+                    )
+                motor["start_write_begin_ms"] = write_begin_ms
+                write_text(
+                    os.path.join(motor["path"], "command"),
+                    "run-timed",
+                )
+                write_end_ms = int(
+                    self.robot.monotonic_fn() * 1000
+                )
+                # A successful write means this motor may already have
+                # moved.  Record that fact before any later validation can
+                # raise so cleanup evidence cannot accidentally erase real
+                # motion from host odometry.
+                start_write_windows.append(
+                    {
+                        "side": motor["side"],
+                        "role": motor["role"],
+                        "begin_ms": write_begin_ms,
+                        "end_ms": write_end_ms,
+                    }
+                )
+                if write_end_ms < write_begin_ms:
+                    raise SupervisorError(
+                        "clock_rollback",
+                        "Monotonic clock moved backwards during motor start",
+                    )
+                motor["start_write_end_ms"] = write_end_ms
+                # Preserve the original field as the conservative earliest
+                # instant at which the kernel could have observed the write.
+                motor["start_write_ms"] = write_begin_ms
+                if (
+                    len(start_write_windows) == 2
+                    and write_end_ms
+                    - start_write_windows[0]["begin_ms"]
+                    > self.limits["max_start_skew_ms"]
+                ):
+                    raise SupervisorError(
+                        "start_skew",
+                        "Motor command-write window exceeded local limit",
+                    )
+        except BaseException as error:
+            propagated = error
+            try:
+                cleanup = self.stop_all_verified()
+            except BaseException as cleanup_error:
+                cleanup = _stop_result_from_exception(cleanup_error)
+                propagated = cleanup_error
+                try:
+                    propagated.supervisor_start_error = str(error)
+                except Exception:
+                    pass
+            try:
+                propagated.supervisor_start_cleanup = copy.deepcopy(
+                    cleanup
+                )
+            except Exception:
+                pass
+            try:
+                completed_at_ms = int(
+                    self.robot.monotonic_fn() * 1000
+                )
+            except BaseException:
+                completed_at_ms = None
+            motor_receipts = []
+            cleanup_positions = (
+                cleanup.get("positions", {})
+                if isinstance(cleanup, dict)
+                else {}
+            )
+            cleanup_states = (
+                cleanup.get("states", {})
+                if isinstance(cleanup, dict)
+                else {}
+            )
+            for motor in motors:
+                before = motor.get("position_before")
+                after = cleanup_positions.get(motor["path"])
+                state = cleanup_states.get(motor["path"])
+                motor_receipts.append(
+                    {
+                        "side": motor["side"],
+                        "role": motor["role"],
+                        "physical_speed_dps": motor[
+                            "physical_speed_dps"
+                        ],
+                        "position_before": before,
+                        "position_after": after,
+                        "position_delta": (
+                            after - before
+                            if isinstance(before, int)
+                            and not isinstance(before, bool)
+                            and isinstance(after, int)
+                            and not isinstance(after, bool)
+                            else None
+                        ),
+                        "state": state,
+                    }
+                )
+            evidence_complete = (
+                isinstance(cleanup, dict)
+                and cleanup.get("stop_confirmed") is True
+                and not cleanup.get("errors")
+                and not cleanup.get("fault_tokens")
+                and isinstance(completed_at_ms, int)
+                and not isinstance(completed_at_ms, bool)
+                and all(
+                    isinstance(receipt["position_before"], int)
+                    and not isinstance(
+                        receipt["position_before"], bool
+                    )
+                    and isinstance(receipt["position_after"], int)
+                    and not isinstance(
+                        receipt["position_after"], bool
+                    )
+                    and isinstance(receipt["position_delta"], int)
+                    and not isinstance(
+                        receipt["position_delta"], bool
+                    )
+                    and isinstance(receipt["state"], str)
+                    for receipt in motor_receipts
+                )
+                and all(
+                    isinstance(window.get("begin_ms"), int)
+                    and not isinstance(window.get("begin_ms"), bool)
+                    and isinstance(window.get("end_ms"), int)
+                    and not isinstance(window.get("end_ms"), bool)
+                    and window["end_ms"] >= window["begin_ms"]
+                    for window in start_write_windows
+                )
+                and (
+                    not start_write_windows
+                    or completed_at_ms
+                    >= start_write_windows[0]["begin_ms"]
+                )
+            )
+            start_evidence = {
+                "complete": evidence_complete,
+                "duration_ms": duration_ms,
+                "started_at_ms": (
+                    start_write_windows[0]["begin_ms"]
+                    if start_write_windows
+                    else None
+                ),
+                "completed_at_ms": completed_at_ms,
+                "started_sides": [
+                    window["side"] for window in start_write_windows
+                ],
+                "start_write_windows": copy.deepcopy(
+                    start_write_windows
+                ),
+                "motors": motor_receipts,
+                "stop": copy.deepcopy(cleanup),
+            }
+            try:
+                propagated.supervisor_start_evidence = copy.deepcopy(
+                    start_evidence
+                )
+            except Exception:
+                pass
+            raise propagated
+
+        started_at_ms = start_write_windows[0]["begin_ms"]
+        for motor in motors:
+            motor["checkpoint_at_ms"] = (
+                started_at_ms
+                + self.limits["stall_startup_grace_ms"]
+            )
+        self.active = {
+            "motors": motors,
+            "duration_ms": duration_ms,
+            "started_at_ms": started_at_ms,
+            "deadline_ms": started_at_ms + duration_ms,
+            "start_write_window_ms": (
+                start_write_windows[-1]["end_ms"]
+                - start_write_windows[0]["begin_ms"]
+            ),
+            "forward_motion": (
+                forward_motion
+            ),
+        }
+        return self.active_snapshot()
+
     def start_drive(
         self,
         left_speed_dps,
@@ -1296,121 +1264,62 @@ class SupervisorMotorOwner(object):
                 ),
             },
         ]
+        return self._start_bound_motors(
+            motors,
+            duration_ms,
+            pre_each_start,
+            left_speed_dps > 0 and right_speed_dps > 0,
+        )
 
-        try:
-            for motor in motors:
-                position = int(
-                    read_text(os.path.join(motor["path"], "position"))
-                )
-                motor["position_before"] = position
-                motor["checkpoint_position"] = position
-
-            for motor in motors:
-                write_text(
-                    os.path.join(motor["path"], "speed_sp"),
-                    motor["physical_speed_dps"],
-                )
-                write_text(
-                    os.path.join(motor["path"], "time_sp"),
-                    duration_ms,
-                )
-                write_text(
-                    os.path.join(motor["path"], "stop_action"),
-                    "brake",
-                )
-
-            start_write_windows = []
-            for motor in motors:
-                if pre_each_start is not None:
-                    pre_each_start(
-                        copy.deepcopy(motor),
-                        tuple(copy.deepcopy(start_write_windows)),
-                    )
-                write_begin_ms = int(
-                    self.robot.monotonic_fn() * 1000
-                )
-                if (
-                    start_write_windows
-                    and write_begin_ms
-                    - start_write_windows[0]["begin_ms"]
-                    > self.limits["max_start_skew_ms"]
-                ):
-                    raise SupervisorError(
-                        "start_skew",
-                        "Second motor start missed the local skew limit",
-                    )
-                motor["start_write_begin_ms"] = write_begin_ms
-                write_text(
-                    os.path.join(motor["path"], "command"),
-                    "run-timed",
-                )
-                write_end_ms = int(
-                    self.robot.monotonic_fn() * 1000
-                )
-                if write_end_ms < write_begin_ms:
-                    raise SupervisorError(
-                        "clock_rollback",
-                        "Monotonic clock moved backwards during motor start",
-                    )
-                motor["start_write_end_ms"] = write_end_ms
-                # Preserve the original field as the conservative earliest
-                # instant at which the kernel could have observed the write.
-                motor["start_write_ms"] = write_begin_ms
-                start_write_windows.append(
-                    {
-                        "begin_ms": write_begin_ms,
-                        "end_ms": write_end_ms,
-                    }
-                )
-                if (
-                    len(start_write_windows) == 2
-                    and write_end_ms
-                    - start_write_windows[0]["begin_ms"]
-                    > self.limits["max_start_skew_ms"]
-                ):
-                    raise SupervisorError(
-                        "start_skew",
-                        "Motor command-write window exceeded local limit",
-                    )
-        except BaseException as error:
-            propagated = error
-            try:
-                cleanup = self.stop_all_verified()
-            except BaseException as cleanup_error:
-                cleanup = _stop_result_from_exception(cleanup_error)
-                propagated = cleanup_error
-                try:
-                    propagated.supervisor_start_error = str(error)
-                except Exception:
-                    pass
-            try:
-                propagated.supervisor_start_cleanup = copy.deepcopy(
-                    cleanup
-                )
-            except Exception:
-                pass
-            raise propagated
-
-        started_at_ms = start_write_windows[0]["begin_ms"]
-        for motor in motors:
-            motor["checkpoint_at_ms"] = (
-                started_at_ms
-                + self.limits["stall_startup_grace_ms"]
+    def start_drive_side(
+        self,
+        side,
+        logical_speed_dps,
+        duration_ms,
+        pre_each_start=None,
+    ):
+        """Start one internal drive-wheel correction under the same lock."""
+        self._require_open()
+        if self.active is not None:
+            raise SupervisorError(
+                "motion_already_active",
+                "A motion command is already active",
             )
-        self.active = {
-            "motors": motors,
-            "duration_ms": duration_ms,
-            "started_at_ms": started_at_ms,
-            "deadline_ms": started_at_ms + duration_ms,
-            "start_write_window_ms": (
-                start_write_windows[-1]["end_ms"]
-                - start_write_windows[0]["begin_ms"]
-            ),
-            "forward_motion": (
-                left_speed_dps > 0 and right_speed_dps > 0
+        if side not in ("left", "right"):
+            raise SupervisorError(
+                "invalid_drive_side",
+                "Drive side must be left or right",
+            )
+        if (
+            pre_each_start is not None
+            and not callable(pre_each_start)
+        ):
+            raise SupervisorError(
+                "invalid_start_guard",
+                "pre_each_start must be callable",
+            )
+        left_role, right_role, forward_signs = self.robot._drive_roles()
+        role = left_role if side == "left" else right_role
+        self.robot._validate_motion(
+            role,
+            logical_speed_dps,
+            duration_ms,
+        )
+        motor = {
+            "side": side,
+            "role": role,
+            "path": self.path_for_role(role),
+            "logical_speed_dps": logical_speed_dps,
+            "physical_speed_dps": (
+                logical_speed_dps * forward_signs[role]
             ),
         }
-        return self.active_snapshot()
+        return self._start_bound_motors(
+            [motor],
+            duration_ms,
+            pre_each_start,
+            logical_speed_dps > 0,
+        )
 
     def validate_drive(
         self,
@@ -2805,7 +2714,10 @@ class EV3Supervisor(object):
                 )
                 if not isinstance(error, Exception):
                     raise
-                raise SupervisorError(code, str(error))
+                raise _copy_start_failure_evidence(
+                    error,
+                    SupervisorError(code, str(error)),
+                )
             self._enter_fault(code, str(error))
             if not isinstance(error, Exception):
                 raise
@@ -2874,7 +2786,10 @@ class EV3Supervisor(object):
                 )
                 if not isinstance(error, Exception):
                     raise
-                raise SupervisorError(code, str(error))
+                raise _copy_start_failure_evidence(
+                    error,
+                    SupervisorError(code, str(error)),
+                )
             self._enter_fault(
                 code,
                 str(error),
@@ -2882,9 +2797,12 @@ class EV3Supervisor(object):
             )
             if not isinstance(error, Exception):
                 raise
-            raise SupervisorError(
-                code,
-                "Motion start failed",
+            raise _copy_start_failure_evidence(
+                error,
+                SupervisorError(
+                    code,
+                    "Motion start failed",
+                ),
             )
 
         self.active_command_id = command_id

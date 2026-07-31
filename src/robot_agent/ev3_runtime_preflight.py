@@ -35,6 +35,7 @@ PERIPHERAL_MANIFEST = (
 SUPERVISOR_ADDITIONS = (
     "ev3/supervisor_daemon.py",
     "ev3/supervisor_protocol.py",
+    "ev3/supervisor_support.py",
     "ev3/supervisor.py",
     "ev3/infrared_safety.py",
     "ev3/supervisor_cli.py",
@@ -42,11 +43,17 @@ SUPERVISOR_ADDITIONS = (
 SUPERVISOR_MANIFEST = PERIPHERAL_MANIFEST + SUPERVISOR_ADDITIONS
 NAVIGATION_WORKER_MANIFEST = (
     "ev3/navigation_worker_cli.py",
+    "ev3/audio_playback_cli.py",
+    "ev3/audio_playback_worker_cli.py",
+    "ev3/speech_worker_cli.py",
     "ev3/robot_cli.py",
     "ev3/navigation_worker.py",
     "ev3/navigation_worker_protocol.py",
     "ev3/navigation_profile.py",
+    "ev3/encoder_recovery.py",
+    "ev3/encoder_recovery_runtime.py",
     "ev3/infrared_safety.py",
+    "ev3/supervisor_support.py",
     "ev3/supervisor.py",
     "ev3/robot_hal.py",
     "ev3/robot_config.py",
@@ -99,8 +106,14 @@ def _validate_manifests() -> None:
     if not set(PERIPHERAL_MANIFEST).issubset(SUPERVISOR_MANIFEST):
         raise RuntimeError("Supervisor manifest omits peripheral files")
     required_navigation_dependencies = {
+        "ev3/audio_playback_cli.py",
+        "ev3/audio_playback_worker_cli.py",
+        "ev3/speech_worker_cli.py",
         "ev3/robot_cli.py",
+        "ev3/encoder_recovery.py",
+        "ev3/encoder_recovery_runtime.py",
         "ev3/infrared_safety.py",
+        "ev3/supervisor_support.py",
         "ev3/supervisor.py",
         "ev3/robot_hal.py",
         "ev3/robot_config.py",

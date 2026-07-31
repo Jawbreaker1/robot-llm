@@ -343,6 +343,16 @@
         button.removeAttribute("aria-current");
       }
     });
+    if (
+      robotControl
+      && (viewName === "robot" || viewName === "workbench")
+    ) {
+      const previousTarget = robotControl.selectedTarget();
+      const nextTarget = robotControl.selectConversationView(viewName);
+      if (microphoneInput && previousTarget !== nextTarget) {
+        microphoneInput.cancel();
+      }
+    }
     if (focusHeading) {
       const panel = document.querySelector(`[data-view-panel="${viewName}"]`);
       const heading = panel ? panel.querySelector("h2") : null;
@@ -1205,14 +1215,17 @@
     );
   }
 
-  async function submitTurn(event) {
-    event.preventDefault();
+  function selectedConversationTarget() {
+    return robotControl ? robotControl.selectedTarget() : "workbench";
+  }
+
+  async function submitCurrentContent(target) {
     const input = byId("message-input");
     const content = input.value.trim();
     if (!content) {
       return;
     }
-    if (robotControl && robotControl.isRobotTarget()) {
+    if (target === "robot" && robotControl) {
       if (microphoneInput) {
         microphoneInput.cancel();
       }
@@ -1271,6 +1284,11 @@
       enforceCapabilities(safeObject(state.bootstrap));
       showToast(localizedError(error, "chat.send_failed"), true);
     }
+  }
+
+  async function submitTurn(event) {
+    event.preventDefault();
+    await submitCurrentContent(selectedConversationTarget());
   }
 
   function eventTime(event) {
@@ -1734,6 +1752,11 @@
     byId("close-inspector-button").addEventListener("click", closeInspector);
     byId("new-conversation-button").addEventListener("click", startNewConversation);
     byId("composer-form").addEventListener("submit", submitTurn);
+    byId("composer-target").addEventListener("change", () => {
+      if (microphoneInput) {
+        microphoneInput.cancel();
+      }
+    });
     byId("message-input").addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
@@ -1810,10 +1833,11 @@
       request: api,
       onTranscript: (text, metadata) => {
         const input = byId("message-input");
+        const target = selectedConversationTarget();
         input.value = text;
         input.focus();
         if (metadata.autoSend && !input.disabled) {
-          byId("composer-form").requestSubmit();
+          void submitCurrentContent(target);
         }
       },
       onError: (message) => showToast(message, true),

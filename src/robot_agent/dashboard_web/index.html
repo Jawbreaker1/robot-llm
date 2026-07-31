@@ -203,11 +203,12 @@
 
           <form class="composer" id="composer-form">
             <div class="composer-meta">
-              <label for="composer-target" data-i18n="workbench.target.label">Mottagare</label>
-              <select id="composer-target" name="target">
-                <option value="robot" data-i18n="workbench.target.robot">Roboten · autonomt mål</option>
-                <option value="workbench" data-i18n="workbench.target.workbench">Arbetsbänken · samtal</option>
+              <label for="composer-target" data-i18n="workbench.target.label">Vem pratar du med?</label>
+              <select id="composer-target" name="target" aria-describedby="composer-target-help">
+                <option value="robot" data-i18n="workbench.target.robot">Roboten</option>
+                <option value="workbench" data-i18n="workbench.target.workbench" selected>Arbetsbänken / applikationen</option>
               </select>
+              <span class="target-help" id="composer-target-help" data-i18n="workbench.target.help">Gäller både skrivna meddelanden och taltranskript.</span>
               <label for="turn-mode" data-i18n="workbench.mode.label">Körläge</label>
               <select id="turn-mode" name="mode">
                 <option value="conversation" data-i18n="workbench.mode.conversation">Lokalt samtal · kan kolla upp saker vid behov</option>
@@ -414,13 +415,14 @@
             <div class="spatial-map-stage">
               <svg id="spatial-map-canvas" class="spatial-map-canvas" viewBox="0 0 1000 620" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="spatial-map-title spatial-map-description">
                 <title id="spatial-map-title" data-i18n="map.canvas.svg_title">Skrivskyddad rumslig karta</title>
-                <desc id="spatial-map-description" data-i18n="map.canvas.svg_description">Rutnät med robotpose, beläggningsceller, färska sensorstrålar och objekthypoteser när sådana fakta finns.</desc>
+                <desc id="spatial-map-description" data-i18n="map.canvas.svg_description">Rutnät med metriska kartfakta när de finns, plus ett separat provisoriskt lokalt odometrilager utan påhittade IR-avstånd.</desc>
                 <defs>
                   <pattern id="spatial-map-grid-pattern" width="50" height="50" patternUnits="userSpaceOnUse">
                     <path class="map-grid-line" d="M 50 0 L 0 0 0 50"></path>
                   </pattern>
                 </defs>
                 <rect class="map-grid-background" x="0" y="0" width="1000" height="620" fill="url(#spatial-map-grid-pattern)"></rect>
+                <g id="map-local-odometry-layer" role="group" aria-label="Provisorisk lokal odometri" data-i18n-aria-label="map.local_odometry.aria_label"></g>
                 <g id="map-cell-layer" aria-hidden="true"></g>
                 <g id="map-ray-layer" aria-hidden="true"></g>
                 <g id="map-object-layer" aria-hidden="true"></g>
@@ -437,6 +439,7 @@
               <span><i class="legend-swatch is-uncertain" aria-hidden="true"></i><span data-i18n="map.legend.uncertain">Osäker</span></span>
               <span><i class="legend-line" aria-hidden="true"></i><span data-i18n="map.legend.sensor_ray">Färsk sensorstråle</span></span>
               <span><i class="legend-robot" aria-hidden="true"></i><span data-i18n="map.legend.robot">Robot och riktning</span></span>
+              <span><i class="legend-provisional-local" aria-hidden="true"></i><span data-i18n="map.legend.provisional_local">Provisorisk lokal odometri</span></span>
             </div>
           </section>
 

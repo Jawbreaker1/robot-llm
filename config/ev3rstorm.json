@@ -102,7 +102,7 @@
   },
   "limits": {
     "drive": {
-      "max_abs_speed_dps": 250,
+      "max_abs_speed_dps": 800,
       "max_duration_ms": 800
     },
     "arm": {

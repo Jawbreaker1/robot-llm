@@ -36,6 +36,7 @@ from .robot_control_contract import (
 MAX_EVENTS = 512
 MAX_SNAPSHOTS = 128
 MAX_REQUEST_HISTORY = 128
+MAX_ERROR_MESSAGE_CHARACTERS = 240
 
 Clock = Callable[[], int]
 IDFactory = Callable[[], str]
@@ -60,6 +61,39 @@ class RobotEpisodeContext:
     stop_requested: threading.Event
     emergency_stop_requested: threading.Event
     publish: Callable[[Mapping[str, object]], None]
+
+
+@dataclass(frozen=True)
+class RobotEpisodeOutcome(Mapping[str, object]):
+    """Typed adapter result with an out-of-band episode disposition."""
+
+    terminal_reason: str
+    completed: bool
+    runtime_update: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.terminal_reason, str)
+            or not self.terminal_reason
+            or self.terminal_reason != self.terminal_reason.strip()
+            or len(self.terminal_reason) > 128
+            or any(ord(character) < 32 for character in self.terminal_reason)
+            or not isinstance(self.completed, bool)
+            or not isinstance(self.runtime_update, Mapping)
+            or not self.runtime_update
+        ):
+            raise ValueError("Robot episode outcome is invalid")
+        RobotRuntimeUpdate.from_mapping(self.runtime_update)
+        object.__setattr__(self, "runtime_update", dict(self.runtime_update))
+
+    def __getitem__(self, key: str) -> object:
+        return self.runtime_update[key]
+
+    def __iter__(self):
+        return iter(self.runtime_update)
+
+    def __len__(self) -> int:
+        return len(self.runtime_update)
 
 
 def _default_clock_ms() -> int:
@@ -96,6 +130,56 @@ def _validated_id(prefix: str, factory: IDFactory) -> str:
             "Robot control could not create an identifier",
         )
     return value
+
+
+def _safe_error_code(error: Exception) -> str:
+    """Return a public snapshot-compatible code for an arbitrary failure."""
+
+    try:
+        value = getattr(error, "code", "robot_runtime_failed")
+    except Exception:
+        value = "robot_runtime_failed"
+    if (
+        isinstance(value, str)
+        and value
+        and value == value.strip()
+        and len(value) <= 128
+        and all(33 <= ord(character) <= 126 for character in value)
+    ):
+        return value
+    return "robot_runtime_failed"
+
+
+def _safe_error_message(error: Exception) -> str:
+    """Create bounded, single-line diagnostic text for loopback events."""
+
+    try:
+        value = str(error)
+    except Exception:
+        value = ""
+    printable = "".join(
+        character if character.isprintable() else " "
+        for character in value
+    )
+    normalized = " ".join(printable.split())
+    if not normalized:
+        normalized = "Runtime failed without additional details"
+    return normalized[:MAX_ERROR_MESSAGE_CHARACTERS]
+
+
+def _safe_primary_error_diagnostic(error: Exception):
+    """Extract one bounded nested failure without walking exception chains."""
+
+    try:
+        primary_error = getattr(error, "primary_error", None)
+    except Exception:
+        return None, None
+    if not isinstance(primary_error, Exception) or primary_error is error:
+        return None, None
+    return (
+        _safe_error_code(primary_error),
+        _safe_error_message(primary_error),
+    )
 
 
 class RobotControlService:
@@ -142,6 +226,8 @@ class RobotControlService:
         self._started_at_unix_ms = None
         self._terminal_reason = None
         self._last_error_code = None
+        self._last_primary_error_code = None
+        self._last_primary_error_message = None
         self._runtime = RobotRuntimeUpdate(
             speech_status=(
                 "idle"
@@ -250,6 +336,8 @@ class RobotControlService:
             terminal_reason=self._terminal_reason,
             last_error_code=self._last_error_code,
             runtime=self._runtime,
+            primary_error_code=self._last_primary_error_code,
+            primary_error_message=self._last_primary_error_message,
         )
 
     def _record_snapshot_locked(self) -> RobotControlSnapshot:
@@ -446,6 +534,8 @@ class RobotControlService:
             self._started_at_unix_ms = self._now()
             self._terminal_reason = None
             self._last_error_code = None
+            self._last_primary_error_code = None
+            self._last_primary_error_message = None
             self._runtime = RobotRuntimeUpdate(
                 speech_status=(
                     "idle"
@@ -554,14 +644,24 @@ class RobotControlService:
                     "Robot episode is running",
                 )
             result = self._adapter.run(context)
+            outcome = (
+                result
+                if isinstance(result, RobotEpisodeOutcome)
+                else None
+            )
             if result is not None:
-                if not isinstance(result, Mapping):
+                runtime_update = (
+                    outcome.runtime_update
+                    if outcome is not None
+                    else result
+                )
+                if not isinstance(runtime_update, Mapping):
                     raise RobotControlServiceError(
                         500,
                         "robot_runtime_result_invalid",
                         "Robot runtime returned an invalid result",
                     )
-                self._publish(context.episode_id, result)
+                self._publish(context.episode_id, runtime_update)
             with self._lock:
                 if context.episode_id != self._episode_id:
                     return
@@ -576,6 +676,8 @@ class RobotControlService:
                     terminal_reason = "emergency_stopped"
                 elif context.stop_requested.is_set():
                     terminal_reason = "stopped"
+                elif outcome is not None and not outcome.completed:
+                    terminal_reason = outcome.terminal_reason
                 else:
                     terminal_reason = "completed"
                 self._terminal_reason = terminal_reason
@@ -584,7 +686,10 @@ class RobotControlService:
                         IDLE,
                         "robot.episode_finished",
                         "Robot episode finished",
-                        {"terminal_reason": terminal_reason},
+                        {
+                            "terminal_reason": terminal_reason,
+                            "completed": terminal_reason == "completed",
+                        },
                     )
         except Exception as error:
             with self._lock:
@@ -592,19 +697,38 @@ class RobotControlService:
                     return
                 if self._state == FAULTED:
                     return
-                code = getattr(error, "code", "robot_runtime_failed")
-                if not isinstance(code, str) or not code:
-                    code = "robot_runtime_failed"
+                code = _safe_error_code(error)
+                error_message = _safe_error_message(error)
+                (
+                    primary_error_code,
+                    primary_error_message,
+                ) = _safe_primary_error_diagnostic(error)
                 self._last_error_code = code
+                self._last_primary_error_code = primary_error_code
+                self._last_primary_error_message = primary_error_message
                 self._terminal_reason = "faulted"
+                # A physical runtime emits its generic terminal marker while
+                # unwinding.  It is not the failure diagnosis and must not
+                # remain presented as the episode's final message.
+                self._runtime = RobotRuntimeUpdate.from_mapping(
+                    {"message": None},
+                    self._runtime,
+                )
+                fault_data = {
+                    "error_code": code,
+                    "error_type": type(error).__name__,
+                    "error_message": error_message,
+                }
+                if primary_error_code is not None:
+                    fault_data.update({
+                        "primary_error_code": primary_error_code,
+                        "primary_error_message": primary_error_message,
+                    })
                 self._transition_locked(
                     FAULTED,
                     "robot.episode_faulted",
                     "Robot episode faulted",
-                    {
-                        "error_code": code,
-                        "error_type": type(error).__name__,
-                    },
+                    fault_data,
                     level="error",
                 )
         finally:
@@ -626,6 +750,8 @@ class RobotControlService:
                     and self._control_signals_inflight == 0
                 ):
                     self._last_error_code = None
+                    self._last_primary_error_code = None
+                    self._last_primary_error_message = None
                     self._terminal_reason = "fault_acknowledged"
                     return self._transition_locked(
                         IDLE,
@@ -712,6 +838,8 @@ class RobotControlService:
         except Exception as error:
             with self._lock:
                 self._last_error_code = "robot_emergency_stop_failed"
+                self._last_primary_error_code = None
+                self._last_primary_error_message = None
                 self._terminal_reason = "faulted"
                 self._transition_locked(
                     FAULTED,
@@ -844,14 +972,18 @@ class RobotControlService:
             thread.join(float(timeout_seconds))
         with self._lock:
             if thread is not None and thread.is_alive():
-                self._last_error_code = "robot_runtime_shutdown_timeout"
-                self._terminal_reason = "faulted"
-                self._transition_locked(
-                    FAULTED,
-                    "robot.shutdown_timeout",
-                    "Robot runtime did not stop before shutdown timeout",
-                    level="error",
+                # Thread liveness is host-process lifecycle evidence, not a
+                # physical stop result.  Keep the episode pending while the
+                # runner completes its bounded cleanup; _run_episode will
+                # transition to FAULTED if that cleanup explicitly reports
+                # missing physical proof.
+                self._append_event_locked(
+                    "robot.control_shutdown_pending",
+                    "Robot runtime is still stopping",
+                    {"join_timeout_seconds": float(timeout_seconds)},
+                    level="warning",
                 )
+                self._record_snapshot_locked()
             else:
                 self._append_event_locked(
                     "robot.control_shutdown",

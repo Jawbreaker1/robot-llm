@@ -15,7 +15,11 @@ from .active_ir_scan_contract import (
     ActiveIrScanContractError,
     ActiveIrScanRequest,
 )
-from .ev3_navigation_transport import EV3NavigationTransportError
+from .ev3_navigation_transport import (
+    EV3NavigationOperationError,
+    EV3NavigationRemoteError,
+    EV3NavigationTransportError,
+)
 from .physical_navigation_contract import (
     SCAN_SAMPLE_OPERATION,
     SCAN_TURN_ALLOWED_DELTAS_MDEG,
@@ -27,6 +31,52 @@ from .physical_navigation_contract import (
     validate_observation,
 )
 from .physical_odometry import normalize_heading_mdeg
+
+
+_RESTORATION_PROHIBITED_WORKER_CODES = frozenset(
+    (
+        "cancel_requested",
+        "cancellation_probe_failed",
+        "encoder_direction_mismatch",
+        "motion_fault_latched",
+        "motion_start_failed",
+        "motor_fault",
+        "process_deadline",
+        "pulse_budget_exhausted",
+        "scan_turn_encoder_verification_failed",
+        "stop_not_confirmed",
+        "touch_pressed",
+    )
+)
+
+
+class EV3ActiveIrScanWorkerError(ActiveIrScanContractError):
+    """Preserve a validated worker failure and its physical stop proof."""
+
+    def __init__(
+        self,
+        *,
+        operation: str,
+        worker_code: str,
+        worker_fatal: bool,
+        observation,
+        stop,
+        operation_result=None,
+    ):
+        self.operation = operation
+        self.worker_code = worker_code
+        self.worker_fatal = worker_fatal
+        self.worker_observation = observation
+        self.worker_stop = stop
+        self.operation_result = operation_result
+        self.stop_confirmed = stop is not None
+        self.verified_actual_delta_mdeg = None
+        self.restoration_prohibited = True
+        self.result_reason = "scan_worker_error:{}".format(worker_code)
+        super().__init__(
+            "scan_worker_error",
+            "EV3 worker rejected {}: {}".format(operation, worker_code),
+        )
 
 
 class EV3ActiveIrScanRig:
@@ -61,8 +111,11 @@ class EV3ActiveIrScanRig:
         self._last_state_version = None
         self._last_observed_at_ms = None
         self._deadline_ms = None
+        self._created_at_ms = None
+        self._created_monotonic_ms = None
         self._left_role = None
         self._right_role = None
+        self._worker_stop_confirmed = False
 
     def bind_cancel_requested(self, cancel_requested) -> None:
         if not callable(cancel_requested):
@@ -82,8 +135,11 @@ class EV3ActiveIrScanRig:
         self._last_state_version = None
         self._last_observed_at_ms = None
         self._deadline_ms = None
+        self._created_at_ms = None
+        self._created_monotonic_ms = None
         self._left_role = None
         self._right_role = None
+        self._worker_stop_confirmed = False
 
     def _now_ms(self) -> int:
         value = self.clock_ms()
@@ -93,6 +149,21 @@ class EV3ActiveIrScanRig:
                 "Physical scan clock returned an invalid value",
             )
         return value
+
+    def _evidence_now_ms(self, monotonic_ms: int = None) -> int:
+        if (
+            self._created_at_ms is None
+            or self._created_monotonic_ms is None
+        ):
+            raise ActiveIrScanContractError(
+                "scan_rig_not_armed",
+                "Physical scan evidence clock is not armed",
+            )
+        now = self._now_ms() if monotonic_ms is None else monotonic_ms
+        return self._created_at_ms + max(
+            0,
+            now - self._created_monotonic_ms,
+        )
 
     def _cancelled(self) -> bool:
         try:
@@ -166,7 +237,10 @@ class EV3ActiveIrScanRig:
                 "Worker state changed before physical scanning began",
             )
         now = self._now_ms()
-        if now < request.created_at_ms or now >= request.deadline_ms:
+        if (
+            now < request.created_monotonic_ms
+            or now >= request.deadline_monotonic_ms
+        ):
             raise ActiveIrScanContractError(
                 "scan_start_deadline",
                 "Physical scan could not begin inside its validity window",
@@ -177,7 +251,9 @@ class EV3ActiveIrScanRig:
         self._heading_mdeg = request.start_pose.heading_mdeg
         self._last_state_version = request.start_state_version
         self._last_observed_at_ms = request.created_at_ms
-        self._deadline_ms = request.deadline_ms
+        self._deadline_ms = request.deadline_monotonic_ms
+        self._created_at_ms = request.created_at_ms
+        self._created_monotonic_ms = request.created_monotonic_ms
 
     def _require_active(
         self,
@@ -186,7 +262,9 @@ class EV3ActiveIrScanRig:
         if (
             self._heading_mdeg is None
             or self._last_state_version is None
-            or self._deadline_ms != deadline_ms
+            or isinstance(deadline_ms, bool)
+            or not isinstance(deadline_ms, int)
+            or deadline_ms > self._deadline_ms
         ):
             raise ActiveIrScanContractError(
                 "scan_rig_not_armed",
@@ -227,6 +305,20 @@ class EV3ActiveIrScanRig:
                     else None
                 ),
             )
+        except (
+            EV3NavigationRemoteError,
+            EV3NavigationOperationError,
+        ) as error:
+            stop = error.stop
+            self._worker_stop_confirmed = stop is not None
+            raise EV3ActiveIrScanWorkerError(
+                operation=operation,
+                worker_code=error.code,
+                worker_fatal=error.fatal,
+                observation=error.observation,
+                stop=stop,
+                operation_result=getattr(error, "result", None),
+            ) from None
         except EV3NavigationTransportError as error:
             self.transport.abort()
             raise ActiveIrScanContractError(
@@ -308,12 +400,48 @@ class EV3ActiveIrScanRig:
                 "invalid_scan_turn",
                 "Physical scan turn is outside the fixed lattice",
             )
-        response = self._request(
-            SCAN_TURN_OPERATION,
-            {"relative_delta_mdeg": relative_delta_mdeg},
-            deadline_ms,
-            cancellation_enabled=True,
-        )
+        try:
+            response = self._request(
+                SCAN_TURN_OPERATION,
+                {"relative_delta_mdeg": relative_delta_mdeg},
+                deadline_ms,
+                cancellation_enabled=True,
+            )
+        except EV3ActiveIrScanWorkerError as error:
+            result = error.operation_result
+            observation = error.worker_observation
+            outcome = (
+                result.get("outcome")
+                if isinstance(result, dict)
+                else None
+            )
+            verified_delta = None
+            if (
+                isinstance(outcome, dict)
+                and outcome.get("status") == "denied"
+                and outcome.get("started_monotonic_ms") is None
+                and outcome.get("completed_slice_count") == 0
+                and outcome.get("slices") == []
+            ):
+                verified_delta = 0
+            if (
+                verified_delta is not None
+                and error.stop_confirmed
+                and not error.worker_fatal
+                and error.worker_code
+                not in _RESTORATION_PROHIBITED_WORKER_CODES
+                and isinstance(observation, dict)
+                and observation["state_version"]
+                > self._last_state_version
+                and observation["touch"]["pressed"] is False
+                and observation["budgets"][
+                    "motion_fault_latched"
+                ] is False
+            ):
+                self._last_state_version = observation["state_version"]
+                error.verified_actual_delta_mdeg = verified_delta
+                error.restoration_prohibited = False
+            raise
         state_version = response.get("state_version")
         if (
             isinstance(state_version, bool)
@@ -412,28 +540,53 @@ class EV3ActiveIrScanRig:
             "stop_confirmed": True,
         }
 
-    def read_snapshot(self) -> Mapping[str, object]:
+    def read_snapshot(self, deadline_ms: int) -> Mapping[str, object]:
         if self._deadline_ms is None:
             raise ActiveIrScanContractError(
                 "scan_rig_not_armed",
                 "Physical scan rig is not armed",
             )
-        self._require_active(self._deadline_ms)
-        response = self._request(
-            SCAN_SAMPLE_OPERATION,
-            {},
-            self._deadline_ms,
-            cancellation_enabled=True,
-        )
+        self._require_active(deadline_ms)
+        try:
+            response = self._request(
+                SCAN_SAMPLE_OPERATION,
+                {},
+                deadline_ms,
+                cancellation_enabled=True,
+            )
+        except EV3ActiveIrScanWorkerError as error:
+            observation = error.worker_observation
+            if (
+                error.stop_confirmed
+                and not error.worker_fatal
+                and error.worker_code
+                not in _RESTORATION_PROHIBITED_WORKER_CODES
+                and isinstance(observation, dict)
+                and observation["state_version"]
+                > self._last_state_version
+                and observation["touch"]["pressed"] is False
+                and observation["budgets"][
+                    "motion_fault_latched"
+                ] is False
+            ):
+                # Stationary sampling cannot alter body heading. The worker's
+                # validated observation plus stop proof is sufficient to keep
+                # the known offset and use the still-live nonfatal channel for
+                # deterministic restoration.
+                self._last_state_version = observation["state_version"]
+                self._last_observed_at_ms = self._evidence_now_ms()
+                error.restoration_prohibited = False
+            raise
         result = response.get("result", {})
         observation = validate_observation(result.get("observation"))
         state_version = response.get("state_version")
-        observed_at_ms = self._now_ms()
+        observed_monotonic_ms = self._now_ms()
+        observed_at_ms = self._evidence_now_ms(observed_monotonic_ms)
         if (
             observation["state_version"] != state_version
             or state_version <= self._last_state_version
             or observed_at_ms <= self._last_observed_at_ms
-            or observed_at_ms > self._deadline_ms
+            or observed_monotonic_ms > deadline_ms
         ):
             self.transport.abort()
             raise ActiveIrScanContractError(
@@ -460,6 +613,9 @@ class EV3ActiveIrScanRig:
 
     def stop(self) -> Mapping[str, object]:
         if self._deadline_ms is None:
+            return {"stop_confirmed": True}
+        if self._worker_stop_confirmed:
+            self._worker_stop_confirmed = False
             return {"stop_confirmed": True}
         response = self._request(
             "stop",
@@ -496,9 +652,10 @@ class EV3ActiveIrScanRig:
 def build_ev3_active_ir_scan_executor(
     transport,
     *,
-    clock_ms: Callable[[], int] = lambda: int(time.time() * 1000),
+    clock_ms: Callable[[], int] = lambda: int(time.monotonic() * 1000),
     cancel_requested: Callable[[], bool] = lambda: False,
     request_timeout_seconds: float = 8.0,
+    restoration_headroom_ms: int = 0,
 ) -> ActiveIrScanExecutor:
     """Factory seam for ``PhysicalNavigationRuntimeAdapter``."""
     rig = EV3ActiveIrScanRig(
@@ -507,4 +664,8 @@ def build_ev3_active_ir_scan_executor(
         cancel_requested=cancel_requested,
         request_timeout_seconds=request_timeout_seconds,
     )
-    return ActiveIrScanExecutor(rig=rig, clock_ms=clock_ms)
+    return ActiveIrScanExecutor(
+        rig=rig,
+        clock_ms=clock_ms,
+        restoration_headroom_ms=restoration_headroom_ms,
+    )

@@ -34,8 +34,11 @@ PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
   --simulation-map-demo
 ```
 
-Flaggan kontaktar ingen EV3. Utan flaggan visar kartytan ärligt att ingen
-kartprovider är ansluten.
+Flaggan kontaktar ingen EV3. Med en fysisk `ev3rstorm-01`-profil ansluts i
+stället en separat fysisk kartprovider; den visar "inga observationer" tills
+runtime:n har tagit sin första verifierade EV3-snapshot. Utan simulator eller
+fysisk profil visar kartytan ärligt att ingen kartprovider är ansluten. De två
+kartkällorna får inte kombineras i samma dashboardprocess.
 
 ### Starta med lokal taligenkänning
 
@@ -45,6 +48,16 @@ mikrofoninmatning:
 
 ```sh
 scripts/start_lab_console.sh
+```
+
+Den kanoniska runtime-standarden är det exakta LM Studio-ID:t
+`google/gemma-4-26b-a4b-qat`. Startprofilen laddar eller byter inte modell;
+det ID:t måste redan exponeras av avsedd LM Studio-server. Ett explicit
+alternativ gäller konsekvent för både Workbench- och Robot-inställningen i den
+processen:
+
+```sh
+scripts/start_lab_console.sh --model 'EXACT-MODEL-ID-FROM-LM-STUDIO'
 ```
 
 Profilen ansluter som standard till `http://127.0.0.1:8178/v1`, använder den
@@ -178,8 +191,9 @@ blockera dialog, navigation eller den deterministiska säkerhetsloopen.
 - **Arbetsbänk** visar en versionsmärkt konversation, pågående tur,
   verifierat slutsvar, typad aktivitet och eventuell evidens.
 - **Karta** visar en skrivskyddad snapshot av robotens osäkra lokala
-  världsminne: robotpose, färska sensorstrålar, `FREE`/`UNKNOWN`/`OCCUPIED`
-  rutor och opaka objekthypoteser med källa, ålder och confidence.
+  världsminne. Simulatorn kan visa metriska `FREE`/`UNKNOWN`/`OCCUPIED`-rutor;
+  EV3 visar i stället encoderbaserad lokal pose och provisoriska, icke-metriska
+  IR-sektorer med samma hypotes-ID:n som den fysiska navigationen använder.
 - **Kroppar** visar logiska robotar med controllers och perceptionskällor.
   EV3RSTORM är deklarerad men inte observerad när ingen fysisk probe har
   körts.
@@ -227,17 +241,25 @@ ger en tydlig framtida söm där kamera-, ljud- eller LLM-klassificering kan
 lägga till en etikett och evidens utan att ändra den geometriska kartan.
 
 Fysisk EV3 `IR-PROX` är en reflektionssignal och får därför bara visas som
-provisorisk kvalitativ evidens. Systemet hittar inte på millimeter, en metrisk
-endpoint, objektidentitet eller positivt fri väg. Gamla strålar försvinner ur
-livevyn medan kartceller och fortfarande stödda objekthypoteser ligger kvar.
-Om den bounded mapping-kön tappar snapshots eller workern får fel markeras
-kartan `degraded`; navigationsloopen fortsätter oberoende.
+provisorisk kvalitativ evidens. Efter varje verifierad fysisk minnesuppdatering
+publicerar runtime:n en frikopplad snapshot med lokal pose, färsk IR-relation
+och de auktoritativa hinderhypoteserna. Ett separat SVG-lager ritar robotens
+riktning och fasta screen-space-sektorer vid observationsposerna. Sektorlängden
+är uttryckligen icke-metrisk: systemet hittar inte på millimeter, endpoint,
+objektidentitet eller positivt fri väg. Om encoderlokaliseringen blir ogiltig
+markeras kartan `degraded` och den osäkra posen ritas inte som aktuell.
+
+Kartpublicering är best effort och har ingen motorauktoritet. Ett avvisat eller
+felande kartanrop loggas som telemetri men kan varken rulla tillbaka fysisk
+navigation memory eller stoppa nästa motorbeslut.
 
 Detta är ännu inte SLAM, global lokalisering, A*, frontier exploration eller
-ett navigationsfacit. Kartan är inte återkopplad som motorunderlag i denna
-slice. Framtida kameror och flera LEGO-controllers måste publicera explicita
-koordinatramar och kalibrerade transformeringar; observationer från olika
-ramar får inte slås ihop bara för att de tillhör samma logiska robot.
+ett navigationsfacit. Fysisk navigation använder sitt auktoritativa hazard
+memory; dashboardprojektionen är endast en read-only vy av samma fakta och kan
+inte skriva tillbaka. Framtida kameror och flera LEGO-controllers måste
+publicera explicita koordinatramar och kalibrerade transformeringar;
+observationer från olika ramar får inte slås ihop bara för att de tillhör samma
+logiska robot.
 
 ## Säkerhetsgräns
 

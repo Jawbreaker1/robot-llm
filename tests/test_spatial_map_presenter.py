@@ -13,7 +13,7 @@ WEB_ROOT = (
 
 
 class SpatialMapPresenterRuntimeTests(unittest.TestCase):
-    def test_qualitative_only_panel_and_metric_svg_are_both_honest(self):
+    def test_local_odometry_layer_is_visible_and_metric_svg_stays_honest(self):
         script = r"""
 const fs = require("fs");
 const vm = require("vm");
@@ -61,6 +61,7 @@ const requiredIds = [
   "map-qualitative-count",
   "map-object-list",
   "map-object-count",
+  "map-local-odometry-layer",
   "map-cell-layer",
   "map-ray-layer",
   "map-object-layer",
@@ -115,6 +116,14 @@ const translations = {
   "map.frame.unavailable": "No frame",
   "map.legend.robot": "Robot",
   "map.legend.sensor_ray": "Ray",
+  "map.local_odometry.ir_label": "PROVISIONAL IR",
+  "map.local_odometry.ir_title": ({ relation }) => (
+    `Provisional IR cue · ${relation}`
+  ),
+  "map.local_odometry.layer_label": "PROVISIONAL LOCAL ODOMETRY",
+  "map.local_odometry.layer_note": "Angular IR cue · no measured distance",
+  "map.local_odometry.nonmetric": "No metric IR distance",
+  "map.local_odometry.robot_title": "Provisional robot pose",
   "map.objects.confidence": ({ value }) => `${value}% confidence`,
   "map.objects.empty": "No objects",
   "map.objects.no_metadata": "No metadata",
@@ -164,6 +173,7 @@ const qualitative = presenter.render({
   status: "qualitative_only",
   robot_id: "robot-1",
   frame_id: "local-odometry",
+  frame_kind: "LOCAL_ODOMETRY",
   map_version: 1,
   bounds: null,
   cells: [],
@@ -217,6 +227,22 @@ const qualitativeResult = {
     nodes["map-object-layer"].children.length,
     nodes["map-robot-layer"].children.length,
   ],
+  localAttributes: nodes["map-local-odometry-layer"].attributes,
+  localTags: nodes["map-local-odometry-layer"].children
+    .map((node) => node.tag),
+  localText: nodes["map-local-odometry-layer"].textContent,
+  cueAttributes: nodes["map-local-odometry-layer"]
+    .children[2].attributes,
+  cueTags: nodes["map-local-odometry-layer"]
+    .children[2].children.map((node) => node.tag),
+  wedgeScreenLength: (() => {
+    const path = nodes["map-local-odometry-layer"]
+      .children[2].children[1].attributes.d.split(" ");
+    return Math.hypot(
+      Number(path[4]) - Number(path[1]),
+      Number(path[5]) - Number(path[2]),
+    );
+  })(),
 };
 
 presenter.render({
@@ -225,6 +251,7 @@ presenter.render({
   status: "pose_only",
   robot_id: "robot-1",
   frame_id: "LOCAL_ODOMETRY",
+  frame_kind: "LOCAL_ODOMETRY",
   map_version: 2,
   bounds: null,
   robot_pose: {
@@ -248,6 +275,20 @@ const poseResult = {
     nodes["map-object-layer"].children.length,
     nodes["map-robot-layer"].children.length,
   ],
+  localTags: nodes["map-local-odometry-layer"].children
+    .map((node) => node.tag),
+  robotAttributes: nodes["map-local-odometry-layer"]
+    .children[2].attributes,
+  robotTags: nodes["map-local-odometry-layer"]
+    .children[2].children.map((node) => node.tag),
+  headingLength: (() => {
+    const heading = nodes["map-local-odometry-layer"]
+      .children[2].children[2].attributes;
+    return Math.hypot(
+      Number(heading.x2) - Number(heading.x1),
+      Number(heading.y2) - Number(heading.y1),
+    );
+  })(),
 };
 
 presenter.render({
@@ -256,6 +297,7 @@ presenter.render({
   status: "available",
   robot_id: "robot-1",
   frame_id: "SIM_WORLD",
+  frame_kind: "SIMULATION_WORLD",
   map_version: 2,
   based_on_state_version: 19,
   based_on_world_model_version: 4,
@@ -301,6 +343,7 @@ const metricResult = {
   rayTags: nodes["map-ray-layer"].children.map((node) => node.tag),
   objectTags: nodes["map-object-layer"].children.map((node) => node.tag),
   robotTags: nodes["map-robot-layer"].children.map((node) => node.tag),
+  localLayerCount: nodes["map-local-odometry-layer"].children.length,
 };
 
 let invalidDependenciesRejected = false;
@@ -342,7 +385,7 @@ process.stdout.write(JSON.stringify({
             qualitative["connection"],
             "Qualitative IR available",
         )
-        self.assertFalse(qualitative["emptyHidden"])
+        self.assertTrue(qualitative["emptyHidden"])
         self.assertEqual(qualitative["emptyTitle"], "No metric map")
         self.assertEqual(
             qualitative["emptyBody"],
@@ -374,13 +417,49 @@ process.stdout.write(JSON.stringify({
             with self.subTest(expected=expected):
                 self.assertIn(expected, qualitative["panelText"])
         self.assertEqual(qualitative["metricLayerCounts"], [0, 0, 0, 0])
+        self.assertEqual(
+            qualitative["localAttributes"],
+            {
+                "data-provisional": "true",
+                "data-geometry": "screen-space-nonmetric",
+            },
+        )
+        self.assertEqual(qualitative["localTags"], ["text", "text", "g"])
+        self.assertEqual(
+            qualitative["cueAttributes"]["data-metric-distance"],
+            "none",
+        )
+        self.assertEqual(
+            qualitative["cueTags"],
+            ["title", "path", "line", "circle", "text"],
+        )
+        self.assertAlmostEqual(qualitative["wedgeScreenLength"], 64)
+        for expected in (
+            "PROVISIONAL LOCAL ODOMETRY",
+            "no measured distance",
+            "PROVISIONAL IR",
+            "Near reflection",
+            "No metric IR distance",
+        ):
+            with self.subTest(local_layer_text=expected):
+                self.assertIn(expected, qualitative["localText"])
 
         pose = result["poseResult"]
         self.assertEqual(pose["connection"], "Pose only")
-        self.assertFalse(pose["emptyHidden"])
+        self.assertTrue(pose["emptyHidden"])
         self.assertEqual(pose["emptyTitle"], "Pose only")
         self.assertEqual(pose["emptyBody"], "Pose body")
         self.assertEqual(pose["metricLayerCounts"], [0, 0, 0, 0])
+        self.assertEqual(pose["localTags"], ["text", "text", "g"])
+        self.assertEqual(
+            pose["robotAttributes"]["data-provisional"],
+            "true",
+        )
+        self.assertEqual(
+            pose["robotTags"],
+            ["title", "circle", "line", "circle"],
+        )
+        self.assertAlmostEqual(pose["headingLength"], 58)
 
         metric = result["metricResult"]
         self.assertEqual(metric["connection"], "Live")
@@ -393,6 +472,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(metric["rayTags"], ["line", "circle"])
         self.assertEqual(metric["objectTags"], ["g"])
         self.assertEqual(metric["robotTags"], ["g"])
+        self.assertEqual(metric["localLayerCount"], 0)
         self.assertIn("State version19", metric["metadataText"])
         self.assertIn("World version4", metric["metadataText"])
         self.assertTrue(result["invalidDependenciesRejected"])

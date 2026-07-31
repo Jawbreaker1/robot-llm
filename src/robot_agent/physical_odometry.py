@@ -1,4 +1,9 @@
-"""Conservative local odometry derived only from verified encoder receipts."""
+"""Conservative local odometry derived from clean encoder observations.
+
+Command conformance and encoder evidence are deliberately separate: a wheel
+may undertravel while its before/after encoder readings still describe the
+robot's best-known physical motion.
+"""
 
 from dataclasses import dataclass
 import math
@@ -147,6 +152,14 @@ class PhysicalPose:
 
 
 @dataclass(frozen=True)
+class EncoderMotionSegment:
+    left_encoder_delta_degrees: int
+    right_encoder_delta_degrees: int
+    command_verified: bool
+    status: str
+
+
+@dataclass(frozen=True)
 class VerifiedMotion:
     action: str
     left_encoder_delta_degrees: int
@@ -154,6 +167,7 @@ class VerifiedMotion:
     verified_slice_count: int
     requested_slice_count: int
     status: str
+    segments: Tuple[EncoderMotionSegment, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -161,6 +175,25 @@ class VerifiedMotion:
             self.status == "completed"
             and self.verified_slice_count == self.requested_slice_count
         )
+
+    @property
+    def observed_slice_count(self) -> int:
+        return len(self.segments)
+
+    def to_dict(self) -> Mapping[str, object]:
+        return {
+            "action": self.action,
+            "left_encoder_delta_degrees": (
+                self.left_encoder_delta_degrees
+            ),
+            "right_encoder_delta_degrees": (
+                self.right_encoder_delta_degrees
+            ),
+            "verified_slice_count": self.verified_slice_count,
+            "observed_slice_count": self.observed_slice_count,
+            "requested_slice_count": self.requested_slice_count,
+            "command_completed": self.complete,
+        }
 
 
 def _motor_delta(
@@ -222,7 +255,7 @@ def verified_motion_from_result(
     result: Mapping[str, object],
     drive_roles: DriveMotorRoles = DriveMotorRoles(),
 ) -> VerifiedMotion:
-    """Return the contiguous verified prefix; reject ambiguous receipts."""
+    """Return the contiguous observable prefix; reject ambiguous receipts."""
 
     if action not in MOTION_ACTIONS:
         raise PhysicalNavigationContractError(
@@ -288,8 +321,7 @@ def verified_motion_from_result(
             "Motion slices are invalid",
         )
 
-    left_total = 0
-    right_total = 0
+    segments = []
     verified_count = 0
     for expected_index, receipt in enumerate(slices, 1):
         if not isinstance(receipt, dict):
@@ -309,24 +341,98 @@ def verified_motion_from_result(
         receipt_stop = receipt.get("stop")
         if (
             not isinstance(verification, dict)
-            or verification.get("passed") is not True
+            or type(verification.get("passed")) is not bool
             or not isinstance(receipt_stop, dict)
             or receipt_stop.get("stop_confirmed") is not True
             or receipt_stop.get("errors") not in ([], None)
             or receipt_stop.get("fault_tokens") not in ([], {}, None)
         ):
             break
-        left_total += _motor_delta(
+        motors = receipt.get("motors")
+        if motors == []:
+            if receipt.get("status") != "denied":
+                raise PhysicalNavigationContractError(
+                    "missing_encoder_evidence",
+                    "A started motion receipt lacks encoder evidence",
+                )
+            break
+        command_verified = verification.get("passed") is True
+        outer_left_delta = _motor_delta(
             receipt,
             drive_roles.left,
             "left",
         )
-        right_total += _motor_delta(
+        outer_right_delta = _motor_delta(
             receipt,
             drive_roles.right,
             "right",
         )
-        verified_count += 1
+        segment_start = len(segments)
+        temporal = receipt.get("segments")
+        if temporal is None:
+            temporal = [receipt]
+        elif not isinstance(temporal, list) or not temporal:
+            raise PhysicalNavigationContractError(
+                "invalid_motion_segments",
+                "Started motion lacks temporal encoder segments",
+            )
+        for segment in temporal:
+            if not isinstance(segment, dict):
+                raise PhysicalNavigationContractError(
+                    "invalid_motion_segment",
+                    "Temporal encoder segment is invalid",
+                )
+            segment_stop = segment.get("stop")
+            segment_verification = segment.get("encoder_verification")
+            if (
+                not isinstance(segment_stop, dict)
+                or segment_stop.get("stop_confirmed") is not True
+                or segment_stop.get("errors") not in ([], None)
+                or segment_stop.get("fault_tokens") not in ([], {}, None)
+                or not isinstance(segment_verification, dict)
+                or type(segment_verification.get("passed")) is not bool
+            ):
+                raise PhysicalNavigationContractError(
+                    "unverified_motion_segment",
+                    "Temporal encoder segment lacks clean evidence",
+                )
+            segments.append(
+                EncoderMotionSegment(
+                    left_encoder_delta_degrees=_motor_delta(
+                        segment,
+                        drive_roles.left,
+                        "left",
+                    ),
+                    right_encoder_delta_degrees=_motor_delta(
+                        segment,
+                        drive_roles.right,
+                        "right",
+                    ),
+                    command_verified=(
+                        segment_verification.get("passed") is True
+                    ),
+                    status=segment.get("status"),
+                )
+            )
+        added = segments[segment_start:]
+        if (
+            sum(
+                segment.left_encoder_delta_degrees
+                for segment in added
+            )
+            != outer_left_delta
+            or sum(
+                segment.right_encoder_delta_degrees
+                for segment in added
+            )
+            != outer_right_delta
+        ):
+            raise PhysicalNavigationContractError(
+                "motion_segment_aggregate_mismatch",
+                "Temporal encoder segments do not match the slice total",
+            )
+        if command_verified:
+            verified_count += 1
         if receipt.get("status") != "completed":
             break
 
@@ -356,11 +462,18 @@ def verified_motion_from_result(
         )
     return VerifiedMotion(
         action=action,
-        left_encoder_delta_degrees=left_total,
-        right_encoder_delta_degrees=right_total,
+        left_encoder_delta_degrees=sum(
+            segment.left_encoder_delta_degrees
+            for segment in segments
+        ),
+        right_encoder_delta_degrees=sum(
+            segment.right_encoder_delta_degrees
+            for segment in segments
+        ),
         verified_slice_count=verified_count,
         requested_slice_count=requested,
         status=status,
+        segments=tuple(segments),
     )
 
 
@@ -383,48 +496,80 @@ def apply_verified_motion(
     motion: VerifiedMotion,
     calibration: OdometryCalibration = OdometryCalibration(),
 ) -> PhysicalPose:
-    """Apply only the verified prefix of a result to local odometry."""
+    """Apply clean, direction-consistent encoder evidence to local odometry."""
 
-    if motion.verified_slice_count == 0:
+    segments = motion.segments
+    if not segments and motion.verified_slice_count:
+        segments = (
+            EncoderMotionSegment(
+                left_encoder_delta_degrees=(
+                    motion.left_encoder_delta_degrees
+                ),
+                right_encoder_delta_degrees=(
+                    motion.right_encoder_delta_degrees
+                ),
+                command_verified=motion.complete,
+                status=motion.status,
+            ),
+        )
+    if not segments:
         return pose
-    left = motion.left_encoder_delta_degrees
-    right = motion.right_encoder_delta_degrees
-    _validate_direction(motion.action, left, right)
-    if motion.action in (ADVANCE, REVERSE):
-        signed_encoder_degrees = (left + right) / 2.0
-        distance_mm = int(
+    if not any(
+        segment.left_encoder_delta_degrees
+        or segment.right_encoder_delta_degrees
+        for segment in segments
+    ):
+        return pose
+    x_mm = pose.x_mm
+    y_mm = pose.y_mm
+    heading_mdeg = pose.heading_mdeg
+    travelled_mm = 0
+    turned_mdeg = 0
+    for segment in segments:
+        left = segment.left_encoder_delta_degrees
+        right = segment.right_encoder_delta_degrees
+        _validate_direction(motion.action, left, right)
+        center_mm = (
+            (left + right)
+            / 2.0
+            * calibration.linear_mm_per_encoder_degree
+        )
+        delta_mdeg = int(
             round(
-                signed_encoder_degrees
-                * calibration.linear_mm_per_encoder_degree
+                (right - left)
+                / 2.0
+                * calibration.turn_mdeg_per_opposed_encoder_degree
             )
         )
-        heading_radians = math.radians(pose.heading_mdeg / 1000.0)
-        return PhysicalPose(
-            x_mm=pose.x_mm
-            + int(round(math.cos(heading_radians) * distance_mm)),
-            y_mm=pose.y_mm
-            + int(round(math.sin(heading_radians) * distance_mm)),
-            heading_mdeg=pose.heading_mdeg,
-            verified_motion_count=pose.verified_motion_count + 1,
-            total_forward_mm=pose.total_forward_mm + abs(distance_mm),
-            total_turn_mdeg=pose.total_turn_mdeg,
+        heading_radians = math.radians(heading_mdeg / 1000.0)
+        delta_radians = math.radians(delta_mdeg / 1000.0)
+        if delta_mdeg == 0:
+            delta_x = math.cos(heading_radians) * center_mm
+            delta_y = math.sin(heading_radians) * center_mm
+        else:
+            radius_mm = center_mm / delta_radians
+            delta_x = radius_mm * (
+                math.sin(heading_radians + delta_radians)
+                - math.sin(heading_radians)
+            )
+            delta_y = -radius_mm * (
+                math.cos(heading_radians + delta_radians)
+                - math.cos(heading_radians)
+            )
+        x_mm += int(round(delta_x))
+        y_mm += int(round(delta_y))
+        heading_mdeg = normalize_heading_mdeg(
+            heading_mdeg + delta_mdeg
         )
-    opposed_encoder_degrees = (right - left) / 2.0
-    delta_mdeg = int(
-        round(
-            opposed_encoder_degrees
-            * calibration.turn_mdeg_per_opposed_encoder_degree
-        )
-    )
+        travelled_mm += abs(int(round(center_mm)))
+        turned_mdeg += abs(delta_mdeg)
     return PhysicalPose(
-        x_mm=pose.x_mm,
-        y_mm=pose.y_mm,
-        heading_mdeg=normalize_heading_mdeg(
-            pose.heading_mdeg + delta_mdeg
-        ),
+        x_mm=x_mm,
+        y_mm=y_mm,
+        heading_mdeg=heading_mdeg,
         verified_motion_count=pose.verified_motion_count + 1,
-        total_forward_mm=pose.total_forward_mm,
-        total_turn_mdeg=pose.total_turn_mdeg + abs(delta_mdeg),
+        total_forward_mm=pose.total_forward_mm + travelled_mm,
+        total_turn_mdeg=pose.total_turn_mdeg + turned_mdeg,
     )
 
 

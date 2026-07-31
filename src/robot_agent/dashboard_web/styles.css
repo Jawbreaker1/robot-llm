@@ -971,6 +971,14 @@ textarea:focus-visible,
   font-size: 10px;
 }
 
+.target-help {
+  min-width: 150px;
+  flex: 0 1 260px;
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
 .capability-note {
   min-width: 0;
   flex: 1 1 240px;
@@ -1622,6 +1630,94 @@ textarea:focus-visible,
   stroke-width: 6;
 }
 
+.map-local-layer-label,
+.map-local-layer-note,
+.map-local-ir-label {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  paint-order: stroke;
+  stroke: var(--panel-deep);
+  stroke-width: 5px;
+}
+
+.map-local-layer-label {
+  fill: var(--warning);
+  font-size: 15px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+}
+
+.map-local-layer-note {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.map-local-ir-wedge {
+  fill: rgb(242 184 75 / 10%);
+  stroke: var(--warning);
+  stroke-dasharray: 8 6;
+  stroke-linejoin: round;
+  stroke-width: 3;
+}
+
+.map-local-ir-cue.is-near .map-local-ir-wedge {
+  fill: rgb(255 107 98 / 18%);
+  stroke: var(--danger);
+}
+
+.map-local-ir-cue.is-no-near-reflection .map-local-ir-wedge {
+  fill: rgb(116 167 255 / 8%);
+  stroke: var(--evidence);
+}
+
+.map-local-ir-tick {
+  stroke: var(--warning);
+  stroke-dasharray: 4 4;
+  stroke-linecap: round;
+  stroke-width: 5;
+}
+
+.map-local-ir-cue.is-near .map-local-ir-tick {
+  stroke: var(--danger);
+}
+
+.map-local-ir-cue.is-no-near-reflection .map-local-ir-tick {
+  stroke: var(--evidence);
+}
+
+.map-local-ir-anchor {
+  fill: var(--panel-deep);
+  stroke: var(--warning);
+  stroke-dasharray: 3 3;
+  stroke-width: 3;
+}
+
+.map-local-ir-label {
+  fill: var(--warning);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+}
+
+.map-local-robot-boundary {
+  fill: none;
+  stroke: var(--warning);
+  stroke-dasharray: 6 5;
+  stroke-width: 2;
+}
+
+.map-local-robot-heading {
+  stroke: var(--ready);
+  stroke-dasharray: 7 5;
+  stroke-linecap: round;
+  stroke-width: 5;
+}
+
+.map-local-robot-body {
+  fill: rgb(110 214 196 / 72%);
+  stroke: var(--panel-deep);
+  stroke-width: 4;
+}
+
 .map-empty-state {
   position: absolute;
   inset: 0;
@@ -1663,7 +1759,8 @@ textarea:focus-visible,
 }
 
 .legend-swatch,
-.legend-robot {
+.legend-robot,
+.legend-provisional-local {
   display: inline-block;
   width: 12px;
   height: 12px;
@@ -1695,6 +1792,13 @@ textarea:focus-visible,
 .legend-robot {
   background: var(--ready);
   transform: rotate(45deg);
+}
+
+.legend-provisional-local {
+  background: rgb(242 184 75 / 12%);
+  border-color: var(--warning);
+  border-style: dashed;
+  clip-path: polygon(0 50%, 100% 0, 100% 100%);
 }
 
 .map-detail-column {

@@ -3,6 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 import math
+import sys
 import threading
 import time
 from typing import Callable, Mapping, Optional, Tuple
@@ -13,7 +14,11 @@ from .active_ir_scan_contract import (
     validate_scan_result,
     worst_case_scan_budget,
 )
-from .lm_studio_navigation import NavigationPlannerResult
+from .lm_studio_navigation import (
+    LMStudioNavigationDecisionError,
+    LMStudioNavigationError,
+    NavigationPlannerResult,
+)
 from .maneuver_commitment import (
     FACT_GOAL_CORRIDOR_CLEAR,
     FACT_GOAL_HEADING_ALIGNED,
@@ -26,6 +31,10 @@ from .navigation_memory_store import (
     NavigationMemoryStore,
 )
 from .navigation_plan_tail import NavigationPlanTail
+from .physical_observation_progress import (
+    observation_information_result,
+    observe_without_information_gain,
+)
 from .physical_navigation_contract import (
     ACTIONS,
     ADVANCE,
@@ -44,8 +53,10 @@ from .physical_navigation_contract import (
     validate_observation,
 )
 from .physical_navigation_mission import DirectionalMission
-from .physical_odometry import DriveMotorRoles
-
+from .physical_odometry import (
+    DriveMotorRoles,
+    verified_motion_from_result,
+)
 
 DEFAULT_MAX_TURNS = 14
 MAX_TURNS_PER_EPISODE_SECOND = 4
@@ -60,18 +71,24 @@ DEFAULT_SCAN_BUDGET = worst_case_scan_budget()
 DEFAULT_SCAN_TIMEOUT_SECONDS = (
     (DEFAULT_SCAN_BUDGET["minimum_deadline_ms"] + 999) // 1000
 )
-
+MAX_SCAN_TIMEOUT_SECONDS = 120.0
 
 class PhysicalNavigationRuntimeError(RuntimeError):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, primary_error=None):
         self.code = code
+        self.primary_error = primary_error
         super().__init__(message)
-
 
 class _EpisodeCancelled(Exception):
     def __init__(self, stage: str):
         self.stage = stage
         super().__init__(stage)
+
+
+class _LogicalEpisodeTermination(Exception):
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
 
 
 @dataclass(frozen=True)
@@ -133,7 +150,7 @@ class PhysicalNavigationRuntimeConfig:
             or not isinstance(self.scan_timeout_seconds, (int, float))
             or not DEFAULT_SCAN_TIMEOUT_SECONDS
             <= float(self.scan_timeout_seconds)
-            <= 30.0
+            <= MAX_SCAN_TIMEOUT_SECONDS
             or isinstance(self.max_validation_attempts, bool)
             or not isinstance(self.max_validation_attempts, int)
             or not 1 <= self.max_validation_attempts <= 3
@@ -190,6 +207,8 @@ class PhysicalNavigationRuntime:
         monotonic: Callable[[], float] = time.monotonic,
         unix_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
         event_sink: Optional[Callable[[Mapping[str, object]], None]] = None,
+        observation_sink: Optional[Callable[..., object]] = None,
+        validated_utterance_sink: Optional[Callable[[str], object]] = None,
         cancel_event=None,
         emergency_event=None,
     ):
@@ -217,6 +236,13 @@ class PhysicalNavigationRuntime:
             raise ValueError("runtime clocks are invalid")
         if event_sink is not None and not callable(event_sink):
             raise ValueError("runtime event sink is invalid")
+        if observation_sink is not None and not callable(observation_sink):
+            raise ValueError("runtime observation sink is invalid")
+        if (
+            validated_utterance_sink is not None
+            and not callable(validated_utterance_sink)
+        ):
+            raise ValueError("validated utterance sink is invalid")
         self.episode_id = episode_id
         self.config = config
         self.transport = transport
@@ -228,6 +254,8 @@ class PhysicalNavigationRuntime:
         self.monotonic = monotonic
         self.unix_ms = unix_ms
         self.event_sink = event_sink
+        self.observation_sink = observation_sink
+        self.validated_utterance_sink = validated_utterance_sink
         self.cancel_event = cancel_event or threading.Event()
         self.emergency_event = emergency_event or threading.Event()
         self._stop_requested = threading.Event()
@@ -235,6 +263,7 @@ class PhysicalNavigationRuntime:
         self._cleanup_started = False
         self._transport_started = False
         self._observation_received_monotonic = None
+        self._latest_validated_observation = None
         self._worker_absolute_max_ms = None
         self._all_sessions_clean = True
 
@@ -266,6 +295,139 @@ class PhysicalNavigationRuntime:
         value.update(fields)
         self.event_sink(value)
 
+    def _offer_observation(
+        self,
+        observation: Mapping[str, object],
+        *,
+        captured_at_ms: int,
+        publication_stage: str,
+    ) -> None:
+        """Offer committed physical state without granting map authority."""
+
+        if self.observation_sink is None:
+            return
+        try:
+            accepted = self.observation_sink(
+                memory=self.memory,
+                observation=validate_observation(observation),
+                episode_id=self.episode_id,
+                captured_at_ms=captured_at_ms,
+            )
+        except Exception as error:
+            try:
+                self._emit(
+                    "spatial_map_observation_failed",
+                    publication_stage=publication_stage,
+                    error_type=type(error).__name__,
+                )
+            except Exception:
+                # A broken general telemetry sink cannot reintroduce map
+                # authority through this failure-reporting path.
+                pass
+            return
+        if accepted is False:
+            try:
+                self._emit(
+                    "spatial_map_observation_rejected",
+                    publication_stage=publication_stage,
+                )
+            except Exception:
+                pass
+
+    def _remember_observation(
+        self,
+        observation: Mapping[str, object],
+    ) -> None:
+        """Retain detached evidence for a later localization invalidation."""
+        checked = validate_observation(observation)
+        self._latest_validated_observation = deepcopy(checked)
+
+    def _offer_invalid_localization(
+        self,
+        *,
+        captured_at_ms: int,
+        publication_stage: str,
+        observation: Optional[Mapping[str, object]] = None,
+    ) -> None:
+        """Publish a persisted invalidation without changing its outcome."""
+
+        if self.memory.localization_valid:
+            return
+        evidence = (
+            observation
+            if observation is not None
+            else self._latest_validated_observation
+        )
+        if evidence is None:
+            try:
+                self._emit(
+                    "spatial_map_invalidation_unpublished",
+                    publication_stage=publication_stage,
+                    reason="no_validated_observation",
+                )
+            except Exception:
+                pass
+            return
+        self._offer_observation(
+            evidence,
+            captured_at_ms=captured_at_ms,
+            publication_stage=publication_stage,
+        )
+
+    def _invalidate_localization(
+        self,
+        reason: str,
+        *,
+        publication_stage: str,
+        observation: Optional[Mapping[str, object]] = None,
+    ) -> None:
+        captured_at_ms = self.unix_ms()
+        self.memory.invalidate_localization(reason, captured_at_ms)
+        self._offer_invalid_localization(
+            captured_at_ms=captured_at_ms,
+            publication_stage=publication_stage,
+            observation=observation,
+        )
+
+    def _commit_decision(
+        self,
+        decision: NavigationDecision,
+        *,
+        turn: int,
+    ) -> None:
+        """Publish and offer speech only for the action being dispatched."""
+
+        self._raise_if_cancelled("immediately_before_decision_commit")
+        self._emit(
+            "model_decision_committed",
+            turn=turn,
+            action=decision.action,
+            plan=list(decision.plan),
+            assessment=decision.assessment,
+            utterance=decision.utterance,
+            decision_status="committed",
+        )
+        if (
+            decision.utterance is None
+            or self.validated_utterance_sink is None
+        ):
+            return
+        self._raise_if_cancelled(
+            "immediately_before_committed_utterance_offer"
+        )
+        try:
+            self.validated_utterance_sink(decision.utterance)
+        except Exception as error:
+            # Speech is advisory output. It must never become motor authority
+            # or turn an otherwise valid physical action into a fault.
+            self._emit(
+                "speech_offer_failed",
+                turn=turn,
+                action=decision.action,
+                speech_status="failed",
+                reason=type(error).__name__,
+            )
+
     def _active_request(
         self,
         operation: str,
@@ -280,14 +442,37 @@ class PhysicalNavigationRuntime:
                 operation,
                 arguments,
                 timeout_seconds,
-                cancel_requested=self._cancelled,
+                # Closing the SSH channel is the hard interruption mechanism
+                # for a possibly active motor pulse.  Read-only requests can
+                # finish their bounded response after STOP, preserving the
+                # channel long enough to obtain the verified shutdown receipt.
+                cancel_requested=(
+                    self._cancelled if operation == "pulse" else None
+                ),
             )
         except Exception:
             # The SSH transport closes its channel when the callback turns
             # true. Convert that expected transport failure into the episode's
-            # cancellation result, while preserving unrelated failures.
+            # cancellation result, while preserving unrelated failures.  A
+            # pulse may already have moved either wheel before the channel is
+            # closed, so without its correlated encoder receipt the persisted
+            # pose is no longer trustworthy.
+            if (
+                operation == "pulse"
+                and self._cancelled()
+                and self.memory.localization_valid
+            ):
+                self._invalidate_localization(
+                    "Pulse cancellation lost its correlated encoder receipt",
+                    publication_stage="pulse_receipt_lost",
+                )
             self._raise_if_cancelled("during_{}_request".format(operation))
             raise
+        # If cancellation raced with a response that is already complete, let
+        # the caller consume that stopped, validated encoder receipt.  The next
+        # cancellation boundary will prevent any later physical action.
+        if operation == "pulse" and self._cancelled():
+            return response
         self._raise_if_cancelled("after_{}_request".format(operation))
         return response
 
@@ -335,7 +520,7 @@ class PhysicalNavigationRuntime:
             or set(process) != {"absolute_max_ms", "max_requests"}
             or isinstance(process["absolute_max_ms"], bool)
             or not isinstance(process["absolute_max_ms"], int)
-            or not 5_000 <= process["absolute_max_ms"] <= 120_000
+            or not 5_000 <= process["absolute_max_ms"] <= 180_000
             or isinstance(process["max_requests"], bool)
             or not isinstance(process["max_requests"], int)
             or process["max_requests"] <= 0
@@ -441,6 +626,7 @@ class PhysicalNavigationRuntime:
                 "worker_state_version_mismatch",
                 "Response and observation state versions differ",
             )
+        self._remember_observation(observation)
         self._observation_received_monotonic = self.monotonic()
         return observation
 
@@ -533,6 +719,18 @@ class PhysicalNavigationRuntime:
     def _remaining_seconds(self, deadline: float) -> float:
         return max(0.0, deadline - self.monotonic())
 
+    def _post_planner_gate(self, deadline: float, stage: str) -> None:
+        """Reject planner output that arrived after stop or episode expiry."""
+
+        self._raise_if_cancelled(stage)
+        if self.monotonic() >= deadline:
+            self._emit(
+                "planner_output_discarded",
+                stage=stage,
+                reason="episode_deadline_elapsed",
+            )
+            raise _LogicalEpisodeTermination("episode_deadline_elapsed")
+
     def _execution_veto(
         self,
         *,
@@ -579,6 +777,7 @@ class PhysicalNavigationRuntime:
         self,
         *,
         turn: int,
+        deadline: float,
         observation: Mapping[str, object],
         mission: Mapping[str, object],
         navigation: Mapping[str, object],
@@ -589,22 +788,90 @@ class PhysicalNavigationRuntime:
     ) -> NavigationDecision:
         feedback = None
         for attempt in range(1, self.config.max_validation_attempts + 1):
-            planner_result = self.planner.decide(
-                episode_id=self.episode_id,
-                turn=turn,
-                locale=self.config.locale,
-                observation=observation,
-                mission=mission,
-                navigation=navigation,
-                maneuver_state=maneuver.state(turn),
-                available_actions=available_actions,
-                last_tool_result=last_tool_result,
-                validation_feedback=feedback,
-            )
+            counters["model_calls"] += 1
+            try:
+                planner_result = self.planner.decide(
+                    episode_id=self.episode_id,
+                    turn=turn,
+                    locale=self.config.locale,
+                    observation=observation,
+                    mission=mission,
+                    navigation=navigation,
+                    maneuver_state=maneuver.state(turn),
+                    available_actions=available_actions,
+                    last_tool_result=last_tool_result,
+                    validation_feedback=feedback,
+                )
+            except LMStudioNavigationDecisionError as error:
+                # The request completed, but the model-authored proposal did
+                # not satisfy the decision contract. This is model feedback,
+                # not a transport failure and never an invitation for the
+                # host to substitute an action.
+                counters["model_latency_ms"] += max(0, error.latency_ms)
+                self._post_planner_gate(
+                    deadline,
+                    "after_invalid_planner_return",
+                )
+                feedback = {
+                    "code": error.code,
+                    "message": error.feedback_message,
+                    "host_selected_alternative_action": False,
+                }
+                self._emit(
+                    "decision_vetoed",
+                    turn=turn,
+                    attempt=attempt,
+                    validation_feedback=feedback,
+                )
+                continue
+            except LMStudioNavigationError as error:
+                latency_ms = getattr(error, "latency_ms", 0)
+                if (
+                    isinstance(latency_ms, bool)
+                    or not isinstance(latency_ms, int)
+                    or latency_ms < 0
+                ):
+                    latency_ms = 0
+                counters["model_latency_ms"] += latency_ms
+                self._emit(
+                    "planner_attempt_failed",
+                    turn=turn,
+                    attempt=attempt,
+                    planner_error_code=getattr(
+                        error,
+                        "code",
+                        "lm_studio_navigation_failed",
+                    ),
+                    model_latency_ms=latency_ms,
+                    host_selected_alternative_action=False,
+                )
+                # A single slow or failed call does not end the sequence.
+                # Cancellation and the absolute episode deadline still win
+                # before the same model gets another bounded attempt. No
+                # model-validation feedback or host-selected action is added.
+                self._post_planner_gate(deadline, "after_planner_failure")
+                if attempt < self.config.max_validation_attempts:
+                    continue
+                # The worker is synchronously verified stationary between
+                # planner calls, so exhausted planner availability is a
+                # logical inability to continue rather than a physical fault.
+                self._emit(
+                    "planner_termination",
+                    turn=turn,
+                    attempt=attempt,
+                    terminal_reason="planner_unavailable",
+                    planner_error_code=getattr(
+                        error,
+                        "code",
+                        "lm_studio_navigation_failed",
+                    ),
+                    model_latency_ms=latency_ms,
+                    host_selected_alternative_action=False,
+                )
+                raise _LogicalEpisodeTermination("planner_unavailable")
             # Planning may take seconds. A stop requested during that call
             # must win before the returned proposal can change state or start
             # any physical operation.
-            self._raise_if_cancelled("after_planner_return")
             if isinstance(planner_result, NavigationPlannerResult):
                 decision = planner_result.decision
                 latency_ms = planner_result.latency_ms
@@ -614,12 +881,13 @@ class PhysicalNavigationRuntime:
                 latency_ms = 0
                 served_model = None
             else:
+                self._post_planner_gate(deadline, "after_planner_return")
                 raise PhysicalNavigationRuntimeError(
                     "invalid_planner_result",
                     "Planner returned the wrong result type",
                 )
-            counters["model_calls"] += 1
             counters["model_latency_ms"] += latency_ms
+            self._post_planner_gate(deadline, "after_planner_return")
             self._emit(
                 "model_decision",
                 turn=turn,
@@ -630,6 +898,7 @@ class PhysicalNavigationRuntime:
                 utterance=decision.utterance,
                 model_latency_ms=latency_ms,
                 served_model=served_model,
+                decision_status="proposed",
             )
             try:
                 self._validate_mission_decision(
@@ -663,10 +932,15 @@ class PhysicalNavigationRuntime:
                     turn=turn,
                     validation_feedback=feedback,
                 )
-        raise PhysicalNavigationRuntimeError(
-            "model_validation_failed",
-            "Model did not correct an invalid decision",
+        self._emit(
+            "planner_termination",
+            turn=turn,
+            attempt=self.config.max_validation_attempts,
+            terminal_reason="reasoning_unavailable",
+            validation_feedback=feedback,
+            host_selected_alternative_action=False,
         )
+        raise _LogicalEpisodeTermination("reasoning_unavailable")
 
     def _execute_motion(
         self,
@@ -686,10 +960,29 @@ class PhysicalNavigationRuntime:
             action,
         )
         result = response["result"]
-        self.memory.apply_motion_result(
+        motion = verified_motion_from_result(
             action,
             result,
-            self.unix_ms(),
+            self.memory.drive_roles,
+        )
+        captured_at_ms = self.unix_ms()
+        try:
+            self.memory.apply_motion_result(
+                action,
+                result,
+                captured_at_ms,
+            )
+        except Exception:
+            self._offer_invalid_localization(
+                captured_at_ms=captured_at_ms,
+                publication_stage="motion_result_invalidated",
+                observation=observation,
+            )
+            raise
+        self._offer_observation(
+            observation,
+            captured_at_ms=captured_at_ms,
+            publication_stage="motion_result",
         )
         outcome = result["outcome"]
         feedback = {
@@ -698,6 +991,8 @@ class PhysicalNavigationRuntime:
             "status": outcome["status"],
             "reason": outcome["reason"],
             "worker_response_state_version": response["state_version"],
+            "encoder_observation": motion.to_dict(),
+            "resulting_pose": self.memory.pose.to_dict(),
         }
         self._emit(
             "motion_result",
@@ -725,6 +1020,12 @@ class PhysicalNavigationRuntime:
             self._emit("scan_unavailable", scan=feedback)
             return observation, feedback
         now_ms = self.unix_ms()
+        now_monotonic = self.monotonic()
+        now_monotonic_ms = int(now_monotonic * 1000)
+        scan_window_ms = min(
+            int(self.config.scan_timeout_seconds * 1000),
+            max(0, int((deadline - now_monotonic) * 1000)),
+        )
         request = build_scan_request(
             choice=ModelScanChoice(
                 decision.perception_target_hypothesis_id
@@ -735,10 +1036,9 @@ class PhysicalNavigationRuntime:
             start_pose=self.memory.pose,
             start_state_version=observation["state_version"],
             created_at_ms=now_ms,
-            deadline_ms=min(
-                now_ms + int(self.config.scan_timeout_seconds * 1000),
-                now_ms + int(self._remaining_seconds(deadline) * 1000),
-            ),
+            deadline_ms=now_ms + scan_window_ms,
+            created_monotonic_ms=now_monotonic_ms,
+            deadline_monotonic_ms=now_monotonic_ms + scan_window_ms,
         )
         try:
             result = self.active_scan_executor.execute(
@@ -746,9 +1046,9 @@ class PhysicalNavigationRuntime:
                 cancel_requested=self._cancelled,
             )
         except Exception:
-            self.memory.invalidate_localization(
+            self._invalidate_localization(
                 "Active scan failed before heading restoration was verified",
-                self.unix_ms(),
+                publication_stage="scan_execution_invalidated",
             )
             raise
         try:
@@ -760,15 +1060,20 @@ class PhysicalNavigationRuntime:
                 current_map_version=self.memory.hazard_map.revision,
             )
         except Exception:
-            self.memory.invalidate_localization(
+            self._invalidate_localization(
                 "Active scan result could not be validated",
-                self.unix_ms(),
+                publication_stage="scan_validation_invalidated",
             )
             raise
         if not result.restored_start_heading or not result.stop_confirmed:
-            self.memory.invalidate_localization(
+            # A validated cancelled result still contains the exact scan
+            # reason and every verified ray. Publish it before escalating an
+            # unknown heading/stop state so dashboard evidence survives the
+            # terminal fault transition.
+            self._emit("scan_result", scan=result.to_dict())
+            self._invalidate_localization(
                 "Active scan did not verify restoration to its start heading",
-                self.unix_ms(),
+                publication_stage="scan_restoration_invalidated",
             )
             self._raise_if_cancelled("scan_cancelled_without_restoration")
             raise PhysicalNavigationRuntimeError(
@@ -776,9 +1081,9 @@ class PhysicalNavigationRuntime:
                 "Active scan ended without verified heading restoration",
             )
         if self._cancelled():
-            self.memory.invalidate_localization(
+            self._invalidate_localization(
                 "Scan completed but cancellation prevented encoder re-anchoring",
-                self.unix_ms(),
+                publication_stage="scan_reanchor_cancelled",
             )
             self._raise_if_cancelled("after_scan_before_encoder_reanchor")
         try:
@@ -791,36 +1096,84 @@ class PhysicalNavigationRuntime:
                 self.config.request_timeout_seconds,
             )
             fresh = self._observation_from_response("observe", response)
+            captured_at_ms = self.unix_ms()
             self.memory.ingest_verified_scan_completion(
                 fresh,
                 result,
-                self.unix_ms(),
+                captured_at_ms,
             )
         except _EpisodeCancelled:
-            self.memory.invalidate_localization(
+            self._invalidate_localization(
                 "Cancellation interrupted post-scan encoder re-anchoring",
-                self.unix_ms(),
+                publication_stage="post_scan_observe_cancelled",
             )
             raise
         except Exception:
             if self.memory.localization_valid:
-                self.memory.invalidate_localization(
+                self._invalidate_localization(
                     "Post-scan encoder re-anchoring failed",
-                    self.unix_ms(),
+                    publication_stage="post_scan_reanchor_invalidated",
+                )
+            else:
+                self._offer_invalid_localization(
+                    captured_at_ms=captured_at_ms,
+                    publication_stage="post_scan_reanchor_invalidated",
+                    observation=fresh,
                 )
             raise
         if result.bilateral_complete:
-            self.memory.hazard_map.record_scan_boundaries(
-                result.target_hypothesis_id,
-                completed_at_ms=result.completed_at_ms,
-                left_boundary_mdeg=result.left_boundary_mdeg,
-                right_boundary_mdeg=result.right_boundary_mdeg,
-            )
+            try:
+                self.memory.hazard_map.record_scan_boundaries(
+                    result.target_hypothesis_id,
+                    evidence_frame_id=result.frame_id,
+                    evidence_map_generation_id=result.map_generation_id,
+                    based_on_map_version=result.based_on_map_version,
+                    completed_at_ms=result.completed_at_ms,
+                    left_boundary_mdeg=result.left_boundary_mdeg,
+                    right_boundary_mdeg=result.right_boundary_mdeg,
+                )
+            except ValueError as error:
+                # Physical stop, heading restoration, and the mandatory fresh
+                # encoder anchor were already verified above. A rejected map
+                # fusion is therefore logical discarded evidence, never a
+                # physical fault or a reason to invalidate localization.
+                feedback = {
+                    "operation": SCAN_FRONT_ARC,
+                    "status": "CANCELLED",
+                    "reason": "scan_boundary_map_integration_rejected",
+                    "target_hypothesis_id": (
+                        result.target_hypothesis_id
+                    ),
+                    "bilateral_complete": False,
+                    "evidence_disposition": "DISCARDED",
+                    "integration_error": type(error).__name__,
+                    "scan": result.to_dict(),
+                }
+                self._offer_observation(
+                    fresh,
+                    captured_at_ms=captured_at_ms,
+                    publication_stage="scan_reanchor",
+                )
+                self._emit(
+                    "scan_result",
+                    scan=result.to_dict(),
+                    evidence_disposition="DISCARDED",
+                    map_integration={
+                        "status": "rejected",
+                        "reason": feedback["reason"],
+                    },
+                )
+                return fresh, feedback
             self.memory.updated_at_ms = max(
                 self.memory.updated_at_ms,
                 result.completed_at_ms,
             )
             self.memory.save()
+        self._offer_observation(
+            fresh,
+            captured_at_ms=captured_at_ms,
+            publication_stage="scan_reanchor",
+        )
         feedback = {
             "operation": SCAN_FRONT_ARC,
             "status": result.status,
@@ -860,6 +1213,7 @@ class PhysicalNavigationRuntime:
             drive_roles,
             absolute_max_ms,
         ) = self._description(description)
+        self._remember_observation(observation)
         if (
             expected_action_specs is not None
             and action_specs != expected_action_specs
@@ -877,7 +1231,21 @@ class PhysicalNavigationRuntime:
                 "Renewed worker exposed different drive geometry",
             )
         self.memory.bind_drive_roles(drive_roles)
-        self.memory.begin_episode(observation, self.unix_ms())
+        captured_at_ms = self.unix_ms()
+        try:
+            self.memory.begin_episode(observation, captured_at_ms)
+        except Exception:
+            self._offer_invalid_localization(
+                captured_at_ms=captured_at_ms,
+                publication_stage="worker_session_start_invalidated",
+                observation=observation,
+            )
+            raise
+        self._offer_observation(
+            observation,
+            captured_at_ms=captured_at_ms,
+            publication_stage="worker_session_started",
+        )
         self._observation_received_monotonic = self.monotonic()
         self._worker_absolute_max_ms = absolute_max_ms
         self._emit(
@@ -910,8 +1278,16 @@ class PhysicalNavigationRuntime:
             clean = False
         try:
             self.transport.close()
-        except Exception:
-            clean = False
+        except Exception as error:
+            # A validated shutdown response above already proves both the
+            # physical stop and motor-owner closure.  Failure to reap the
+            # local SSH wrapper is transport degradation, not contrary
+            # physical evidence.
+            self._emit(
+                "transport_cleanup_degraded",
+                physical_shutdown_verified=clean,
+                error_type=type(error).__name__,
+            )
         self._transport_started = False
         return clean
 
@@ -1108,6 +1484,7 @@ class PhysicalNavigationRuntime:
         maneuver = ManeuverCommitment()
         last_tool_result = None
         shutdown_clean = False
+        cleanup_error = None
         try:
             observation, action_specs, drive_roles = (
                 self._start_worker_session()
@@ -1148,10 +1525,15 @@ class PhysicalNavigationRuntime:
                     action_specs,
                 )
                 final_mission = mission_value
+                repeated_uninformative_observe = observe_without_information_gain(last_tool_result)
                 available = [
                     action
                     for action in sorted(ACTIONS)
                     if (
+                        action != OBSERVE
+                        or not repeated_uninformative_observe
+                    )
+                    and (
                         action not in MOTION_ACTIONS
                         or motion_budget_allows(
                             action,
@@ -1170,6 +1552,7 @@ class PhysicalNavigationRuntime:
                 ]
                 decision = self._validated_decision(
                     turn=turn,
+                    deadline=deadline,
                     observation=observation,
                     mission=mission_value,
                     navigation=navigation,
@@ -1178,13 +1561,20 @@ class PhysicalNavigationRuntime:
                     last_tool_result=last_tool_result,
                     counters=counters,
                 )
+                self._post_planner_gate(
+                    deadline,
+                    "before_planner_decision_dispatch",
+                )
                 if decision.action == FINISH:
+                    self._commit_decision(decision, turn=turn)
                     actions.append(FINISH)
                     completed = True
                     terminal_reason = "goal_completed"
                     break
                 if decision.action == OBSERVE:
                     self._raise_if_cancelled("immediately_before_observe")
+                    self._commit_decision(decision, turn=turn)
+                    previous_observation = observation
                     response = self._active_request(
                         "observe",
                         {},
@@ -1194,21 +1584,47 @@ class PhysicalNavigationRuntime:
                         "observe",
                         response,
                     )
-                    self.memory.ingest_stationary_observation(
+                    captured_at_ms = self.unix_ms()
+                    try:
+                        self.memory.ingest_stationary_observation(
+                            observation,
+                            captured_at_ms,
+                        )
+                    except Exception:
+                        self._offer_invalid_localization(
+                            captured_at_ms=captured_at_ms,
+                            publication_stage=(
+                                "stationary_observation_invalidated"
+                            ),
+                            observation=observation,
+                        )
+                        raise
+                    self._offer_observation(
                         observation,
-                        self.unix_ms(),
+                        captured_at_ms=captured_at_ms,
+                        publication_stage="stationary_observation",
                     )
                     actions.append(OBSERVE)
+                    information = observation_information_result(
+                        previous_observation,
+                        observation,
+                    )
                     last_tool_result = {
                         "operation": "observe",
                         "status": "observed",
                         "worker_response_state_version": response[
                             "state_version"
                         ],
+                        **information,
                     }
+                    self._emit(
+                        "observation_information_assessed",
+                        **information,
+                    )
                     continue
                 if decision.action == SCAN_FRONT_ARC:
                     self._raise_if_cancelled("immediately_before_scan_dispatch")
+                    self._commit_decision(decision, turn=turn)
                     observation, last_tool_result = self._execute_scan(
                         decision,
                         observation=observation,
@@ -1244,6 +1660,7 @@ class PhysicalNavigationRuntime:
                     maneuver_state=maneuver.state(turn),
                     fact_values=navigation["fact_values"],
                 )
+                self._commit_decision(decision, turn=turn)
                 observation, last_tool_result = self._execute_motion(
                     decision.action,
                     action_specs=action_specs,
@@ -1336,6 +1753,9 @@ class PhysicalNavigationRuntime:
                 if self.emergency_event.is_set()
                 else "cancelled"
             )
+        except _LogicalEpisodeTermination as termination:
+            terminal_reason = termination.reason
+            completed = False
         except (
             NavigationMemoryError,
             PhysicalNavigationContractError,
@@ -1344,12 +1764,27 @@ class PhysicalNavigationRuntime:
             terminal_reason = "navigation_fault"
             raise
         finally:
-            shutdown_clean = self._cleanup()
+            primary_error = sys.exc_info()[1]
+            try:
+                shutdown_clean = self._cleanup() is True
+            except Exception as error:
+                cleanup_error = error
+                shutdown_clean = False
+            if not shutdown_clean:
+                terminal_reason = "physical_shutdown_unverified"
             self._emit(
                 "episode_stopped",
                 terminal_reason=terminal_reason,
                 shutdown_clean=shutdown_clean,
+                model_calls=counters["model_calls"],
+                model_latency_ms=counters["model_latency_ms"],
             )
+            if not shutdown_clean:
+                raise PhysicalNavigationRuntimeError(
+                    "physical_shutdown_unverified",
+                    "Physical worker shutdown could not be verified",
+                    primary_error=primary_error,
+                ) from cleanup_error
         return PhysicalNavigationResult(
             terminal_reason=terminal_reason,
             completed=completed,
@@ -1363,141 +1798,3 @@ class PhysicalNavigationRuntime:
             final_navigation=self.memory.context(),
             shutdown_clean=shutdown_clean,
         )
-
-
-class PhysicalNavigationRuntimeAdapter:
-    """Factory-backed adapter for ``RobotControlService``'s runner seam."""
-
-    def __init__(
-        self,
-        *,
-        transport_factory: Callable[[], object],
-        planner_factory: Callable[[str], object],
-        memory_factory: Callable[[], NavigationMemoryStore],
-        scan_executor_factory: Optional[Callable[[object], object]] = None,
-        minimum_forward_progress_mm: int = 420,
-        event_mapper: Optional[
-            Callable[[Mapping[str, object]], Optional[Mapping[str, object]]]
-        ] = None,
-    ):
-        for dependency in (
-            transport_factory,
-            planner_factory,
-            memory_factory,
-        ):
-            if not callable(dependency):
-                raise ValueError("runtime adapter factory is invalid")
-        if scan_executor_factory is not None and not callable(
-            scan_executor_factory
-        ):
-            raise ValueError("scan executor factory is invalid")
-        self.transport_factory = transport_factory
-        self.planner_factory = planner_factory
-        self.memory_factory = memory_factory
-        self.scan_executor_factory = scan_executor_factory
-        self.minimum_forward_progress_mm = minimum_forward_progress_mm
-        self.event_mapper = event_mapper or self._dashboard_update
-        self._lock = threading.Lock()
-        self._active = None
-
-    @staticmethod
-    def _dashboard_update(
-        event: Mapping[str, object],
-    ) -> Optional[Mapping[str, object]]:
-        name = event.get("event")
-        if name == "model_decision":
-            value = {
-                "current_action": event["action"],
-                "plan": event["plan"],
-                "model_latency_ms": event["model_latency_ms"],
-                "message": event["assessment"],
-            }
-            if event.get("utterance"):
-                value["message"] = event["utterance"]
-            return value
-        if name == "motion_result":
-            hazards = event["navigation"].get(
-                "navigation_hazard_hypotheses",
-                [],
-            )
-            return {
-                "current_action": event["action"],
-                "obstacle": hazards[-1] if hazards else None,
-            }
-        if name == "scan_result":
-            return {"scan": event["scan"]}
-        if name == "episode_stopped":
-            return {
-                "current_action": None,
-                "plan": [],
-                "message": event["terminal_reason"],
-            }
-        return None
-
-    def run(self, context) -> Mapping[str, object]:
-        transport = self.transport_factory()
-        planner = self.planner_factory(context.settings.model)
-        memory = self.memory_factory()
-        scan_executor = (
-            None
-            if self.scan_executor_factory is None
-            else self.scan_executor_factory(transport)
-        )
-
-        def publish(event):
-            update = self.event_mapper(event)
-            if update:
-                context.publish(update)
-
-        runtime = PhysicalNavigationRuntime(
-            episode_id=context.episode_id,
-            config=PhysicalNavigationRuntimeConfig(
-                goal=context.request.goal,
-                locale=context.request.locale,
-                minimum_forward_progress_mm=(
-                    self.minimum_forward_progress_mm
-                ),
-                max_episode_seconds=(
-                    context.settings.max_episode_ms / 1000.0
-                ),
-            ),
-            transport=transport,
-            transport_factory=self.transport_factory,
-            planner=planner,
-            memory=memory,
-            active_scan_executor=scan_executor,
-            active_scan_executor_factory=self.scan_executor_factory,
-            event_sink=publish,
-            cancel_event=context.stop_requested,
-            emergency_event=context.emergency_stop_requested,
-        )
-        with self._lock:
-            if self._active is not None:
-                raise PhysicalNavigationRuntimeError(
-                    "runtime_already_active",
-                    "A physical navigation runtime is already active",
-                )
-            self._active = runtime
-        try:
-            result = runtime.run()
-            return {
-                "current_action": None,
-                "plan": [],
-                "message": result.terminal_reason,
-            }
-        finally:
-            with self._lock:
-                if self._active is runtime:
-                    self._active = None
-
-    def request_stop(self) -> None:
-        with self._lock:
-            runtime = self._active
-        if runtime is not None:
-            runtime.request_stop()
-
-    def emergency_stop(self) -> None:
-        with self._lock:
-            runtime = self._active
-        if runtime is not None:
-            runtime.emergency_stop()

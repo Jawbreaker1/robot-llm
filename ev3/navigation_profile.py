@@ -10,18 +10,41 @@ from __future__ import print_function
 
 
 REQUEST_SCHEMA = "ev3-agent-worker-request/v1"
-RESPONSE_SCHEMA = "ev3-agent-worker-response/v1"
+RESPONSE_SCHEMA = "ev3-agent-worker-response/v2"
 # Keep the identifier wire-compatible with the validated live prototype.
 # The implementation now lives in production modules, but changing this
 # value would unnecessarily break strict host capability validation.
 WORKER_ID = "ev3-demo-agent-worker-v1"
 
 MAX_FRAME_BYTES = 4096
-MAX_PROCESS_SECONDS = 45.0
+# The 300 MHz EV3 spends a material part of a cold worker session importing
+# Python modules, binding sysfs devices, and establishing its initial stop
+# proof.  Concurrent audio startup can consume more of that same wall-clock
+# budget even though navigation remains asynchronous.  Give this hardware
+# profile enough lifetime for one worst-case host plan, bilateral scan, final
+# encoder observation, and verified shutdown.  This process lifetime is not a
+# motion duration: every pulse and scan slice remains independently bounded
+# and self-stopping, SSH EOF still triggers cleanup immediately, and the host
+# renews the worker before this absolute backstop is reached.
+MAX_PROCESS_SECONDS = 180.0
 MAX_REQUESTS = 256
 MAX_PULSES = 40
 MAX_PULSE_DURATION_MS = 32000
 POLL_INTERVAL_MS = 20
+
+# EV3-specific closed-loop compensation.  These limits are intentionally
+# local to this hardware profile; faster hubs can publish different values.
+ENCODER_RECOVERY_ACTIONS = ("ADVANCE", "REVERSE")
+ENCODER_RECOVERY_MINIMUM_PROGRESS_DEGREES = 3
+ENCODER_RECOVERY_LEADER_MINIMUM_DEGREES = 12
+ENCODER_RECOVERY_ACCEPTABLE_COMPLETION_PERCENT = 75
+ENCODER_RECOVERY_MAXIMUM_PROGRESS_SKEW_PERCENT = 15
+ENCODER_RECOVERY_MAXIMUM_CATCH_UP_ATTEMPTS = 2
+ENCODER_RECOVERY_MAXIMUM_PAIR_RETRY_ATTEMPTS = 1
+ENCODER_RECOVERY_MAXIMUM_TOTAL_ATTEMPTS = 3
+ENCODER_RECOVERY_MAXIMUM_STEP_DURATION_MS = 800
+ENCODER_RECOVERY_MAXIMUM_TOTAL_DURATION_MS = 1600
+ENCODER_RECOVERY_MAXIMUM_TOTAL_ENCODER_DEGREES = 400
 
 # The stock 25 ms limit is below the measured two-write sysfs latency on the
 # 300 MHz EV3.  This remains bounded while permitting both drive motors to
@@ -48,7 +71,7 @@ SCAN_TURN_ALLOWED_DELTAS_MDEG = tuple(
     for value in range(-120000, 120001, 15000)
     if value != 0
 )
-SCAN_TURN_PROFILE_ID = "ev3rstorm-provisional-ir-turn-v1"
+SCAN_TURN_PROFILE_ID = "ev3rstorm-provisional-ir-turn-v2"
 SCAN_TURN_CALIBRATION = "provisional_live_encoder_derived"
 SCAN_TURN_SPEED_DPS = 250
 SCAN_TURN_REFERENCE_BODY_MDEG = 90000
@@ -57,6 +80,7 @@ SCAN_TURN_REFERENCE_DURATION_MS = 2560
 SCAN_TURN_MAX_SLICE_DURATION_MS = 800
 SCAN_TURN_MAX_SIDE_DIVERGENCE_DEGREES = 80
 SCAN_SAMPLE_COUNT = 5
+SCAN_SAMPLE_FILTER_WINDOW = 3
 SCAN_SAMPLE_INTERVAL_MS = 30
 SCAN_SAMPLE_SETTLED_DURATION_MS = (
     (SCAN_SAMPLE_COUNT - 1) * SCAN_SAMPLE_INTERVAL_MS
@@ -68,14 +92,20 @@ def _rounded_ratio(numerator, denominator):
 
 
 def _slice_durations(total_duration_ms):
-    durations = []
-    remaining = total_duration_ms
-    while remaining > SCAN_TURN_MAX_SLICE_DURATION_MS:
-        durations.append(SCAN_TURN_MAX_SLICE_DURATION_MS)
-        remaining -= SCAN_TURN_MAX_SLICE_DURATION_MS
-    if remaining:
-        durations.append(remaining)
-    return durations
+    # Split the calibrated total into balanced slices instead of emitting a
+    # tiny final pulse (for example 800 + 53 ms for 30 degrees).  The EV3's
+    # regulated motors may spend most of such a tail leaving rest, even though
+    # the preceding slice already established useful encoder motion.
+    count = max(
+        1,
+        (
+            total_duration_ms
+            + SCAN_TURN_MAX_SLICE_DURATION_MS
+            - 1
+        ) // SCAN_TURN_MAX_SLICE_DURATION_MS,
+    )
+    base, extra = divmod(total_duration_ms, count)
+    return [base + (1 if index < extra else 0) for index in range(count)]
 
 
 def scan_turn_spec(relative_delta_mdeg):
@@ -140,6 +170,7 @@ def scan_sample_profile():
     """Describe stopped-at-bearing IR sampling on the wire."""
     return {
         "sample_count": SCAN_SAMPLE_COUNT,
+        "filter_window_samples": SCAN_SAMPLE_FILTER_WINDOW,
         "sample_interval_ms": SCAN_SAMPLE_INTERVAL_MS,
         "settled_duration_ms": SCAN_SAMPLE_SETTLED_DURATION_MS,
         "motors_stopped_before_sampling": True,
@@ -148,22 +179,27 @@ def scan_sample_profile():
 
 ACTION_SPECS = {
     "ADVANCE": {
-        "left_speed_dps": 250,
-        "right_speed_dps": 250,
-        "slice_durations_ms": [800],
+        # The assembled EV3RSTORM intermittently fails to leave one motor
+        # phase at the old 250 dps command.  A short high-speed launch keeps
+        # approximately the same nominal 200 encoder-degree travel while
+        # giving the regulated motor controller substantially more starting
+        # authority and shortening each closed-loop pulse.
+        "left_speed_dps": 800,
+        "right_speed_dps": 800,
+        "slice_durations_ms": [250],
         "slice_count": 1,
-        "total_duration_ms": 800,
+        "total_duration_ms": 250,
         "estimated_body_turn_degrees": None,
         "target_mean_abs_encoder_degrees": None,
         "calibration_evidence": None,
         "calibration": "not_applicable",
     },
     "REVERSE": {
-        "left_speed_dps": -250,
-        "right_speed_dps": -250,
-        "slice_durations_ms": [800],
+        "left_speed_dps": -800,
+        "right_speed_dps": -800,
+        "slice_durations_ms": [250],
         "slice_count": 1,
-        "total_duration_ms": 800,
+        "total_duration_ms": 250,
         "estimated_body_turn_degrees": None,
         "target_mean_abs_encoder_degrees": None,
         "calibration_evidence": None,
