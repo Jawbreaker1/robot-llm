@@ -28,6 +28,7 @@ from ev3.supervisor import (
 )
 from ev3.supervisor_protocol import (
     PROTOCOL_VERSION,
+    ProtocolError,
     SupervisorProtocol,
     decode_request,
 )
@@ -430,19 +431,167 @@ class EV3SupervisorTests(unittest.TestCase):
             1,
         )
 
+    def test_second_topology_bind_is_rejected_without_replacing_readers(self):
+        readers = self.supervisor._owner._bound_readers
+        descriptors = tuple(reader.descriptor for reader in readers)
+
+        with self.assertRaises(SupervisorError) as context:
+            self.supervisor._owner.bind_topology()
+
+        self.assertEqual(
+            context.exception.code,
+            "hardware_topology_already_bound",
+        )
+        self.assertIs(self.supervisor._owner._bound_readers, readers)
+        self.assertEqual(
+            tuple(reader.descriptor for reader in readers),
+            descriptors,
+        )
+
+    def test_partial_reader_bind_failure_closes_provisional_descriptors(self):
+        self.supervisor.close()
+        opened = []
+        calls = {"count": 0}
+        real_open = (
+            supervisor_module.SupervisorMotorOwner._open_bound_reader
+        )
+
+        def fail_third_reader(path, attribute, kind):
+            calls["count"] += 1
+            if calls["count"] == 3:
+                raise OSError("simulated reader open failure")
+            reader = real_open(path, attribute, kind)
+            opened.append(reader)
+            return reader
+
+        candidate = None
+        with patch.object(
+            supervisor_module.SupervisorMotorOwner,
+            "_open_bound_reader",
+            side_effect=fail_third_reader,
+        ):
+            candidate = EV3Supervisor(self.hal)
+        try:
+            self.assertEqual(candidate.state, STATE_FAULT_LATCHED)
+            self.assertIsNone(candidate._owner._motor_bindings)
+            self.assertIsNone(candidate._owner._touch_binding)
+            self.assertEqual(candidate._owner._bound_readers, ())
+            self.assertTrue(
+                all(reader.descriptor is None for reader in opened)
+            )
+        finally:
+            candidate.close()
+
+    def test_steady_polls_reuse_bound_descriptors_without_opening(self):
+        descriptors = tuple(
+            reader.descriptor
+            for reader in self.supervisor._owner._bound_readers
+        )
+
+        with patch.object(
+            supervisor_module.os,
+            "open",
+            side_effect=AssertionError(
+                "steady polling must not reopen sysfs attributes"
+            ),
+        ), patch.object(
+            supervisor_module,
+            "read_text",
+            side_effect=AssertionError(
+                "steady polling must use only bound readers"
+            ),
+        ):
+            for _index in range(5):
+                self.supervisor.poll_once()
+
+        self.assertEqual(
+            descriptors,
+            tuple(
+                reader.descriptor
+                for reader in self.supervisor._owner._bound_readers
+            ),
+        )
+        self.assertEqual(self.supervisor.state, STATE_DISARMED)
+        self.assertIsNone(self.supervisor.fault)
+
+    def test_unlink_and_recreate_cached_attribute_faults(self):
+        state_path = self.sysfs.motors["outA"] / "state"
+        state_path.unlink()
+        write(state_path, "")
+
+        self.supervisor.poll_once()
+
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "hardware_read_failed",
+        )
+        self.assert_all_stopped()
+
+    def test_reused_descriptor_identity_faults(self):
+        target = self.supervisor._owner._motor_bindings[0][
+            "readers"
+        ]["state"]
+        real_fstat = supervisor_module.os.fstat
+        unrelated = os.stat("/dev/null")
+
+        def replaced_fstat(descriptor):
+            if descriptor == target.descriptor:
+                return unrelated
+            return real_fstat(descriptor)
+
+        with patch.object(
+            supervisor_module.os,
+            "fstat",
+            side_effect=replaced_fstat,
+        ):
+            self.supervisor.poll_once()
+
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "hardware_read_failed",
+        )
+        self.assert_all_stopped()
+
+    def test_oversized_cached_attribute_faults(self):
+        state_path = self.sysfs.motors["outA"] / "state"
+        write(state_path, "x" * 257)
+
+        self.supervisor.poll_once()
+
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "hardware_read_failed",
+        )
+        self.assert_all_stopped()
+
     def test_idle_poll_has_a_bounded_dynamic_io_budget(self):
-        real_read = supervisor_module.read_text
+        real_pread = supervisor_module.os.pread
         real_discover = (
             self.supervisor._owner._discovered_motor_paths
         )
         real_identity = self.supervisor._owner._identity_token
-        read_paths = []
+        reader_names = {}
+        for name, reader in self.supervisor._owner._touch_binding[
+            "readers"
+        ].items():
+            reader_names[reader.descriptor] = name
+        for name, reader in self.supervisor._owner._infrared_binding[
+            "readers"
+        ].items():
+            reader_names[reader.descriptor] = "infrared_{}".format(name)
+        for binding in self.supervisor._owner._motor_bindings:
+            for name, reader in binding["readers"].items():
+                reader_names[reader.descriptor] = name
+        cached_reads = []
         discovery_calls = []
         identity_calls = []
 
-        def counted_read(path):
-            read_paths.append(Path(path).name)
-            return real_read(path)
+        def counted_pread(descriptor, maximum, offset):
+            cached_reads.append(reader_names[descriptor])
+            return real_pread(descriptor, maximum, offset)
 
         def counted_discover():
             discovery_calls.append(True)
@@ -453,9 +602,9 @@ class EV3SupervisorTests(unittest.TestCase):
             return real_identity(path, kind, error_code)
 
         with patch.object(
-            supervisor_module,
-            "read_text",
-            side_effect=counted_read,
+            supervisor_module.os,
+            "pread",
+            side_effect=counted_pread,
         ), patch.object(
             self.supervisor._owner,
             "_discovered_motor_paths",
@@ -468,27 +617,47 @@ class EV3SupervisorTests(unittest.TestCase):
             self.supervisor.poll_once()
 
         self.assertEqual(
-            read_paths,
-            ["mode", "value0", "state", "state", "state"],
+            cached_reads,
+            [
+                "mode",
+                "value0",
+                "infrared_mode",
+                "infrared_value0",
+                "state",
+                "state",
+                "state",
+            ],
         )
         self.assertEqual(len(discovery_calls), 1)
-        self.assertEqual(len(identity_calls), 4)
+        self.assertEqual(len(identity_calls), 5)
 
     def test_running_poll_has_a_bounded_dynamic_io_budget(self):
         session_id = self.claim_and_arm()
         self.start_drive(session_id, duration_ms=800)
-        real_read = supervisor_module.read_text
+        real_pread = supervisor_module.os.pread
         real_discover = (
             self.supervisor._owner._discovered_motor_paths
         )
         real_identity = self.supervisor._owner._identity_token
-        read_paths = []
+        reader_names = {}
+        for name, reader in self.supervisor._owner._touch_binding[
+            "readers"
+        ].items():
+            reader_names[reader.descriptor] = name
+        for name, reader in self.supervisor._owner._infrared_binding[
+            "readers"
+        ].items():
+            reader_names[reader.descriptor] = "infrared_{}".format(name)
+        for binding in self.supervisor._owner._motor_bindings:
+            for name, reader in binding["readers"].items():
+                reader_names[reader.descriptor] = name
+        cached_reads = []
         discovery_calls = []
         identity_calls = []
 
-        def counted_read(path):
-            read_paths.append(Path(path).name)
-            return real_read(path)
+        def counted_pread(descriptor, maximum, offset):
+            cached_reads.append(reader_names[descriptor])
+            return real_pread(descriptor, maximum, offset)
 
         def counted_discover():
             discovery_calls.append(True)
@@ -499,9 +668,9 @@ class EV3SupervisorTests(unittest.TestCase):
             return real_identity(path, kind, error_code)
 
         with patch.object(
-            supervisor_module,
-            "read_text",
-            side_effect=counted_read,
+            supervisor_module.os,
+            "pread",
+            side_effect=counted_pread,
         ), patch.object(
             self.supervisor._owner,
             "_discovered_motor_paths",
@@ -514,10 +683,12 @@ class EV3SupervisorTests(unittest.TestCase):
             self.supervisor.poll_once()
 
         self.assertEqual(
-            read_paths,
+            cached_reads,
             [
                 "mode",
                 "value0",
+                "infrared_mode",
+                "infrared_value0",
                 "state",
                 "state",
                 "position",
@@ -526,7 +697,7 @@ class EV3SupervisorTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(discovery_calls), 1)
-        self.assertEqual(len(identity_calls), 4)
+        self.assertEqual(len(identity_calls), 5)
 
     def test_missing_bound_dynamic_attribute_faults_and_stops(self):
         state_path = self.sysfs.motors["outA"] / "state"
@@ -1085,7 +1256,7 @@ class EV3SupervisorTests(unittest.TestCase):
         self.assertEqual(self.run_timed_write_count(), 1)
         self.assert_all_stopped()
 
-    def test_touch_change_between_motor_starts_blocks_second_start(self):
+    def test_touch_change_in_write_gap_is_caught_post_start(self):
         session_id = self.claim_and_arm()
         left = self.sysfs.motors["outB"]
         original_write = supervisor_module.write_text
@@ -1107,7 +1278,7 @@ class EV3SupervisorTests(unittest.TestCase):
                 self.start_drive(session_id)
 
         self.assertEqual(context.exception.code, "touch_pressed")
-        self.assertEqual(self.run_timed_write_count(), 1)
+        self.assertEqual(self.run_timed_write_count(), 2)
         self.assert_all_stopped()
 
     def test_heartbeat_expiry_between_motor_starts_blocks_second_start(self):
@@ -1139,9 +1310,8 @@ class EV3SupervisorTests(unittest.TestCase):
         session_id = self.claim_and_arm()
         left = self.sysfs.motors["outB"]
         original_write = supervisor_module.write_text
-        real_read_touch = self.supervisor._owner.read_touch_value
         first_started = {"value": False}
-        delay_applied = {"value": False}
+        delayed = {"value": False}
 
         def mark_left_start(path, value):
             original_write(path, value)
@@ -1151,76 +1321,158 @@ class EV3SupervisorTests(unittest.TestCase):
             ):
                 first_started["value"] = True
 
-        def delayed_touch_read():
-            if (
-                first_started["value"]
-                and not delay_applied["value"]
-            ):
+        def delayed_external_guard():
+            if first_started["value"] and not delayed["value"]:
                 self.clock.advance(26)
-                delay_applied["value"] = True
-            return real_read_touch()
+                delayed["value"] = True
 
         with patch.object(
             supervisor_module,
             "write_text",
             side_effect=mark_left_start,
-        ), patch.object(
-            self.supervisor._owner,
-            "read_touch_value",
-            side_effect=delayed_touch_read,
         ):
             with self.assertRaises(SupervisorError) as context:
-                self.start_drive(session_id)
+                self.supervisor.start_drive(
+                    session_id,
+                    3,
+                    "drive-1",
+                    1,
+                    100,
+                    100,
+                    300,
+                    external_start_guard=delayed_external_guard,
+                )
 
         self.assertEqual(context.exception.code, "start_skew")
         self.assertEqual(self.run_timed_write_count(), 1)
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertTrue(self.supervisor.fault["stop_confirmed"])
         self.assert_all_stopped()
 
-    def test_slow_inventory_guard_blocks_second_motor_before_write(self):
+    def test_slow_prestart_checks_do_not_consume_command_write_window(self):
         session_id = self.claim_and_arm()
         left = self.sysfs.motors["outB"]
+        right = self.sysfs.motors["outC"]
         original_write = supervisor_module.write_text
+        real_touch = self.supervisor._owner.read_touch_value
+        real_infrared = self.supervisor._owner.read_infrared_value
         real_snapshot = (
             self.supervisor._owner.dynamic_motor_snapshots
         )
-        first_started = {"value": False}
-        delay_applied = {"value": False}
+        real_guard = self.supervisor._guard_individual_motor_start
+        in_write_gap = {"value": False}
+        in_first_guard = {"value": False}
+        injected_delays = []
 
-        def mark_left_start(path, value):
+        def track_write_gap(path, value):
+            if (
+                path == str(right / "command")
+                and value == "run-timed"
+            ):
+                in_write_gap["value"] = False
             original_write(path, value)
             if (
                 path == str(left / "command")
                 and value == "run-timed"
             ):
-                first_started["value"] = True
+                in_write_gap["value"] = True
 
-        def slow_snapshot(*args, **kwargs):
-            result = real_snapshot(*args, **kwargs)
+        def slow_touch():
+            self.assertFalse(in_write_gap["value"])
+            result = real_touch()
+            if in_first_guard["value"]:
+                self.clock.advance(7)
+                injected_delays.append(7)
+            return result
+
+        def slow_infrared():
+            self.assertFalse(in_write_gap["value"])
+            result = real_infrared()
+            if in_first_guard["value"]:
+                self.clock.advance(7)
+                injected_delays.append(7)
+            return result
+
+        def slow_snapshot(*arguments, **keywords):
+            self.assertFalse(in_write_gap["value"])
+            result = real_snapshot(*arguments, **keywords)
+            if in_first_guard["value"]:
+                self.clock.advance(22)
+                injected_delays.append(22)
+            return result
+
+        def mark_first_guard(*arguments, **keywords):
+            in_first_guard["value"] = not arguments[1]
+            try:
+                return real_guard(*arguments, **keywords)
+            finally:
+                in_first_guard["value"] = False
+
+        with patch.object(
+            supervisor_module,
+            "write_text",
+            side_effect=track_write_gap,
+        ), patch.object(
+            self.supervisor._owner,
+            "read_touch_value",
+            side_effect=slow_touch,
+        ), patch.object(
+            self.supervisor._owner,
+            "read_infrared_value",
+            side_effect=slow_infrared,
+        ), patch.object(
+            self.supervisor._owner,
+            "dynamic_motor_snapshots",
+            side_effect=slow_snapshot,
+        ), patch.object(
+            self.supervisor,
+            "_guard_individual_motor_start",
+            side_effect=mark_first_guard,
+        ):
+            status = self.start_drive(session_id)
+
+        self.assertEqual(status["state"], STATE_RUNNING)
+        self.assertEqual(self.run_timed_write_count(), 2)
+        self.assertEqual(injected_delays, [7, 7, 22])
+        self.assertLessEqual(
+            self.supervisor._owner.active["start_write_window_ms"],
+            25,
+        )
+        for motor in self.supervisor._owner.active["motors"]:
+            self.assertLessEqual(
+                motor["start_write_begin_ms"],
+                motor["start_write_end_ms"],
+            )
+
+    def test_second_command_write_overrun_stops_and_faults(self):
+        session_id = self.claim_and_arm()
+        right = self.sysfs.motors["outC"]
+        original_write = supervisor_module.write_text
+
+        def slow_second_write(path, value):
+            result = original_write(path, value)
             if (
-                first_started["value"]
-                and not delay_applied["value"]
+                path == str(right / "command")
+                and value == "run-timed"
             ):
                 self.clock.advance(26)
-                delay_applied["value"] = True
             return result
 
         with patch.object(
             supervisor_module,
             "write_text",
-            side_effect=mark_left_start,
-        ), patch.object(
-            self.supervisor._owner,
-            "dynamic_motor_snapshots",
-            side_effect=slow_snapshot,
+            side_effect=slow_second_write,
         ):
             with self.assertRaises(SupervisorError) as context:
                 self.start_drive(session_id)
 
         self.assertEqual(context.exception.code, "start_skew")
-        self.assertEqual(self.run_timed_write_count(), 1)
+        self.assertEqual(self.run_timed_write_count(), 2)
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertTrue(self.supervisor.fault["stop_confirmed"])
         self.assert_all_stopped()
 
-    def test_motor_fault_after_first_start_blocks_second_motor(self):
+    def test_motor_fault_in_write_gap_is_caught_post_start(self):
         session_id = self.claim_and_arm()
         left = self.sysfs.motors["outB"]
         original_write = supervisor_module.write_text
@@ -1242,7 +1494,7 @@ class EV3SupervisorTests(unittest.TestCase):
                 self.start_drive(session_id)
 
         self.assertEqual(context.exception.code, "motor_state_fault")
-        self.assertEqual(self.run_timed_write_count(), 1)
+        self.assertEqual(self.run_timed_write_count(), 2)
         self.assert_all_stopped()
 
     def test_emergency_stop_is_unauthenticated_and_invalidates_session(self):
@@ -1272,6 +1524,51 @@ class EV3SupervisorTests(unittest.TestCase):
         status = self.supervisor.reset_fault()
         self.assertEqual(status["state"], STATE_DISARMED)
         self.assertFalse(status["motion_allowed"])
+
+    def test_cached_hardware_binding_fault_requires_restart(self):
+        state_path = self.sysfs.motors["outA"] / "state"
+        state_path.unlink()
+        write(state_path, "")
+        self.supervisor.poll_once()
+
+        with self.assertRaises(SupervisorError) as context:
+            self.supervisor.reset_fault()
+
+        self.assertEqual(
+            context.exception.code,
+            "supervisor_restart_required",
+        )
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assert_all_stopped()
+
+    def test_secondary_cached_touch_failure_prevents_nonhardware_reset(self):
+        session_id = self.claim_and_arm()
+        self.clock.advance(
+            self.supervisor.limits["heartbeat_timeout_ms"]
+        )
+        self.supervisor.poll_once()
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "heartbeat_timeout",
+        )
+        touch_value = self.sysfs.sensors["in1"] / "value0"
+        touch_value.unlink()
+        write(touch_value, 0)
+
+        with self.assertRaises(SupervisorError) as context:
+            self.supervisor.reset_fault()
+
+        self.assertEqual(
+            context.exception.code,
+            "supervisor_restart_required",
+        )
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "heartbeat_timeout",
+        )
+        self.assertTrue(self.supervisor.fault["secondary_errors"])
+        self.assert_all_stopped()
 
     def test_emergency_stop_does_not_clear_latched_fault(self):
         session_id = self.claim_and_arm()
@@ -1874,6 +2171,118 @@ class EV3SupervisorTests(unittest.TestCase):
         self.assert_all_stopped()
         self.assertEqual(protocol.remaining_motion_budget, 0)
 
+    def test_ttl_expiry_during_second_write_invalidates_motion_ack(self):
+        session_id = self.claim_and_arm()
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+            allow_motion=True,
+            motion_budget=1,
+            experiment_max_abs_speed_dps=100,
+            experiment_max_duration_ms=300,
+        )
+        right = self.sysfs.motors["outC"]
+        original_side_effect = self.mock_supervisor_write.side_effect
+
+        def expire_during_right_write(path, value):
+            result = original_side_effect(path, value)
+            if (
+                path == str(right / "command")
+                and value == "run-timed"
+            ):
+                self.clock.advance(1)
+            return result
+
+        request = self.protocol_request(
+            "drive_timed",
+            arguments={
+                "session_id": session_id,
+                "sequence_id": 3,
+                "command_id": "ttl-during-right-write",
+                "reference_heartbeat_sequence": 1,
+                "left_speed_dps": 100,
+                "right_speed_dps": 100,
+                "duration_ms": 300,
+            },
+            ttl_ms=1,
+        )
+        self.mock_supervisor_write.side_effect = (
+            expire_during_right_write
+        )
+        try:
+            response = protocol.execute(
+                request,
+                dispatch_at_ms=self.clock.now_ms,
+            )
+        finally:
+            self.mock_supervisor_write.side_effect = (
+                original_side_effect
+            )
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], "stale_request")
+        self.assertEqual(self.run_timed_write_count(), 2)
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assert_all_stopped()
+
+    def test_cancel_during_second_write_invalidates_motion_ack(self):
+        session_id = self.claim_and_arm()
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+            allow_motion=True,
+            motion_budget=1,
+            experiment_max_abs_speed_dps=100,
+            experiment_max_duration_ms=300,
+        )
+        cancelled = threading.Event()
+        right = self.sysfs.motors["outC"]
+        original_side_effect = self.mock_supervisor_write.side_effect
+
+        def cancel_during_right_write(path, value):
+            result = original_side_effect(path, value)
+            if (
+                path == str(right / "command")
+                and value == "run-timed"
+            ):
+                cancelled.set()
+            return result
+
+        request = self.protocol_request(
+            "drive_timed",
+            arguments={
+                "session_id": session_id,
+                "sequence_id": 3,
+                "command_id": "cancel-during-right-write",
+                "reference_heartbeat_sequence": 1,
+                "left_speed_dps": 100,
+                "right_speed_dps": 100,
+                "duration_ms": 300,
+            },
+        )
+        self.mock_supervisor_write.side_effect = (
+            cancel_during_right_write
+        )
+        try:
+            response = protocol.execute(
+                request,
+                dispatch_at_ms=self.clock.now_ms,
+                cancellation_requested=cancelled.is_set,
+            )
+        finally:
+            self.mock_supervisor_write.side_effect = (
+                original_side_effect
+            )
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            response["error"]["code"],
+            "external_stop_requested",
+        )
+        self.assertEqual(self.run_timed_write_count(), 2)
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assert_all_stopped()
+
     def test_stale_stop_is_still_prioritized_and_invalidates_session(self):
         session_id = self.claim_and_arm()
         self.start_drive(session_id)
@@ -1932,7 +2341,7 @@ class EV3SupervisorTests(unittest.TestCase):
 
         self.assertEqual(order, ["poll", "dispatch"])
 
-    def test_loop_skips_dispatch_when_poll_consumes_the_tick(self):
+    def test_loop_dispatches_when_poll_consumes_exact_interval(self):
         loop = EV3SupervisorLoop(self.supervisor)
         dispatched = []
         real_poll = self.supervisor.poll_once
@@ -1951,8 +2360,906 @@ class EV3SupervisorTests(unittest.TestCase):
                 dispatch_one=lambda: dispatched.append(True)
             )
 
-        self.assertEqual(dispatched, [])
+        self.assertEqual(dispatched, [True])
         self.assertEqual(self.supervisor.state, STATE_DISARMED)
+
+    def test_session_replaces_late_claim_success_before_publication(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        request = self.protocol_request(
+            "claim",
+            {"owner_id": "late-claim-client"},
+            request_id="late-claim-success",
+            ttl_ms=1000,
+        )
+        real_execute = protocol.execute
+
+        def delayed_execute(*args, **kwargs):
+            response = real_execute(*args, **kwargs)
+            self.clock.advance(
+                loop.interval_ms + loop.max_lateness_ms + 1
+            )
+            return response
+
+        self.assertTrue(session.enqueue_request(request))
+        with patch.object(
+            protocol,
+            "execute",
+            side_effect=delayed_execute,
+        ):
+            loop.run_once(dispatch_one=session._dispatch_one)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            response["error"]["code"],
+            "poll_deadline_missed",
+        )
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assertFalse(self.supervisor.status()["session_active"])
+        self.assert_all_stopped()
+
+    def test_session_replaces_late_drive_success_before_publication(self):
+        session_id = self.claim_and_arm()
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+            allow_motion=True,
+            motion_budget=1,
+            experiment_max_abs_speed_dps=100,
+            experiment_max_duration_ms=300,
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        request = self.protocol_request(
+            "drive_timed",
+            {
+                "session_id": session_id,
+                "sequence_id": 3,
+                "command_id": "late-drive-success",
+                "reference_heartbeat_sequence": 1,
+                "left_speed_dps": 100,
+                "right_speed_dps": 100,
+                "duration_ms": 300,
+            },
+            request_id="late-drive-success",
+            ttl_ms=1000,
+        )
+        real_execute = protocol.execute
+
+        def delayed_execute(*args, **kwargs):
+            response = real_execute(*args, **kwargs)
+            self.clock.advance(
+                loop.interval_ms + loop.max_lateness_ms + 1
+            )
+            return response
+
+        self.assertTrue(session.enqueue_request(request))
+        with patch.object(
+            protocol,
+            "execute",
+            side_effect=delayed_execute,
+        ):
+            loop.run_once(dispatch_one=session._dispatch_one)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            response["error"]["code"],
+            "poll_deadline_missed",
+        )
+        self.assertEqual(protocol.remaining_motion_budget, 0)
+        self.assertEqual(self.run_timed_write_count(), 2)
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assertFalse(self.supervisor.status()["session_active"])
+        self.assert_all_stopped()
+
+    def test_urgent_stop_after_drive_execute_invalidates_success_ack(self):
+        session_id = self.claim_and_arm()
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+            allow_motion=True,
+            motion_budget=1,
+            experiment_max_abs_speed_dps=100,
+            experiment_max_duration_ms=300,
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        request = self.protocol_request(
+            "drive_timed",
+            {
+                "session_id": session_id,
+                "sequence_id": 3,
+                "command_id": "urgent-stop-race",
+                "reference_heartbeat_sequence": 1,
+                "left_speed_dps": 100,
+                "right_speed_dps": 100,
+                "duration_ms": 300,
+            },
+            request_id="urgent-stop-race",
+            ttl_ms=1000,
+        )
+        real_execute = protocol.execute
+
+        def execute_then_request_stop(*args, **kwargs):
+            response = real_execute(*args, **kwargs)
+            loop.request_emergency_stop()
+            return response
+
+        self.assertTrue(session.enqueue_request(request))
+        with patch.object(
+            protocol,
+            "execute",
+            side_effect=execute_then_request_stop,
+        ):
+            loop.run_once(dispatch_one=session._dispatch_one)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            response["error"]["code"],
+            "external_stop_requested",
+        )
+        self.assertEqual(self.supervisor.state, STATE_DISARMED)
+        self.assertFalse(self.supervisor.status()["session_active"])
+        self.assertEqual(self.run_timed_write_count(), 2)
+        self.assert_all_stopped()
+
+    def test_response_encoding_is_charged_to_dispatch_deadline(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        request = self.protocol_request(
+            "claim",
+            {"owner_id": "slow-response-encoding"},
+            request_id="slow-response-encoding",
+            ttl_ms=1000,
+        )
+        real_encode = supervisor_daemon_module.encode_response
+
+        def slow_encode(response):
+            self.clock.advance(
+                loop.interval_ms + loop.max_lateness_ms + 1
+            )
+            return real_encode(response)
+
+        self.assertTrue(session.enqueue_request(request))
+        with patch.object(
+            supervisor_daemon_module,
+            "encode_response",
+            side_effect=slow_encode,
+        ):
+            loop.run_once(dispatch_one=session._dispatch_one)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            response["error"]["code"],
+            "poll_deadline_missed",
+        )
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assertFalse(self.supervisor.status()["session_active"])
+        self.assert_all_stopped()
+
+    def test_post_publication_overrun_faults_instead_of_rebasing(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        request = self.protocol_request(
+            "status",
+            request_id="slow-response-put",
+            ttl_ms=1000,
+        )
+        real_put = session._output_queue.put_nowait
+
+        def slow_put(wire):
+            real_put(wire)
+            self.clock.advance(
+                loop.interval_ms + loop.max_lateness_ms + 1
+            )
+
+        self.assertTrue(session.enqueue_request(request))
+        with patch.object(
+            session._output_queue,
+            "put_nowait",
+            side_effect=slow_put,
+        ):
+            loop.run_once(dispatch_one=session._dispatch_one)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertTrue(response["ok"])
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "poll_deadline_missed",
+        )
+        self.assert_all_stopped()
+
+    def test_session_preserves_existing_error_after_dispatch_overrun(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        request = self.protocol_request(
+            "status",
+            request_id="late-wrong-controller",
+            controller_id="another-controller",
+            ttl_ms=1000,
+        )
+        real_execute = protocol.execute
+
+        def delayed_execute(*args, **kwargs):
+            response = real_execute(*args, **kwargs)
+            self.clock.advance(
+                loop.interval_ms + loop.max_lateness_ms + 1
+            )
+            return response
+
+        self.assertTrue(session.enqueue_request(request))
+        with patch.object(
+            protocol,
+            "execute",
+            side_effect=delayed_execute,
+        ):
+            loop.run_once(dispatch_one=session._dispatch_one)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], "wrong_controller")
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "poll_deadline_missed",
+        )
+        self.assert_all_stopped()
+
+    def test_dispatch_completion_runs_exactly_once_after_deadline_check(self):
+        loop = EV3SupervisorLoop(self.supervisor)
+        completions = []
+
+        def dispatch():
+            self.clock.advance(
+                loop.interval_ms + loop.max_lateness_ms + 1
+            )
+
+            def complete(post_dispatch_error=None):
+                completions.append(post_dispatch_error)
+
+            return complete
+
+        loop.run_once(dispatch_one=dispatch)
+
+        self.assertEqual(len(completions), 1)
+        self.assertIsInstance(completions[0], SupervisorError)
+        self.assertEqual(
+            completions[0].code,
+            "poll_deadline_missed",
+        )
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assert_all_stopped()
+
+    def test_full_response_queue_requests_emergency_stop_on_completion(self):
+        session_id = self.claim_and_arm()
+        self.start_drive(session_id, duration_ms=800)
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        for _index in range(
+            supervisor_daemon_module.OUTPUT_QUEUE_SIZE
+        ):
+            session._output_queue.put_nowait(b"occupied\n")
+        self.assertTrue(
+            session.enqueue_request(
+                self.protocol_request(
+                    "status",
+                    request_id="response-queue-full",
+                )
+            )
+        )
+
+        loop.run_once(dispatch_one=session._dispatch_one)
+
+        self.assertEqual(
+            session.transport_failure,
+            "response_queue_failed",
+        )
+        self.assertTrue(session.shutdown_requested())
+        self.assertEqual(self.supervisor.state, STATE_DISARMED)
+        self.assertFalse(self.supervisor.status()["session_active"])
+        self.assertEqual(self.run_timed_write_count(), 2)
+        self.assert_all_stopped()
+
+    def test_late_shutdown_error_keeps_session_open_for_retry(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        request = self.protocol_request(
+            "shutdown",
+            request_id="late-shutdown-success",
+            ttl_ms=1000,
+        )
+        real_encode = supervisor_daemon_module.encode_response
+
+        def delayed_encode(response):
+            self.clock.advance(
+                loop.interval_ms + loop.max_lateness_ms + 1
+            )
+            return real_encode(response)
+
+        self.assertTrue(session.enqueue_request(request))
+        with patch.object(
+            supervisor_daemon_module,
+            "encode_response",
+            side_effect=delayed_encode,
+        ):
+            loop.run_once(dispatch_one=session._dispatch_one)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            response["error"]["code"],
+            "poll_deadline_missed",
+        )
+        self.assertFalse(session.shutdown_requested())
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assert_all_stopped()
+
+    def test_unverified_shutdown_returns_error_and_keeps_session_open(self):
+        session_id = self.claim_and_arm()
+        self.start_drive(session_id, duration_ms=800)
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        blocked_path = str(
+            self.sysfs.motors["outB"] / "command"
+        )
+        base_write = supervisor_module.write_text
+
+        def fail_left_stop(path, value):
+            if path == blocked_path and value == "stop":
+                raise IOError("persistent shutdown stop failure")
+            base_write(path, value)
+
+        self.assertTrue(
+            session.enqueue_request(
+                self.protocol_request(
+                    "shutdown",
+                    request_id="unverified-shutdown",
+                    ttl_ms=1000,
+                )
+            )
+        )
+        with patch.object(
+            supervisor_module,
+            "write_text",
+            side_effect=fail_left_stop,
+        ):
+            loop.run_once(dispatch_one=session._dispatch_one)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            response["error"]["code"],
+            "stop_not_confirmed",
+        )
+        self.assertFalse(session.shutdown_requested())
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assertFalse(self.supervisor.fault["stop_confirmed"])
+
+    def test_protocol_exposes_no_preverified_stop_bypass(self):
+        session_id = self.claim_and_arm()
+        self.start_drive(session_id, duration_ms=800)
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        request = self.protocol_request(
+            "shutdown",
+            request_id="forged-stop-proof",
+        )
+        forged_status = {
+            "state": STATE_DISARMED,
+            "session_active": False,
+            "active_command_id": None,
+        }
+
+        with self.assertRaises(TypeError):
+            protocol.execute(
+                request,
+                dispatch_at_ms=self.clock.now_ms,
+                preverified_stop_result=forged_status,
+            )
+
+        self.assertEqual(self.supervisor.state, STATE_RUNNING)
+        self.assertEqual(
+            self.supervisor.active_command_id,
+            "drive-1",
+        )
+        self.assertEqual(
+            read_text(str(self.sysfs.motors["outB"] / "state")),
+            "running",
+        )
+        self.assertEqual(
+            read_text(str(self.sysfs.motors["outC"] / "state")),
+            "running",
+        )
+
+    def test_loop_rejects_stale_internal_stop_proof_after_state_change(
+        self,
+    ):
+        loop = EV3SupervisorLoop(self.supervisor)
+        loop.request_emergency_stop()
+        outcome = loop._perform_requested_emergency_stop()
+        self.assertEqual(
+            outcome.code,
+            "external_stop_requested",
+        )
+
+        session_id = self.claim_and_arm()
+        self.start_drive(session_id, duration_ms=800)
+
+        self.assertIsNone(
+            loop._take_preverified_stop_status(self.supervisor)
+        )
+        self.assertEqual(self.supervisor.state, STATE_RUNNING)
+        self.assertEqual(
+            read_text(str(self.sysfs.motors["outB"] / "state")),
+            "running",
+        )
+        self.assertEqual(
+            read_text(str(self.sysfs.motors["outC"] / "state")),
+            "running",
+        )
+
+    def test_failed_second_stop_invalidates_shutdown_before_publication(
+        self,
+    ):
+        session_id = self.claim_and_arm()
+        self.start_drive(session_id, duration_ms=800)
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        self.assertTrue(
+            session.enqueue_request(
+                self.protocol_request(
+                    "shutdown",
+                    request_id="failed-second-stop",
+                    ttl_ms=1000,
+                )
+            )
+        )
+        blocked_path = str(
+            self.sysfs.motors["outB"] / "command"
+        )
+        base_write = self.mock_supervisor_write.side_effect
+        fail_stop = [False]
+        requested_second_stop = [False]
+        real_encode = supervisor_daemon_module.encode_response
+
+        def fail_late_stop(path, value):
+            if (
+                fail_stop[0]
+                and path == blocked_path
+                and value == "stop"
+            ):
+                raise IOError("late stop verification failure")
+            return base_write(path, value)
+
+        def request_second_stop_before_publication(response):
+            wire = real_encode(response)
+            if (
+                response.get("ok") is True
+                and not requested_second_stop[0]
+            ):
+                requested_second_stop[0] = True
+                fail_stop[0] = True
+                loop.request_emergency_stop()
+            return wire
+
+        with patch.object(
+            supervisor_module,
+            "write_text",
+            side_effect=fail_late_stop,
+        ), patch.object(
+            supervisor_daemon_module,
+            "encode_response",
+            side_effect=request_second_stop_before_publication,
+        ):
+            loop.run_once(dispatch_one=session._dispatch_one)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            response["error"]["code"],
+            "stop_not_confirmed",
+        )
+        self.assertFalse(session.shutdown_requested())
+        self.assertEqual(
+            self.supervisor.state,
+            STATE_FAULT_LATCHED,
+        )
+        self.assertTrue(self.supervisor.fault["stop_errors"])
+
+    def test_shutdown_reuses_immediately_preverified_emergency_stop(self):
+        session_id = self.claim_and_arm()
+        self.start_drive(session_id, duration_ms=800)
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        write_start = len(self.motor_writes)
+        self.assertTrue(
+            session.enqueue_request(
+                self.protocol_request(
+                    "shutdown",
+                    request_id="preverified-shutdown",
+                    ttl_ms=1000,
+                )
+            )
+        )
+
+        loop.run_once(dispatch_one=session._dispatch_one)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertTrue(response["ok"])
+        self.assertTrue(session.shutdown_requested())
+        stop_writes = [
+            (path, value)
+            for path, value in self.motor_writes[write_start:]
+            if value == "stop"
+        ]
+        # One verified stop needs two stable-position samples.  A second
+        # protocol-level stop would therefore double this count.
+        self.assertEqual(
+            len(stop_writes),
+            2 * len(self.sysfs.motors),
+        )
+        self.assertEqual(self.supervisor.state, STATE_DISARMED)
+        self.assertFalse(self.supervisor.status()["session_active"])
+        self.assert_all_stopped()
+
+    def test_urgent_protocol_stop_credits_exact_verified_stop_time(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        initial_tick_ms = loop._next_tick_ms
+        self.clock.advance(17)
+        debt_before_stop_ms = (
+            self.clock.now_ms - loop._next_tick_ms
+        )
+        real_stop = self.supervisor.stop
+
+        def delayed_verified_stop():
+            self.clock.advance(425)
+            return real_stop()
+
+        self.assertTrue(
+            session.enqueue_request(
+                self.protocol_request(
+                    "stop",
+                    request_id="credited-urgent-stop",
+                    ttl_ms=1000,
+                )
+            )
+        )
+        stop_started_ms = self.clock.now_ms
+        with patch.object(
+            self.supervisor,
+            "stop",
+            side_effect=delayed_verified_stop,
+        ):
+            outcome = loop._perform_requested_emergency_stop()
+        stop_elapsed_ms = self.clock.now_ms - stop_started_ms
+
+        self.assertEqual(
+            loop._next_tick_ms,
+            initial_tick_ms + stop_elapsed_ms,
+        )
+        self.assertEqual(
+            self.clock.now_ms - loop._next_tick_ms,
+            debt_before_stop_ms,
+        )
+        self.assertEqual(
+            outcome.code,
+            "external_stop_requested",
+        )
+
+        completion = session._dispatch_one()
+        self.assertIsNotNone(completion)
+        completion(outcome)
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["request_id"], "credited-urgent-stop")
+
+    def test_generic_external_stop_receives_no_deadline_credit(self):
+        loop = EV3SupervisorLoop(self.supervisor)
+        initial_tick_ms = loop._next_tick_ms
+        real_stop = self.supervisor.stop
+
+        def delayed_verified_stop():
+            self.clock.advance(425)
+            return real_stop()
+
+        loop.request_emergency_stop()
+        with patch.object(
+            self.supervisor,
+            "stop",
+            side_effect=delayed_verified_stop,
+        ):
+            outcome = loop._perform_requested_emergency_stop()
+
+        self.assertEqual(
+            outcome.code,
+            "external_stop_requested",
+        )
+        self.assertEqual(loop._next_tick_ms, initial_tick_ms)
+
+    def test_urgent_stop_credit_does_not_hide_preexisting_overrun(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        self.assertTrue(
+            session.enqueue_request(
+                self.protocol_request(
+                    "stop",
+                    request_id="late-urgent-stop",
+                    ttl_ms=1000,
+                )
+            )
+        )
+        self.clock.advance(loop.max_lateness_ms + 1)
+
+        status = loop.run_once(dispatch_one=session._dispatch_one)
+
+        self.assertEqual(status["state"], STATE_FAULT_LATCHED)
+        self.assertEqual(
+            status["fault"]["code"],
+            "poll_deadline_missed",
+        )
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["request_id"], "late-urgent-stop")
+
+    def test_unverified_urgent_protocol_stop_receives_no_credit(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        initial_tick_ms = loop._next_tick_ms
+        self.assertTrue(
+            session.enqueue_request(
+                self.protocol_request(
+                    "shutdown",
+                    request_id="unverified-urgent-stop",
+                    ttl_ms=1000,
+                )
+            )
+        )
+
+        def unverified_stop():
+            self.clock.advance(425)
+            return {
+                "state": STATE_RUNNING,
+                "session_active": True,
+                "active_command_id": "still-running",
+            }
+
+        with patch.object(
+            self.supervisor,
+            "stop",
+            side_effect=unverified_stop,
+        ):
+            outcome = loop._perform_requested_emergency_stop()
+
+        self.assertEqual(outcome.code, "stop_not_confirmed")
+        self.assertEqual(loop._next_tick_ms, initial_tick_ms)
+        self.assertIsNone(
+            loop._take_preverified_stop_status(self.supervisor)
+        )
+
+    def test_wrong_controller_stop_is_not_urgent_or_credited(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        initial_tick_ms = loop._next_tick_ms
+        self.assertTrue(
+            session.enqueue_request(
+                self.protocol_request(
+                    "stop",
+                    request_id="wrong-controller-stop",
+                    controller_id="another-controller",
+                    ttl_ms=1000,
+                )
+            )
+        )
+
+        self.assertFalse(loop.emergency_stop_requested())
+        self.assertIsNone(loop._perform_requested_emergency_stop())
+        self.assertEqual(loop._next_tick_ms, initial_tick_ms)
+        completion = session._dispatch_one()
+        self.assertIsNotNone(completion)
+        completion()
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], "wrong_controller")
 
     def test_loop_faults_and_stops_on_unexpected_dispatch_exception(self):
         session_id = self.claim_and_arm()
@@ -2449,6 +3756,373 @@ class EV3SupervisorTests(unittest.TestCase):
         )
         self.assert_all_stopped()
 
+    def test_deadline_fault_services_safe_requests_without_spinning(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        responses = []
+        dispatch_states = []
+        sleep_durations = []
+        iteration_elapsed_ms = []
+        operations = ("status", "describe", "stop", "shutdown")
+
+        def tracked_sleep(seconds):
+            sleep_durations.append(seconds)
+            self.clock.sleep(seconds)
+
+        with patch.object(
+            self.hal,
+            "sleep_fn",
+            side_effect=tracked_sleep,
+        ):
+            for index, operation in enumerate(operations):
+                self.clock.advance(loop.max_lateness_ms + 1)
+                request = self.protocol_request(
+                    operation,
+                    request_id="late-safe-{}".format(index),
+                    ttl_ms=1000,
+                )
+
+                def dispatch(request=request):
+                    dispatch_states.append(self.supervisor.state)
+                    responses.append(
+                        protocol.execute(
+                            request,
+                            dispatch_at_ms=self.clock.now_ms,
+                        )
+                    )
+
+                iteration_started_ms = self.clock.now_ms
+                loop.run_once(dispatch_one=dispatch)
+                iteration_elapsed_ms.append(
+                    self.clock.now_ms - iteration_started_ms
+                )
+
+        self.assertEqual(
+            dispatch_states,
+            [STATE_FAULT_LATCHED] * len(operations),
+        )
+        self.assertTrue(all(response["ok"] for response in responses))
+        self.assertEqual(
+            responses[0]["result"]["state"],
+            STATE_FAULT_LATCHED,
+        )
+        self.assertEqual(
+            responses[1]["result"]["protocol_version"],
+            PROTOCOL_VERSION,
+        )
+        self.assertEqual(
+            responses[2]["result"]["state"],
+            STATE_FAULT_LATCHED,
+        )
+        self.assertEqual(
+            responses[3]["result"]["state"],
+            STATE_FAULT_LATCHED,
+        )
+        self.assertGreaterEqual(
+            len(sleep_durations),
+            len(operations),
+        )
+        self.assertTrue(
+            all(
+                0 < seconds <= loop.interval_ms / 1000.0
+                for seconds in sleep_durations
+            )
+        )
+        self.assertTrue(
+            all(
+                elapsed_ms >= loop.interval_ms
+                for elapsed_ms in iteration_elapsed_ms
+            )
+        )
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "poll_deadline_missed",
+        )
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assert_all_stopped()
+
+    def test_deadline_fault_rejects_claim_arm_and_motion_start(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+            allow_motion=True,
+            motion_budget=1,
+            experiment_max_abs_speed_dps=100,
+            experiment_max_duration_ms=300,
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        requests = (
+            self.protocol_request(
+                "claim",
+                {"owner_id": "late-client"},
+                request_id="late-claim",
+                ttl_ms=1000,
+            ),
+            self.protocol_request(
+                "arm",
+                {
+                    "session_id": "unavailable-after-fault",
+                    "sequence_id": 1,
+                },
+                request_id="late-arm",
+                ttl_ms=1000,
+            ),
+            self.protocol_request(
+                "drive_timed",
+                {
+                    "session_id": "unavailable-after-fault",
+                    "sequence_id": 2,
+                    "command_id": "must-not-start",
+                    "reference_heartbeat_sequence": 1,
+                    "left_speed_dps": 100,
+                    "right_speed_dps": 100,
+                    "duration_ms": 300,
+                },
+                request_id="late-drive",
+                ttl_ms=1000,
+            ),
+        )
+        responses = []
+
+        with patch.object(
+            self.supervisor._owner,
+            "start_drive",
+            wraps=self.supervisor._owner.start_drive,
+        ) as motor_start:
+            for request in requests:
+                self.clock.advance(loop.max_lateness_ms + 1)
+
+                def dispatch(request=request):
+                    responses.append(
+                        protocol.execute(
+                            request,
+                            dispatch_at_ms=self.clock.now_ms,
+                        )
+                    )
+
+                loop.run_once(dispatch_one=dispatch)
+
+        self.assertEqual(
+            [response["error"]["code"] for response in responses],
+            ["wrong_state", "wrong_state", "wrong_state"],
+        )
+        motor_start.assert_not_called()
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "poll_deadline_missed",
+        )
+        self.assert_all_stopped()
+
+    def test_deadline_fault_still_dispatches_protocol_error_response(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        self.assertTrue(
+            session.enqueue_protocol_error(
+                ProtocolError(
+                    "invalid_test_request",
+                    "The test request is invalid",
+                    request_id="late-invalid",
+                )
+            )
+        )
+        self.clock.advance(loop.max_lateness_ms + 1)
+
+        loop.run_once(dispatch_one=session._dispatch_one)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["request_id"], "late-invalid")
+        self.assertEqual(
+            response["error"]["code"],
+            "invalid_test_request",
+        )
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "poll_deadline_missed",
+        )
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assert_all_stopped()
+
+    def test_protocol_error_publish_survives_concurrent_external_stop(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        self.assertTrue(
+            session.enqueue_protocol_error(
+                ProtocolError(
+                    "invalid_test_request",
+                    "The queued request is invalid",
+                    request_id="invalid-with-stop",
+                )
+            )
+        )
+
+        completion = session._dispatch_one()
+        loop.request_emergency_stop()
+        loop._complete_dispatch(completion)
+
+        wire = session._output_queue.get_nowait()
+        session._output_queue.task_done()
+        response = json.loads(wire.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["request_id"], "invalid-with-stop")
+        self.assertEqual(
+            response["error"]["code"],
+            "invalid_test_request",
+        )
+        self.assertEqual(self.supervisor.state, STATE_DISARMED)
+        self.assert_all_stopped()
+
+    def test_persistent_poll_overrun_dispatches_and_latches_fault(self):
+        loop = EV3SupervisorLoop(self.supervisor)
+        real_poll = self.supervisor.poll_once
+        dispatch_states = []
+        sleep_durations = []
+        started_ms = self.clock.now_ms
+
+        def delayed_poll():
+            result = real_poll()
+            self.clock.advance(30)
+            return result
+
+        def tracked_sleep(seconds):
+            sleep_durations.append(seconds)
+            self.clock.sleep(seconds)
+
+        with patch.object(
+            self.supervisor,
+            "poll_once",
+            side_effect=delayed_poll,
+        ), patch.object(
+            self.hal,
+            "sleep_fn",
+            side_effect=tracked_sleep,
+        ):
+            for _index in range(4):
+                loop.run_once(
+                    dispatch_one=lambda: dispatch_states.append(
+                        self.supervisor.state
+                    )
+                )
+
+        self.assertEqual(len(dispatch_states), 4)
+        self.assertIn(STATE_FAULT_LATCHED, dispatch_states)
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "poll_deadline_missed",
+        )
+        self.assertTrue(sleep_durations)
+        self.assertTrue(
+            all(
+                0 < seconds <= loop.interval_ms / 1000.0
+                for seconds in sleep_durations
+            )
+        )
+        self.assertGreaterEqual(
+            self.clock.now_ms - started_ms,
+            4 * loop.interval_ms,
+        )
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assert_all_stopped()
+
+    def test_post_poll_fault_prioritizes_urgent_shutdown_over_backlog(self):
+        protocol = SupervisorProtocol(
+            self.supervisor,
+            "ev3rstorm-01.ev3-main",
+        )
+        session = ForegroundSupervisorSession(
+            self.supervisor,
+            protocol,
+            InteractiveInput(),
+            InteractiveOutput(),
+        )
+        loop = EV3SupervisorLoop(self.supervisor)
+        session._loop = loop
+        real_poll = self.supervisor.poll_once
+
+        def delayed_poll():
+            result = real_poll()
+            self.clock.advance(30)
+            return result
+
+        for index in range(3):
+            self.assertTrue(
+                session.enqueue_request(
+                    self.protocol_request(
+                        "status",
+                        request_id="backlog-{}".format(index),
+                        ttl_ms=1000,
+                    )
+                )
+            )
+
+        with patch.object(
+            self.supervisor,
+            "poll_once",
+            side_effect=delayed_poll,
+        ):
+            loop.run_once(dispatch_one=session._dispatch_one)
+            loop.run_once(dispatch_one=session._dispatch_one)
+            self.assertTrue(
+                session.enqueue_request(
+                    self.protocol_request(
+                        "shutdown",
+                        request_id="urgent-shutdown",
+                        ttl_ms=1000,
+                    )
+                )
+            )
+            loop.run_once(dispatch_one=session._dispatch_one)
+
+        responses = []
+        for _index in range(3):
+            wire = session._output_queue.get_nowait()
+            session._output_queue.task_done()
+            responses.append(json.loads(wire.decode("utf-8")))
+
+        self.assertEqual(
+            [response["request_id"] for response in responses],
+            ["backlog-0", "backlog-1", "urgent-shutdown"],
+        )
+        self.assertTrue(responses[-1]["ok"])
+        self.assertTrue(session.shutdown_requested())
+        self.assertEqual(self.supervisor.state, STATE_FAULT_LATCHED)
+        self.assertEqual(
+            self.supervisor.fault["code"],
+            "poll_deadline_missed",
+        )
+        self.assertEqual(self.run_timed_write_count(), 0)
+        self.assert_all_stopped()
+
     def test_supervisor_loop_checks_deadline_on_first_tick(self):
         session_id = self.claim_and_arm()
         self.start_drive(session_id, duration_ms=800)
@@ -2729,6 +4403,10 @@ class EV3SupervisorTests(unittest.TestCase):
     def test_close_is_idempotent_and_releases_lifetime_lock(self):
         session_id = self.claim_and_arm()
         self.start_drive(session_id)
+        readers = self.supervisor._owner._bound_readers
+        self.assertTrue(
+            all(reader.descriptor is not None for reader in readers)
+        )
 
         first = self.supervisor.close()
         second = self.supervisor.close()
@@ -2737,6 +4415,10 @@ class EV3SupervisorTests(unittest.TestCase):
         self.assertTrue(first["audit_complete"])
         self.assertEqual(second, first)
         self.assert_all_stopped()
+        self.assertTrue(
+            all(reader.descriptor is None for reader in readers)
+        )
+        self.assertEqual(self.supervisor._owner._bound_readers, ())
 
         lock_handle = open(self.lock_path, "a+")
         try:
@@ -2747,6 +4429,39 @@ class EV3SupervisorTests(unittest.TestCase):
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
             lock_handle.close()
+
+    def test_close_reports_reader_cleanup_error_after_verified_stop(self):
+        target = self.supervisor._owner._bound_readers[0]
+        with patch.object(
+            target,
+            "close",
+            side_effect=OSError("simulated descriptor close failure"),
+        ):
+            status = self.supervisor.close()
+        try:
+            self.assertEqual(status["state"], STATE_CLOSED)
+            self.assertTrue(status["audit_complete"])
+            self.assertFalse(status["cleanup_complete"])
+            self.assertEqual(
+                status["cleanup_errors"],
+                ["simulated descriptor close failure"],
+            )
+            self.assert_all_stopped()
+
+            lock_handle = open(self.lock_path, "a+")
+            try:
+                fcntl.flock(
+                    lock_handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            finally:
+                fcntl.flock(
+                    lock_handle.fileno(),
+                    fcntl.LOCK_UN,
+                )
+                lock_handle.close()
+        finally:
+            target.close()
 
     def test_close_finalizes_after_one_shot_stop_interrupt(self):
         session_id = self.claim_and_arm()

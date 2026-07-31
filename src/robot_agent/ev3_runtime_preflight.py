@@ -36,6 +36,7 @@ SUPERVISOR_ADDITIONS = (
     "ev3/supervisor_daemon.py",
     "ev3/supervisor_protocol.py",
     "ev3/supervisor.py",
+    "ev3/infrared_safety.py",
     "ev3/supervisor_cli.py",
 )
 SUPERVISOR_MANIFEST = PERIPHERAL_MANIFEST + SUPERVISOR_ADDITIONS

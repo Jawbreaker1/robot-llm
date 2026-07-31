@@ -24,6 +24,7 @@ MAX_ERROR_BYTES = 16 * 1024
 # cannot accumulate a partial multi-frame backlog.
 MAX_REQUEST_BYTES = 512
 STARTUP_SAFE_OPERATIONS = frozenset(("describe", "status"))
+SUPERVISOR_PROFILES = frozenset(("motion-free", "ir-roamer-v1"))
 
 ProcessFactory = Callable[..., Any]
 
@@ -93,6 +94,17 @@ def _validate_target(target: str) -> str:
             "SSH target is invalid"
         )
     return target
+
+
+def _validate_profile(profile: str) -> str:
+    if (
+        not isinstance(profile, str)
+        or profile not in SUPERVISOR_PROFILES
+    ):
+        raise SupervisorSSHConfigurationError(
+            "Supervisor profile is invalid"
+        )
+    return profile
 
 
 def _strict_object(pairs):
@@ -280,7 +292,8 @@ class SupervisorSSHSession:
         connect_timeout_seconds: int = 3,
         response_timeout_seconds: float = 3.0,
         startup_response_timeout_seconds: float = 30.0,
-        remote_session_ms: int = 15_000,
+        remote_session_ms: Optional[int] = None,
+        profile: str = "motion-free",
     ):
         self.target = _validate_target(target)
         self.controller_id = _validate_identifier(
@@ -288,6 +301,7 @@ class SupervisorSSHSession:
             controller_id,
             128,
         )
+        self.profile = _validate_profile(profile)
         if not callable(process_factory):
             raise SupervisorSSHConfigurationError(
                 "Process factory is invalid"
@@ -319,13 +333,28 @@ class SupervisorSSHSession:
             raise SupervisorSSHConfigurationError(
                 "Startup response timeout is invalid"
             )
+        if remote_session_ms is None:
+            effective_remote_session_ms = (
+                20_000
+                if self.profile == "ir-roamer-v1"
+                else 15_000
+            )
+        else:
+            if (
+                isinstance(remote_session_ms, bool)
+                or not isinstance(remote_session_ms, int)
+                or not 1000 <= remote_session_ms <= 120_000
+            ):
+                raise SupervisorSSHConfigurationError(
+                    "Remote session duration is invalid"
+                )
+            effective_remote_session_ms = remote_session_ms
         if (
-            isinstance(remote_session_ms, bool)
-            or not isinstance(remote_session_ms, int)
-            or not 1000 <= remote_session_ms <= 120_000
+            self.profile == "ir-roamer-v1"
+            and effective_remote_session_ms != 20_000
         ):
             raise SupervisorSSHConfigurationError(
-                "Remote session duration is invalid"
+                "IR roamer session duration must be 20000 ms"
             )
 
         argv = [
@@ -341,8 +370,10 @@ class SupervisorSSHSession:
             "python3",
             REMOTE_DAEMON,
             "--max-session-ms",
-            str(remote_session_ms),
+            str(effective_remote_session_ms),
         ]
+        if self.profile == "ir-roamer-v1":
+            argv.extend(("--profile", "ir-roamer-v1"))
         try:
             self._process = process_factory(
                 argv,

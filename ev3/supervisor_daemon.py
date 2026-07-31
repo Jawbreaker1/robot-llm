@@ -26,13 +26,18 @@ if __package__:
     from .supervisor import (
         EV3Supervisor,
         EV3SupervisorLoop,
+        IR_ROAMER_RUNTIME_PROFILE,
         JSONLAuditLog,
         STATE_CLOSED,
         SupervisorError,
     )
     from .supervisor_cli import default_config_path
     from .supervisor_protocol import (
+        DRIVE_PULSE_MAX_COMMANDS,
+        IR_ROAMER_MAX_PROCESS_REQUESTS,
+        IR_ROAMER_MAX_SESSION_MS,
         MAX_FRAME_BYTES,
+        MOTION_FREE_MAX_PROCESS_REQUESTS,
         OP_SHUTDOWN,
         STOP_OPERATIONS,
         ProtocolError,
@@ -40,19 +45,25 @@ if __package__:
         decode_request,
         encode_response,
         error_response,
+        success_response,
     )
 else:
     from robot_hal import RobotHAL, SafetyError
     from supervisor import (
         EV3Supervisor,
         EV3SupervisorLoop,
+        IR_ROAMER_RUNTIME_PROFILE,
         JSONLAuditLog,
         STATE_CLOSED,
         SupervisorError,
     )
     from supervisor_cli import default_config_path
     from supervisor_protocol import (
+        DRIVE_PULSE_MAX_COMMANDS,
+        IR_ROAMER_MAX_PROCESS_REQUESTS,
+        IR_ROAMER_MAX_SESSION_MS,
         MAX_FRAME_BYTES,
+        MOTION_FREE_MAX_PROCESS_REQUESTS,
         OP_SHUTDOWN,
         STOP_OPERATIONS,
         ProtocolError,
@@ -60,13 +71,14 @@ else:
         decode_request,
         encode_response,
         error_response,
+        success_response,
     )
 
 
 DEFAULT_AUDIT_PATH = "/tmp/robot-llm-supervisor-daemon-audit.jsonl"
 DEFAULT_MAX_SESSION_MS = 60000
 MAX_SESSION_MS = 120000
-MAX_PROCESS_REQUESTS = 128
+MAX_PROCESS_REQUESTS = MOTION_FREE_MAX_PROCESS_REQUESTS
 NORMAL_QUEUE_SIZE = 8
 URGENT_QUEUE_SIZE = 4
 OUTPUT_QUEUE_SIZE = 16
@@ -295,6 +307,7 @@ class ForegroundSupervisorSession(object):
         output_stream,
         max_session_ms=DEFAULT_MAX_SESSION_MS,
         external_shutdown_event=None,
+        max_process_requests=MAX_PROCESS_REQUESTS,
     ):
         if not isinstance(supervisor, EV3Supervisor):
             raise SessionError(
@@ -339,15 +352,28 @@ class ForegroundSupervisorSession(object):
                 "invalid_session_deadline",
                 "Session deadline is invalid",
             )
+        expected_request_budget = (
+            IR_ROAMER_MAX_PROCESS_REQUESTS
+            if protocol.runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+            else MOTION_FREE_MAX_PROCESS_REQUESTS
+        )
+        if max_process_requests != expected_request_budget:
+            raise SessionError(
+                "invalid_request_budget",
+                "Process request budget does not match runtime profile",
+            )
 
         self.supervisor = supervisor
         self.protocol = protocol
         self.input_stream = input_stream
         self.output_stream = output_stream
         self.max_session_ms = max_session_ms
+        self.max_process_requests = max_process_requests
         self._external_shutdown_event = external_shutdown_event
         self._normal_queue = queue.Queue(maxsize=NORMAL_QUEUE_SIZE)
         self._urgent_queue = queue.Queue(maxsize=URGENT_QUEUE_SIZE)
+        self._inbound_queue_lock = threading.Lock()
+        self._pending_request_bound_stop = False
         self._output_queue = queue.Queue(maxsize=OUTPUT_QUEUE_SIZE)
         self._shutdown = threading.Event()
         self._transport_failure = None
@@ -402,7 +428,8 @@ class ForegroundSupervisorSession(object):
     def enqueue_protocol_error(self, error):
         item = _InboundItem(error=error)
         try:
-            self._normal_queue.put_nowait(item)
+            with self._inbound_queue_lock:
+                self._normal_queue.put_nowait(item)
             return True
         except queue.Full:
             self.fail_transport("request_queue_full")
@@ -410,7 +437,7 @@ class ForegroundSupervisorSession(object):
 
     def enqueue_request(self, request):
         self._request_count += 1
-        if self._request_count > MAX_PROCESS_REQUESTS:
+        if self._request_count > self.max_process_requests:
             self.fail_transport("request_budget_exhausted")
             return False
         if request.request_id in self._seen_request_ids:
@@ -431,27 +458,37 @@ class ForegroundSupervisorSession(object):
             )
             else self._normal_queue
         )
-        if (
+        request_bound_stop = (
             request.operation in STOP_OPERATIONS
             and request.controller_id == self.protocol.controller_id
-            and self._loop is not None
-        ):
-            self._loop.request_emergency_stop()
+        )
         try:
-            target.put_nowait(_InboundItem(request=request))
+            with self._inbound_queue_lock:
+                target.put_nowait(_InboundItem(request=request))
+                if request_bound_stop:
+                    if self._loop is None:
+                        self._pending_request_bound_stop = True
+                    else:
+                        self._loop._request_protocol_emergency_stop()
             return True
         except queue.Full:
             self.fail_transport("request_queue_full")
             return False
 
-    def _enqueue_response(self, response):
+    def _prepare_response_wire(self, response):
         try:
-            wire = encode_response(response)
+            return encode_response(response)
+        except (ProtocolError, ValueError, TypeError):
+            self.fail_transport("response_queue_failed")
+            return None
+
+    def _enqueue_response_wire(self, wire):
+        try:
             self._output_queue.put_nowait(wire)
-        except (ProtocolError, ValueError, TypeError, queue.Full):
+            return True
+        except queue.Full:
             self.fail_transport("response_queue_failed")
             return False
-        return True
 
     @staticmethod
     def _take_nowait(source):
@@ -461,18 +498,46 @@ class ForegroundSupervisorSession(object):
             return None
 
     def _dispatch_one(self):
-        source = self._urgent_queue
-        item = self._take_nowait(source)
-        if item is None:
-            source = self._normal_queue
+        with self._inbound_queue_lock:
+            source = self._urgent_queue
             item = self._take_nowait(source)
+            if item is None:
+                source = self._normal_queue
+                item = self._take_nowait(source)
         if item is None:
-            return
+            return None
         try:
+            preverified_stop_status = None
+            if (
+                self._loop is not None
+                and item.request is not None
+                and item.request.operation in STOP_OPERATIONS
+                and item.request.controller_id
+                == self.protocol.controller_id
+            ):
+                if self._loop.supervisor is not self.supervisor:
+                    raise SessionError(
+                        "stop_proof_mismatch",
+                        "Stop proof loop belongs to another supervisor",
+                    )
+                preverified_stop_status = (
+                    self._loop._take_preverified_stop_status(
+                        self.supervisor
+                    )
+                )
             if item.error is not None:
                 response = error_response(
                     self.protocol.controller_id,
                     item.error,
+                )
+            elif preverified_stop_status is not None:
+                # The proof is loop-local, single-use, freshly checked
+                # against this exact supervisor and admitted only for a
+                # correctly targeted STOP/SHUTDOWN request in this session.
+                response = success_response(
+                    item.request,
+                    self.protocol.controller_id,
+                    preverified_stop_status,
                 )
             else:
                 response = self.protocol.execute(
@@ -482,16 +547,92 @@ class ForegroundSupervisorSession(object):
                         self._motion_start_cancelled
                     ),
                 )
-            if not self._enqueue_response(response):
-                return
-            if (
+            shutdown_completed = (
                 item.request is not None
                 and item.request.operation == OP_SHUTDOWN
                 and response.get("ok") is True
-            ):
-                self.request_shutdown()
+            )
         finally:
             source.task_done()
+
+        normal_wire = self._prepare_response_wire(response)
+        if normal_wire is None:
+            return None
+        alternate_wires = {}
+        if response.get("ok") is True:
+            request_id = item.request.request_id
+            for code, message in (
+                (
+                    "external_stop_requested",
+                    "An emergency stop was requested before "
+                    "response publication",
+                ),
+                (
+                    "poll_deadline_missed",
+                    "The supervisor deadline was missed before "
+                    "response publication",
+                ),
+                (
+                    "stop_not_confirmed",
+                    "An emergency stop could not be locally verified",
+                ),
+            ):
+                alternate = error_response(
+                    self.protocol.controller_id,
+                    SupervisorError(code, message),
+                    request_id=request_id,
+                )
+                wire = self._prepare_response_wire(alternate)
+                if wire is None:
+                    return None
+                alternate_wires[code] = wire
+
+        completed = [False]
+
+        def publish(post_dispatch_error=None):
+            if completed[0]:
+                raise SessionError(
+                    "response_already_completed",
+                    "Dispatch response was already completed",
+                )
+            completed[0] = True
+            selected_wire = normal_wire
+            if (
+                post_dispatch_error is not None
+                and getattr(
+                    post_dispatch_error,
+                    "code",
+                    None,
+                )
+                == "external_stop_requested"
+                and item.request is not None
+                and item.request.operation in STOP_OPERATIONS
+            ):
+                post_dispatch_error = None
+            if (
+                post_dispatch_error is not None
+                and response.get("ok") is True
+            ):
+                selected_wire = alternate_wires.get(
+                    getattr(post_dispatch_error, "code", None)
+                )
+                if selected_wire is None:
+                    self.fail_transport(
+                        "response_invalidation_unavailable"
+                    )
+                    return
+            if not self._enqueue_response_wire(selected_wire):
+                return
+            if (
+                shutdown_completed
+                and selected_wire is normal_wire
+            ):
+                # OP_SHUTDOWN has already completed a verified local stop.
+                # Setting only the session signal avoids another stop after
+                # the loop's final deadline check and response decision.
+                self._shutdown.set()
+
+        return publish
 
     def _motion_start_cancelled(self):
         return (
@@ -528,7 +669,12 @@ class ForegroundSupervisorSession(object):
         # is already verified DISARMED, so begin the safety-loop epoch only
         # after both workers have started.  Once constructed, the normal
         # first-tick and steady-state deadline checks remain unchanged.
-        self._loop = EV3SupervisorLoop(self.supervisor)
+        loop = EV3SupervisorLoop(self.supervisor)
+        with self._inbound_queue_lock:
+            self._loop = loop
+            if self._pending_request_bound_stop:
+                self._pending_request_bound_stop = False
+                self._loop._request_protocol_emergency_stop()
 
         status = None
         pending_error = None
@@ -571,6 +717,11 @@ class ForegroundSupervisorSession(object):
             "remaining_motion_budget": (
                 self.protocol.remaining_motion_budget
             ),
+            "remaining_motion_duration_ms": (
+                self.protocol.remaining_motion_duration_ms
+            ),
+            "runtime_profile": self.protocol.runtime_profile,
+            "max_process_requests": self.max_process_requests,
         }
 
 
@@ -582,6 +733,7 @@ def run_daemon(
     allow_one_drive_test=False,
     max_session_ms=DEFAULT_MAX_SESSION_MS,
     external_shutdown_event=None,
+    runtime_profile=None,
 ):
     """Run one foreground session and persist audit only after shutdown."""
     if not isinstance(allow_one_drive_test, bool):
@@ -589,13 +741,41 @@ def run_daemon(
             "invalid_motion_mode",
             "allow_one_drive_test must be boolean",
         )
+    if runtime_profile not in (None, IR_ROAMER_RUNTIME_PROFILE):
+        raise SessionError(
+            "invalid_runtime_profile",
+            "Runtime profile is not supported",
+        )
+    if (
+        runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+        and allow_one_drive_test
+    ):
+        raise SessionError(
+            "invalid_motion_mode",
+            "Runtime profile cannot be combined with one-shot motion",
+        )
+    if (
+        runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+        and (
+            not _is_int(max_session_ms)
+            or max_session_ms != IR_ROAMER_MAX_SESSION_MS
+        )
+    ):
+        raise SessionError(
+            "invalid_session_deadline",
+            "IR roamer session must use the fixed 20000 ms deadline",
+        )
     supervisor = None
     supervisor_initialized = False
     result = None
     pending_error = None
     try:
         supervisor = EV3Supervisor.__new__(EV3Supervisor)
-        EV3Supervisor.__init__(supervisor, robot)
+        EV3Supervisor.__init__(
+            supervisor,
+            robot,
+            runtime_profile=runtime_profile,
+        )
         supervisor_initialized = True
         try:
             controller_id = robot.config["controller_id"]
@@ -607,10 +787,18 @@ def run_daemon(
         protocol = SupervisorProtocol(
             supervisor,
             controller_id,
-            allow_motion=allow_one_drive_test,
-            motion_budget=1 if allow_one_drive_test else 0,
+            allow_motion=(
+                allow_one_drive_test
+                or runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+            ),
+            motion_budget=(
+                DRIVE_PULSE_MAX_COMMANDS
+                if runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+                else (1 if allow_one_drive_test else 0)
+            ),
             experiment_max_abs_speed_dps=100,
             experiment_max_duration_ms=300,
+            runtime_profile=runtime_profile,
         )
         session = ForegroundSupervisorSession(
             supervisor,
@@ -619,6 +807,11 @@ def run_daemon(
             output_stream,
             max_session_ms=max_session_ms,
             external_shutdown_event=external_shutdown_event,
+            max_process_requests=(
+                IR_ROAMER_MAX_PROCESS_REQUESTS
+                if runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+                else MOTION_FREE_MAX_PROCESS_REQUESTS
+            ),
         )
         result = session.run()
     except BaseException as error:
@@ -662,7 +855,8 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description=(
             "Foreground EV3 supervisor over strict JSONL stdin/stdout. "
-            "This entrypoint is motion-free and cannot enable motor starts."
+            "It is motion-free unless the fixed ir-roamer-v1 profile is "
+            "selected explicitly."
         )
     )
     parser.add_argument(
@@ -674,9 +868,14 @@ def build_parser():
         default=DEFAULT_AUDIT_PATH,
     )
     parser.add_argument(
+        "--profile",
+        choices=("motion-free", IR_ROAMER_RUNTIME_PROFILE),
+        default="motion-free",
+    )
+    parser.add_argument(
         "--max-session-ms",
         type=int,
-        default=DEFAULT_MAX_SESSION_MS,
+        default=None,
     )
     return parser
 
@@ -703,10 +902,26 @@ def main(argv=None):
             )
 
     try:
+        runtime_profile = (
+            IR_ROAMER_RUNTIME_PROFILE
+            if args.profile == IR_ROAMER_RUNTIME_PROFILE
+            else None
+        )
+        max_session_ms = args.max_session_ms
+        if max_session_ms is None:
+            max_session_ms = (
+                IR_ROAMER_MAX_SESSION_MS
+                if runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+                else DEFAULT_MAX_SESSION_MS
+            )
         if (
-            not _is_int(args.max_session_ms)
-            or args.max_session_ms <= 0
-            or args.max_session_ms > MAX_SESSION_MS
+            not _is_int(max_session_ms)
+            or max_session_ms <= 0
+            or max_session_ms > MAX_SESSION_MS
+            or (
+                runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+                and max_session_ms != IR_ROAMER_MAX_SESSION_MS
+            )
         ):
             raise SessionError(
                 "invalid_session_deadline",
@@ -724,8 +939,9 @@ def main(argv=None):
             input_stream,
             output_stream,
             allow_one_drive_test=False,
-            max_session_ms=args.max_session_ms,
+            max_session_ms=max_session_ms,
             external_shutdown_event=external_shutdown_event,
+            runtime_profile=runtime_profile,
         )
         status = result["status"]
         if (

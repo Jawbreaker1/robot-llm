@@ -534,11 +534,114 @@ class SupervisorSSHConstructionTests(unittest.TestCase):
             self.assertIn("StrictHostKeyChecking=yes", factory.argv)
             self.assertIn(REMOTE_DAEMON, factory.argv)
             self.assertNotIn("--allow-one-drive-test", factory.argv)
+            self.assertNotIn("--profile", factory.argv)
+            self.assertEqual(session.profile, "motion-free")
+            self.assertEqual(
+                factory.argv[-2:],
+                ["--max-session-ms", "15000"],
+            )
             self.assertIs(factory.kwargs["stdin"], subprocess.PIPE)
             self.assertIs(factory.kwargs["stdout"], subprocess.PIPE)
             self.assertIs(factory.kwargs["stderr"], subprocess.PIPE)
         finally:
             session.close()
+
+    def test_ir_roamer_profile_appends_only_fixed_profile_argv(self):
+        factory = RecordingProcessFactory()
+        session = SupervisorSSHSession(
+            "robot@ev3dev.local",
+            CONTROLLER_ID,
+            process_factory=factory,
+            profile="ir-roamer-v1",
+        )
+        try:
+            self.assertEqual(session.profile, "ir-roamer-v1")
+            self.assertEqual(
+                factory.argv[-4:],
+                [
+                    "--max-session-ms",
+                    "20000",
+                    "--profile",
+                    "ir-roamer-v1",
+                ],
+            )
+            self.assertEqual(factory.argv.count("--profile"), 1)
+        finally:
+            session.close()
+
+    def test_motion_free_explicit_session_duration_remains_supported(self):
+        factory = RecordingProcessFactory()
+        session = SupervisorSSHSession(
+            "robot@ev3dev.local",
+            CONTROLLER_ID,
+            process_factory=factory,
+            remote_session_ms=25_000,
+        )
+        try:
+            self.assertEqual(
+                factory.argv[-2:],
+                ["--max-session-ms", "25000"],
+            )
+            self.assertNotIn("--profile", factory.argv)
+        finally:
+            session.close()
+
+    def test_ir_roamer_accepts_only_fixed_session_duration(self):
+        factory = RecordingProcessFactory()
+        session = SupervisorSSHSession(
+            "robot@ev3dev.local",
+            CONTROLLER_ID,
+            process_factory=factory,
+            remote_session_ms=20_000,
+            profile="ir-roamer-v1",
+        )
+        try:
+            self.assertEqual(
+                factory.argv[-4:],
+                [
+                    "--max-session-ms",
+                    "20000",
+                    "--profile",
+                    "ir-roamer-v1",
+                ],
+            )
+        finally:
+            session.close()
+
+        for duration in (15_000, 19_999, 20_001, 120_000):
+            rejecting_factory = RecordingProcessFactory()
+            with self.subTest(duration=duration):
+                with self.assertRaises(
+                    SupervisorSSHConfigurationError
+                ):
+                    SupervisorSSHSession(
+                        "robot@ev3dev.local",
+                        CONTROLLER_ID,
+                        process_factory=rejecting_factory,
+                        remote_session_ms=duration,
+                        profile="ir-roamer-v1",
+                    )
+                self.assertIsNone(rejecting_factory.argv)
+
+    def test_profile_rejects_unknown_and_control_character_values(self):
+        factory = RecordingProcessFactory()
+        for profile in (
+            "roamer",
+            "ir-roamer-v1 --max-session-ms 999999",
+            "ir-roamer-v1\n--unsafe",
+            "motion-free\x00",
+            "",
+        ):
+            with self.subTest(profile=profile):
+                with self.assertRaises(
+                    SupervisorSSHConfigurationError
+                ):
+                    SupervisorSSHSession(
+                        "robot@ev3dev.local",
+                        CONTROLLER_ID,
+                        process_factory=factory,
+                        profile=profile,
+                    )
 
     def test_target_validation_rejects_shell_and_option_syntax(self):
         factory = RecordingProcessFactory()

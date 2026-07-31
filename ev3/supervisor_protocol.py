@@ -14,9 +14,23 @@ import binascii
 import os
 
 if __package__:
-    from .supervisor import EV3Supervisor, SupervisorError
+    from .supervisor import (
+        EV3Supervisor,
+        IR_ROAMER_RUNTIME_PROFILE,
+        STATE_CLOSED,
+        STATE_DISARMED,
+        STATE_FAULT_LATCHED,
+        SupervisorError,
+    )
 else:
-    from supervisor import EV3Supervisor, SupervisorError
+    from supervisor import (
+        EV3Supervisor,
+        IR_ROAMER_RUNTIME_PROFILE,
+        STATE_CLOSED,
+        STATE_DISARMED,
+        STATE_FAULT_LATCHED,
+        SupervisorError,
+    )
 
 
 PROTOCOL_VERSION = 1
@@ -30,6 +44,7 @@ OP_CLAIM = "claim"
 OP_HEARTBEAT = "heartbeat"
 OP_ARM = "arm"
 OP_DRIVE_TIMED = "drive_timed"
+OP_DRIVE_PULSE = "drive_pulse"
 OP_RELEASE = "release"
 OP_STOP = "stop"
 OP_SHUTDOWN = "shutdown"
@@ -42,6 +57,7 @@ OPERATIONS = frozenset(
         OP_HEARTBEAT,
         OP_ARM,
         OP_DRIVE_TIMED,
+        OP_DRIVE_PULSE,
         OP_RELEASE,
         OP_STOP,
         OP_SHUTDOWN,
@@ -76,9 +92,31 @@ _ARGUMENT_FIELDS = {
             "duration_ms",
         )
     ),
+    OP_DRIVE_PULSE: frozenset(
+        (
+            "session_id",
+            "sequence_id",
+            "command_id",
+            "reference_heartbeat_sequence",
+            "action",
+        )
+    ),
     OP_RELEASE: frozenset(("session_id", "sequence_id")),
     OP_STOP: frozenset(),
     OP_SHUTDOWN: frozenset(),
+}
+
+DRIVE_PULSE_DURATION_MS = 150
+DRIVE_PULSE_SPEED_DPS = 100
+DRIVE_PULSE_MAX_COMMANDS = 20
+DRIVE_PULSE_MAX_TOTAL_DURATION_MS = 3000
+IR_ROAMER_MAX_SESSION_MS = 20000
+MOTION_FREE_MAX_PROCESS_REQUESTS = 128
+IR_ROAMER_MAX_PROCESS_REQUESTS = 256
+DRIVE_PULSE_ACTIONS = {
+    "ADVANCE": (100, 100),
+    "TURN_LEFT": (-100, 100),
+    "TURN_RIGHT": (100, -100),
 }
 
 
@@ -309,6 +347,19 @@ def decode_request(raw, received_at_ms):
                 128 if name != "owner_id" else 64,
                 request_id=request_id,
             )
+    if "action" in arguments:
+        action = _identifier(
+            "action",
+            arguments["action"],
+            32,
+            request_id=request_id,
+        )
+        if action not in DRIVE_PULSE_ACTIONS:
+            raise ProtocolError(
+                "invalid_action",
+                "action is not an allowed semantic drive pulse",
+                request_id=request_id,
+            )
     for name in (
         "sequence_id",
         "reference_heartbeat_sequence",
@@ -392,6 +443,7 @@ class SupervisorProtocol(object):
         motion_budget=0,
         experiment_max_abs_speed_dps=100,
         experiment_max_duration_ms=300,
+        runtime_profile=None,
     ):
         if not isinstance(supervisor, EV3Supervisor):
             raise ProtocolError(
@@ -418,16 +470,45 @@ class SupervisorProtocol(object):
                 fatal=True,
             )
         self.allow_motion = allow_motion
-        if (
-            (allow_motion and motion_budget != 1)
-            or (not allow_motion and motion_budget != 0)
-        ):
+        if runtime_profile not in (None, IR_ROAMER_RUNTIME_PROFILE):
+            raise ProtocolError(
+                "invalid_runtime_profile",
+                "Runtime profile is not supported",
+                fatal=True,
+            )
+        self.runtime_profile = runtime_profile
+        if supervisor.runtime_profile != runtime_profile:
+            raise ProtocolError(
+                "runtime_profile_mismatch",
+                "Protocol and supervisor runtime profiles differ",
+                fatal=True,
+            )
+        expected_budget = (
+            DRIVE_PULSE_MAX_COMMANDS
+            if runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+            else (1 if allow_motion else 0)
+        )
+        if motion_budget != expected_budget:
             raise ProtocolError(
                 "invalid_motion_budget",
-                "Motion mode requires an exact one-shot budget",
+                "Motion budget does not match the fixed runtime profile",
+                fatal=True,
+            )
+        if (
+            runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+            and not allow_motion
+        ):
+            raise ProtocolError(
+                "invalid_motion_mode",
+                "IR roamer profile requires semantic motion",
                 fatal=True,
             )
         self.remaining_motion_budget = motion_budget
+        self.remaining_motion_duration_ms = (
+            DRIVE_PULSE_MAX_TOTAL_DURATION_MS
+            if runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+            else 0
+        )
         self.experiment_max_abs_speed_dps = _positive_int(
             "experiment_max_abs_speed_dps",
             experiment_max_abs_speed_dps,
@@ -469,7 +550,35 @@ class SupervisorProtocol(object):
             "controller_id": self.controller_id,
             "controller_instance_id": self.controller_instance_id,
             "motion_enabled": self.allow_motion,
+            "runtime_profile": (
+                self.runtime_profile
+                if self.runtime_profile is not None
+                else (
+                    "one-shot-drive-test"
+                    if self.allow_motion
+                    else "motion-free"
+                )
+            ),
             "remaining_motion_budget": self.remaining_motion_budget,
+            "remaining_motion_duration_ms": (
+                self.remaining_motion_duration_ms
+            ),
+            "max_session_ms": (
+                IR_ROAMER_MAX_SESSION_MS
+                if self.runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+                else None
+            ),
+            "max_process_requests": (
+                IR_ROAMER_MAX_PROCESS_REQUESTS
+                if self.runtime_profile == IR_ROAMER_RUNTIME_PROFILE
+                else MOTION_FREE_MAX_PROCESS_REQUESTS
+            ),
+            "poll_interval_ms": self.supervisor.limits[
+                "poll_interval_ms"
+            ],
+            "max_poll_lateness_ms": self.supervisor.limits[
+                "max_poll_lateness_ms"
+            ],
             "capabilities": {
                 "status": {
                     "enabled": True,
@@ -478,14 +587,85 @@ class SupervisorProtocol(object):
                     "enabled": True,
                 },
                 "differential_drive_timed": {
-                    "enabled": self.allow_motion,
+                    "enabled": (
+                        self.allow_motion
+                        and self.runtime_profile is None
+                    ),
                     "max_abs_speed_dps": drive_speed_limit,
                     "max_duration_ms": drive_duration_limit,
+                },
+                "semantic_drive_pulse": {
+                    "enabled": (
+                        self.runtime_profile
+                        == IR_ROAMER_RUNTIME_PROFILE
+                    ),
+                    "actions": [
+                        "ADVANCE",
+                        "TURN_LEFT",
+                        "TURN_RIGHT",
+                    ],
+                    "mapping": {
+                        "ADVANCE": {
+                            "left_speed_dps": 100,
+                            "right_speed_dps": 100,
+                        },
+                        "TURN_LEFT": {
+                            "left_speed_dps": -100,
+                            "right_speed_dps": 100,
+                        },
+                        "TURN_RIGHT": {
+                            "left_speed_dps": 100,
+                            "right_speed_dps": -100,
+                        },
+                    },
+                    "duration_ms": DRIVE_PULSE_DURATION_MS,
+                    "max_commands_per_process": (
+                        DRIVE_PULSE_MAX_COMMANDS
+                    ),
+                    "max_total_duration_ms": (
+                        DRIVE_PULSE_MAX_TOTAL_DURATION_MS
+                    ),
                 },
             },
         }
 
-    def _dispatch(self, request, cancellation_requested=None):
+    @staticmethod
+    def _stop_is_verified(result):
+        if not isinstance(result, dict):
+            return False
+        state = result.get("state")
+        if state == STATE_CLOSED:
+            return True
+        if (
+            result.get("session_active") is not False
+            or result.get("active_command_id") is not None
+        ):
+            return False
+        if state == STATE_DISARMED:
+            return True
+        fault = result.get("fault")
+        return (
+            state == STATE_FAULT_LATCHED
+            and isinstance(fault, dict)
+            and fault.get("stop_confirmed") is True
+            and not fault.get("stop_errors")
+            and not fault.get("fault_tokens")
+        )
+
+    @classmethod
+    def _require_verified_stop(cls, result):
+        if cls._stop_is_verified(result):
+            return result
+        raise SupervisorError(
+            "stop_not_confirmed",
+            "Local stop could not be verified",
+        )
+
+    def _dispatch(
+        self,
+        request,
+        cancellation_requested=None,
+    ):
         arguments = request.arguments
         operation = request.operation
         if operation == OP_DESCRIBE:
@@ -505,10 +685,13 @@ class SupervisorProtocol(object):
                 arguments["sequence_id"],
             )
         if operation == OP_DRIVE_TIMED:
-            if not self.allow_motion:
+            if (
+                not self.allow_motion
+                or self.runtime_profile is not None
+            ):
                 raise ProtocolError(
                     "motion_disabled",
-                    "This supervisor process was started motion-free",
+                    "Numeric timed drive is disabled for this process",
                     request_id=request.request_id,
                 )
             if self.remaining_motion_budget <= 0:
@@ -563,15 +746,81 @@ class SupervisorProtocol(object):
                 arguments["duration_ms"],
                 external_start_guard=guard,
             )
+        if operation == OP_DRIVE_PULSE:
+            if self.runtime_profile != IR_ROAMER_RUNTIME_PROFILE:
+                raise ProtocolError(
+                    "motion_disabled",
+                    "Semantic drive pulse is disabled for this process",
+                    request_id=request.request_id,
+                )
+            if self.remaining_motion_budget <= 0:
+                raise ProtocolError(
+                    "motion_budget_exhausted",
+                    "Semantic motion command budget is exhausted",
+                    request_id=request.request_id,
+                )
+            if (
+                self.remaining_motion_duration_ms
+                < DRIVE_PULSE_DURATION_MS
+            ):
+                raise ProtocolError(
+                    "motion_duration_budget_exhausted",
+                    "Semantic motion duration budget is exhausted",
+                    request_id=request.request_id,
+                )
+            try:
+                left_speed_dps, right_speed_dps = (
+                    DRIVE_PULSE_ACTIONS[arguments["action"]]
+                )
+            except KeyError:
+                raise ProtocolError(
+                    "invalid_action",
+                    "Semantic drive action is not allowed",
+                    request_id=request.request_id,
+                )
+            self.remaining_motion_budget -= 1
+            self.remaining_motion_duration_ms -= (
+                DRIVE_PULSE_DURATION_MS
+            )
+
+            def pulse_guard():
+                if self.supervisor._now_ms() >= request.deadline_ms:
+                    raise SupervisorError(
+                        "stale_request",
+                        "Request expired before motor start",
+                    )
+                if (
+                    cancellation_requested is not None
+                    and cancellation_requested()
+                ):
+                    raise SupervisorError(
+                        "external_stop_requested",
+                        "Stop or shutdown was requested before motor start",
+                    )
+
+            return self.supervisor.start_drive(
+                arguments["session_id"],
+                arguments["sequence_id"],
+                arguments["command_id"],
+                arguments["reference_heartbeat_sequence"],
+                left_speed_dps,
+                right_speed_dps,
+                DRIVE_PULSE_DURATION_MS,
+                external_start_guard=pulse_guard,
+            )
         if operation == OP_RELEASE:
             return self.supervisor.release(
                 arguments["session_id"],
                 arguments["sequence_id"],
             )
         if operation == OP_STOP:
-            return self.supervisor.stop()
+            return self._require_verified_stop(
+                self.supervisor.stop()
+            )
         if operation == OP_SHUTDOWN:
-            return self.supervisor.stop()
+            return self._require_verified_stop(
+                self.supervisor.stop()
+            )
         raise ProtocolError(
             "unknown_operation",
             "Operation is not allowed",

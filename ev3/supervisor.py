@@ -15,10 +15,15 @@ import hashlib
 import io
 import json
 import os
+import stat
 import threading
 import time
 
 if __package__:
+    from .infrared_safety import (
+        InfraredGatePolicy,
+        InfraredObstacleGate,
+    )
     from .robot_hal import (
         MotionVerificationError,
         RobotHAL,
@@ -27,6 +32,10 @@ if __package__:
         write_text,
     )
 else:
+    from infrared_safety import (
+        InfraredGatePolicy,
+        InfraredObstacleGate,
+    )
     from robot_hal import (
         MotionVerificationError,
         RobotHAL,
@@ -50,6 +59,9 @@ KNOWN_MOTOR_STATES = frozenset(
     ("running", "ramping", "holding", "stalled", "overloaded")
 )
 AUDIT_SCHEMA = "ev3-supervisor-audit/v1"
+IR_ROAMER_RUNTIME_PROFILE = "ir-roamer-v1"
+IR_ROAMER_POLL_INTERVAL_MS = 150
+IR_ROAMER_MAX_POLL_LATENESS_MS = 400
 
 
 def _is_int(value):
@@ -113,6 +125,114 @@ class SupervisorError(SafetyError):
     def __init__(self, code, message):
         self.code = code
         SafetyError.__init__(self, message)
+
+
+class _BoundAttributeReader(object):
+    """Read one immutable sysfs attribute without reopening it per tick."""
+
+    MAX_BYTES = 256
+
+    def __init__(self, path, kind):
+        self.path = path
+        self.kind = kind
+        self._descriptor = None
+        self._identity_token = None
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            self._descriptor = os.open(path, flags)
+            metadata = os.fstat(self._descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink <= 0
+            ):
+                raise OSError("attribute is not a linked regular file")
+            self._identity_token = (
+                metadata.st_dev,
+                metadata.st_ino,
+            )
+            self._verify_identity("hardware_topology_unreadable")
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                pass
+            raise
+
+    @property
+    def descriptor(self):
+        return self._descriptor
+
+    def _verify_identity(self, error_code):
+        if self._descriptor is None:
+            raise SupervisorError(
+                error_code,
+                "{} cached attribute is closed".format(self.kind),
+            )
+        try:
+            descriptor_metadata = os.fstat(self._descriptor)
+            path_metadata = os.stat(self.path)
+        except (IOError, OSError, ValueError) as error:
+            raise SupervisorError(
+                error_code,
+                "{} identity could not be read: {}".format(
+                    self.kind,
+                    error,
+                ),
+            )
+        descriptor_token = (
+            descriptor_metadata.st_dev,
+            descriptor_metadata.st_ino,
+        )
+        path_token = (
+            path_metadata.st_dev,
+            path_metadata.st_ino,
+        )
+        if (
+            not stat.S_ISREG(descriptor_metadata.st_mode)
+            or descriptor_metadata.st_nlink <= 0
+            or descriptor_token != self._identity_token
+            or path_token != self._identity_token
+        ):
+            raise SupervisorError(
+                error_code,
+                "{} identity changed after binding".format(self.kind),
+            )
+
+    def read(self, error_code):
+        self._verify_identity(error_code)
+        try:
+            raw = os.pread(
+                self._descriptor,
+                self.MAX_BYTES + 1,
+                0,
+            )
+        except (IOError, OSError, ValueError) as error:
+            raise SupervisorError(
+                error_code,
+                "{} could not be read: {}".format(self.kind, error),
+            )
+        if len(raw) > self.MAX_BYTES:
+            raise SupervisorError(
+                error_code,
+                "{} exceeded the read limit".format(self.kind),
+            )
+        try:
+            return raw.decode("ascii").strip()
+        except (AttributeError, UnicodeDecodeError):
+            raise SupervisorError(
+                error_code,
+                "{} was not valid ASCII".format(self.kind),
+            )
+
+    def close(self):
+        descriptor = self._descriptor
+        self._descriptor = None
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 class JSONLAuditLog(object):
@@ -249,6 +369,8 @@ class SupervisorMotorOwner(object):
         self._motor_bindings = None
         self._motor_binding_by_role = None
         self._touch_binding = None
+        self._infrared_binding = None
+        self._bound_readers = ()
 
     def _require_open(self):
         if self.closed:
@@ -312,140 +434,43 @@ class SupervisorMotorOwner(object):
             )
         return (metadata.st_dev, metadata.st_ino)
 
-    def bind_topology(self):
-        """Bind immutable device identity once while the motor lock is held."""
+    @staticmethod
+    def _close_readers(readers):
+        pending_error = None
+        for reader in reversed(tuple(readers)):
+            try:
+                reader.close()
+            except BaseException as error:
+                if pending_error is None:
+                    pending_error = error
+        if pending_error is not None:
+            raise pending_error
 
-        self._require_open()
-        bindings = []
-        seen_paths = set()
+    @staticmethod
+    def _open_bound_reader(path, attribute, kind):
+        reader = _BoundAttributeReader(
+            os.path.join(path, attribute),
+            "{} {}".format(kind, attribute),
+        )
         try:
-            for role in sorted(self.robot.config["motors"]):
-                configured = self.robot.config["motors"][role]
-                path = self.robot._motor_path_for_role(role)
-                if path in seen_paths:
-                    raise SupervisorError(
-                        "hardware_topology_changed",
-                        "Two configured roles resolve to one motor",
-                    )
-                seen_paths.add(path)
-                kind = "Motor {}".format(role)
-                bindings.append(
-                    {
-                        "role": role,
-                        "path": path,
-                        "address": self._attribute_text(
-                            path,
-                            "address",
-                            kind,
-                            "hardware_topology_unreadable",
-                        ),
-                        "driver": self._attribute_text(
-                            path,
-                            "driver_name",
-                            kind,
-                            "hardware_topology_unreadable",
-                        ),
-                        "identity_token": self._identity_token(
-                            path,
-                            kind,
-                            "hardware_topology_unreadable",
-                        ),
-                    }
-                )
-        except SupervisorError:
+            reader.read("hardware_topology_unreadable")
+        except BaseException:
+            try:
+                reader.close()
+            except BaseException:
+                pass
             raise
-        except (KeyError, IOError, OSError, RuntimeError, ValueError) as error:
-            raise SupervisorError(
-                "hardware_topology_changed",
-                "Motor topology could not be resolved: {}".format(error),
-            )
+        return reader
 
-        discovered_paths = self._discovered_motor_paths()
-        if seen_paths != set(discovered_paths):
-            raise SupervisorError(
-                "hardware_topology_changed",
-                "Discovered motors do not exactly match configuration",
-            )
-
-        try:
-            touch_config = self.robot.config["sensors"]["touch"]
-            touch_path = self.robot._sensor_path_for_role("touch")
-        except (
-            KeyError,
-            IOError,
-            OSError,
-            RuntimeError,
-            ValueError,
-        ) as error:
-            raise SupervisorError(
-                "hardware_topology_changed",
-                "Touch sensor could not be resolved: {}".format(error),
-            )
-        touch_address = self._attribute_text(
-            touch_path,
-            "address",
-            "Touch sensor",
-            "hardware_topology_unreadable",
-        )
-        touch_driver = self._attribute_text(
-            touch_path,
-            "driver_name",
-            "Touch sensor",
-            "hardware_topology_unreadable",
-        )
-        touch_mode = self._attribute_text(
-            touch_path,
-            "mode",
-            "Touch sensor",
-            "hardware_topology_unreadable",
-        )
-        if (
-            touch_driver != touch_config["driver"]
-            or touch_mode != touch_config["mode"]
-        ):
-            raise SupervisorError(
-                "hardware_topology_changed",
-                "Touch sensor identity does not match configuration",
-            )
-
-        # Publish the immutable bindings only after every identity check
-        # succeeds.  A failed partial bind can therefore never feed a poll.
-        self._motor_bindings = tuple(bindings)
-        self._motor_binding_by_role = dict(
-            (binding["role"], binding)
-            for binding in bindings
-        )
-        self._touch_binding = {
-            "path": touch_path,
-            "address": touch_address,
-            "driver": touch_driver,
-            "mode": touch_mode,
-            "identity_token": self._identity_token(
-                touch_path,
-                "Touch sensor",
-                "hardware_topology_unreadable",
-            ),
-        }
-
-    def _require_bound_topology(self):
-        if (
-            self._motor_bindings is None
-            or self._motor_binding_by_role is None
-            or self._touch_binding is None
-        ):
-            raise SupervisorError(
-                "hardware_topology_unbound",
-                "Supervisor hardware topology is not bound",
-            )
-
-    def revalidate_topology(self):
-        """Re-resolve every immutable identity before arming or motion."""
-
-        self._require_open()
-        self._require_bound_topology()
+    def _revalidate_bindings(
+        self,
+        motor_bindings,
+        touch,
+        infrared,
+    ):
         discovered_paths = self._discovered_motor_paths()
         expected_paths = set(
-            binding["path"] for binding in self._motor_bindings
+            binding["path"] for binding in motor_bindings
         )
         if set(discovered_paths) != expected_paths:
             raise SupervisorError(
@@ -453,7 +478,7 @@ class SupervisorMotorOwner(object):
                 "Discovered motor set changed after startup",
             )
 
-        for binding in self._motor_bindings:
+        for binding in motor_bindings:
             role = binding["role"]
             try:
                 resolved = self.robot._motor_path_for_role(role)
@@ -487,6 +512,8 @@ class SupervisorMotorOwner(object):
                 "Motor {}".format(role),
                 "hardware_topology_unreadable",
             )
+            for reader in binding["readers"].values():
+                reader._verify_identity("hardware_topology_changed")
             if (
                 resolved != binding["path"]
                 or address != binding["address"]
@@ -512,7 +539,6 @@ class SupervisorMotorOwner(object):
                     error
                 ),
             )
-        touch = self._touch_binding
         address = self._attribute_text(
             touch["path"],
             "address",
@@ -536,17 +562,374 @@ class SupervisorMotorOwner(object):
             "Touch sensor",
             "hardware_topology_unreadable",
         )
+        for reader in touch["readers"].values():
+            reader._verify_identity("hardware_topology_changed")
+        cached_mode = touch["readers"]["mode"].read(
+            "hardware_topology_changed"
+        )
         if (
             touch_path != touch["path"]
             or address != touch["address"]
             or driver != touch["driver"]
             or mode != touch["mode"]
+            or cached_mode != touch["mode"]
             or identity_token != touch["identity_token"]
         ):
             raise SupervisorError(
                 "hardware_topology_changed",
                 "Touch sensor identity changed after startup",
             )
+
+        try:
+            infrared_path = self.robot._sensor_path_for_role("infrared")
+        except (
+            IOError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as error:
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Infrared sensor could not be revalidated: {}".format(
+                    error
+                ),
+            )
+        address = self._attribute_text(
+            infrared["path"],
+            "address",
+            "Infrared sensor",
+            "hardware_topology_unreadable",
+        )
+        driver = self._attribute_text(
+            infrared["path"],
+            "driver_name",
+            "Infrared sensor",
+            "hardware_topology_unreadable",
+        )
+        mode = self._attribute_text(
+            infrared["path"],
+            "mode",
+            "Infrared sensor",
+            "hardware_topology_unreadable",
+        )
+        identity_token = self._identity_token(
+            infrared["path"],
+            "Infrared sensor",
+            "hardware_topology_unreadable",
+        )
+        for reader in infrared["readers"].values():
+            reader._verify_identity("hardware_topology_changed")
+        cached_mode = infrared["readers"]["mode"].read(
+            "hardware_topology_changed"
+        )
+        if (
+            infrared_path != infrared["path"]
+            or address != infrared["address"]
+            or driver != infrared["driver"]
+            or mode != infrared["mode"]
+            or cached_mode != infrared["mode"]
+            or identity_token != infrared["identity_token"]
+        ):
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Infrared sensor identity changed after startup",
+            )
+
+    def bind_topology(self):
+        """Bind immutable device identity once while the motor lock is held."""
+
+        self._require_open()
+        if (
+            self._motor_bindings is not None
+            or self._motor_binding_by_role is not None
+            or self._touch_binding is not None
+            or self._infrared_binding is not None
+            or self._bound_readers
+        ):
+            raise SupervisorError(
+                "hardware_topology_already_bound",
+                "Hardware topology is already bound",
+            )
+        bindings = []
+        seen_paths = set()
+        provisional_readers = []
+        try:
+            for role in sorted(self.robot.config["motors"]):
+                configured = self.robot.config["motors"][role]
+                path = self.robot._motor_path_for_role(role)
+                if path in seen_paths:
+                    raise SupervisorError(
+                        "hardware_topology_changed",
+                        "Two configured roles resolve to one motor",
+                    )
+                seen_paths.add(path)
+                kind = "Motor {}".format(role)
+                bindings.append(
+                    {
+                        "role": role,
+                        "path": path,
+                        "address": self._attribute_text(
+                            path,
+                            "address",
+                            kind,
+                            "hardware_topology_unreadable",
+                        ),
+                        "driver": self._attribute_text(
+                            path,
+                            "driver_name",
+                            kind,
+                            "hardware_topology_unreadable",
+                        ),
+                        "identity_token": self._identity_token(
+                            path,
+                            kind,
+                            "hardware_topology_unreadable",
+                        ),
+                        "readers": {},
+                    }
+                )
+            discovered_paths = self._discovered_motor_paths()
+            if seen_paths != set(discovered_paths):
+                raise SupervisorError(
+                    "hardware_topology_changed",
+                    "Discovered motors do not exactly match configuration",
+                )
+
+            touch_config = self.robot.config["sensors"]["touch"]
+            touch_path = self.robot._sensor_path_for_role("touch")
+            touch_address = self._attribute_text(
+                touch_path,
+                "address",
+                "Touch sensor",
+                "hardware_topology_unreadable",
+            )
+            touch_driver = self._attribute_text(
+                touch_path,
+                "driver_name",
+                "Touch sensor",
+                "hardware_topology_unreadable",
+            )
+            touch_mode = self._attribute_text(
+                touch_path,
+                "mode",
+                "Touch sensor",
+                "hardware_topology_unreadable",
+            )
+            if (
+                touch_driver != touch_config["driver"]
+                or touch_mode != touch_config["mode"]
+            ):
+                raise SupervisorError(
+                    "hardware_topology_changed",
+                    "Touch sensor identity does not match configuration",
+                )
+            touch = {
+                "path": touch_path,
+                "address": touch_address,
+                "driver": touch_driver,
+                "mode": touch_mode,
+                "identity_token": self._identity_token(
+                    touch_path,
+                    "Touch sensor",
+                    "hardware_topology_unreadable",
+                ),
+                "readers": {},
+            }
+
+            infrared_config = self.robot.config["sensors"]["infrared"]
+            infrared_path = self.robot._sensor_path_for_role("infrared")
+            infrared_address = self._attribute_text(
+                infrared_path,
+                "address",
+                "Infrared sensor",
+                "hardware_topology_unreadable",
+            )
+            infrared_driver = self._attribute_text(
+                infrared_path,
+                "driver_name",
+                "Infrared sensor",
+                "hardware_topology_unreadable",
+            )
+            infrared_mode = self._attribute_text(
+                infrared_path,
+                "mode",
+                "Infrared sensor",
+                "hardware_topology_unreadable",
+            )
+            if (
+                infrared_config.get("port") != "in4"
+                or infrared_driver != infrared_config["driver"]
+                or infrared_mode != infrared_config["mode"]
+                or infrared_mode != "IR-PROX"
+            ):
+                raise SupervisorError(
+                    "hardware_topology_changed",
+                    "Infrared sensor identity does not match "
+                    "the fixed in4 IR-PROX configuration",
+                )
+            infrared = {
+                "path": infrared_path,
+                "address": infrared_address,
+                "driver": infrared_driver,
+                "mode": infrared_mode,
+                "identity_token": self._identity_token(
+                    infrared_path,
+                    "Infrared sensor",
+                    "hardware_topology_unreadable",
+                ),
+                "readers": {},
+            }
+
+            for binding in bindings:
+                kind = "Motor {}".format(binding["role"])
+                for attribute in ("state", "position"):
+                    reader = self._open_bound_reader(
+                        binding["path"],
+                        attribute,
+                        kind,
+                    )
+                    provisional_readers.append(reader)
+                    binding["readers"][attribute] = reader
+                _state_tokens(
+                    binding["readers"]["state"].read(
+                        "hardware_topology_unreadable"
+                    )
+                )
+                try:
+                    int(
+                        binding["readers"]["position"].read(
+                            "hardware_topology_unreadable"
+                        )
+                    )
+                except ValueError:
+                    raise SupervisorError(
+                        "hardware_topology_unreadable",
+                        "{} position is not an integer".format(kind),
+                    )
+
+            for attribute in ("mode", "value0"):
+                reader = self._open_bound_reader(
+                    touch_path,
+                    attribute,
+                    "Touch sensor",
+                )
+                provisional_readers.append(reader)
+                touch["readers"][attribute] = reader
+            if (
+                touch["readers"]["mode"].read(
+                    "hardware_topology_unreadable"
+                )
+                != touch_mode
+            ):
+                raise SupervisorError(
+                    "hardware_topology_changed",
+                    "Touch sensor mode changed while binding",
+                )
+            try:
+                int(
+                    touch["readers"]["value0"].read(
+                        "hardware_topology_unreadable"
+                    )
+                )
+            except ValueError:
+                raise SupervisorError(
+                    "hardware_topology_unreadable",
+                    "Touch sensor value is not an integer",
+                )
+
+            for attribute in ("mode", "value0"):
+                reader = self._open_bound_reader(
+                    infrared_path,
+                    attribute,
+                    "Infrared sensor",
+                )
+                provisional_readers.append(reader)
+                infrared["readers"][attribute] = reader
+            if (
+                infrared["readers"]["mode"].read(
+                    "hardware_topology_unreadable"
+                )
+                != infrared_mode
+            ):
+                raise SupervisorError(
+                    "hardware_topology_changed",
+                    "Infrared sensor mode changed while binding",
+                )
+            try:
+                infrared_value = int(
+                    infrared["readers"]["value0"].read(
+                        "hardware_topology_unreadable"
+                    )
+                )
+            except ValueError:
+                raise SupervisorError(
+                    "hardware_topology_unreadable",
+                    "Infrared sensor value is not an integer",
+                )
+            if infrared_value < 0 or infrared_value > 100:
+                raise SupervisorError(
+                    "hardware_topology_unreadable",
+                    "Infrared sensor value is outside 0..100",
+                )
+
+            # Close the open-vs-hotplug race before publishing the complete
+            # immutable binding set.
+            self._revalidate_bindings(
+                tuple(bindings),
+                touch,
+                infrared,
+            )
+        except BaseException as error:
+            try:
+                self._close_readers(provisional_readers)
+            except BaseException:
+                pass
+            if isinstance(error, SupervisorError):
+                raise
+            if isinstance(
+                error,
+                (KeyError, IOError, OSError, RuntimeError, ValueError),
+            ):
+                raise SupervisorError(
+                    "hardware_topology_changed",
+                    "Hardware topology could not be bound: {}".format(
+                        error
+                    ),
+                )
+            raise
+
+        # Publish only after every descriptor and fresh path has passed.
+        self._motor_bindings = tuple(bindings)
+        self._motor_binding_by_role = dict(
+            (binding["role"], binding)
+            for binding in bindings
+        )
+        self._touch_binding = touch
+        self._infrared_binding = infrared
+        self._bound_readers = tuple(provisional_readers)
+
+    def _require_bound_topology(self):
+        if (
+            self._motor_bindings is None
+            or self._motor_binding_by_role is None
+            or self._touch_binding is None
+            or self._infrared_binding is None
+        ):
+            raise SupervisorError(
+                "hardware_topology_unbound",
+                "Supervisor hardware topology is not bound",
+            )
+
+    def revalidate_topology(self):
+        """Re-resolve every immutable identity before arming or motion."""
+
+        self._require_open()
+        self._require_bound_topology()
+        return self._revalidate_bindings(
+            self._motor_bindings,
+            self._touch_binding,
+            self._infrared_binding,
+        )
 
     def path_for_role(self, role):
         self._require_bound_topology()
@@ -567,11 +950,8 @@ class SupervisorMotorOwner(object):
             "Touch sensor",
             "hardware_topology_changed",
         )
-        mode = self._attribute_text(
-            touch["path"],
-            "mode",
-            "Touch sensor",
-            "hardware_read_failed",
+        mode = touch["readers"]["mode"].read(
+            "hardware_read_failed"
         )
         if (
             identity_token != touch["identity_token"]
@@ -581,11 +961,8 @@ class SupervisorMotorOwner(object):
                 "hardware_topology_changed",
                 "Touch sensor identity changed during polling",
             )
-        raw = self._attribute_text(
-            touch["path"],
-            "value0",
-            "Touch sensor",
-            "hardware_read_failed",
+        raw = touch["readers"]["value0"].read(
+            "hardware_read_failed"
         )
         try:
             return int(raw)
@@ -594,6 +971,44 @@ class SupervisorMotorOwner(object):
                 "hardware_read_failed",
                 "Touch sensor value is not an integer",
             )
+
+    def read_infrared_value(self):
+        self._require_open()
+        self._require_bound_topology()
+        infrared = self._infrared_binding
+        identity_token = self._identity_token(
+            infrared["path"],
+            "Infrared sensor",
+            "hardware_topology_changed",
+        )
+        mode = infrared["readers"]["mode"].read(
+            "hardware_read_failed"
+        )
+        if (
+            identity_token != infrared["identity_token"]
+            or mode != infrared["mode"]
+            or mode != "IR-PROX"
+        ):
+            raise SupervisorError(
+                "hardware_topology_changed",
+                "Infrared sensor identity changed during polling",
+            )
+        raw = infrared["readers"]["value0"].read(
+            "hardware_read_failed"
+        )
+        try:
+            value = int(raw)
+        except ValueError:
+            raise SupervisorError(
+                "hardware_read_failed",
+                "Infrared sensor value is not an integer",
+            )
+        if value < 0 or value > 100:
+            raise SupervisorError(
+                "hardware_read_failed",
+                "Infrared sensor value is outside 0..100",
+            )
+        return value
 
     def dynamic_motor_snapshots(self, position_roles=()):
         """Read one consolidated dynamic snapshot from bound devices."""
@@ -638,19 +1053,13 @@ class SupervisorMotorOwner(object):
                 "role": role,
                 "path": binding["path"],
                 "address": binding["address"],
-                "state": self._attribute_text(
-                    binding["path"],
-                    "state",
-                    "Motor {}".format(role),
-                    "hardware_read_failed",
+                "state": binding["readers"]["state"].read(
+                    "hardware_read_failed"
                 ),
             }
             if role in requested:
-                raw_position = self._attribute_text(
-                    binding["path"],
-                    "position",
-                    "Motor {}".format(role),
-                    "hardware_read_failed",
+                raw_position = binding["readers"]["position"].read(
+                    "hardware_read_failed"
                 )
                 try:
                     snapshot["position"] = int(raw_position)
@@ -910,20 +1319,59 @@ class SupervisorMotorOwner(object):
                     "brake",
                 )
 
-            start_times_ms = []
+            start_write_windows = []
             for motor in motors:
                 if pre_each_start is not None:
                     pre_each_start(
                         copy.deepcopy(motor),
-                        tuple(start_times_ms),
+                        tuple(copy.deepcopy(start_write_windows)),
                     )
+                write_begin_ms = int(
+                    self.robot.monotonic_fn() * 1000
+                )
+                if (
+                    start_write_windows
+                    and write_begin_ms
+                    - start_write_windows[0]["begin_ms"]
+                    > self.limits["max_start_skew_ms"]
+                ):
+                    raise SupervisorError(
+                        "start_skew",
+                        "Second motor start missed the local skew limit",
+                    )
+                motor["start_write_begin_ms"] = write_begin_ms
                 write_text(
                     os.path.join(motor["path"], "command"),
                     "run-timed",
                 )
-                started_ms = int(self.robot.monotonic_fn() * 1000)
-                motor["start_write_ms"] = started_ms
-                start_times_ms.append(started_ms)
+                write_end_ms = int(
+                    self.robot.monotonic_fn() * 1000
+                )
+                if write_end_ms < write_begin_ms:
+                    raise SupervisorError(
+                        "clock_rollback",
+                        "Monotonic clock moved backwards during motor start",
+                    )
+                motor["start_write_end_ms"] = write_end_ms
+                # Preserve the original field as the conservative earliest
+                # instant at which the kernel could have observed the write.
+                motor["start_write_ms"] = write_begin_ms
+                start_write_windows.append(
+                    {
+                        "begin_ms": write_begin_ms,
+                        "end_ms": write_end_ms,
+                    }
+                )
+                if (
+                    len(start_write_windows) == 2
+                    and write_end_ms
+                    - start_write_windows[0]["begin_ms"]
+                    > self.limits["max_start_skew_ms"]
+                ):
+                    raise SupervisorError(
+                        "start_skew",
+                        "Motor command-write window exceeded local limit",
+                    )
         except BaseException as error:
             propagated = error
             try:
@@ -943,7 +1391,7 @@ class SupervisorMotorOwner(object):
                 pass
             raise propagated
 
-        started_at_ms = min(start_times_ms)
+        started_at_ms = start_write_windows[0]["begin_ms"]
         for motor in motors:
             motor["checkpoint_at_ms"] = (
                 started_at_ms
@@ -954,6 +1402,13 @@ class SupervisorMotorOwner(object):
             "duration_ms": duration_ms,
             "started_at_ms": started_at_ms,
             "deadline_ms": started_at_ms + duration_ms,
+            "start_write_window_ms": (
+                start_write_windows[-1]["end_ms"]
+                - start_write_windows[0]["begin_ms"]
+            ),
+            "forward_motion": (
+                left_speed_dps > 0 and right_speed_dps > 0
+            ),
         }
         return self.active_snapshot()
 
@@ -1152,6 +1607,14 @@ class SupervisorMotorOwner(object):
             or result["fault_tokens"]
         ):
             return result
+        cleanup_errors = []
+        try:
+            self._close_readers(self._bound_readers)
+        except BaseException as error:
+            cleanup_errors.append(str(error))
+        self._bound_readers = ()
+        if cleanup_errors:
+            result["cleanup_errors"] = cleanup_errors
         try:
             import fcntl
 
@@ -1174,6 +1637,7 @@ class EV3Supervisor(object):
         robot,
         audit_buffer=None,
         session_id_factory=_default_session_id,
+        runtime_profile=None,
     ):
         if not callable(session_id_factory):
             raise SupervisorError(
@@ -1183,6 +1647,33 @@ class EV3Supervisor(object):
         self.robot = robot
         self._session_id_factory = session_id_factory
         self.limits = self._validated_limits(robot.config)
+        if runtime_profile not in (None, IR_ROAMER_RUNTIME_PROFILE):
+            raise SupervisorError(
+                "invalid_runtime_profile",
+                "Supervisor runtime profile is not supported",
+            )
+        self.runtime_profile = runtime_profile
+        if runtime_profile == IR_ROAMER_RUNTIME_PROFILE:
+            self.limits["poll_interval_ms"] = (
+                IR_ROAMER_POLL_INTERVAL_MS
+            )
+            self.limits["max_poll_lateness_ms"] = (
+                IR_ROAMER_MAX_POLL_LATENESS_MS
+            )
+            if (
+                self.limits["poll_interval_ms"]
+                >= self.limits["heartbeat_timeout_ms"]
+                or self.limits["max_poll_lateness_ms"]
+                >= self.limits["heartbeat_timeout_ms"]
+            ):
+                raise SupervisorError(
+                    "invalid_supervisor_config",
+                    "IR roamer timing must remain inside heartbeat timeout",
+                )
+        self._infrared_gate = InfraredObstacleGate(
+            InfraredGatePolicy.from_config(robot.config)
+        )
+        self._infrared_observed_ms = None
         if audit_buffer is None:
             audit_buffer = AuditBuffer(
                 self.limits["audit_buffer_events"]
@@ -1641,6 +2132,100 @@ class EV3Supervisor(object):
             "value0": value,
         }
 
+    def _read_infrared(self):
+        observed_ms = self._checked_now_ms()
+        try:
+            value = self._owner.read_infrared_value()
+        except BaseException:
+            self._infrared_gate.fail_closed()
+            self._infrared_observed_ms = observed_ms
+            raise
+        try:
+            snapshot = self._infrared_gate.observe(value)
+        except SafetyError as error:
+            self._infrared_observed_ms = observed_ms
+            raise SupervisorError(
+                "infrared_invalid_sample",
+                str(error),
+            )
+        self._infrared_observed_ms = observed_ms
+        return snapshot
+
+    def _infrared_status(self, now_ms):
+        snapshot = self._infrared_gate.snapshot()
+        observed_ms = self._infrared_observed_ms
+        age_ms = (
+            None
+            if observed_ms is None
+            else now_ms - observed_ms
+        )
+        freshness_limit_ms = (
+            self.limits["poll_interval_ms"]
+            + self.limits["max_poll_lateness_ms"]
+        )
+        fresh = (
+            age_ms is not None
+            and age_ms >= 0
+            and age_ms <= freshness_limit_ms
+            and snapshot["raw"] is not None
+        )
+        snapshot.update(
+            {
+                "observed_monotonic_ms": observed_ms,
+                "age_ms": age_ms,
+                "fresh": fresh,
+            }
+        )
+        return snapshot
+
+    def _require_forward_infrared_clear(self):
+        now_ms = self._checked_now_ms()
+        infrared = self._infrared_status(now_ms)
+        if not infrared["fresh"]:
+            raise SupervisorError(
+                "infrared_not_fresh",
+                "Forward motion requires a fresh local IR observation",
+            )
+        if infrared["blocked"]:
+            raise SupervisorError(
+                "infrared_obstacle",
+                "Forward motion is blocked by the local IR gate",
+            )
+        return infrared
+
+    def _stop_forward_for_infrared(self):
+        command_id = self.active_command_id
+        infrared = self._infrared_status(self._checked_now_ms())
+        result, stop_error = self._finish_active_with_retry(
+            "infrared_obstacle_stop"
+        )
+        self.active_command_id = None
+        if (
+            stop_error is None
+            and result["stop_confirmed"]
+            and not result["errors"]
+            and not result.get("fault_tokens")
+        ):
+            self.state = STATE_ARMED_IDLE
+            self._audit(
+                "infrared_obstacle_stop",
+                command_id=command_id,
+                infrared=infrared,
+                stop=result,
+            )
+            return self.status()
+        self._enter_fault(
+            "infrared_stop_failed",
+            "IR obstacle stop was not verified",
+            stop_result=result,
+        )
+        if (
+            stop_error is not None
+            and not isinstance(stop_error, Exception)
+        ):
+            raise stop_error
+        return self.status()
+
     def _check_idle_motors(self):
         snapshots = self._owner.dynamic_motor_snapshots()
         for snapshot in snapshots:
@@ -1827,6 +2412,7 @@ class EV3Supervisor(object):
                 self.fault["stop_errors"] = [str(error)]
             try:
                 self._read_touch()
+                self._read_infrared()
                 self._checked_now_ms()
             except Exception as error:
                 secondary_errors.append(str(error))
@@ -1837,8 +2423,15 @@ class EV3Supervisor(object):
         try:
             now_ms = self._checked_now_ms()
             self._read_touch()
+            self._read_infrared()
             now_ms = self._checked_now_ms()
             if self.state == STATE_RUNNING:
+                if (
+                    self._owner.active is not None
+                    and self._owner.active.get("forward_motion") is True
+                    and self._infrared_gate.blocked
+                ):
+                    return self._stop_forward_for_infrared()
                 running = self._check_running_motion(
                     touch_already_read=True
                 )
@@ -2030,65 +2623,40 @@ class EV3Supervisor(object):
     def _guard_individual_motor_start(
         self,
         motor,
-        prior_start_times_ms,
+        prior_start_write_windows,
+        require_infrared_clear=False,
     ):
-        self._read_touch()
+        if not prior_start_write_windows:
+            # Motor parameters have already been staged, but neither
+            # run-timed command has been written.  Take the final full local
+            # safety snapshot at this last atomic boundary.  The second
+            # guard below deliberately uses only these cached results so the
+            # two command writes are not separated by slow sysfs reads.
+            self._read_touch()
+            self._read_infrared()
+            self._check_idle_motors()
         now_ms = self._checked_now_ms()
         if self.touch_value != 0:
             raise SupervisorError(
                 "touch_pressed",
-                "Touch stop input changed between motor starts",
+                "Cached touch input is not released before motor start",
             )
         if not self._heartbeat_is_fresh(now_ms):
             raise SupervisorError(
                 "heartbeat_timeout",
                 "Heartbeat expired between motor starts",
             )
+        if require_infrared_clear:
+            self._require_forward_infrared_clear()
         if (
-            prior_start_times_ms
-            and now_ms - min(prior_start_times_ms)
+            prior_start_write_windows
+            and now_ms
+            - prior_start_write_windows[0]["begin_ms"]
             > self.limits["max_start_skew_ms"]
         ):
             raise SupervisorError(
                 "start_skew",
                 "Second motor start missed the local skew limit",
-            )
-        allowed_active_paths = set()
-        if prior_start_times_ms:
-            left_role, right_role, _signs = self.robot._drive_roles()
-            for role in (left_role, right_role):
-                path = self._owner.path_for_role(role)
-                if path != motor["path"]:
-                    allowed_active_paths.add(path)
-        for observed in self._owner.dynamic_motor_snapshots():
-            tokens = _state_tokens(observed["state"])
-            if tokens & FAULT_MOTOR_STATES:
-                raise SupervisorError(
-                    "motor_state_fault",
-                    "A motor fault appeared between motor starts",
-                )
-            if (
-                tokens & ACTIVE_MOTOR_STATES
-                and observed["path"] not in allowed_active_paths
-            ):
-                raise SupervisorError(
-                    "unexpected_external_motion",
-                    "Unexpected motion appeared between motor starts",
-                )
-        now_ms = self._checked_now_ms()
-        if not self._heartbeat_is_fresh(now_ms):
-            raise SupervisorError(
-                "heartbeat_timeout",
-                "Heartbeat expired during motor start guard",
-            )
-        if (
-            prior_start_times_ms
-            and now_ms - min(prior_start_times_ms)
-            > self.limits["max_start_skew_ms"]
-        ):
-            raise SupervisorError(
-                "start_skew",
-                "Motor inventory check exceeded the start skew limit",
             )
 
     def start_drive(
@@ -2165,6 +2733,9 @@ class EV3Supervisor(object):
                 str(error),
             )
 
+        forward_motion = (
+            left_speed_dps > 0 and right_speed_dps > 0
+        )
         self._revalidate_hardware_topology("drive")
         self.poll_once()
         self._require_state(STATE_ARMED_IDLE)
@@ -2179,6 +2750,8 @@ class EV3Supervisor(object):
                 "touch_pressed",
                 "Touch stop input is pressed",
             )
+        if forward_motion:
+            self._require_forward_infrared_clear()
         if external_start_guard is not None:
             external_start_guard()
 
@@ -2200,6 +2773,7 @@ class EV3Supervisor(object):
         )
         try:
             self._read_touch()
+            self._read_infrared()
             self._check_idle_motors()
             now_ms = self._checked_now_ms()
             if self.touch_value != 0:
@@ -2212,10 +2786,26 @@ class EV3Supervisor(object):
                     "heartbeat_timeout",
                     "Heartbeat expired before motor start",
                 )
+            if forward_motion:
+                self._require_forward_infrared_clear()
             if external_start_guard is not None:
                 external_start_guard()
         except BaseException as error:
             code = getattr(error, "code", "prestart_failure")
+            if code in (
+                "infrared_not_fresh",
+                "infrared_obstacle",
+            ):
+                self._audit(
+                    "infrared_forward_denied",
+                    command_id=command_id,
+                    infrared=self._infrared_status(
+                        self._checked_now_ms()
+                    ),
+                )
+                if not isinstance(error, Exception):
+                    raise
+                raise SupervisorError(code, str(error))
             self._enter_fault(code, str(error))
             if not isinstance(error, Exception):
                 raise
@@ -2226,11 +2816,12 @@ class EV3Supervisor(object):
         try:
             def guarded_individual_start(
                 motor,
-                prior_start_times_ms,
+                prior_start_write_windows,
             ):
                 self._guard_individual_motor_start(
                     motor,
-                    prior_start_times_ms,
+                    prior_start_write_windows,
+                    require_infrared_clear=forward_motion,
                 )
                 if external_start_guard is not None:
                     external_start_guard()
@@ -2262,6 +2853,28 @@ class EV3Supervisor(object):
                 )
             )
             code = getattr(error, "code", "motion_start_failed")
+            if (
+                code in (
+                    "infrared_not_fresh",
+                    "infrared_obstacle",
+                )
+                and stop_result.get("stop_confirmed") is True
+                and not stop_result.get("errors")
+                and not stop_result.get("fault_tokens")
+            ):
+                self.active_command_id = None
+                self.state = STATE_ARMED_IDLE
+                self._audit(
+                    "infrared_obstacle_stop",
+                    command_id=command_id,
+                    infrared=self._infrared_status(
+                        self._checked_now_ms()
+                    ),
+                    stop=stop_result,
+                )
+                if not isinstance(error, Exception):
+                    raise
+                raise SupervisorError(code, str(error))
             self._enter_fault(
                 code,
                 str(error),
@@ -2276,12 +2889,17 @@ class EV3Supervisor(object):
 
         self.active_command_id = command_id
         self.state = STATE_RUNNING
-        start_times = [
-            motor["start_write_ms"]
-            for motor in self._owner.active["motors"]
+        start_skew_ms = self._owner.active[
+            "start_write_window_ms"
         ]
-        start_skew_ms = max(start_times) - min(start_times)
         try:
+            self._read_infrared()
+            if forward_motion and self._infrared_gate.blocked:
+                self._stop_forward_for_infrared()
+                raise SupervisorError(
+                    "infrared_obstacle",
+                    "Forward motion was stopped by the local IR gate",
+                )
             running = self._check_running_motion()
             now_ms = running["observed_at_ms"]
             if (
@@ -2301,8 +2919,20 @@ class EV3Supervisor(object):
                     "heartbeat_timeout",
                     "Heartbeat expired during motor start",
                 )
+            if external_start_guard is not None:
+                external_start_guard()
         except BaseException as error:
             code = getattr(error, "code", "poststart_failure")
+            if (
+                code in (
+                    "infrared_not_fresh",
+                    "infrared_obstacle",
+                )
+                and self.state == STATE_ARMED_IDLE
+            ):
+                if not isinstance(error, Exception):
+                    raise
+                raise SupervisorError(code, str(error))
             self._enter_fault(code, str(error))
             if not isinstance(error, Exception):
                 raise
@@ -2425,8 +3055,45 @@ class EV3Supervisor(object):
     def reset_fault(self):
         self._require_dispatch_thread()
         self._require_state(STATE_FAULT_LATCHED)
+        if (
+            isinstance(self.fault, dict)
+            and self.fault.get("code")
+            in (
+                "hardware_read_failed",
+                "hardware_topology_changed",
+                "hardware_topology_unreadable",
+                "infrared_invalid_sample",
+            )
+        ):
+            raise SupervisorError(
+                "supervisor_restart_required",
+                "Hardware binding faults require a supervisor restart",
+            )
         self.poll_once()
         self._require_state(STATE_FAULT_LATCHED)
+        if (
+            isinstance(self.fault, dict)
+            and self.fault.get("secondary_errors")
+        ):
+            raise SupervisorError(
+                "supervisor_restart_required",
+                "Secondary safety-read failures require a restart",
+            )
+        try:
+            self._owner.revalidate_topology()
+            self._read_touch()
+            self._read_infrared()
+        except (
+            IOError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            SupervisorError,
+        ):
+            raise SupervisorError(
+                "supervisor_restart_required",
+                "Fresh hardware binding could not be verified",
+            )
         if (
             self.touch_value != 0
             or self.touch_released_samples
@@ -2473,6 +3140,7 @@ class EV3Supervisor(object):
             "heartbeat_age_ms": self._heartbeat_age_ms(now_ms),
             "touch": self.touch_value,
             "touch_released_samples": self.touch_released_samples,
+            "infrared": self._infrared_status(now_ms),
             "active_command_id": self.active_command_id,
             "fault": self.fault,
         }
@@ -2494,6 +3162,9 @@ class EV3Supervisor(object):
             audit_error = error
         self._close_status = self.status()
         self._close_status["audit_complete"] = audit_complete
+        cleanup_errors = list(result.get("cleanup_errors", []))
+        self._close_status["cleanup_complete"] = not cleanup_errors
+        self._close_status["cleanup_errors"] = cleanup_errors
         completed = copy.deepcopy(self._close_status)
         if (
             audit_error is not None
@@ -2586,18 +3257,199 @@ class EV3SupervisorLoop(object):
             else now_ms
         )
         self._emergency_stop_requested = threading.Event()
+        self._emergency_stop_request_lock = threading.Lock()
+        self._request_bound_emergency_stop = False
+        self._preverified_stop_status = None
 
     def request_emergency_stop(self):
         """Thread-safe signal; the dispatch thread performs the stop."""
-        self._emergency_stop_requested.set()
+        with self._emergency_stop_request_lock:
+            self._emergency_stop_requested.set()
+
+    def _request_protocol_emergency_stop(self):
+        """Signal a correctly targeted, admitted protocol stop request."""
+        with self._emergency_stop_request_lock:
+            self._request_bound_emergency_stop = True
+            self._emergency_stop_requested.set()
 
     def emergency_stop_requested(self):
         return self._emergency_stop_requested.is_set()
 
+    @staticmethod
+    def _status_proves_verified_stop(status):
+        if not isinstance(status, dict):
+            return False
+        state = status.get("state")
+        if state == STATE_CLOSED:
+            return True
+        if (
+            status.get("session_active") is not False
+            or status.get("active_command_id") is not None
+        ):
+            return False
+        if state == STATE_DISARMED:
+            return True
+        fault = status.get("fault")
+        return (
+            state == STATE_FAULT_LATCHED
+            and isinstance(fault, dict)
+            and fault.get("stop_confirmed") is True
+            and not fault.get("stop_errors")
+            and not fault.get("fault_tokens")
+        )
+
+    def _take_preverified_stop_status(self, supervisor):
+        """Consume one loop-local stop proof for this exact supervisor."""
+
+        status = self._preverified_stop_status
+        self._preverified_stop_status = None
+        if supervisor is not self.supervisor:
+            raise SupervisorError(
+                "stop_proof_mismatch",
+                "Stop proof belongs to another supervisor loop",
+            )
+        if (
+            status is None
+            or not self._status_proves_verified_stop(status)
+        ):
+            return None
+        current_status = self.supervisor.status()
+        if not self._status_proves_verified_stop(current_status):
+            return None
+        return current_status
+
     def _perform_requested_emergency_stop(self):
-        if self._emergency_stop_requested.is_set():
+        request_bound = False
+        with self._emergency_stop_request_lock:
+            if not self._emergency_stop_requested.is_set():
+                return None
             self._emergency_stop_requested.clear()
-            self.supervisor.stop()
+            request_bound = self._request_bound_emergency_stop
+            self._request_bound_emergency_stop = False
+
+        stop_started_ms = self.supervisor._checked_now_ms()
+        status = self.supervisor.stop()
+        stop_completed_ms = self.supervisor._checked_now_ms()
+        if self._status_proves_verified_stop(status):
+            if request_bound:
+                # A locally verified urgent STOP/SHUTDOWN is mandatory
+                # safety work, not scheduler starvation.  Shift only by
+                # the measured stop duration so any debt that existed
+                # before the request remains fully visible.
+                self._next_tick_ms += (
+                    stop_completed_ms - stop_started_ms
+                )
+            self._preverified_stop_status = status
+            return self._external_stop_error()
+        self._preverified_stop_status = None
+        return self._stop_not_confirmed_error()
+
+    @staticmethod
+    def _external_stop_error():
+        return SupervisorError(
+            "external_stop_requested",
+            "An emergency stop was requested before response publication",
+        )
+
+    @staticmethod
+    def _stop_not_confirmed_error():
+        return SupervisorError(
+            "stop_not_confirmed",
+            "An emergency stop could not be locally verified",
+        )
+
+    def _dispatch_one(self, dispatch_one):
+        if dispatch_one is None:
+            self._preverified_stop_status = None
+            return (None, None)
+        try:
+            completion = dispatch_one()
+        except BaseException as error:
+            self._preverified_stop_status = None
+            code = getattr(error, "code", "dispatch_failure")
+            self.supervisor._enter_fault(code, str(error))
+            raise
+        self._preverified_stop_status = None
+        post_dispatch_error = None
+        stop_outcome = self._perform_requested_emergency_stop()
+        if stop_outcome is not None:
+            post_dispatch_error = stop_outcome
+            self._preverified_stop_status = None
+        return (completion, post_dispatch_error)
+
+    def _complete_dispatch(
+        self,
+        completion,
+        post_dispatch_error=None,
+    ):
+        stop_outcome = self._perform_requested_emergency_stop()
+        if stop_outcome is not None:
+            post_dispatch_error = self._prefer_dispatch_error(
+                stop_outcome,
+                post_dispatch_error,
+            )
+            self._preverified_stop_status = None
+        if completion is None:
+            return
+        if not callable(completion):
+            error = SupervisorError(
+                "invalid_dispatch_completion",
+                "Dispatch completion must be callable",
+            )
+            self.supervisor._enter_fault(error.code, str(error))
+            raise error
+        try:
+            completion(post_dispatch_error)
+        except BaseException as error:
+            code = getattr(
+                error,
+                "code",
+                "dispatch_completion_failure",
+            )
+            self.supervisor._enter_fault(code, str(error))
+            raise
+        late_stop_outcome = self._perform_requested_emergency_stop()
+        self._preverified_stop_status = None
+        if (
+            late_stop_outcome is not None
+            and getattr(
+                late_stop_outcome,
+                "code",
+                None,
+            )
+            == "stop_not_confirmed"
+        ):
+            # The response was already linearized by its bounded, nonblocking
+            # queue insertion.  A later failed stop is a subsequent safety
+            # transition, but it must still terminate the loop loudly.
+            raise late_stop_outcome
+
+    @staticmethod
+    def _prefer_dispatch_error(first, second):
+        if (
+            first is not None
+            and getattr(first, "code", None)
+            == "stop_not_confirmed"
+        ):
+            return first
+        if (
+            second is not None
+            and getattr(second, "code", None)
+            == "stop_not_confirmed"
+        ):
+            return second
+        if first is not None:
+            return first
+        return second
+
+    def _sleep_after_deadline_fault(self):
+        """Keep fault response service bounded without spinning."""
+        now_ms = self.supervisor._now_ms()
+        remaining_ms = self._next_tick_ms - now_ms
+        if remaining_ms <= 0:
+            self._next_tick_ms = now_ms + self.interval_ms
+            remaining_ms = self.interval_ms
+        self.supervisor.robot.sleep_fn(remaining_ms / 1000.0)
 
     def run_once(self, dispatch_one=None):
         if dispatch_one is not None and not callable(dispatch_one):
@@ -2616,9 +3468,21 @@ class EV3SupervisorLoop(object):
                 ),
             )
             self._next_tick_ms = now_ms + self.interval_ms
-            self.supervisor.robot.sleep_fn(
-                self.interval_ms / 1000.0
+            # The fault is latched and motion/session state has been
+            # invalidated before any queued request is serviced.  Dispatch
+            # exactly one item so stop/shutdown and diagnostic/error
+            # responses cannot starve under repeated late wakeups.  Normal
+            # motion, claim, and arm requests remain fail-closed behind the
+            # supervisor's FAULT_LATCHED state guards.
+            self._perform_requested_emergency_stop()
+            completion, dispatch_error = self._dispatch_one(
+                dispatch_one
             )
+            self._complete_dispatch(
+                completion,
+                post_dispatch_error=dispatch_error,
+            )
+            self._sleep_after_deadline_fault()
             return self.supervisor.status()
 
         self._perform_requested_emergency_stop()
@@ -2628,36 +3492,98 @@ class EV3SupervisorLoop(object):
         self._perform_requested_emergency_stop()
 
         now_ms = self.supervisor._checked_now_ms()
-        if (
-            dispatch_one is not None
-            and now_ms < self._next_tick_ms
-        ):
-            try:
-                dispatch_one()
-            except BaseException as error:
-                code = getattr(error, "code", "dispatch_failure")
-                self.supervisor._enter_fault(code, str(error))
-                raise
+        post_poll_lateness_ms = now_ms - self._next_tick_ms
+        if post_poll_lateness_ms > self.max_lateness_ms:
+            self.supervisor._enter_fault(
+                "poll_deadline_missed",
+                "Supervisor poll deadline missed by {} ms".format(
+                    post_poll_lateness_ms
+                ),
+            )
+            self._next_tick_ms = now_ms + self.interval_ms
             self._perform_requested_emergency_stop()
+            completion, dispatch_error = self._dispatch_one(
+                dispatch_one
+            )
+            self._complete_dispatch(
+                completion,
+                post_dispatch_error=dispatch_error,
+            )
+            self._sleep_after_deadline_fault()
+            return self.supervisor.status()
+
+        # Dispatch at most one item after a completed safety poll even when
+        # the exact interval has been consumed.  The configured lateness
+        # budget remains authoritative, and any dispatch-caused overrun
+        # below faults and stops before another request can be admitted.
+        completion, dispatch_error = self._dispatch_one(dispatch_one)
+        post_dispatch_error = dispatch_error
 
         now_ms = self.supervisor._checked_now_ms()
         lateness_ms = now_ms - self._next_tick_ms
         if lateness_ms > self.max_lateness_ms:
-            self.supervisor._enter_fault(
+            deadline_error = SupervisorError(
                 "poll_deadline_missed",
                 "Supervisor poll deadline missed by {} ms".format(
                     lateness_ms
                 ),
             )
+            self.supervisor._enter_fault(
+                deadline_error.code,
+                str(deadline_error),
+            )
             self._next_tick_ms = now_ms + self.interval_ms
+            deadline_stop_outcome = (
+                self._perform_requested_emergency_stop()
+            )
+            self._complete_dispatch(
+                completion,
+                post_dispatch_error=self._prefer_dispatch_error(
+                    deadline_error,
+                    self._prefer_dispatch_error(
+                        deadline_stop_outcome,
+                        post_dispatch_error,
+                    ),
+                ),
+            )
+            self._sleep_after_deadline_fault()
+            return self.supervisor.status()
 
-        remaining_ms = self._next_tick_ms - self.supervisor._now_ms()
+        self._complete_dispatch(
+            completion,
+            post_dispatch_error=post_dispatch_error,
+        )
+        now_ms = self.supervisor._checked_now_ms()
+        completion_lateness_ms = now_ms - self._next_tick_ms
+        if completion_lateness_ms > self.max_lateness_ms:
+            self.supervisor._enter_fault(
+                "poll_deadline_missed",
+                "Supervisor completion deadline missed by {} ms".format(
+                    completion_lateness_ms
+                ),
+            )
+            self._next_tick_ms = now_ms + self.interval_ms
+            late_stop_outcome = (
+                self._perform_requested_emergency_stop()
+            )
+            if (
+                late_stop_outcome is not None
+                and getattr(
+                    late_stop_outcome,
+                    "code",
+                    None,
+                )
+                == "stop_not_confirmed"
+            ):
+                raise late_stop_outcome
+            self._sleep_after_deadline_fault()
+            return self.supervisor.status()
+
+        remaining_ms = self._next_tick_ms - now_ms
         if remaining_ms > 0:
             self.supervisor.robot.sleep_fn(
                 remaining_ms / 1000.0
             )
-        elif remaining_ms < -self.interval_ms:
-            self._next_tick_ms = self.supervisor._now_ms()
         return self.supervisor.status()
 
     def run_forever(self, shutdown_requested, dispatch_one=None):
