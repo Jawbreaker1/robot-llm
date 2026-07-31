@@ -8,8 +8,8 @@
 ![EV3 hardware: live](https://img.shields.io/badge/EV3%20hardware-live%20over%20Wi--Fi%2FSSH-2ea44f)
 ![Live autonomous validation: pending](https://img.shields.io/badge/live%20autonomy-pending-f59e0b)
 
-**Robot LLM Lab lets a local AI make plans and carry them out with a real
-LEGO robot—moving, sensing, and talking one checked step at a time.**
+**A real LEGO robot controlled by a local agentic AI that can plan, observe,
+speak, and change course as it goes.**
 
 > **Running on real hardware:** the project now communicates with an assembled
 > physical EV3RSTORM over Wi-Fi/SSH. ev3dev boot, motors A/B/C, encoders, IR,
