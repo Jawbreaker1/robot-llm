@@ -6,11 +6,14 @@ from robot_agent.navigation_contract import NavigationContractError
 from robot_agent.spatial_map_contract import (
     CELL_OCCUPIED,
     LOCAL_ODOMETRY,
+    LOCAL_ODOMETRY_POSE,
     MAP_PROVISIONAL_IR,
     METRIC_FUSED,
     ObjectHypothesis,
     PHYSICAL_IR_REFLECTION,
     PROVISIONAL_QUALITATIVE,
+    QUALITATIVE_FORWARD_ENVELOPE,
+    ProvisionalObjectHypothesis,
     QualitativeObstacleEvidence,
     OccupancyCell,
     SpatialMapSnapshot,
@@ -71,6 +74,33 @@ def physical_map_snapshot():
         cells=(),
         qualitative_evidence=(physical_evidence(),),
         object_hypotheses=(),
+    )
+
+
+def provisional_hypothesis():
+    return ProvisionalObjectHypothesis(
+        hypothesis_id="provisional-object-1",
+        robot_id="robot-1",
+        controller_instance_id="controller-1",
+        frame_id="local-odometry",
+        semantic_label="UNKNOWN",
+        source=PHYSICAL_IR_REFLECTION,
+        geometry_kind=QUALITATIVE_FORWARD_ENVELOPE,
+        bearing="FORWARD",
+        relation="NEAR_OBSTACLE",
+        anchor_x_mm=10,
+        anchor_y_mm=20,
+        anchor_heading_mdeg=30_000,
+        first_seen_at_ms=100,
+        last_seen_at_ms=100,
+        last_state_version=2,
+        last_world_model_version=1,
+        evidence_count=1,
+        confidence_milli=250,
+        provenance=(
+            LOCAL_ODOMETRY_POSE,
+            PHYSICAL_IR_REFLECTION,
+        ),
     )
 
 
@@ -138,6 +168,25 @@ class SpatialEvidenceContractTests(unittest.TestCase):
             replace(physical_evidence(), confidence_milli=401)
         with self.assertRaises(NavigationContractError):
             replace(physical_evidence(), provisional=False)
+
+    def test_provisional_object_has_anchor_but_no_metric_object_bounds(self):
+        hypothesis = provisional_hypothesis()
+        payload = hypothesis.to_dict()
+
+        self.assertIsNone(payload["bounds_mm"])
+        self.assertEqual(payload["anchor_pose"]["x_mm"], 10)
+        self.assertNotIn("centroid_mm", payload)
+        self.assertNotIn("cell_count", payload)
+        self.assertNotIn("measured_range_mm", payload)
+        self.assertLessEqual(hypothesis.confidence_milli, 400)
+
+        with self.assertRaises(NavigationContractError):
+            replace(hypothesis, confidence_milli=401)
+        with self.assertRaises(NavigationContractError):
+            replace(
+                hypothesis,
+                provenance=(PHYSICAL_IR_REFLECTION,),
+            )
 
 
 class SpatialSnapshotContractTests(unittest.TestCase):
@@ -235,6 +284,17 @@ class SpatialSnapshotContractTests(unittest.TestCase):
                 snapshot,
                 object_hypotheses=(foreign_hypothesis,),
             )
+
+    def test_snapshot_accepts_local_provisional_hypothesis(self):
+        snapshot = replace(
+            physical_map_snapshot(),
+            object_hypotheses=(provisional_hypothesis(),),
+        )
+
+        self.assertEqual(
+            snapshot.object_hypotheses[0].hypothesis_id,
+            "provisional-object-1",
+        )
 
 
 if __name__ == "__main__":

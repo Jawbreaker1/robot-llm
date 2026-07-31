@@ -6,7 +6,7 @@ host hypotheses; the only semantic label in this first slice is ``UNKNOWN``.
 """
 
 from dataclasses import dataclass
-from typing import Mapping, Optional, Tuple
+from typing import Mapping, Optional, Tuple, Union
 
 from .navigation_contract import (
     NavigationContractError,
@@ -27,6 +27,8 @@ SEMANTIC_UNKNOWN = "UNKNOWN"
 METRIC_FUSED = "METRIC_FUSED"
 PROVISIONAL_QUALITATIVE = "PROVISIONAL_QUALITATIVE"
 PHYSICAL_IR_REFLECTION = "physical_ir_reflection"
+LOCAL_ODOMETRY_POSE = "LOCAL_ODOMETRY_POSE"
+QUALITATIVE_FORWARD_ENVELOPE = "QUALITATIVE_FORWARD_ENVELOPE"
 
 SIMULATION_WORLD = "SIMULATION_WORLD"
 LOCAL_ODOMETRY = "LOCAL_ODOMETRY"
@@ -699,6 +701,165 @@ class ObjectHypothesis:
 
 
 @dataclass(frozen=True)
+class ProvisionalObjectHypothesis:
+    """One persistent physical-IR encounter without invented geometry.
+
+    ``anchor_*`` records the trusted local-odometry pose from which a near
+    reflection was observed.  It is not an object position.  The forward
+    relation has no range, endpoint, metric bounds, or occupied cells.
+    ``hypothesis_id`` is only a stable map-local handle for the encounter,
+    never a claim that later reflections identify the same physical object.
+    """
+
+    hypothesis_id: str
+    robot_id: str
+    controller_instance_id: str
+    frame_id: str
+    semantic_label: str
+    source: str
+    geometry_kind: str
+    bearing: str
+    relation: str
+    anchor_x_mm: int
+    anchor_y_mm: int
+    anchor_heading_mdeg: int
+    first_seen_at_ms: int
+    last_seen_at_ms: int
+    last_state_version: int
+    last_world_model_version: int
+    evidence_count: int
+    confidence_milli: int
+    provenance: Tuple[str, ...]
+    provisional: bool = True
+    quality: str = PROVISIONAL_QUALITATIVE
+
+    def __post_init__(self) -> None:
+        identifier("hypothesis_id", self.hypothesis_id)
+        identifier("robot_id", self.robot_id)
+        identifier(
+            "controller_instance_id",
+            self.controller_instance_id,
+        )
+        identifier("frame_id", self.frame_id, 96)
+        if self.semantic_label != SEMANTIC_UNKNOWN:
+            raise NavigationContractError(
+                "unsupported_semantic_label",
+                "Spatial hypotheses are not semantically classified",
+            )
+        if self.source != PHYSICAL_IR_REFLECTION:
+            raise NavigationContractError(
+                "invalid_provisional_hypothesis_source",
+                "Provisional hypothesis source is invalid",
+            )
+        if self.geometry_kind != QUALITATIVE_FORWARD_ENVELOPE:
+            raise NavigationContractError(
+                "invalid_provisional_hypothesis_geometry",
+                "Physical IR hypothesis must remain non-metric",
+            )
+        if self.bearing != "FORWARD" or self.relation != "NEAR_OBSTACLE":
+            raise NavigationContractError(
+                "invalid_provisional_hypothesis_relation",
+                "Physical IR hypothesis requires a forward near reflection",
+            )
+        integer(
+            "anchor_x_mm",
+            self.anchor_x_mm,
+            -1_000_000,
+            1_000_000,
+        )
+        integer(
+            "anchor_y_mm",
+            self.anchor_y_mm,
+            -1_000_000,
+            1_000_000,
+        )
+        integer(
+            "anchor_heading_mdeg",
+            self.anchor_heading_mdeg,
+            -180_000,
+            179_999,
+        )
+        integer("first_seen_at_ms", self.first_seen_at_ms, 0, _MAX_INT)
+        integer(
+            "last_seen_at_ms",
+            self.last_seen_at_ms,
+            self.first_seen_at_ms,
+            _MAX_INT,
+        )
+        integer("last_state_version", self.last_state_version, 1, _MAX_INT)
+        integer(
+            "last_world_model_version",
+            self.last_world_model_version,
+            1,
+            _MAX_INT,
+        )
+        integer("evidence_count", self.evidence_count, 1, _MAX_INT)
+        integer("confidence_milli", self.confidence_milli, 1, 400)
+        if (
+            not isinstance(self.provenance, tuple)
+            or any(
+                identifier("hypothesis_provenance", item, 96) != item
+                for item in self.provenance
+            )
+            or len(set(self.provenance)) != len(self.provenance)
+            or not {
+                LOCAL_ODOMETRY_POSE,
+                PHYSICAL_IR_REFLECTION,
+            }.issubset(self.provenance)
+        ):
+            raise NavigationContractError(
+                "invalid_hypothesis_provenance",
+                "Provisional hypothesis provenance is invalid",
+            )
+        _boolean("provisional", self.provisional)
+        if (
+            not self.provisional
+            or self.quality != PROVISIONAL_QUALITATIVE
+        ):
+            raise NavigationContractError(
+                "untrusted_provisional_hypothesis",
+                "Physical IR hypothesis must remain provisional",
+            )
+
+    def to_dict(self) -> Mapping[str, object]:
+        # The anchor is the observing robot pose, not an object coordinate.
+        return {
+            "hypothesis_id": self.hypothesis_id,
+            "robot_id": self.robot_id,
+            "controller_instance_id": self.controller_instance_id,
+            "frame_id": self.frame_id,
+            "semantic_label": self.semantic_label,
+            "source": self.source,
+            "geometry_kind": self.geometry_kind,
+            "bounds_mm": None,
+            "anchor_pose": {
+                "x_mm": self.anchor_x_mm,
+                "y_mm": self.anchor_y_mm,
+                "heading_mdeg": self.anchor_heading_mdeg,
+            },
+            "bearing": self.bearing,
+            "relation": self.relation,
+            "first_seen_at_ms": self.first_seen_at_ms,
+            "last_seen_at_ms": self.last_seen_at_ms,
+            "last_state_version": self.last_state_version,
+            "last_world_model_version": (
+                self.last_world_model_version
+            ),
+            "evidence_count": self.evidence_count,
+            "confidence_milli": self.confidence_milli,
+            "provenance": list(self.provenance),
+            "provisional": self.provisional,
+            "quality": self.quality,
+        }
+
+
+SpatialObjectHypothesis = Union[
+    ObjectHypothesis,
+    ProvisionalObjectHypothesis,
+]
+
+
+@dataclass(frozen=True)
 class SpatialMapSnapshot:
     """A deeply immutable point-in-time view of one bounded grid."""
 
@@ -723,7 +884,7 @@ class SpatialMapSnapshot:
     sensor_rays: Tuple[SpatialSensorRay, ...]
     cells: Tuple[OccupancyCell, ...]
     qualitative_evidence: Tuple[QualitativeObstacleEvidence, ...]
-    object_hypotheses: Tuple[ObjectHypothesis, ...]
+    object_hypotheses: Tuple[SpatialObjectHypothesis, ...]
 
     def __post_init__(self) -> None:
         identifier("map_id", self.map_id)
@@ -940,7 +1101,10 @@ class SpatialMapSnapshot:
         if (
             not isinstance(self.object_hypotheses, tuple)
             or any(
-                not isinstance(item, ObjectHypothesis)
+                not isinstance(
+                    item,
+                    (ObjectHypothesis, ProvisionalObjectHypothesis),
+                )
                 for item in self.object_hypotheses
             )
             or len(
@@ -964,13 +1128,40 @@ class SpatialMapSnapshot:
                 "inconsistent_object_hypotheses",
                 "Object hypotheses cross the map frame or time boundary",
             )
-        if (
-            self.object_hypotheses
-            and "simulation_metric" not in self.evidence_sources
+        metric_hypotheses = tuple(
+            item
+            for item in self.object_hypotheses
+            if isinstance(item, ObjectHypothesis)
+        )
+        provisional_hypotheses = tuple(
+            item
+            for item in self.object_hypotheses
+            if isinstance(item, ProvisionalObjectHypothesis)
+        )
+        if metric_hypotheses and (
+            "simulation_metric" not in self.evidence_sources
         ):
             raise NavigationContractError(
                 "inconsistent_hypothesis_source",
-                "Object hypotheses require simulator metric evidence",
+                "Metric hypotheses require simulator metric evidence",
+            )
+        if provisional_hypotheses and (
+            self.frame_kind != LOCAL_ODOMETRY
+            or PHYSICAL_IR_REFLECTION not in self.evidence_sources
+            or any(
+                item.robot_id != self.robot_id
+                or item.controller_instance_id
+                != self.controller_instance_id
+                or item.last_state_version
+                > self.based_on_state_version
+                or item.last_world_model_version
+                != self.based_on_world_model_version
+                for item in provisional_hypotheses
+            )
+        ):
+            raise NavigationContractError(
+                "inconsistent_provisional_hypothesis",
+                "Provisional hypotheses cross map trust boundaries",
             )
 
     def to_dict(self) -> Mapping[str, object]:

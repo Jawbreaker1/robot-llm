@@ -202,8 +202,28 @@ const qualitativeOnlyMap = logic.normalizeSpatialMap({
   schema: "robot-spatial-map/v1",
   read_only: true,
   status: "qualitative_only",
-  frame_id: "ROBOT_BASE",
+  frame_id: "local-odometry",
   bounds: null,
+  object_hypotheses: [{
+    hypothesis_id: "provisional-object-1",
+    label: "UNKNOWN",
+    x_mm: 999,
+    y_mm: 999,
+    bounds: null,
+    anchor_pose: {
+      x_mm: 10,
+      y_mm: 20,
+      heading_mdeg: 60000,
+    },
+    geometry_kind: "QUALITATIVE_FORWARD_ENVELOPE",
+    bearing: "FORWARD",
+    relation: "NEAR_OBSTACLE",
+    confidence_milli: 250,
+    source_id: "physical_ir_reflection",
+    provenance: "LOCAL_ODOMETRY_POSE | physical_ir_reflection",
+    provisional: true,
+    age_ms: 90,
+  }],
   qualitative_observations: [{
     bearing: "FORWARD",
     relation: "NO_NEAR_REFLECTION",
@@ -450,6 +470,27 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(qualitative["status"], "qualitative_only")
         self.assertIsNone(qualitative["bounds"])
         self.assertEqual(len(qualitative["qualitativeObservations"]), 1)
+        self.assertEqual(len(qualitative["objectHypotheses"]), 1)
+        hypothesis = qualitative["objectHypotheses"][0]
+        self.assertEqual(
+            hypothesis["hypothesisId"],
+            "provisional-object-1",
+        )
+        self.assertTrue(hypothesis["provisional"])
+        self.assertIsNone(hypothesis["xMm"])
+        self.assertIsNone(hypothesis["yMm"])
+        self.assertEqual(
+            hypothesis["geometryKind"],
+            "QUALITATIVE_FORWARD_ENVELOPE",
+        )
+        self.assertEqual(
+            hypothesis["anchorPose"],
+            {
+                "xMm": 10,
+                "yMm": 20,
+                "headingMdeg": 60000,
+            },
+        )
         self.assertEqual(
             qualitative["qualitativeObservations"][0]["ageMs"],
             90,

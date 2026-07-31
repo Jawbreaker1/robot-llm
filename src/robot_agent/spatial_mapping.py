@@ -23,18 +23,23 @@ from .spatial_map_contract import (
     CELL_OCCUPIED,
     CELL_UNKNOWN,
     LOCAL_ODOMETRY,
+    LOCAL_ODOMETRY_POSE,
     MAP_EMPTY,
     MAP_METRIC_WITH_PROVISIONAL_IR,
     MAP_PROVISIONAL_IR,
     MAP_SIMULATION_METRIC,
     METRIC_FUSED,
     PHYSICAL_IR_REFLECTION,
+    QUALITATIVE_FORWARD_ENVELOPE,
+    PROVISIONAL_QUALITATIVE,
+    SEMANTIC_UNKNOWN,
     SIMULATION_WORLD,
     STALE_STATE_VERSION,
     STALE_TIMESTAMP,
     STALE_WORLD_MODEL_VERSION,
     UPDATE_APPLIED,
     OccupancyCell,
+    ProvisionalObjectHypothesis,
     QualitativeObstacleEvidence,
     SpatialBounds,
     SpatialMapSnapshot,
@@ -45,6 +50,7 @@ from .spatial_map_contract import (
 from .spatial_objects import (
     OccupiedCellEvidence,
     connected_object_hypotheses,
+    provisional_object_hypothesis_id,
 )
 from .spatial_sensor_model import (
     ROBOT_BASE_FRAME,
@@ -65,6 +71,7 @@ class SpatialMappingPolicy:
     range_max_mm: int = 1_000
     max_cells: int = 4_096
     max_qualitative_evidence: int = 128
+    max_provisional_object_hypotheses: int = 128
     free_evidence_step_milli: int = 250
     occupied_evidence_step_milli: int = 650
     free_threshold_milli: int = 250
@@ -78,6 +85,12 @@ class SpatialMappingPolicy:
         integer(
             "max_qualitative_evidence",
             self.max_qualitative_evidence,
+            1,
+            100_000,
+        )
+        integer(
+            "max_provisional_object_hypotheses",
+            self.max_provisional_object_hypotheses,
             1,
             100_000,
         )
@@ -145,6 +158,21 @@ class _SnapshotCellEvidence:
     )
 
 
+@dataclass
+class _ProvisionalObjectAccumulator:
+    """Persistent state for one contiguous physical-IR near episode."""
+
+    hypothesis_id: str
+    anchor_x_mm: int
+    anchor_y_mm: int
+    anchor_heading_mdeg: int
+    first_seen_at_ms: int
+    last_seen_at_ms: int
+    last_state_version: int
+    last_world_model_version: int
+    evidence_count: int = 1
+
+
 class BoundedOccupancyGrid:
     """One identity-bound spatial map with atomic ingest and snapshots."""
 
@@ -195,6 +223,10 @@ class BoundedOccupancyGrid:
         self._qualitative: Deque[QualitativeObstacleEvidence] = deque(
             maxlen=policy.max_qualitative_evidence
         )
+        self._provisional_objects: "OrderedDict[str, _ProvisionalObjectAccumulator]" = (
+            OrderedDict()
+        )
+        self._active_provisional_object_id: Optional[str] = None
         self._evidence_sources: Set[str] = set()
         self._latest_robot_pose: Optional[SpatialRobotPose] = None
         self._sensor_rays: Tuple[SpatialSensorRay, ...] = ()
@@ -368,9 +400,71 @@ class BoundedOccupancyGrid:
 
         self._cells.clear()
         self._qualitative.clear()
+        self._provisional_objects.clear()
+        self._active_provisional_object_id = None
         self._evidence_sources.clear()
         self._sensor_rays = ()
         self._latest_robot_pose = None
+
+    def _ingest_provisional_object_locked(
+        self,
+        snapshot: NavigationSnapshot,
+        evidence: QualitativeObstacleEvidence,
+    ) -> None:
+        """Retain one map-local hypothesis per contiguous near episode."""
+
+        if self.frame_kind != LOCAL_ODOMETRY:
+            return
+        if evidence.relation != "NEAR_OBSTACLE":
+            # A clear sample ends association with the current encounter, but
+            # it cannot erase an encounter anchored at another pose/heading.
+            self._active_provisional_object_id = None
+            return
+
+        record = None
+        if self._active_provisional_object_id is not None:
+            record = self._provisional_objects.get(
+                self._active_provisional_object_id
+            )
+        if record is None:
+            hypothesis_id = provisional_object_hypothesis_id(
+                map_id=self.map_id,
+                robot_id=self.robot_id,
+                controller_instance_id=self.controller_instance_id,
+                frame_id=self.frame_id,
+                world_model_version=snapshot.world_model_version,
+                first_evidence_id=evidence.evidence_id,
+            )
+            if (
+                len(self._provisional_objects)
+                >= self.policy.max_provisional_object_hypotheses
+            ):
+                evicted_id, _record = (
+                    self._provisional_objects.popitem(last=False)
+                )
+                if evicted_id == self._active_provisional_object_id:
+                    self._active_provisional_object_id = None
+            record = _ProvisionalObjectAccumulator(
+                hypothesis_id=hypothesis_id,
+                anchor_x_mm=snapshot.pose.x_mm,
+                anchor_y_mm=snapshot.pose.y_mm,
+                anchor_heading_mdeg=snapshot.pose.heading_mdeg,
+                first_seen_at_ms=evidence.observed_at_ms,
+                last_seen_at_ms=evidence.observed_at_ms,
+                last_state_version=snapshot.state_version,
+                last_world_model_version=(
+                    snapshot.world_model_version
+                ),
+            )
+            self._provisional_objects[hypothesis_id] = record
+            self._active_provisional_object_id = hypothesis_id
+            return
+
+        record.last_seen_at_ms = evidence.observed_at_ms
+        record.last_state_version = snapshot.state_version
+        record.last_world_model_version = snapshot.world_model_version
+        record.evidence_count += 1
+        self._provisional_objects.move_to_end(record.hypothesis_id)
 
 
     def _ignored_update_locked(
@@ -479,6 +573,10 @@ class BoundedOccupancyGrid:
                     snapshot=snapshot,
                 )
                 self._qualitative.append(evidence)
+                self._ingest_provisional_object_locked(
+                    snapshot,
+                    evidence,
+                )
                 self._sensor_rays = (
                     qualitative_sensor_ray(evidence),
                 )
@@ -591,6 +689,41 @@ class BoundedOccupancyGrid:
             cells=occupied,
         )
 
+    def _provisional_object_hypotheses_locked(self):
+        return tuple(
+            ProvisionalObjectHypothesis(
+                hypothesis_id=record.hypothesis_id,
+                robot_id=self.robot_id,
+                controller_instance_id=self.controller_instance_id,
+                frame_id=self.frame_id,
+                semantic_label=SEMANTIC_UNKNOWN,
+                source=PHYSICAL_IR_REFLECTION,
+                geometry_kind=QUALITATIVE_FORWARD_ENVELOPE,
+                bearing="FORWARD",
+                relation="NEAR_OBSTACLE",
+                anchor_x_mm=record.anchor_x_mm,
+                anchor_y_mm=record.anchor_y_mm,
+                anchor_heading_mdeg=record.anchor_heading_mdeg,
+                first_seen_at_ms=record.first_seen_at_ms,
+                last_seen_at_ms=record.last_seen_at_ms,
+                last_state_version=record.last_state_version,
+                last_world_model_version=(
+                    record.last_world_model_version
+                ),
+                evidence_count=record.evidence_count,
+                confidence_milli=(
+                    self.policy.physical_ir_confidence_milli
+                ),
+                provenance=tuple(sorted((
+                    LOCAL_ODOMETRY_POSE,
+                    PHYSICAL_IR_REFLECTION,
+                ))),
+                provisional=True,
+                quality=PROVISIONAL_QUALITATIVE,
+            )
+            for record in self._provisional_objects.values()
+        )
+
 
     def _map_quality_locked(self) -> str:
         has_metric = SIMULATION_METRIC in self._evidence_sources
@@ -660,7 +793,11 @@ class BoundedOccupancyGrid:
                 sensor_rays=self._sensor_rays,
                 cells=cells,
                 qualitative_evidence=tuple(self._qualitative),
-                object_hypotheses=(
-                    self._object_hypotheses_locked()
-                ),
+                object_hypotheses=tuple(sorted(
+                    (
+                        self._object_hypotheses_locked()
+                        + self._provisional_object_hypotheses_locked()
+                    ),
+                    key=lambda item: item.hypothesis_id,
+                )),
             )

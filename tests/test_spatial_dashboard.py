@@ -186,6 +186,7 @@ class SpatialDashboardViewTests(unittest.TestCase):
         self.assertIsNone(value["bounds"])
         self.assertEqual(value["cells"], [])
         self.assertEqual(len(value["qualitative_observations"]), 1)
+        self.assertEqual(len(value["object_hypotheses"]), 1)
         observation = value["qualitative_observations"][0]
         self.assertEqual(observation["relation"], "NEAR_OBSTACLE")
         self.assertEqual(observation["raw_ir_proximity"], 82)
@@ -198,6 +199,32 @@ class SpatialDashboardViewTests(unittest.TestCase):
             value["robot_pose"]["provenance"],
             "LOCAL_ODOMETRY",
         )
+        hypothesis = value["object_hypotheses"][0]
+        self.assertTrue(hypothesis["provisional"])
+        self.assertIsNone(hypothesis["x_mm"])
+        self.assertIsNone(hypothesis["y_mm"])
+        self.assertIsNone(hypothesis["bounds"])
+        self.assertEqual(
+            hypothesis["geometry_kind"],
+            "QUALITATIVE_FORWARD_ENVELOPE",
+        )
+        self.assertEqual(
+            hypothesis["anchor_pose"],
+            {
+                "x_mm": 100,
+                "y_mm": 200,
+                "heading_mdeg": 0,
+            },
+        )
+        self.assertEqual(
+            hypothesis["source_id"],
+            "physical_ir_reflection",
+        )
+        self.assertIn(
+            "LOCAL_ODOMETRY_POSE",
+            hypothesis["provenance"],
+        )
+        self.assertLessEqual(hypothesis["confidence_milli"], 400)
 
 
 if __name__ == "__main__":

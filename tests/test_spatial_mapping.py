@@ -16,6 +16,10 @@ from robot_agent.spatial_map_contract import (
     LOCAL_ODOMETRY,
     MAP_PROVISIONAL_IR,
     MAP_SIMULATION_METRIC,
+    LOCAL_ODOMETRY_POSE,
+    PHYSICAL_IR_REFLECTION,
+    QUALITATIVE_FORWARD_ENVELOPE,
+    ProvisionalObjectHypothesis,
     SEMANTIC_UNKNOWN,
     SIMULATION_WORLD,
     STALE_STATE_VERSION,
@@ -74,6 +78,8 @@ def physical_snapshot(
     captured_at_ms=None,
     near=True,
     raw_ir_proximity=82,
+    pose=PoseEstimate(10, 20, 30_000),
+    world_model_version=1,
 ):
     captured = (
         state_version * 100
@@ -87,10 +93,10 @@ def physical_snapshot(
         goal_epoch=1,
         plan_revision=1,
         state_version=state_version,
-        world_model_version=1,
+        world_model_version=world_model_version,
         captured_at_host_ms=captured,
         state_observed_at_ms=captured,
-        pose=PoseEstimate(10, 20, 30_000),
+        pose=pose,
         left_encoder_mdeg=0,
         right_encoder_mdeg=0,
         motors_running=False,
@@ -604,7 +610,7 @@ class QualitativeSpatialMappingTests(unittest.TestCase):
         self.assertTrue(update.applied)
         self.assertEqual(update.cells_touched, 0)
         self.assertEqual(snapshot.cells, ())
-        self.assertEqual(snapshot.object_hypotheses, ())
+        self.assertEqual(len(snapshot.object_hypotheses), 1)
         self.assertEqual(snapshot.map_quality, MAP_PROVISIONAL_IR)
         self.assertTrue(evidence.provisional)
         self.assertLessEqual(evidence.confidence_milli, 400)
@@ -617,6 +623,104 @@ class QualitativeSpatialMappingTests(unittest.TestCase):
                 any(key.endswith("_mm") for key in value),
                 value,
             )
+        hypothesis = snapshot.object_hypotheses[0]
+        self.assertIsInstance(
+            hypothesis,
+            ProvisionalObjectHypothesis,
+        )
+        self.assertEqual(
+            hypothesis.geometry_kind,
+            QUALITATIVE_FORWARD_ENVELOPE,
+        )
+        self.assertEqual(hypothesis.anchor_x_mm, 10)
+        self.assertEqual(hypothesis.anchor_y_mm, 20)
+        self.assertEqual(hypothesis.anchor_heading_mdeg, 30_000)
+        self.assertEqual(hypothesis.to_dict()["bounds_mm"], None)
+        self.assertIsNone(snapshot.bounds)
+        self.assertEqual(
+            set(hypothesis.provenance),
+            {LOCAL_ODOMETRY_POSE, PHYSICAL_IR_REFLECTION},
+        )
+        self.assertLessEqual(hypothesis.confidence_milli, 400)
+        self.assertNotIn(
+            "measured_range_mm",
+            hypothesis.to_dict(),
+        )
+        self.assertNotIn("centroid_mm", hypothesis.to_dict())
+
+    def test_clear_after_heading_change_keeps_same_encounter_hypothesis(self):
+        grid = BoundedOccupancyGrid(
+            map_id="map-physical",
+            robot_id="robot-1",
+            controller_instance_id="controller-1",
+            frame_id="local-odometry",
+            frame_kind=LOCAL_ODOMETRY,
+        )
+        grid.ingest(physical_snapshot(
+            state_version=1,
+            pose=PoseEstimate(10, 20, 0),
+            near=True,
+        ))
+        first = grid.snapshot().object_hypotheses[0]
+
+        grid.ingest(physical_snapshot(
+            state_version=2,
+            pose=PoseEstimate(10, 20, 60_000),
+            near=False,
+            raw_ir_proximity=55,
+        ))
+        after_turn = grid.snapshot()
+
+        self.assertEqual(len(after_turn.object_hypotheses), 1)
+        self.assertEqual(
+            after_turn.object_hypotheses[0].hypothesis_id,
+            first.hypothesis_id,
+        )
+        self.assertEqual(after_turn.object_hypotheses[0], first)
+        self.assertEqual(
+            after_turn.latest_robot_pose.heading_mdeg,
+            60_000,
+        )
+        self.assertEqual(
+            after_turn.qualitative_evidence[-1].relation,
+            "NO_NEAR_REFLECTION",
+        )
+        self.assertEqual(after_turn.cells, ())
+        self.assertIsNone(after_turn.bounds)
+
+    def test_new_near_episode_gets_new_handle_without_erasing_old_one(self):
+        grid = BoundedOccupancyGrid(
+            map_id="map-physical",
+            robot_id="robot-1",
+            controller_instance_id="controller-1",
+            frame_id="local-odometry",
+            frame_kind=LOCAL_ODOMETRY,
+            policy=SpatialMappingPolicy(
+                max_provisional_object_hypotheses=2,
+            ),
+        )
+        grid.ingest(physical_snapshot(state_version=1, near=True))
+        first_id = grid.snapshot().object_hypotheses[0].hypothesis_id
+        grid.ingest(physical_snapshot(
+            state_version=2,
+            near=False,
+            raw_ir_proximity=50,
+        ))
+        grid.ingest(physical_snapshot(
+            state_version=3,
+            near=True,
+            pose=PoseEstimate(20, 30, 90_000),
+        ))
+        hypotheses = grid.snapshot().object_hypotheses
+
+        self.assertEqual(len(hypotheses), 2)
+        self.assertIn(
+            first_id,
+            {item.hypothesis_id for item in hypotheses},
+        )
+        self.assertEqual(len({
+            item.hypothesis_id for item in hypotheses
+        }), 2)
 
     def test_qualitative_history_is_bounded(self):
         grid = BoundedOccupancyGrid(

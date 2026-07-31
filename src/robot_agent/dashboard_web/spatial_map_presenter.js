@@ -237,6 +237,14 @@
           item.appendChild(createElement("span"));
         }
         const details = [
+          hypothesis.provisional && hypothesis.relation
+            ? relationLabel(hypothesis.relation)
+            : "",
+          hypothesis.provisional && hypothesis.bearing
+            ? t("map.qualitative.bearing", {
+              bearing: hypothesis.bearing,
+            })
+            : "",
           hypothesis.sourceId
             ? t("map.tooltip.source", {
               source: hypothesis.sourceId,
@@ -442,6 +450,12 @@
         }));
       });
       map.objectHypotheses.forEach((hypothesis) => {
+        if (
+          !Number.isFinite(hypothesis.xMm)
+          || !Number.isFinite(hypothesis.yMm)
+        ) {
+          return;
+        }
         const point = projection.point(
           hypothesis.xMm,
           hypothesis.yMm,

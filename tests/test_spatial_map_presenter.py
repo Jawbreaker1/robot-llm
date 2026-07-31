@@ -163,12 +163,31 @@ const qualitative = presenter.render({
   read_only: true,
   status: "qualitative_only",
   robot_id: "robot-1",
-  frame_id: "ROBOT_BASE",
+  frame_id: "local-odometry",
   map_version: 1,
   bounds: null,
   cells: [],
   sensor_rays: [],
-  object_hypotheses: [],
+  object_hypotheses: [{
+    hypothesis_id: "provisional-object-1",
+    label: "UNKNOWN",
+    x_mm: null,
+    y_mm: null,
+    bounds: null,
+    anchor_pose: {
+      x_mm: 10,
+      y_mm: 20,
+      heading_mdeg: 60000,
+    },
+    geometry_kind: "QUALITATIVE_FORWARD_ENVELOPE",
+    bearing: "FORWARD",
+    relation: "NEAR_OBSTACLE",
+    confidence_milli: 250,
+    source_id: "physical_ir_reflection",
+    provenance: "LOCAL_ODOMETRY_POSE | physical_ir_reflection",
+    provisional: true,
+    observed_at_unix_ms: 1900,
+  }],
   qualitative_observations: [{
     bearing: "FORWARD",
     relation: "NEAR_OBSTACLE",
@@ -190,6 +209,8 @@ const qualitativeResult = {
   emptyBody: nodes["map-empty-body"].textContent,
   count: nodes["map-qualitative-count"].textContent,
   panelText: nodes["map-qualitative-list"].textContent,
+  objectCount: nodes["map-object-count"].textContent,
+  objectPanelText: nodes["map-object-list"].textContent,
   metricLayerCounts: [
     nodes["map-cell-layer"].children.length,
     nodes["map-ray-layer"].children.length,
@@ -328,6 +349,20 @@ process.stdout.write(JSON.stringify({
             "Qualitative evidence panel",
         )
         self.assertEqual(qualitative["count"], "1")
+        self.assertEqual(qualitative["objectCount"], "1")
+        for expected in (
+            "UNKNOWN",
+            "physical_ir_reflection",
+            "LOCAL_ODOMETRY_POSE",
+            "25% confidence",
+            "Near reflection",
+            "bearing FORWARD",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(
+                    expected,
+                    qualitative["objectPanelText"],
+                )
         for expected in (
             "Near reflection",
             "81 / 100",

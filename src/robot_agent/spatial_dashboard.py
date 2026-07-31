@@ -14,6 +14,7 @@ from .spatial_map_contract import (
     MAP_SIMULATION_METRIC,
     MAP_METRIC_WITH_PROVISIONAL_IR,
     SIMULATION_WORLD,
+    ProvisionalObjectHypothesis,
     SpatialMapSnapshot,
 )
 
@@ -119,30 +120,58 @@ def spatial_dashboard_view(
 
     hypotheses = []
     for item in snapshot.object_hypotheses:
-        hypotheses.append({
-            "hypothesis_id": item.hypothesis_id,
-            "x_mm": item.centroid_x_mm,
-            "y_mm": item.centroid_y_mm,
-            "label": item.semantic_label,
-            "bounds": {
-                "min_x_mm": item.min_x_mm,
-                "min_y_mm": item.min_y_mm,
-                "max_x_mm": item.max_x_mm,
-                "max_y_mm": item.max_y_mm,
-            },
-            "cell_count": item.cell_count,
-            "evidence_count": item.evidence_count,
-            "confidence_milli": item.confidence_milli,
-            "source_id": "occupied-component",
-            "provenance": provenance_for(item.provenance),
-            "trusted_simulator_object_id": (
-                item.trusted_simulator_object_id
-            ),
-            "observed_at_unix_ms": unix_for(
-                item.last_seen_at_ms
-            ),
-            "age_ms": age_for(item.last_seen_at_ms),
-        })
+        if isinstance(item, ProvisionalObjectHypothesis):
+            hypotheses.append({
+                "hypothesis_id": item.hypothesis_id,
+                "x_mm": None,
+                "y_mm": None,
+                "label": item.semantic_label,
+                "bounds": None,
+                "anchor_pose": {
+                    "x_mm": item.anchor_x_mm,
+                    "y_mm": item.anchor_y_mm,
+                    "heading_mdeg": item.anchor_heading_mdeg,
+                },
+                "geometry_kind": item.geometry_kind,
+                "bearing": item.bearing,
+                "relation": item.relation,
+                "evidence_count": item.evidence_count,
+                "confidence_milli": item.confidence_milli,
+                "source_id": item.source,
+                "provenance": provenance_for(item.provenance),
+                "provisional": True,
+                "trusted_simulator_object_id": None,
+                "observed_at_unix_ms": unix_for(
+                    item.last_seen_at_ms
+                ),
+                "age_ms": age_for(item.last_seen_at_ms),
+            })
+        else:
+            hypotheses.append({
+                "hypothesis_id": item.hypothesis_id,
+                "x_mm": item.centroid_x_mm,
+                "y_mm": item.centroid_y_mm,
+                "label": item.semantic_label,
+                "bounds": {
+                    "min_x_mm": item.min_x_mm,
+                    "min_y_mm": item.min_y_mm,
+                    "max_x_mm": item.max_x_mm,
+                    "max_y_mm": item.max_y_mm,
+                },
+                "cell_count": item.cell_count,
+                "evidence_count": item.evidence_count,
+                "confidence_milli": item.confidence_milli,
+                "source_id": "occupied-component",
+                "provenance": provenance_for(item.provenance),
+                "provisional": False,
+                "trusted_simulator_object_id": (
+                    item.trusted_simulator_object_id
+                ),
+                "observed_at_unix_ms": unix_for(
+                    item.last_seen_at_ms
+                ),
+                "age_ms": age_for(item.last_seen_at_ms),
+            })
 
     qualitative_observations = []
     for item in snapshot.qualitative_evidence:

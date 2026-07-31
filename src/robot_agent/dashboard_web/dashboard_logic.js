@@ -180,10 +180,42 @@
       const hypothesis = record(rawHypothesis);
       const xMm = finite(hypothesis.x_mm);
       const yMm = finite(hypothesis.y_mm);
+      const provisional = (
+        hypothesis.provisional === true
+        && hypothesis.geometry_kind === "QUALITATIVE_FORWARD_ENVELOPE"
+      );
+      const anchor = record(hypothesis.anchor_pose);
+      const anchorX = finite(anchor.x_mm);
+      const anchorY = finite(anchor.y_mm);
+      const anchorHeading = finite(anchor.heading_mdeg);
+      const anchorPose = (
+        provisional
+        && anchorX !== null
+        && anchorY !== null
+        && anchorHeading !== null
+      )
+        ? Object.freeze({
+          xMm: anchorX,
+          yMm: anchorY,
+          headingMdeg: anchorHeading,
+        })
+        : null;
+      const confidence = finite(hypothesis.confidence_milli);
       const validUntil = finite(hypothesis.valid_until_unix_ms);
       if (
-        xMm === null
-        || yMm === null
+        (
+          !provisional
+          && (xMm === null || yMm === null)
+        )
+        || (
+          provisional
+          && (
+            anchorPose === null
+            || confidence === null
+            || confidence < 0
+            || confidence > 400
+          )
+        )
         || validUntil !== null
         && validUntil <= now
       ) {
@@ -192,12 +224,17 @@
       return [Object.freeze({
         hypothesisId: text(hypothesis.hypothesis_id),
         label: text(hypothesis.label),
-        xMm,
-        yMm,
-        confidenceMilli: finite(hypothesis.confidence_milli),
+        xMm: provisional ? null : xMm,
+        yMm: provisional ? null : yMm,
+        anchorPose,
+        geometryKind: text(hypothesis.geometry_kind),
+        bearing: text(hypothesis.bearing),
+        relation: text(hypothesis.relation),
+        provisional,
+        confidenceMilli: confidence,
         sourceId: text(hypothesis.source_id),
         provenance: provenance(hypothesis.provenance),
-        ageMs: ageAt(hypothesis.observed_at_unix_ms, now),
+        ageMs: observationAge(hypothesis, now),
       })];
     });
     const rawQualitative = (

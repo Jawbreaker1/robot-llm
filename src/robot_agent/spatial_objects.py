@@ -79,6 +79,33 @@ def _hypothesis_id(
     )
 
 
+def provisional_object_hypothesis_id(
+    map_id: str,
+    robot_id: str,
+    controller_instance_id: str,
+    frame_id: str,
+    world_model_version: int,
+    first_evidence_id: str,
+) -> str:
+    """Return an opaque, deterministic handle for one IR encounter.
+
+    The handle names this map-local evidence episode.  It does not associate
+    later, independently reacquired reflections with a physical object.
+    """
+
+    identity = "\0".join((
+        map_id,
+        robot_id,
+        controller_instance_id,
+        frame_id,
+        str(world_model_version),
+        first_evidence_id,
+    )).encode("utf-8")
+    return "provisional-object-{}".format(
+        hashlib.sha256(identity).hexdigest()[:20]
+    )
+
+
 def _oldest_supported_record(records):
     """Choose an anchor that cannot move merely because a component grows."""
 
