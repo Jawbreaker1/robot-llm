@@ -17,6 +17,7 @@
   const MAX_LOCAL_EVENTS = 500;
   const MAP_POLL_INTERVAL_MS = 2000;
   let microphoneInput = null;
+  let robotControl = null;
   const i18n = window.RobotI18n.createDefaultI18n();
   const t = (key, args) => i18n.t(key, args);
   const ERROR_MESSAGE_KEYS = Object.freeze({
@@ -54,6 +55,23 @@
     lm_studio_unreachable: "errors.runtime_unavailable",
     model_not_ready: "errors.model_not_ready",
     spatial_map_unavailable: "errors.spatial_map_unavailable",
+    robot_control_disabled: "errors.robot_control_disabled",
+    robot_not_idle: "errors.robot_not_idle",
+    robot_episode_active: "errors.robot_episode_active",
+    robot_settings_revision_conflict: "errors.robot_settings_revision_conflict",
+    robot_idempotency_conflict: "errors.robot_idempotency_conflict",
+    robot_service_stopping: "errors.robot_service_stopping",
+    invalid_robot_locale: "errors.invalid_robot_request",
+    invalid_robot_text: "errors.invalid_robot_request",
+    invalid_robot_identifier: "errors.invalid_robot_request",
+    invalid_robot_integer: "errors.invalid_robot_request",
+    invalid_robot_settings: "errors.invalid_robot_request",
+    invalid_robot_settings_fields: "errors.invalid_robot_request",
+    invalid_robot_request: "errors.invalid_robot_request",
+    invalid_robot_request_fields: "errors.invalid_robot_request",
+    robot_request_too_large: "errors.invalid_robot_request",
+    invalid_robot_query: "errors.invalid_robot_request",
+    robot_emergency_stop_failed: "errors.robot_emergency_stop_failed",
   });
 
   const state = {
@@ -73,7 +91,7 @@
     afterSequence: 0,
     eventsPaused: false,
     selectedEvent: null,
-    readOnlyInvariant: true,
+    workbenchReadOnlyInvariant: true,
     turnPollGeneration: 0,
     turnPollFailures: 0,
     turnPollConnection: "connected",
@@ -85,7 +103,7 @@
       result: null,
       errorCode: null,
     },
-    readOnlyViolationAnnounced: false,
+    workbenchViolationAnnounced: false,
     eventStreamState: "live",
     eventGapActive: false,
     eventGapDroppedTotal: 0,
@@ -417,27 +435,29 @@
 
   function enforceCapabilities(bootstrap) {
     const capabilities = safeObject(bootstrap.capabilities);
-    state.readOnlyInvariant = (
-      bootstrap.physical_control_enabled === false
-      && capabilities.physical_control === false
-      && capabilities.ssh === false
-      && capabilities.tts === false
+    const workbench = safeObject(capabilities.workbench);
+    state.workbenchReadOnlyInvariant = (
+      workbench.tool_effects === "read_only"
+      && workbench.physical_control === false
+      && workbench.ssh === false
+      && workbench.tts === false
     );
-    setStatus(
-      "status-motion",
-      state.readOnlyInvariant ? "locked" : "fault",
-      state.readOnlyInvariant ? t("capability.locked") : t("capability.contract_breach"),
-    );
+    if (!robotControl) {
+      setStatus(
+        "status-motion",
+        state.workbenchReadOnlyInvariant ? "locked" : "fault",
+        state.workbenchReadOnlyInvariant
+          ? t("capability.locked")
+          : t("capability.contract_breach"),
+      );
+    }
 
     const turnActive = state.activeTurn
       && !TERMINAL_TURN_STATES.has(state.activeTurn.status);
     const chatEnabled = capabilities.chat === true
-      && state.readOnlyInvariant
+      && state.workbenchReadOnlyInvariant
       && !turnActive
       && state.modelReady === true;
-    byId("message-input").disabled = !chatEnabled;
-    byId("send-button").disabled = !chatEnabled;
-    byId("new-conversation-button").disabled = !chatEnabled;
     const researchOption = byId("turn-mode").querySelector('option[value="research_required"]');
     const researchTools = safeArray(capabilities.research);
     researchOption.disabled = !researchTools.includes("weather.current");
@@ -446,24 +466,37 @@
       researchOption.disabled ? "idle" : "ready",
       researchOption.disabled ? t("capability.unavailable") : t("capability.weather_ready"),
     );
-    byId("composer-status").textContent = turnActive
-      ? activeTurnComposerStatus(state.activeTurn)
-      : chatEnabled
-        ? t("capability.chat_ready")
-        : state.modelReady === false
-          ? t("capability.model_not_ready")
-          : t("capability.chat_unavailable");
+    let composerEnabled = chatEnabled;
+    if (robotControl) {
+      composerEnabled = robotControl.reconcileComposer(chatEnabled);
+    } else {
+      byId("message-input").disabled = !chatEnabled;
+      byId("send-button").disabled = !chatEnabled;
+      byId("new-conversation-button").disabled = !chatEnabled;
+    }
+    if (!robotControl || !robotControl.isRobotTarget()) {
+      byId("composer-status").textContent = turnActive
+        ? activeTurnComposerStatus(state.activeTurn)
+        : chatEnabled
+          ? t("capability.chat_ready")
+          : state.modelReady === false
+            ? t("capability.model_not_ready")
+            : t("capability.chat_unavailable");
+    }
     if (microphoneInput) {
       microphoneInput.setAvailability(
         safeObject(capabilities.speech_to_text),
-        chatEnabled,
+        composerEnabled,
       );
     }
-    if (!state.readOnlyInvariant && !state.readOnlyViolationAnnounced) {
-      state.readOnlyViolationAnnounced = true;
+    if (
+      !state.workbenchReadOnlyInvariant
+      && !state.workbenchViolationAnnounced
+    ) {
+      state.workbenchViolationAnnounced = true;
       showToast(t("capability.read_only_violation"), true);
-    } else if (state.readOnlyInvariant) {
-      state.readOnlyViolationAnnounced = false;
+    } else if (state.workbenchReadOnlyInvariant) {
+      state.workbenchViolationAnnounced = false;
     }
   }
 
@@ -566,8 +599,10 @@
     byId("fleet-aggregate-status").textContent = robots.length > 0
       ? humanState(robots[0].lifecycle)
       : t("registry.not_observed");
-    if (nodes.some((node) => node.control_exposed === true)) {
-      state.readOnlyInvariant = false;
+    if (
+      !robotControl
+      && nodes.some((node) => node.control_exposed === true)
+    ) {
       setStatus("status-motion", "fault", t("capability.rejected"));
     }
   }
@@ -635,6 +670,9 @@
     enforceCapabilities(state.bootstrap);
     renderRegistry(state.bootstrap.registry);
     renderExperiments(state.bootstrap.experiments);
+    if (robotControl) {
+      robotControl.renderLocale();
+    }
   }
 
   function settingsFromForm() {
@@ -684,7 +722,9 @@
   function updateSettingsDirtyState() {
     const dirty = Object.keys(settingsChanges()).length > 0;
     state.settingsDirty = dirty;
-    byId("save-settings-button").disabled = !dirty || !state.readOnlyInvariant;
+    byId("save-settings-button").disabled = (
+      !dirty || !state.workbenchReadOnlyInvariant
+    );
     byId("reset-settings-button").disabled = !dirty;
     byId("settings-status").textContent = dirty
       ? t("settings.unsaved")
@@ -1169,7 +1209,23 @@
     event.preventDefault();
     const input = byId("message-input");
     const content = input.value.trim();
-    if (!content || !state.readOnlyInvariant) {
+    if (!content) {
+      return;
+    }
+    if (robotControl && robotControl.isRobotTarget()) {
+      if (microphoneInput) {
+        microphoneInput.cancel();
+      }
+      const accepted = await robotControl.startGoal(
+        content,
+        i18n.locale,
+      );
+      if (accepted) {
+        input.value = "";
+      }
+      return;
+    }
+    if (!state.workbenchReadOnlyInvariant) {
       return;
     }
     if (state.activeTurn && !TERMINAL_TURN_STATES.has(state.activeTurn.status)) {
@@ -1434,6 +1490,9 @@
   }
 
   function updateModeCopy() {
+    if (robotControl && robotControl.isRobotTarget()) {
+      return;
+    }
     const research = byId("turn-mode").value === "research_required";
     byId("mode-capability-note").textContent = research
       ? t("mode.research_note")
@@ -1620,6 +1679,9 @@
     if (microphoneInput) {
       microphoneInput.renderLocale();
     }
+    if (robotControl) {
+      robotControl.renderLocale();
+    }
     if (state.selectedEvent && !byId("event-detail").hidden) {
       openEventDetail(state.selectedEvent, false);
     }
@@ -1759,10 +1821,38 @@
       workletUrl: "assets/pcm_capture_worklet.js",
     });
     microphoneInput.initialize();
+    robotControl = window.RobotControlUI.create({
+      document,
+      request: api,
+      translate: t,
+      randomId,
+      showToast,
+      getLocale: () => i18n.locale,
+      formatError: (error) => localizedError(
+        error,
+        "errors.robot_control_failed",
+      ),
+      onAvailabilityChanged: (enabled) => {
+        if (!microphoneInput) {
+          return;
+        }
+        const capabilities = safeObject(
+          safeObject(state.bootstrap).capabilities,
+        );
+        microphoneInput.setAvailability(
+          safeObject(capabilities.speech_to_text),
+          enabled,
+        );
+      },
+      onGoalAccepted: () => {
+        byId("message-input").value = "";
+      },
+    });
     try {
       const [bootstrapPayload, settingsPayload] = await Promise.all([
         api("/api/v1/bootstrap"),
         api("/api/v1/settings"),
+        robotControl.initialize(),
       ]);
       renderBootstrap(bootstrapPayload);
       renderSettings(settingsPayload.settings || bootstrapPayload.settings);

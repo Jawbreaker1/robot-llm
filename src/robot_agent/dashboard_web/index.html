@@ -13,6 +13,7 @@
   <script src="assets/speech_input_logic.js" defer></script>
   <script src="assets/microphone_input.js" defer></script>
   <script src="assets/spatial_map_presenter.js" defer></script>
+  <script src="assets/robot_control.js" defer></script>
   <script src="assets/app.js" defer></script>
 </head>
 <body>
@@ -116,10 +117,10 @@
       </div>
 
       <div class="sidebar-note">
-        <span class="lock-glyph" aria-hidden="true">×</span>
+        <span class="lock-glyph" aria-hidden="true">R</span>
         <div>
-          <strong data-i18n="nav.safety.title">Fysisk styrning avstängd</strong>
-          <p data-i18n="nav.safety.body">Motorstyrning, SSH och TTS är avstängda i den här versionen.</p>
+          <strong data-i18n="nav.safety.title">Separat robotkontroll</strong>
+          <p data-i18n="nav.safety.body">Wi-Fi/USB-SSH, navigation och tal körs bakom en egen kontrolltjänst.</p>
         </div>
       </div>
     </nav>
@@ -131,7 +132,7 @@
             <div>
               <p class="eyebrow" data-i18n="workbench.session.eyebrow">Aktiv session</p>
               <h2 id="workbench-heading" data-i18n="workbench.title">Arbetsbänk</h2>
-              <p class="panel-subtitle" id="conversation-subtitle" data-i18n="workbench.subtitle">Lokal Gemma · robotstyrning avstängd</p>
+              <p class="panel-subtitle" id="conversation-subtitle" data-i18n="workbench.subtitle">Lokal Gemma · samtal och robotmål är separata</p>
             </div>
             <div class="conversation-actions">
               <button class="button button-secondary inspector-toggle" type="button" id="open-inspector-button" aria-controls="agent-inspector" aria-expanded="false">
@@ -143,6 +144,46 @@
             </div>
           </header>
 
+          <section class="robot-control-panel" id="robot-control-panel" aria-labelledby="robot-control-heading">
+            <header class="robot-control-header">
+              <div>
+                <p class="eyebrow" data-i18n="robot.control.eyebrow">Fysisk episod</p>
+                <h3 id="robot-control-heading" data-i18n="robot.control.title">Robotkontroll</h3>
+              </div>
+              <span class="state-chip state-idle" id="robot-control-state" role="status">DISABLED</span>
+            </header>
+            <div class="robot-control-actions">
+              <button class="button button-primary" type="button" id="robot-start-button" disabled data-i18n="robot.actions.start">Starta mål</button>
+              <button class="button button-secondary" type="button" id="robot-stop-button" disabled data-i18n="robot.actions.stop">Stoppa</button>
+              <button class="button button-danger" type="button" id="robot-emergency-stop-button" disabled data-i18n="robot.actions.emergency_stop">Nödstopp</button>
+              <span id="robot-control-summary" data-i18n="robot.summary.loading">Läser robotstatus…</span>
+            </div>
+            <dl class="robot-runtime-grid">
+              <div><dt data-i18n="robot.runtime.action">Aktuell handling</dt><dd id="robot-current-action">—</dd></div>
+              <div><dt data-i18n="robot.runtime.obstacle">Hinder</dt><dd id="robot-obstacle">—</dd></div>
+              <div><dt data-i18n="robot.runtime.plan">Plan</dt><dd id="robot-plan">—</dd></div>
+              <div><dt data-i18n="robot.runtime.scan">IR-skanning</dt><dd id="robot-scan">—</dd></div>
+              <div><dt data-i18n="robot.runtime.model_latency">Modell-latens</dt><dd id="robot-model-latency">—</dd></div>
+              <div><dt data-i18n="robot.runtime.speech">Tal</dt><dd id="robot-speech-status">—</dd></div>
+            </dl>
+            <form class="robot-settings" id="robot-settings-form">
+              <label class="field">
+                <span data-i18n="robot.settings.model">Navigationsmodell</span>
+                <input id="robot-setting-model" type="text" maxlength="256" autocomplete="off" spellcheck="false" disabled>
+              </label>
+              <label class="field">
+                <span data-i18n="robot.settings.max_episode">Maximal episod, ms</span>
+                <input id="robot-setting-max-episode-ms" type="number" min="1000" max="3600000" step="1000" disabled>
+              </label>
+              <label class="robot-speech-toggle">
+                <input id="robot-setting-speech-enabled" type="checkbox" disabled>
+                <span data-i18n="robot.settings.speech">Låt roboten prata under körning</span>
+              </label>
+              <button class="button button-secondary" type="submit" id="robot-save-settings-button" disabled data-i18n="robot.settings.save">Spara robotinställningar</button>
+              <span id="robot-settings-status" role="status"></span>
+            </form>
+          </section>
+
           <div class="message-feed" id="message-feed" role="region" aria-label="Konversationshistorik" data-i18n-aria-label="workbench.history.aria_label">
             <div class="welcome-message" id="welcome-message">
               <img class="welcome-mascot" src="assets/robot-llm-mascot.png" alt="Robot LLM Labs lätt griniga modulrobot vinkar" data-i18n-alt="workbench.welcome.mascot_alt" width="250" height="250">
@@ -151,7 +192,7 @@
               </div>
               <p class="eyebrow" data-i18n="workbench.welcome.eyebrow">Redo när du är</p>
               <h3 data-i18n="workbench.welcome.title">Hallå! Vad ska vi hitta på?</h3>
-              <p data-i18n="workbench.welcome.body">Jag kör lokalt på din Mac. Vi kan prata eller kolla upp aktuell information, som väder. Jag styr inte robotkroppen från den här chatten ännu.</p>
+              <p data-i18n="workbench.welcome.body">Jag kör lokalt på din Mac. Välj Arbetsbänk för samtal eller Robot för att ge EV3RSTORM ett autonomt mål.</p>
               <div class="starter-prompts" aria-label="Exempelfrågor" data-i18n-aria-label="workbench.starter.aria_label">
                 <button type="button" data-prompt="Behöver jag paraply i Stockholm just nu?" data-prompt-mode="research_required" data-i18n="workbench.starter.weather.label" data-i18n-prompt="workbench.starter.weather.prompt">Behöver jag paraply i Stockholm?</button>
                 <button type="button" data-prompt="Förklara vad du kan göra i det här läget." data-prompt-mode="conversation" data-i18n="workbench.starter.capabilities.label" data-i18n-prompt="workbench.starter.capabilities.prompt">Vad kan du göra just nu?</button>
@@ -162,16 +203,21 @@
 
           <form class="composer" id="composer-form">
             <div class="composer-meta">
+              <label for="composer-target" data-i18n="workbench.target.label">Mottagare</label>
+              <select id="composer-target" name="target">
+                <option value="robot" data-i18n="workbench.target.robot">Roboten · autonomt mål</option>
+                <option value="workbench" data-i18n="workbench.target.workbench">Arbetsbänken · samtal</option>
+              </select>
               <label for="turn-mode" data-i18n="workbench.mode.label">Körläge</label>
               <select id="turn-mode" name="mode">
                 <option value="conversation" data-i18n="workbench.mode.conversation">Lokalt samtal · kan kolla upp saker vid behov</option>
                 <option value="research_required" data-i18n="workbench.mode.research">Aktuell information · färska källor krävs</option>
               </select>
-              <span class="capability-note" id="mode-capability-note" data-i18n="workbench.mode.capability">Ingen robotstyrning</span>
+              <span class="capability-note" id="mode-capability-note" data-i18n="workbench.mode.capability">Välj vart instruktionen ska skickas</span>
             </div>
             <label class="sr-only" for="message-input" data-i18n="workbench.composer.message_label">Meddelande till Gemma</label>
             <div class="composer-input-shell">
-              <textarea id="message-input" name="message" rows="3" maxlength="4000" placeholder="Prata med Gemma eller be den undersöka något…" data-i18n-placeholder="workbench.composer.placeholder" disabled></textarea>
+              <textarea id="message-input" name="message" rows="3" maxlength="4000" placeholder="Ge roboten ett mål eller skriv till arbetsbänken…" data-i18n-placeholder="workbench.composer.placeholder" disabled></textarea>
               <button class="microphone-button" type="button" id="microphone-button" aria-label="Prata med roboten" data-i18n-aria-label="microphone.button.start" aria-describedby="microphone-status" aria-pressed="false" disabled>
                 <span class="microphone-glyph" aria-hidden="true"></span>
                 <span class="microphone-button-label" data-i18n="microphone.button.label">Prata</span>
@@ -292,7 +338,7 @@
                 <div class="node-icon" aria-hidden="true">C</div>
                 <div class="node-copy">
                   <strong>EV3 Main</strong>
-                  <small data-i18n="bodies.nodes.controller_transport">styrenhet · USB/SSH</small>
+                  <small data-i18n="bodies.nodes.controller_transport">styrenhet · Wi-Fi/USB-SSH</small>
                 </div>
                 <span class="node-state" data-i18n="bodies.status.unobserved">inte observerad</span>
               </div>
@@ -330,12 +376,12 @@
               <div><dt data-i18n="bodies.controller.instance_id">Instans-ID</dt><dd data-i18n="shell.value.unavailable">—</dd></div>
               <div><dt data-i18n="bodies.controller.state_version">Tillståndsversion</dt><dd data-i18n="shell.value.unavailable">—</dd></div>
               <div><dt data-i18n="bodies.controller.heartbeat">Hjärtslag</dt><dd data-i18n="shell.value.unavailable">—</dd></div>
-              <div><dt data-i18n="bodies.controller.physical_capabilities">Fysiska funktioner</dt><dd data-i18n="bodies.status.locked_plural">Låsta</dd></div>
+              <div><dt data-i18n="bodies.controller.physical_capabilities">Fysiska funktioner</dt><dd data-i18n="bodies.status.locked_plural">Via kontrolltjänsten</dd></div>
             </dl>
             <div class="safety-notice">
               <span aria-hidden="true">×</span>
               <div>
-                <strong data-i18n="bodies.safety.title">Ingen exekveringsväg</strong>
+                <strong data-i18n="bodies.safety.title">Separat exekveringsväg</strong>
                 <p data-i18n="bodies.safety.body">Att en styrenhet blir synlig innebär aldrig automatiskt att rörelse är tillåten.</p>
               </div>
             </div>
@@ -562,7 +608,7 @@
           <div>
             <p class="eyebrow" data-i18n="settings.eyebrow">Lokal konfiguration</p>
             <h2 id="settings-heading" data-i18n="settings.title">Inställningar</h2>
-            <p data-i18n="settings.description">Modell, agentbudgetar och loggning. Fysisk armering hör inte hemma här.</p>
+            <p data-i18n="settings.description">Modell, agentbudgetar och loggning. Robotepisodens inställningar finns i den separata robotkontrollen.</p>
           </div>
           <span class="settings-revision" id="settings-revision" data-i18n="settings.revision.empty">Revision —</span>
         </header>
@@ -752,22 +798,22 @@
                 <span class="section-number" aria-hidden="true">05</span>
                 <div>
                   <h3 id="settings-safety-heading" data-i18n="settings.safety.title">Fysisk säkerhet</h3>
-                  <p data-i18n="settings.safety.description">Informationsyta, inte en kontroll.</p>
+                  <p data-i18n="settings.safety.description">Status för den separata exekveringsvägen.</p>
                 </div>
               </div>
-              <span class="state-chip state-locked" data-i18n="settings.safety.locked">Låst</span>
+              <span class="state-chip state-locked" data-i18n="settings.safety.locked">Separat</span>
             </header>
             <div class="safety-banner">
               <span class="large-lock" aria-hidden="true">×</span>
               <div>
-                <strong data-i18n="settings.safety.banner_title">Rörelse är inte aktiverad i denna version.</strong>
-                <p data-i18n="settings.safety.banner_body">Ingen exekveringsprofil är installerad. Fysisk armering blir senare ett separat, kortlivat och granskat arbetsflöde.</p>
+                <strong data-i18n="settings.safety.banner_title">Fysisk körning har en separat kontrollgräns.</strong>
+                <p data-i18n="settings.safety.banner_body">Dashboardchatten äger aldrig motorerna. En explicit injicerad robotruntime äger en episod åt gången och kan stoppas oberoende.</p>
               </div>
             </div>
             <dl class="capability-matrix">
-              <div><dt data-i18n="settings.safety.physical_control">Fysisk styrning</dt><dd data-i18n="settings.safety.off">Av</dd></div>
-              <div><dt>SSH</dt><dd data-i18n="settings.safety.not_exposed">Ej exponerat</dd></div>
-              <div><dt>TTS</dt><dd data-i18n="settings.safety.not_exposed">Ej exponerat</dd></div>
+              <div><dt data-i18n="settings.safety.physical_control">Fysisk styrning</dt><dd data-i18n="settings.safety.off">Via robotkontrollpanelen</dd></div>
+              <div><dt>SSH</dt><dd data-i18n="settings.safety.not_exposed">Ägs av robotruntimen</dd></div>
+              <div><dt>TTS</dt><dd data-i18n="settings.safety.not_exposed">Ägs av robotruntimen</dd></div>
               <div><dt data-i18n="settings.safety.research">Research</dt><dd data-i18n="settings.safety.read_only">Skrivskyddat</dd></div>
             </dl>
           </section>

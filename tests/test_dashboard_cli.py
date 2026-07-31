@@ -12,6 +12,7 @@ from robot_agent.dashboard_cli import (
     _handler_class,
     _parser,
     _raise_termination_interrupt,
+    _run,
     main,
 )
 from robot_agent.dashboard_http import DashboardHTTPResponse
@@ -234,6 +235,50 @@ class DashboardCLITests(unittest.TestCase):
 
         self.assertFalse(defaults.simulation_map_demo)
         self.assertTrue(enabled.simulation_map_demo)
+
+    def test_run_injects_robot_adapter_into_separate_control_service(self):
+        adapter = mock.Mock()
+        dashboard_service = mock.Mock()
+        control_service = mock.Mock()
+        http_server = mock.Mock()
+        router = mock.Mock()
+        router.session_path = "/session/token/"
+
+        with (
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+                return_value=dashboard_service,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.RobotControlService",
+                return_value=control_service,
+            ) as control_factory,
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+                return_value=(http_server, router),
+            ) as server_factory,
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            result = _run([], robot_runtime_adapter=adapter)
+
+        self.assertEqual(result, 0)
+        self.assertIs(
+            control_factory.call_args.args[0],
+            adapter,
+        )
+        self.assertEqual(
+            control_factory.call_args.kwargs["settings"].model,
+            _parser().parse_args([]).model,
+        )
+        server_factory.assert_called_once_with(
+            dashboard_service,
+            8765,
+            robot_control_service=control_service,
+        )
+        control_service.shutdown.assert_called_once_with()
+        self.assertTrue(
+            json.loads(stdout.getvalue())["physical_control_enabled"]
+        )
 
     def test_speech_source_is_explicit_and_mutually_exclusive(self):
         defaults = _parser().parse_args([])

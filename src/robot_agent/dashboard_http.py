@@ -1,10 +1,9 @@
-"""Loopback-only HTTP boundary for the motion-free Robot LLM dashboard.
+"""Loopback-only HTTP boundary for the Robot LLM dashboard.
 
 The router is deliberately independent from sockets so its complete security
 surface can be exercised in unit tests.  The thin ``BaseHTTPRequestHandler``
-adapter owns framing only; it never interprets natural language and exposes
-bounded speech transcription, but no route for robot motion, SSH, TTS, or
-supervisor control.
+adapter owns framing only; it never interprets natural language.  Physical
+control routes, when configured, are delegated to a separate typed router.
 """
 
 from __future__ import annotations
@@ -157,6 +156,10 @@ class DashboardRouter:
             "spatial_map_presenter.js",
             "text/javascript; charset=utf-8",
         ),
+        "assets/robot_control.js": (
+            "robot_control.js",
+            "text/javascript; charset=utf-8",
+        ),
         "assets/speech_input_logic.js": (
             "speech_input_logic.js",
             "text/javascript; charset=utf-8",
@@ -189,6 +192,7 @@ class DashboardRouter:
         session_token: str,
         expected_host: str,
         web_root: Optional[Path] = None,
+        robot_control_router=None,
     ):
         if (
             service is None
@@ -209,6 +213,7 @@ class DashboardRouter:
         self._session_path = "/session/{}/".format(session_token)
         self._expected_host = expected_host
         self._expected_origin = "http://" + expected_host
+        self._robot_control_router = robot_control_router
         self._web_root = (
             Path(web_root)
             if web_root is not None
@@ -237,8 +242,15 @@ class DashboardRouter:
             "text/html; charset=utf-8",
         )
         for route, (filename, content_type) in self._STATIC_ROUTES.items():
+            path = self._web_root / filename
+            if not path.is_file():
+                if filename.encode("utf-8") in index:
+                    raise ValueError(
+                        "Dashboard index references a missing asset"
+                    )
+                continue
             assets[self._session_path + route] = (
-                (self._web_root / filename).read_bytes(),
+                path.read_bytes(),
                 content_type,
             )
         return assets
@@ -889,6 +901,33 @@ class DashboardRouter:
                 200,
                 {"speech_to_text": value},
             )
+
+        if (
+            self._robot_control_router is not None
+            and self._robot_control_router.handles(path)
+        ):
+            try:
+                value = self._robot_control_router.handle(
+                    method,
+                    path,
+                    parsed.query,
+                    body,
+                )
+            except Exception as error:
+                status = getattr(error, "status", None)
+                code = getattr(error, "code", None)
+                if (
+                    isinstance(status, int)
+                    and isinstance(code, str)
+                    and code
+                ):
+                    raise DashboardHTTPError(
+                        status,
+                        code,
+                        str(error),
+                    ) from None
+                raise
+            return self._response(value.status, value.body)
 
         raise DashboardHTTPError(
             404,

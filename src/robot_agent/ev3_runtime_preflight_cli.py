@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ssh-target", required=True)
     parser.add_argument(
         "--profile",
-        choices=("peripheral", "supervisor"),
+        choices=("peripheral", "supervisor", "navigation-worker"),
         default="peripheral",
     )
     parser.add_argument(

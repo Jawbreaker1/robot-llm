@@ -16,6 +16,7 @@ REMOTE_ROBOT_CLI = "/home/robot/robot-llm/ev3/robot_cli.py"
 MAX_SSH_OUTPUT_BYTES = 64 * 1024
 IR_SAMPLE_COUNT = 3
 DEFAULT_CONTROLLER_ID = "ev3rstorm-01.ev3-main"
+EV3_SPEECH_VOICES = ("sv", "en")
 
 Runner = Callable[..., Any]
 
@@ -202,14 +203,22 @@ class EV3SSHTransport:
             raise EV3SSHProtocolError("EV3 sensor timestamp was invalid")
         return reading
 
-    def speak(self, text: str) -> Mapping[str, object]:
+    def speak(
+        self,
+        text: str,
+        voice: str = "sv",
+    ) -> Mapping[str, object]:
         if not isinstance(text, str):
             raise EV3SSHConfigurationError("Speech text must be a string")
+        if voice not in EV3_SPEECH_VOICES:
+            raise EV3SSHConfigurationError("Speech voice is unsupported")
         output = self._execute(
             [
                 "python3",
                 REMOTE_ROBOT_CLI,
                 "speak-stdin",
+                "--voice",
+                voice,
             ],
             timeout_seconds=self._speech_timeout_seconds,
             stdin_text=text + "\n",

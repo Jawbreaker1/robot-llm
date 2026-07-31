@@ -1,4 +1,4 @@
-"""Run the local, motion-free Robot LLM dashboard on macOS."""
+"""Run the local Robot LLM dashboard and its delegated control plane."""
 
 from __future__ import annotations
 
@@ -19,6 +19,9 @@ from .dashboard_http import (
 )
 from .dashboard_service import DashboardService
 from .lm_studio import DEFAULT_BASE_URL, DEFAULT_MODEL
+from .robot_control_contract import RobotControlSettings
+from .robot_control_http import RobotControlHTTPRouter
+from .robot_control_service import RobotControlService
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -244,6 +247,7 @@ def build_server(
     service: DashboardService,
     port: int = DEFAULT_PORT,
     session_token: Optional[str] = None,
+    robot_control_service=None,
 ):
     if (
         isinstance(port, bool)
@@ -253,10 +257,16 @@ def build_server(
         raise ValueError("Dashboard port is invalid")
     token = session_token or new_session_token()
     expected_host = "{}:{}".format(LOOPBACK_HOST, port)
+    control_service = (
+        robot_control_service
+        if robot_control_service is not None
+        else RobotControlService()
+    )
     router = DashboardRouter(
         service=service,
         session_token=token,
         expected_host=expected_host,
+        robot_control_router=RobotControlHTTPRouter(control_service),
     )
     server = _LoopbackThreadingHTTPServer(
         (LOOPBACK_HOST, port),
@@ -268,7 +278,7 @@ def build_server(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Starta Robot LLM:s lokala, rörelsefria Mac-dashboard."
+            "Starta Robot LLM:s lokala Mac-dashboard."
         )
     )
     parser.add_argument(
@@ -355,6 +365,7 @@ def _parser() -> argparse.ArgumentParser:
 def _close_resources(
     server,
     service,
+    robot_control_service,
     map_runtime,
     whisper_runtime,
     *,
@@ -367,22 +378,31 @@ def _close_resources(
             server.server_close()
     finally:
         try:
-            if service is not None:
-                service.shutdown()
+            if robot_control_service is not None:
+                robot_control_service.shutdown()
         finally:
             try:
-                if map_runtime is not None:
-                    map_runtime.close(drain=drain_map)
+                if service is not None:
+                    service.shutdown()
             finally:
-                if whisper_runtime is not None:
-                    whisper_runtime.stop()
+                try:
+                    if map_runtime is not None:
+                        map_runtime.close(drain=drain_map)
+                finally:
+                    if whisper_runtime is not None:
+                        whisper_runtime.stop()
 
 
-def _run(argv: Optional[Sequence[str]] = None) -> int:
+def _run(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    robot_runtime_adapter=None,
+) -> int:
     args = _parser().parse_args(argv)
     map_runtime = None
     whisper_runtime = None
     service = None
+    robot_control_service = None
     server = None
     try:
         if args.simulation_map_demo:
@@ -435,7 +455,15 @@ def _run(argv: Optional[Sequence[str]] = None) -> int:
             spatial_map_provider=map_runtime,
             speech_transcriber=speech_transcriber,
         )
-        server, _router = build_server(service, args.port)
+        robot_control_service = RobotControlService(
+            robot_runtime_adapter,
+            settings=RobotControlSettings(model=args.model),
+        )
+        server, _router = build_server(
+            service,
+            args.port,
+            robot_control_service=robot_control_service,
+        )
 
         address = "http://{}:{}{}".format(
             LOOPBACK_HOST,
@@ -447,7 +475,9 @@ def _run(argv: Optional[Sequence[str]] = None) -> int:
                 {
                     "status": "ready",
                     "url": address,
-                    "physical_control_enabled": False,
+                    "physical_control_enabled": (
+                        robot_runtime_adapter is not None
+                    ),
                     "speech_to_text_enabled": (
                         speech_transcriber is not None
                     ),
@@ -480,6 +510,7 @@ def _run(argv: Optional[Sequence[str]] = None) -> int:
         _close_resources(
             server,
             service,
+            robot_control_service,
             map_runtime,
             whisper_runtime,
             drain_map=server is not None,

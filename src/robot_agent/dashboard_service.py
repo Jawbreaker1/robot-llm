@@ -625,6 +625,16 @@ class DashboardService:
                 "research": ["weather.current"],
                 "spatial_map": "read_only",
                 "speech_to_text": self._stt.capability(),
+                # This object describes only the conversational workbench.
+                # Physical robot control is a separate, explicitly injected
+                # service with its own status endpoint and state machine.
+                "workbench": {
+                    "schema": "dashboard-workbench-capabilities/v1",
+                    "tool_effects": "read_only",
+                    "physical_control": False,
+                    "ssh": False,
+                    "tts": False,
+                },
                 "physical_control": False,
                 "ssh": False,
                 "tts": False,

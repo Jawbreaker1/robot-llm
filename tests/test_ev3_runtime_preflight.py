@@ -24,6 +24,7 @@ from robot_agent.ev3_runtime_preflight import (
     EV3RuntimePreflightTransportError,
     MAX_COMMAND_TIMEOUT_SECONDS,
     MAX_OUTPUT_BYTES,
+    NAVIGATION_WORKER_MANIFEST,
     PERIPHERAL_MANIFEST,
     REMOTE_PREFLIGHT_PROGRAM,
     REMOTE_PROJECT_ROOT,
@@ -121,6 +122,28 @@ class EV3RuntimePreflightTests(unittest.TestCase):
             len(SUPERVISOR_MANIFEST),
             len(set(SUPERVISOR_MANIFEST)),
         )
+        self.assertEqual(
+            NAVIGATION_WORKER_MANIFEST,
+            (
+                "ev3/navigation_worker_cli.py",
+                "ev3/robot_cli.py",
+                "ev3/navigation_worker.py",
+                "ev3/navigation_worker_protocol.py",
+                "ev3/navigation_profile.py",
+                "ev3/infrared_safety.py",
+                "ev3/supervisor.py",
+                "ev3/robot_hal.py",
+                "ev3/robot_config.py",
+                "ev3/emergency_stop.py",
+                "config/ev3rstorm.json",
+            ),
+        )
+        self.assertEqual(
+            len(NAVIGATION_WORKER_MANIFEST),
+            len(set(NAVIGATION_WORKER_MANIFEST)),
+        )
+        self.assertNotIn("ev3/robot_cli.py", PERIPHERAL_MANIFEST)
+        self.assertNotIn("ev3/robot_cli.py", SUPERVISOR_MANIFEST)
 
     def test_transport_daemons_are_in_corresponding_manifests(self):
         peripheral_remote_paths = {
@@ -160,14 +183,20 @@ class EV3RuntimePreflightTests(unittest.TestCase):
             "exec(",
             "motor",
             "run-timed",
+            "speak-stdin",
         ):
             self.assertNotIn(forbidden, REMOTE_PREFLIGHT_PROGRAM)
+        self.assertIn('"ev3/robot_cli.py"', REMOTE_PREFLIGHT_PROGRAM)
         self.assertIn("compile(", REMOTE_PREFLIGHT_PROGRAM)
 
     def test_happy_profiles_use_fixed_strict_ssh_command(self):
         for profile, expected_count in (
             ("peripheral", len(PERIPHERAL_MANIFEST)),
             ("supervisor", len(SUPERVISOR_MANIFEST)),
+            (
+                "navigation-worker",
+                len(NAVIGATION_WORKER_MANIFEST),
+            ),
         ):
             with self.subTest(profile=profile):
                 runner = RecordingRunner(completed_for())
@@ -370,6 +399,10 @@ class EV3RuntimePreflightTests(unittest.TestCase):
         for profile, relative_path in (
             ("peripheral", "ev3/peripheral_daemon.py"),
             ("supervisor", "ev3/supervisor_daemon.py"),
+            (
+                "navigation-worker",
+                "ev3/robot_cli.py",
+            ),
         ):
             with self.subTest(profile=profile):
                 with tempfile.TemporaryDirectory() as directory:
@@ -403,6 +436,37 @@ class EV3RuntimePreflightTests(unittest.TestCase):
                         str(raised.exception),
                     )
                     self.assertEqual(runner.calls, [])
+
+    def test_navigation_tts_companion_remote_python35_failure_is_fatal(
+        self,
+    ):
+        remote = matching_remote_result()
+        for index, entry in enumerate(remote["files"]):
+            if entry["path"] == "ev3/robot_cli.py":
+                remote["files"][index] = {
+                    "path": "ev3/robot_cli.py",
+                    "status": "python_incompatible",
+                    "size": None,
+                    "sha256": None,
+                }
+                break
+        else:
+            self.fail("robot_cli.py is absent from the fixed manifest")
+
+        with self.assertRaises(
+            EV3RuntimeDeploymentMismatchError
+        ) as raised:
+            run_ev3_runtime_preflight(
+                "robot@ev3dev.local",
+                profile="navigation-worker",
+                local_root=PROJECT_ROOT,
+                runner=RecordingRunner(completed_for(remote)),
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "remote_python_incompatible",
+        )
 
     def test_malformed_selected_local_config_stops_before_ssh(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -5,188 +5,234 @@
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![STT: local](https://img.shields.io/badge/STT-local%20whisper.cpp-14b8a6)
 ![UI: English + Swedish](https://img.shields.io/badge/UI-English%20%2B%20Swedish-0ea5e9)
-![Physical motion: manual only](https://img.shields.io/badge/physical%20motion-manual%20only-f59e0b)
-![Navigation: simulator only](https://img.shields.io/badge/navigation-simulator%20only-2563eb)
+![Physical runtime: code complete](https://img.shields.io/badge/physical%20runtime-code%20complete-2ea44f)
+![Live autonomous validation: pending](https://img.shields.io/badge/live%20autonomy-pending-f59e0b)
 
-**Building a physical LEGO robot with a local LLM as its brain.**
+**A local, goal-driven agent that can plan, observe, speak, and control a
+physical LEGO robot through bounded actions.**
 
 Robot LLM Lab is an embodied-agent research project built around a LEGO
-EV3RSTORM. The goal is for a local LLM to understand instructions, form
-plans, converse, choose high-level actions, observe the results, and replan.
-In that architecture, the model decides what the robot should try to do;
-deterministic software decides whether and how the motors may carry it out.
+EV3RSTORM. A local LLM interprets a goal, produces a short structured plan,
+chooses semantic robot actions, observes their results, and decides whether to
+continue, investigate, replan, or stop. Deterministic software—not the
+model—translates accepted actions into fixed motor behavior and remains the
+only authority over the physical robot.
+
+This is not a prompt-to-motor demo. The project is about a continuing,
+closed-loop agent that can pursue an outcome while dialogue, perception,
+mapping, validation, and speech are allowed to progress asynchronously.
 
 > **Research question:** Can asynchronous LLM reasoning, dialogue, and
 > perception produce useful closed-loop robot behavior while a deterministic
-> safety and control layer remains the sole authority over motion?
-
-The Lab Console is the human-facing workbench for developing and observing
-the agent. Today it exercises typed dialogue and a local speech-input
-pipeline, context, read-only tool use, evidence, personality, and model
-behavior while the physical language-to-motion path remains intentionally
-locked.
+> control layer remains the sole authority over motion?
 
 <p align="center">
   <img src="src/robot_agent/dashboard_web/robot-llm-mascot.png" alt="Robot LLM Lab's mildly grumpy modular mascot waving" width="280">
 </p>
 
-<p align="center"><em>Mildly grumpy by design. Personality lives in the language layer; safety does not.</em></p>
+<p align="center"><em>Mildly grumpy by design. Personality lives in the language layer; motor authority does not.</em></p>
 
-## From a goal to robot behavior
+## What the project is for
 
-The intended interaction is a **goal**, not a low-level motor script:
+Give the robot an outcome such as:
 
 ```text
-Human: "Explore the room. If something blocks you, investigate it and tell me what you think it is."
-
-local LLM        → interprets the goal, proposes a plan, comments, replans
-host policy      → validates typed proposals, versions, freshness, and budgets
-MotionSupervisor → chooses exactly one bounded physical decision per tick
-robot            → acts briefly, observes again, and reports new evidence
+Explore the room. If something blocks you, investigate it, get around it,
+and tell me what you think is happening.
 ```
 
-Today the motion, observation, arbitration, and verification parts of that
-loop are exercised against a synthetic robot and world. Live Gemma has made
-bounded exploration and expression decisions in simulator runs, but arbitrary
-human-language missions are not yet wired end-to-end. The real EV3RSTORM has
-verified motors, sensors, speech, manual bounded movement, and key-only SSH
-over both USB and Wi-Fi. Autonomous physical motion remains gated until the
-optimized supervisor poll path is remeasured on the brick and the calibration,
-braking, and fault-injection evidence is strong enough.
+The intended result is not a translated list of wheel commands. It is an
+episode in which the system repeatedly:
+
+1. interprets the goal and current evidence;
+2. proposes a small typed plan;
+3. executes one short, host-approved semantic action;
+4. observes sensors and verified motor results;
+5. updates its world memory; and
+6. continues, replans, asks for more perception, or stops.
+
+The same application provides the human conversation, technical trace,
+settings, map, start/stop controls, and eventually additional bodies, cameras,
+and microphones. Weather lookup and general conversation are supporting
+agent capabilities; they are not the purpose of the project.
 
 ## Why this differs from common LLM-controlled robots
 
-Many LLM–robot prototypes are essentially natural-language remote controls:
+Many LLM–robot demonstrations are effectively one-shot remote controls:
 
-`prompt → model chooses one command → robot executes it`
+```text
+prompt → model chooses a command → robot executes it
+```
 
-Robot LLM Lab is built around a continuing feedback loop instead:
+Robot LLM Lab is built around a persistent feedback loop:
 
-`goal → plan → bounded action → observe → verify → continue, replan, or stop`
+```text
+goal → plan → bounded action → observe → verify → continue, replan, or stop
+```
 
-A goal can persist across many actions. Independent workers can plan,
-perceive, map, validate, and speak in parallel. The LLM publishes typed,
-time-bounded proposals; a deterministic MotionSupervisor alone turns the best
-still-valid proposal into one short, interruptible execution decision per
-tick.
+The distinction matters:
 
-This changes the model's role from a one-shot command translator into the
-reasoning layer of a system that can pursue an outcome, judge its own
-progress, investigate unexpected evidence, initiate bounded exploration when
-idle, and revise its plan. The complete control loop and concurrent runtime
-are implemented and tested in simulation; live Gemma already participates in
-bounded decision and expression seams. Arbitrary human-language missions and
-autonomous EV3 deployment remain explicitly gated.
+- a goal survives across many observations and actions;
+- the model may revise its plan when physical evidence contradicts it;
+- obstacle hypotheses remain relevant after the robot turns away from them;
+- perception, mapping, dialogue, and speech can run without serializing every
+  function behind one model call;
+- every proposal carries typed identity and freshness information; and
+- one deterministic execution path serializes all physical motor decisions.
 
-## Core architecture
+Natural-language intent is handled semantically by the model and returned
+through strict schemas. The host does not route robot instructions with
+regular expressions, keyword menus, or Swedish/English-specific command
+heuristics. The host validates what the model proposed; it does not secretly
+reinterpret the user's sentence into motor power or duration.
+
+> **Semantic invariant:** the LLM may choose intent, plan, and expression, but
+> it never owns a motor.
+
+> **Execution invariant:** reasoning and perception may run in parallel;
+> physical execution is serialized, bounded, observable, and interruptible.
+
+## From goal to physical action
 
 ```mermaid
 flowchart LR
-    U["Target interface<br/>human goal"] --> L["Local LLM<br/>interpret · plan · explain"]
-    O["Sensors · pose · map<br/>time-stamped observations"] --> L
-    L --> P["Typed proposals<br/>no motor access"]
+    U["Human goal<br/>Robot view or voice"] --> A["Local LLM agent<br/>interpret · plan · explain"]
+    O["Fresh observations<br/>IR · touch · encoders · memory"] --> A
+    A --> P["Typed short plan<br/>semantic actions only"]
 
-    subgraph HOST["Mac · deterministic policy and orchestration"]
-        P --> V["Schema · identity · state version<br/>freshness · TTL · budgets"]
-        V --> M["MotionSupervisor<br/>one decision per tick"]
+    subgraph HOST["Mac · agent runtime and deterministic policy"]
+        P --> V["Schema · identity · state version<br/>budgets · validity · path checks"]
+        V --> E["Physical navigation runtime<br/>one bounded action at a time"]
+        O --> M["Persistent qualitative<br/>obstacle hypotheses"]
+        M --> V
+        A -. utterance .-> T["Bounded asynchronous<br/>speech worker"]
     end
 
-    M -->|"verified now"| X["2D simulator<br/>synthetic robot · sensors · world"]
-    X --> O
-    M -.->|"target physical path · gated"| S["EV3 safety supervisor<br/>sole local motor owner"]
-    S --> R["EV3RSTORM<br/>motors · sensors · speaker"]
-    R -.-> O
+    E -->|"one persistent SSH session"| W["EV3 navigation worker<br/>sole motor owner"]
+    W --> R["EV3RSTORM<br/>motors · IR · touch · encoders"]
+    R --> O
+    T -. "sv/en text via stdin" .-> R
 ```
 
-The solid `MotionSupervisor → 2D simulator → observations` control path is
-implemented today. Individual Gemma seams are verified for bounded selection
-and expression, but the arbitrary human-goal interface and dashed EV3 path
-remain target architecture—not end-to-end physical capability claims.
+The physical implementation uses a foreground, policy-free EV3 worker over a
+persistent key-only Wi-Fi SSH connection. The worker exposes only fixed
+semantic operations: observe, bounded advance/reverse/turn pulses, a bounded
+relative scan turn, stop, describe, and shutdown. It owns the configured
+drive motors for the worker session and accepts one request at a time.
 
-The LLM can propose intent, dialogue, and higher-level actions. It cannot
-choose motor ports, raw wheel speeds, safety timeouts, authority, or its own
-proposal lifetime. Parallel perception and reasoning are welcome; physical
-execution remains serialized and deterministic.
-
-The design deliberately rules out phrase menus, regular-expression intent
-matching, and language-specific keyword heuristics. In the implemented seams
-today, natural language is used for dialogue and read-only tool selection,
-while simulator autonomy gives the model opaque, host-generated structured
-choices. Model outputs are schema-validated typed proposals.
-Natural-language robot-action classification is not connected yet; when it
-is, strict host policy will accept, reject, or request clarification without
-reinterpreting the user's sentence into a motor command.
-
-> **Semantic invariant:** the LLM may propose intent and express personality,
-> but it never owns a motor.
-
-> **Execution invariant:** parallel perception and reasoning are welcome;
-> physical execution is serialized, bounded, interruptible, and deterministic.
+The host runtime performs the agent loop: goal → structured model plan → short
+semantic action → observation → verification → replan. It retains qualitative
+IR obstacle hypotheses, rejects model actions that conflict with current
+evidence or a swept path, renews a failed or exhausted worker session only at
+a verified safe boundary, and never gives the model raw motor parameters.
 
 ## What works today
 
-Status snapshot: **2026-07-30**.
+Status snapshot: **2026-07-31**.
 
-| Area | Verified now | Important boundary |
+“Verified” below means either observed on the assembled EV3RSTORM or exercised
+by the hardware-free quality suite. “Awaiting live validation” means the
+production path exists and its contracts pass simulated/fake-hardware tests,
+but the complete path has not yet run as one physical autonomous episode.
+
+| Area | Current state | Important boundary |
 |---|---|---|
-| Physical EV3 baseline | ev3dev boot, USB/SSH, motors A/B/C, bounded manual drive/turn pulses, encoders, touch, relative IR, reflected-light sensing, and Swedish eSpeak TTS | This verifies the assembled EV3RSTORM, not autonomous motion |
-| EV3 Wi-Fi transport | The AR9271 adapter, `ath9k_htc` driver/firmware path, ConnMan onboarding, key-only SSH, same-brick identity, reboot auto-connect, and operation with mini-USB physically removed are verified | Motion-free only; no SSID, address, or device identifier is stored here |
-| Persistent EV3 sensors | One authenticated Wi-Fi SSH process can serve repeated IR and touch reads; controlled disconnect detection, ConnMan recovery, and post-reboot cable-free IR reads were observed | Constant sensor values verify transport continuity, not sensor stimulus, motor-stop latency, or heartbeat behavior |
-| Physical LLM path | One complete motion-free shadow cycle: IR readings → deterministic zone; Gemma generated an audit-only comment, while a separate deterministic Swedish fallback was sent to TTS | Gemma output was not spoken and had no tools or motor access |
-| EV3 supervisor | Physical foreground startup, fault-stop, terminal audit, and clean lock release are now observed; the last 12 motion-free physical polls measured `196–216 ms` | This is the pre-optimization result. The `20 ms` contract remains unproven until the optimized path is remeasured, so physical motion remains disabled |
-| Lab Console | Local Gemma chat, standards-based microphone UI, local whisper.cpp STT, versioned context, read-only weather, evidence, event log, settings, experiment register, and English/Swedish UI + text responses | A live Razer Kiyo Pro utterance passed microphone → `large-v3-turbo` → Gemma → weather; a repeatable Swedish/English short-command accuracy corpus remains a gate. Speech becomes agent text—no motor, SSH, TTS, or stop routes exist here |
-| RobotAPI loop | Typed, snapshot-bound arm API and a closed `observe → plan → act → verify → replan` loop | Simulator-only and currently driven by a scripted fake planner |
-| Navigation | Waypoint following, obstacle avoidance, version-bound multi-waypoint missions, self-directed idle exploration, one MotionSupervisor, and an independent collision oracle | 2D simulator only; Gemma selects opaque host-created opportunities, not arbitrary coordinates or physical commands |
-| Spatial map | Continuous bounded occupancy fusion, robot pose, fresh sensor rays, and persistent opaque object hypotheses in a read-only Lab Console map | Current map input is simulator-only. The contract can later retain physical EV3 IR as low-confidence qualitative evidence without inventing metric distance or free space |
-| Concurrent interaction | Independent bounded workers plus one live local-Gemma simulator run where model speech overlapped a later navigation tick | Virtual callbacks only; no physical drive, speaker, or arm adapter |
-| Physical autonomy | Not enabled | Waiting for physical supervisor timing, calibration, stop-latency evidence, and fault injection |
+| Simulator agent | Fully exercised closed loops for waypoint navigation, idle exploration, obstacle avoidance, concurrent expression, and mapping | Simulator measurements are not physical calibration evidence |
+| Physical EV3 baseline | Live-verified ev3dev boot, USB and Wi-Fi SSH, motors A/B/C, encoders, touch, relative IR, reflected light, manual bounded movement, and Swedish TTS | Historical measurements are listed below; they do not validate the new complete autonomous runtime |
+| EV3 navigation worker | Production bounded JSONL worker and persistent Wi-Fi SSH transport are implemented and hardware-free tested, including exclusive motor ownership, strict identity/sequencing, interruptible slices, verified stop, EOF/signal handling, and bounded session renewal | The worker has not yet completed a live autonomous episode on the EV3 |
+| Physical closed loop | Goal → structured model plan → short semantic action → observe/verify → replan is implemented on the host with fixed action profiles and cumulative budgets | End-to-end model + Wi-Fi + worker + moving EV3 validation is still pending |
+| Gemma 4 QAT planner | The loaded `google/gemma-4-26b-a4b-qat` Q4_0 model produced 45/45 valid first-pass structured decisions and 45/45 expected semantic actions in the hardware-free physical-planner benchmark | This is planner evidence, not a moving-robot run or proof that QAT is faster than Q8 |
+| Active IR investigation | Bilateral coarse-to-fine front-arc scanning, encoder-derived headings, boundary observations, and restoration to the starting heading are implemented | The current `682°` mean wheel-encoder estimate for an approximately `90°` body turn is provisional and must be live-calibrated |
+| Obstacle memory | Physical navigation retains qualitative IR hazard hypotheses after turning and applies swept-path vetoes instead of assuming “not in front” means “gone” | IR-PROX is not metric distance or object identity; the physical map is deliberately qualitative |
+| Robot speech | A bounded asynchronous speech runtime and fixed EV3 `speak-stdin --voice sv|en` path are implemented; speech failures are isolated from navigation | Runtime integration is in progress and English physical TTS has not had a live acceptance run |
+| Robot control GUI | A distinct Robot view and Workbench view, opt-in runtime adapter, episode start, settings, normal stop, emergency stop, snapshots, and technical event streams are implemented and hardware-free tested | Ordinary console startup injects no physical adapter and therefore reports `DISABLED`; the complete production path has not yet been live-validated |
+| Lab Console dialogue and STT | Local Gemma chat, local whisper.cpp STT, microphone selection and sensitivity controls, context, read-only weather, evidence, and English/Swedish UI and text responses | STT text reaches the agent; always-listening robot conversation remains future work |
+| Spatial UI map | The simulator occupancy map and opaque object hypotheses are available in the read-only Map view | Physical qualitative hazard memory is implemented in the runtime but is not yet rendered as the metric simulator map |
+| Multi-controller architecture | Identity, proposal, and authority contracts are designed to grow to EV3, Robot Inventor 51515, BOOST, cameras, and microphones | Only the EV3 path has a production physical worker today |
 
-English and Swedish are verified for the dashboard and model text responses.
-The local STT path is provider-neutral and accepts explicit language hints;
-English and Swedish microphone quality remain separately measured demo gates.
-English EV3 speech, multilingual robot personality, camera vision, and
-physical language-to-action classification are not yet verified. The locale
-contract is generic so more languages can be added without language detection
-in the safety layer.
+On the operator-confirmed `lmlink` path to the gaming computer, the QAT Q4_0
+planner produced `45/45` valid, expected first-pass decisions. At client
+concurrency `1 / 2 / 4`, median end-to-end latency was
+`3.220 / 7.054 / 11.920 s`, median LM Studio server decode speed was
+`99.559 / 50.828 / 27.872 tok/s` per request, and measured aggregate
+end-to-end output was `90.678 / 85.232 / 90.408 tok/s`. Four concurrent
+structured planners therefore did not improve total measured throughput and
+materially hurt latency; the physical planner will start single-flight. A
+separate unconstrained diagnostic was much faster at four requests, so this is
+a structured-workload result rather than evidence that `lmlink` universally
+serializes generation. This is not a claim that QAT is faster than Q8; that
+requires running the same harness after loading Q8. An earlier project update
+mislabelled client end-to-end token rate as generation speed; the v2 evidence
+now records server decode, TTFT, client wall time, makespan, and aggregate rate
+separately.
 
-## Fastest robot-focused demo
+## Fastest demonstrations
 
-This runs the implemented autonomous navigation stack in the 2D simulator,
-builds its spatial map, and then opens the read-only Lab Console:
+### 1. See the complete interface and a real autonomous map
+
+This is the fastest visual demonstration and does not contact the EV3:
 
 ```sh
 PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
   --simulation-map-demo
 ```
 
-Choose **Map** in the session URL printed by the server. The episode is
-simulator-only and cannot contact or move the EV3.
-Its navigation uses deterministic reference behaviors, so this command
-validates the control, verification, and mapping stack—not LLM planning.
+Open the unique session URL printed by the server. The **Robot** view shows the
+episode control plane and its disabled/live state; the **Map** view shows the
+completed simulator episode. The map episode uses deterministic reference
+behavior, so it validates orchestration, supervision, verification, and
+mapping—not live model planning or physical calibration.
 
-To evaluate live Gemma making one bounded exploration choice from
-host-generated opportunities:
+### 2. Let local Gemma select a bounded simulator objective
 
 ```sh
 PYTHONPATH=src python3 -m robot_agent.autonomy_demo \
   --lm-studio --scenario range-change
 ```
 
-Gemma sees opaque candidate IDs rather than coordinates or motor parameters;
-this still is not arbitrary natural-language mission planning.
+The model sees opaque, host-created opportunities rather than coordinates or
+motor values. This exercises model selection inside the agent loop while the
+robot and world remain simulated.
+
+### 3. Exercise the physical production contracts without moving a robot
+
+```sh
+sh ./scripts/quality_check.sh
+```
+
+The suite runs the host runtime, EV3 worker, SSH process transport, scan rig,
+session renewal, stop/error paths, GUI control plane, speech scheduling, and
+simulator scenarios against fakes and simulated sysfs. It cannot replace live
+braking, calibration, room geometry, speaker, or network tests.
+
+There is intentionally no advertised one-command autonomous EV3 demo yet.
+The physical runtime is opt-in through an injected adapter, while normal
+dashboard startup remains disabled. The first live run will be promoted to a
+public launch profile only after the complete deployment and observation path
+has passed on the assembled robot.
 
 ## The Lab Console
 
-The Mac workbench is the human-facing console for the experiment. It provides
-local Gemma dialogue, local speech-to-text, context, agent traces, evidence,
-the spatial map, settings, experiment history, component state, and technical
-events. It is currently an **observability and dialogue surface**, not a robot
-remote: there are no motor, stop, SSH, or TTS routes.
+The Mac application has two deliberate identities:
+
+- **Robot** is where a person gives the physical agent a goal, selects the
+  exact model and episode budget, enables speech, starts one episode, stops it,
+  or uses emergency stop. It also shows the current plan, action, obstacle or
+  scan evidence, speech state, snapshots, and technical events.
+- **Workbench** is for general dialogue, speech-to-text experiments,
+  read-only research tools, evidence inspection, component configuration, and
+  development traces.
+
+The split prevents “talking to the development workbench” from being confused
+with “talking directly to the embodied robot.” The Robot routes exist today,
+but they fail closed as `DISABLED` unless the application was constructed
+with the physical runtime adapter.
 
 ![The experiment register separating verified results from a waiting physical preflight](docs/images/dashboard-experiments-en.jpg)
 
-The experiment register separates measured evidence from capabilities that
-are still waiting on a physical gate.
+The screenshots currently document the verified workbench and experiment
+surfaces. The live Robot control path is described by current status rather
+than presented as completed physical evidence.
 
 <details>
 <summary><strong>Secondary proof: typed read-only tool use</strong></summary>
@@ -209,164 +255,98 @@ project.
 
 This is an inventory, not a control surface. The future camera, microphone,
 Robot Inventor, and BOOST nodes are offline declarations with no exposed
-control path.
+physical control path.
 
 </details>
 
-## Architecture in detail
+## Parallel behavior without parallel motor ownership
 
-The concurrent simulator runtime now uses independent bounded workers and
-latest-snapshot mailboxes for its navigation behaviors. Obstruction-triggered
-expression planning, speech playback, and the propeller reaction have separate
-bounded queues. Each result is bound to controller, goal, plan, world model,
-evidence, locale, and a host-owned lifetime. The MotionSupervisor never waits
-for every producer; each tick uses the best fresh proposals already available
-and emits at most one short-lived wheel decision.
+The system is deliberately asynchronous above the execution boundary:
 
-Speech generation and playback may overlap later navigation ticks. A propeller
-wave may not overlap wheel motion: it requests a pause, waits for a verified
-stopped-boundary acknowledgement, revalidates the current obstruction, runs
-fixed host-owned alternating segments, and releases navigation. Speech-only
-reactions never pause the wheels. A slow or failed model/audio callback is
-isolated from navigation. Host-tracked object identity gives speech a separate
-short-lived semantic context, so briefly losing and reacquiring the same
-identified object while turning does not discard a still-relevant model
-response. A different object, world, goal, expired lifetime, or a newly
-reacquired unknown obstruction still invalidates it. Physical gestures retain
-the stricter exact-snapshot check. A per-object cooldown and total planner
-budget stop repeated sensor reacquisition from turning into model or speech
-spam.
+- the main agent can interpret goals and create a short plan;
+- perception can publish new observations;
+- mapping can retain and update world hypotheses;
+- validation can judge the last action;
+- speech can be generated and played while navigation continues; and
+- future vision and sound workers can publish independent, time-stamped
+  evidence.
 
-Navigation snapshots can also feed a separate spatial-map worker through a
-bounded, non-blocking, drop-oldest relay. Ray projection, occupancy fusion,
-object clustering, and dashboard serialization never run on the motion tick.
-The map keeps explicit `FREE`, `UNKNOWN`, and `OCCUPIED` evidence, the latest
-robot pose and sensor rays, and opaque persistent `UNKNOWN` object hypotheses
-that a later vision or language classifier can enrich without rewriting the
-geometric safety layer. Relay gaps and mapping failures make the map visibly
-degraded; they never stop or authorize motion.
+None of those producers can write to a motor. Physical requests are
+serialized through one host runtime and one EV3 worker session. Slow model or
+speech work cannot stall deterministic motor cleanup. The speech queue is
+bounded and latest-pending-wins; cancellation and playback failure are
+observable but do not become motion authority.
 
-The current metric map is deliberately simulator-only. Its ranges describe
-robot-radius-inflated configuration space used by the collision simulator,
-not exact physical object surfaces. EV3 `IR-PROX` is stored only as
-low-confidence qualitative evidence with no invented millimetres or occupied
-endpoint. This is an uncertain local world memory—not SLAM, global
-localization, a path planner, or proof that an unseen area is clear.
+The simulator already exercises richer concurrent navigation, expression,
+speech, and propeller behavior. The physical TTS scheduler and EV3 English/
+Swedish voice seam are implemented, but the full simultaneous
+move-and-speak path remains an explicit live acceptance item.
 
-Above a single waypoint episode, the simulator now accepts a strict,
-version-bound mission plan containing up to eight semantic waypoint legs.
-Each leg receives a newer goal epoch and shares global time, action, motion,
-proposal, and replan budgets. The next leg starts only after the previous
-episode has reached its waypoint and verified a terminal STOP. A changed
-world model invalidates the remaining plan at that stopped boundary, and a
-failed leg never starts later legs. This is the deterministic plan-execution
-seam. Gemma does not author arbitrary multi-leg missions yet.
+## Physical perception and obstacle memory
 
-The first self-directed layer now sits above that seam. When idle mode has
-been explicitly enabled and no user owns or is waiting for the goal lease, a
-typed range producer records exact stopped observations and the host creates
-a small feasible menu of local opportunities. Candidate IDs are opaque to the
-model; coordinates remain in a private host registry. Gemma may return only
-`SELECT`, `HOLD`, or `ABORT`, and `SELECT` must name exactly one offered ID.
-The host then revalidates the lease generation, deadline, state version,
-world-model version, observation producer/robot/controller/frame identity,
-host receive-time/TTL, candidate set, safe stopped snapshot, and cumulative
-budgets before creating one short one-leg mission.
+EV3 `IR-PROX` is a relative reflection/proximity signal from 0 to 100. It is
+not centimeters, object identification, or proof that an unseen direction is
+clear. The physical runtime therefore stores qualitative hazard hypotheses
+with evidence lineage instead of inventing metric geometry.
 
-Completed cells are remembered only after waypoint success and verified STOP.
-Failed or stale attempts are counted separately and a cell is suppressed after
-a deterministic retry cap unless an exact new observation makes it relevant
-again. Session budgets are backed by a persistent duty-cycle budget across
-public scheduler calls; resetting it requires idle to be disabled with no
-owner, pending user, fault, motion, or outstanding selector worker. An atomic
-authority guard blocks idle enablement and new goal claims during the reset.
-An exact same-pose range or simulator-object change is published as typed
-evidence without being declared interesting by host heuristics; the model
-decides whether the linked opportunity is worth investigating. A user request
-first reserves `USER_PENDING`, atomically prevents new idle work, cancels the
-active idle lease, and receives a newer goal epoch only after the idle task has
-returned a verified STOP. Model selection runs behind a single-flight,
-cancelable boundary, so even a selector that never returns cannot hold up user
-activation; its late result is discarded and no replacement worker is spawned
-while it remains alive. This goal lease is separate from pulse arbitration:
-the model can choose a bounded purpose but can never transfer motor ownership
-to itself.
+When an obstacle blocks progress, the model can request `SCAN_FRONT_ARC`. The
+deterministic scan executor samples a fixed bilateral arc, optionally refines
+blocked/clear transitions, records encoder-derived headings, and restores the
+robot to its starting orientation before publishing a result. A later route
+must respect the retained obstacle boundary and swept robot footprint; turning
+until the IR sensor no longer sees the box does not erase the box.
 
-Preemption is ordered and bounded, not physically instantaneous. Cancellation
-observed before dispatch prevents a pulse. If a user reservation lands inside
-the final simulator `apply` seam, at most the one already-dispatched pulse may
-finish; its duration is capped by the motion calibration. No later DRIVE is
-issued, STOP is verified, and only then can the newer user epoch activate.
+The fixed scan profile currently derives an approximately 90-degree body turn
+from a provisional target of 682 mean absolute wheel-encoder degrees. The
+implementation and failure paths are tested, but the conversion, alignment
+tolerance, and scan timing must be measured on the physical build before the
+result is treated as calibrated.
 
-If geometry changes after observation but before dispatch, the stale pulse is
-rejected, the episode re-observes, and the retry consumes the existing replan
-budget. Repeated invalidation ends in a STOP bound to the newest state.
-Likewise, release from an exclusive propeller pause forces a new stopped
-observation boundary before any later DRIVE.
+The existing dashboard occupancy map remains a simulator metric map. A future
+adapter may visualize the physical qualitative hypotheses, confidence, and
+evidence age without pretending they are SLAM coordinates.
 
-Touch stop, distance gates, heartbeat, timeout, speed limits, stall checks,
-and emergency stop are deterministic. They do not wait for an LLM response.
-Only the supervisor may own the motor bus; planning, validation, dialogue,
-vision, and audio processes are proposal producers.
+## Safety and authority boundaries
 
-The same node and identity model is intended to grow from one EV3 into a
-composite LEGO body with EV3, Robot Inventor 51515, BOOST, cameras, and
-microphones. Multiple controllers still result in one coordinated,
-authoritative physical decision.
+Enforced in code today:
 
-See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the detailed state,
-identity, freshness, and multi-controller design.
+- the model may select only strict semantic actions such as `ADVANCE`,
+  `REVERSE`, `TURN_LEFT_90`, `TURN_RIGHT_90`, `SCAN_FRONT_ARC`, `OBSERVE`,
+  and `FINISH`;
+- fixed host/worker profiles own wheel speeds, pulse durations, allowed scan
+  deltas, timeouts, and motor roles;
+- the EV3 worker owns the drive motors exclusively and processes one request
+  at a time;
+- every action is bounded, sliced, observable, and followed by verified stop
+  and encoder/sensor evidence;
+- touch, worker cancellation, signal, SSH EOF, request/session budgets, and
+  emergency stop do not wait for an LLM response;
+- strict schemas bind controller, request, state version, sequence, and result;
+- stale plans, changed localization, unsafe swept paths, and unverifiable
+  finishes fail closed;
+- session renewal occurs only through bounded cleanup and re-observation;
+- speech text is length-bounded and passed through stdin, never interpolated
+  into a remote shell command;
+- the local GUI has bounded request sizes, a unique loopback session URL,
+  Host/Origin checks, strict route and asset allowlists, and no physical
+  runtime unless one is explicitly injected; and
+- natural-language routing belongs to schema-constrained model inference, not
+  regular expressions or language-specific keyword heuristics.
 
-## Safety boundaries
+Still required before calling physical autonomy live-validated:
 
-Verified or enforced today:
-
-- hard speed, duration, speech-length, queue, response-size, and episode
-  budgets;
-- explicit acknowledgement for every current manual physical motion command;
-- motor and audio locks plus encoder postconditions;
-- fixed SSH commands and speech text passed through stdin, never interpolated
-  into shell code;
-- loopback-only LM Studio with deadlines and bounded responses;
-- a supervisor core with exclusive motor ownership, heartbeat, touch stop,
-  stall/direction checks, latched faults, and verified stop;
-- strict JSONL transport identity, sequence, TTL, replay, EOF, signal, and
-  backpressure handling, verified against fake hardware;
-- snapshot-bound RobotAPI actions with explicit capability allowlists and
-  conservative at-most-once semantics;
-- an exact read-only research allowlist with provenance, hashes, timestamps,
-  TTL, evidence IDs, and citations;
-- a loopback-only dashboard with a fresh 256-bit session URL, Host/Origin
-  checks, strict route/asset allowlists, CSP, bounded jobs, and no physical
-  endpoints;
-- simulator-only closed loops for typed arm actions, waypoint navigation, and
-  concurrent navigation/expression/speech/propeller coordination, all without
-  a physical autonomy adapter;
-- simulator-only self-directed exploration with an exclusive goal lease,
-  opaque model-selected opportunities, persistent wandering budgets, bounded
-  ordered user preemption, stale-world replanning, and verified terminal
-  stops;
-- a bounded asynchronous spatial-map worker and authenticated read-only map
-  endpoint; mapping has no reference to the proposal inbox, motion authority,
-  motor bus, or physical adapter.
-
-Still required before autonomous physical motion:
-
-- an optimized physical poll path and a passing motion-free foreground
-  handshake; the deployed daemon currently fails closed because measured
-  physical polls exceed its `20 ms` contract;
-- a motion-enabled physical adapter with lock-retaining fail-stop behavior;
-- measured stop latency, braking distance, polling jitter, and stall
-  thresholds;
-- linear and turn calibration plus controlled reflected-light samples;
-- fault injection for lost client, link, process, heartbeat, and motor writes;
-- explicit time, distance, action, and replan budgets for each physical
-  episode.
-
-IR-PROX is a relative reflection/proximity signal from 0 to 100. It is not
-centimeters, object identification, or proof that the path is clear. Object
-IDs in the concurrent experiment are labels on synthetic simulator obstacles;
-physical IR observations are never allowed to claim an identity.
+- deploy the exact navigation-worker manifest to the current EV3;
+- complete one motion-free describe/observe/stop/shutdown session over Wi-Fi;
+- measure straight and turn profiles, encoder alignment, stop behavior, and
+  the provisional scan conversion on this physical build;
+- run obstacle and bilateral-scan scenarios with recorded observations;
+- verify stop, emergency stop, SSH loss, worker death, touch interruption,
+  and session renewal while the robot is moving;
+- accept Swedish and English physical speech, including navigation overlap;
+- connect the physical adapter to a documented opt-in application launch
+  profile; and
+- complete one end-to-end goal → model → action → observation → replan → stop
+  episode and publish its evidence.
 
 ## Try it locally
 
@@ -376,8 +356,8 @@ tests of the dependency-free dashboard JavaScript; CI currently uses Node 22.
 
 ### Start the Lab Console
 
-With LM Studio running on `127.0.0.1:1234` and
-`google/gemma-4-26b-a4b` loaded, the normal voice-enabled launch is:
+With LM Studio running on `127.0.0.1:1234` and the configured model already
+loaded, run:
 
 ```sh
 scripts/start_lab_console.sh
@@ -389,20 +369,16 @@ Open the unique loopback session URL printed by the server:
 http://127.0.0.1:8765/session/<session-token>/
 ```
 
-Restarting the server invalidates the token. The language selector switches
-the complete UI and sends a typed `response_locale` with every model turn;
-conversation state and form state survive the switch.
+Restarting the server invalidates the token. The ordinary command launches
+the complete UI but deliberately injects no EV3 runtime; the Robot view must
+therefore report physical control as disabled. Model IDs are explicit
+configuration values. Loading or benchmarking a model is a separate operator
+decision on the intended LM Studio host.
 
-The launch profile reuses a warm local `whisper.cpp` service at
+The normal voice profile reuses a warm local `whisper.cpp` service at
 `http://127.0.0.1:8178/v1`, posts to the separately validated
-`/audio/transcriptions` inference path, and identifies the model as
-`ggml-large-v3-turbo-q5_0`. This is the quality standard for Swedish and
-English microphone input. On this development machine that service is already
-kept alive outside the dashboard; do not start a duplicate.
-
-For a new installation, install `whisper.cpp`, download the checksum-verified
-model, and run the same compatible local service in a separate terminal or
-service manager:
+`/audio/transcriptions` path, and identifies the model as
+`ggml-large-v3-turbo-q5_0`. For a new installation:
 
 ```sh
 brew install whisper-cpp
@@ -419,245 +395,128 @@ whisper-server \
   --inference-path /audio/transcriptions
 ```
 
-Then run `scripts/start_lab_console.sh`. It probes the service before declaring
-the dashboard ready, so a missing or incompatible provider fails visibly
-instead of silently falling back to another model. The portable profile can be
-changed with `ROBOT_LLM_STT_URL`, `ROBOT_LLM_STT_INFERENCE_PATH`,
-`ROBOT_LLM_STT_MODEL_ID`, and `ROBOT_LLM_PYTHON`; ordinary dashboard CLI
-arguments are forwarded unchanged.
+Then run `scripts/start_lab_console.sh`. It probes the service before
+declaring the dashboard ready, so a missing or incompatible provider fails
+visibly instead of silently falling back. The provider-neutral settings
+surface exposes microphone selection, input level and threshold, sensitivity,
+silence auto-stop, maximum utterance length, browser audio processing,
+language hint, warm-stream behavior, and automatic or editable transcript
+submission.
 
-`small` and `base` remain explicit comparison models:
+The browser captures bounded 16 kHz mono PCM16 WAV through `getUserMedia` and
+`AudioWorklet`; it does not use a browser-vendor transcription service. STT
+has its own bounded worker and does not serialize Gemma dialogue, navigation,
+speech playback, or motor supervision.
 
-```sh
-sh scripts/download_whisper_model.sh small
-sh scripts/download_whisper_model.sh base
-```
-
-If no persistent service is available, managed STT remains an explicit
-fallback. Stop any competing GPU-backed Whisper service first, or choose an
-isolated CPU run:
-
-```sh
-ROBOT_LLM_STT_URL='' scripts/start_lab_console.sh \
-  --stt-model models/ggml-large-v3-turbo-q5_0.bin \
-  --stt-port 8180
-```
-
-External STT URLs are restricted to loopback. Their base path must be either
-the exact allowlisted `/v1` compatibility path or a long opaque private
-segment. The inference path is validated independently as a canonical
-relative path: no host, query, fragment, empty segment, traversal, or
-non-ASCII form is accepted. `/v1` is a compatibility allowlist entry, not an
-authentication secret.
-
-The **Talk** button uses standards-based `getUserMedia` and `AudioWorklet`,
-not a browser-vendor speech service. The settings view exposes microphone
-selection, live signal level and threshold, sensitivity, silence auto-stop,
-maximum utterance length, browser audio processing, spoken-language hint, and
-whether the selected stream stays warm between turns, and whether a fresh
-transcript is sent automatically or left editable. A warm stream can keep the
-browser's microphone indicator visible, but the PCM worklet remains stopped
-and does not accumulate audio until an explicitly generation-bound capture
-begins.
-
-Audio is converted in the browser to bounded 16 kHz mono PCM16 WAV and sent
-only to the loopback dashboard. It is held in application memory during active
-capture, while queued, or while the local provider call is running, and never
-written to the event log. Queued audio is cleared immediately on cancellation;
-an in-flight provider may retain its request until its bounded call returns,
-after which the result is
-discarded. STT has its own bounded worker, so it does not serialize Gemma
-dialogue, navigation, speech playback, or motor supervision.
-
-### Run the hardware-free tests
+### Run hardware-free validation
 
 ```sh
 sh ./scripts/quality_check.sh
 ```
 
-The suite uses simulated sysfs and never activates physical hardware. It
-verifies contracts, budgets, process behavior, agent loops, and the
-accelerated synchronous simulator—not real stop latency or braking distance.
-The same dependency-free quality gate runs on Python 3.9 and 3.13 in GitHub
-Actions and also checks JavaScript syntax and the EV3 modules' Python 3.5
-grammar.
+The suite uses simulated sysfs, fake subprocesses, deterministic clocks, and
+the accelerated simulator. It verifies contracts, budgets, process behavior,
+agent loops, GUI routing, mapping, and failure cleanup. It never activates
+physical hardware and cannot prove real stop latency or braking distance.
 
-### Run autonomous navigation in the 2D simulator
+### Run autonomous simulator scenarios
+
+Waypoint navigation:
 
 ```sh
 PYTHONPATH=src python3 -m robot_agent.navigation_demo
 ```
 
-Use `--scenario clear` for a direct waypoint and `--full` for the reproducible
-tick trace. Every measurement in `config/navigation_simulation.json` is
-labelled `simulation_only`. The command cannot import RobotAPI, SSH transport,
-or the EV3 HAL.
-
-### Build and inspect the spatial map
-
-Run the same bounded obstacle-navigation episode while accumulating an
-occupancy map:
+Spatial mapping:
 
 ```sh
 PYTHONPATH=src python3 -m robot_agent.spatial_mapping_demo
 ```
 
-To inspect that completed simulator map in the Lab Console:
-
-```sh
-PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
-  --simulation-map-demo
-```
-
-Open the session URL and choose **Map**. The view is read-only and shows
-uncertain/free/occupied cells, the final robot pose, fresh sensor rays,
-source and age metadata, and opaque object hypotheses. The flag runs a real
-simulator episode before the dashboard starts; without it the map honestly
-reports that no provider is connected. Neither command contacts EV3
-hardware.
-
-### Run self-directed idle exploration
-
-Run the deterministic test oracle for three bounded, self-created waypoint
-tasks:
+Self-directed idle exploration:
 
 ```sh
 PYTHONPATH=src python3 -m robot_agent.autonomy_demo
 ```
 
-Let the loaded local Gemma model choose among the same opaque, host-owned
-opportunities:
-
-```sh
-PYTHONPATH=src python3 -m robot_agent.autonomy_demo --lm-studio
-```
-
-The dynamic scenario completes one task, moves the synthetic box while the
-robot is stopped, and asks the model to choose again from candidates linked to
-the exact range transition:
-
-```sh
-PYTHONPATH=src python3 -m robot_agent.autonomy_demo \
-  --lm-studio --scenario range-change
-```
-
-All three commands are simulator-only. Idle autonomy defaults off in the goal
-coordinator; the demo enables it explicitly. Every task receives a new lease
-and goal epoch, each task ends at a verified stopped boundary, and repeated
-scheduler calls share a persistent duty-cycle budget until an explicit safe
-re-arm.
-
-### Run concurrent navigation and object interaction
+Concurrent navigation, dialogue, virtual speech, and propeller behavior:
 
 ```sh
 PYTHONPATH=src python3 -m robot_agent.concurrent_demo
 ```
 
-The default planner and simulated world are deterministic and offline; thread
-timestamps and event interleaving are intentionally not byte-reproducible. The
-run exercises independent navigation, expression, speech, and arm workers with
-virtual callbacks and prints bounded JSON evidence, including whether speech
-actually interleaved with navigation ticks and whether the propeller pause/ack
-gate ran.
+The deterministic defaults run offline. `--lm-studio` is an explicit option
+for the autonomy and concurrent demos; it should be used only after confirming
+that the command points at the intended LM Studio host and model. All of these
+demos remain simulated and make no claim about physical calibration.
 
-To use the loaded local model for the typed expression decision:
-
-```sh
-PYTHONPATH=src python3 -m robot_agent.concurrent_demo \
-  --lm-studio --locale en-US --tick-ms 50
-```
-
-This remains a 2D simulation. Its speech and propeller callbacks record what
-would happen; they do not play audio or contact EV3 hardware. A live LM Studio
-run is therefore evidence for asynchronous model orchestration, not physical
-TTS or motion.
-
-### Run the read-only weather agent
+### Use the read-only research seam
 
 ```sh
 PYTHONPATH=src python3 -m robot_agent.research_cli --pretty \
   'Do I need an umbrella in Stockholm right now?'
 ```
 
-Gemma chooses semantically from a strict schema; the host performs no regex,
-substring, or keyword routing. The current registry contains only
+The model chooses semantically from a strict schema; the host performs no
+regex, substring, or keyword routing. The current registry contains only
 `weather.current`, backed by Open-Meteo's
 [geocoding](https://open-meteo.com/en/docs/geocoding-api) and
 [forecast](https://open-meteo.com/en/docs) APIs. Responses include evidence
 IDs, timestamps, TTL, source URLs, byte counts, and SHA-256 hashes.
 
-<details>
-<summary><strong>Physical EV3 operator path</strong></summary>
+## Physical EV3 deployment path
 
-Before deploying or testing on the EV3, back up current files, verify the
-destination and hashes, keep a physical abort method ready, and compare the
-assembled wiring with
-[`config/ev3rstorm.json`](config/ev3rstorm.json). The committed map is
-specific to this EV3RSTORM.
+Keep mini-USB available as a recovery path during deployment. Verify the
+assembled wiring against [`config/ev3rstorm.json`](config/ev3rstorm.json),
+back up the destination, and follow the
+[EV3 Wi-Fi onboarding runbook](docs/EV3_WIFI.md).
 
-For untethered setup, keep mini-USB as the recovery path and follow the
-[EV3 Wi-Fi onboarding runbook](docs/EV3_WIFI.md). Its first command is a
-motion-free, read-only driver, firmware, interface, identity, and ConnMan
-inventory.
-
-Deploy and inventory:
+Deploy the exact code and configuration:
 
 ```sh
 ssh 'robot@<EV3-host>' 'mkdir -p /home/robot/robot-llm'
 scp -r ev3 config 'robot@<EV3-host>:/home/robot/robot-llm/'
+```
+
+Compare the fixed local and remote navigation-worker manifests before
+starting any process:
+
+```sh
 PYTHONPATH=src python3 -m robot_agent.ev3_runtime_preflight_cli \
   --ssh-target 'robot@<EV3-host>' \
-  --profile peripheral
-ssh 'robot@<EV3-host>' \
-  'cd /home/robot/robot-llm && python3 ev3/robot_cli.py inventory'
+  --profile navigation-worker \
+  --pretty
 ```
 
-The [runtime deployment preflight](docs/EV3_RUNTIME_DEPLOYMENT.md) compares
-the fixed local and remote manifests, including SHA-256 and Python 3.5
-compatibility, without importing a daemon or enabling motion. Run the
-`supervisor` profile before any foreground-supervisor test.
+The preflight checks exact files, SHA-256 hashes, Python 3.5 grammar, fixed
+remote paths, and remote compilation. It does not import the worker, generate
+speech, or enable motion.
 
-Read the IR sensor or test the already verified **Swedish** TTS path without
-motion:
+Motion-free checks remain available on the EV3:
 
 ```sh
-python3 ev3/robot_cli.py read-sensor --role infrared
-printf '%s\n' 'Jag ser något framför mig.' |
-  python3 ev3/robot_cli.py speak-stdin
-```
-
-Run the motion-free local probes:
-
-```sh
+cd /home/robot/robot-llm
+python3 ev3/robot_cli.py inventory
 python3 ev3/robot_cli.py stop
 python3 ev3/ir_gate_probe.py
-python3 ev3/supervisor_cli.py preflight
 ```
 
-`robot_cli.py stop` exits successfully only when every configured motor is
-inactive, fault-free, encoder-stable, and matched to the expected topology.
-An unreadable or invalid config does not prevent a best-effort emergency stop,
-but that configless attempt is reported on stderr with exit code 1 and can
-never claim `stop_confirmed: true`.
-
-Run one motion-free Gemma shadow cycle from the Mac:
+Test the bounded voice seam independently of navigation:
 
 ```sh
-PYTHONPATH=src python3 -m robot_agent.shadow_cli \
-  --ssh-target 'robot@<EV3-host>'
+printf '%s\n' 'Jag ser något framför mig.' |
+  python3 ev3/robot_cli.py speak-stdin --voice sv
+printf '%s\n' 'I can see something in front of me.' |
+  python3 ev3/robot_cli.py speak-stdin --voice en
 ```
 
-The foreground daemon preflight is the next physical gate. Its public entry
-point cannot enable motion, and the host sends only
-`describe → status → claim → heartbeat → status → arm → status → release → status → shutdown`:
+The host transport starts `ev3/navigation_worker_cli.py` as a foreground
+JSONL process over one SSH channel. It should not be launched interactively as
+an autonomous robot: the worker contains no goals, planner, personality, or
+independent navigation policy. Those live in the Mac application.
 
-```sh
-PYTHONPATH=src python3 -m robot_agent.supervisor_preflight_cli \
-  --ssh-target 'robot@<EV3-host>'
-```
-
-Only after the experiment protocol's power, wiring, clearance, exclusivity,
-and abort checks may an operator run a bounded manual pulse:
+Until the opt-in application composition and first live evidence run are
+documented, use the existing manual pulse only for controlled calibration:
 
 ```sh
 python3 ev3/robot_cli.py drive-test \
@@ -667,12 +526,14 @@ python3 ev3/robot_cli.py drive-test \
   --acknowledge-physical-motion
 ```
 
-This is a manual hardware test, not autonomous navigation. Read the full
-[experiment plan](docs/EXPERIMENT_PLAN.md) before physical work.
-
-</details>
+Read the full [runtime deployment preflight](docs/EV3_RUNTIME_DEPLOYMENT.md)
+and [experiment plan](docs/EXPERIMENT_PLAN.md) before physical work.
 
 ## Verified results
+
+The table below is historical evidence. It is preserved to distinguish prior
+measurements from the new production physical path that still awaits its full
+live run.
 
 | Measurement | Result |
 |---|---:|
@@ -693,6 +554,7 @@ This is a manual hardware test, not autonomous navigation. Read the full
 | IR gate blocked | `100 ms` after first raw value `≤35` |
 | IR gate released | `100 ms` after first filtered value `≥40` |
 | Gemma proposal in one physical shadow run | `417 ms` |
+| Gemma 4 QAT structured physical planner | `45/45` valid schemas and expected actions; single-flight median/p95 `3.220 / 3.513 s`; median server decode `99.559 tok/s`; measured aggregate E2E output `90.678 tok/s` |
 | Live concurrent Gemma simulator run | `1` accepted expression; speech/navigation interleaving observed; `98` actions; verified stop |
 | Live idle Gemma range-change run | `2 / 2` self-selected tasks; same box `207 → 357 mm`; `22` actions; `0` collisions; verified stop |
 | Spatial-map simulator run | `100` fused snapshots; `193` retained cells; `9` opaque hypotheses; `98` actions; `0` collisions; verified stop |
@@ -703,55 +565,58 @@ that either sensor reacted to a physical stimulus. The disconnect result
 measures host-side timeout and ConnMan recovery only; it is not evidence for
 motor-stop latency, heartbeat enforcement, or safe motion over Wi-Fi.
 
+The pre-optimization polling figure is retained as historical evidence; it is
+not the architecture or a current requirement of the bounded navigation
+worker. The new worker uses short fixed operations, local cancellation, and
+verified stops and must be evaluated through its own live protocol.
+
 The IR gate figures verify filtering and hysteresis in stationary tests. They
 are not motor stop time, braking distance, a real-time guarantee, or a
-benchmark.
-The STT figures use locally synthesized canonical WAV fixtures, not a physical
-microphone recording, and therefore verify the managed server and API path
-rather than room-noise robustness.
+benchmark. The STT figures use synthesized canonical WAV fixtures rather than
+a physical microphone recording.
+
 Protocols, limitations, and raw data are in the
 [experiment plan](docs/EXPERIMENT_PLAN.md) and
-[EXP-F1-IR-DYN-002.json](docs/data/EXP-F1-IR-DYN-002.json).
+[EXP-F1-IR-DYN-002.json](docs/data/EXP-F1-IR-DYN-002.json). The QAT planner
+benchmark is recorded separately in
+[EXP-GEMMA4-QAT-NAV-001.json](docs/data/EXP-GEMMA4-QAT-NAV-001.json).
 
 ## Roadmap
 
-- [x] Physical EV3 baseline: ev3dev, USB/SSH, manual motors, sensors, encoders,
-  and Swedish TTS
-- [x] Motion-free physical Gemma shadow cycle and supervisor preflight
-- [x] Foreground transport verified against fake sysfs and real subprocesses
-- [x] English/Swedish Lab Console, typed response locale, local chat, and
-  read-only cited weather
-- [x] Typed RobotAPI and closed arm loop in simulation
-- [x] Simulator-first waypoint navigation with parallelizable proposals and
-  serialized supervision
-- [x] Strict multi-waypoint mission execution with shared budgets, verified
-  inter-leg stops, and world-version invalidation
-- [x] Concurrent simulator runtime: asynchronous navigation/expression/speech,
-  optional propeller reaction, and serialized wheel ownership
-- [x] Self-directed simulator idle loop: typed change observations, opaque
-  Gemma-selected waypoint opportunities, cancelable single-flight selection,
-  goal leases, bounded user preemption, retry memory, and persistent wandering
-  budgets
-- [x] Asynchronous simulator spatial map with bounded occupancy evidence,
-  persistent unknown-object hypotheses, and a read-only live GUI view
-- [x] AR9271 Wi-Fi onboarding, key-only SSH, USB/Wi-Fi brick identity match,
-  reboot auto-connect, mini-USB removal, and persistent motion-free sensor
-  transport
-- [ ] Remeasure the optimized physical supervisor poll path and complete the
-  motion-free foreground timing gate
-- [ ] Physical RobotAPI adapter, semantic tools, calibration, and safety
-  evidence
-- [ ] Gemma-driven physical `ACT`/`ABORT` loop behind a separate motion gate
-- [ ] Map-informed frontier planning and semantic classification of persistent
-  hypotheses, with confidence and evidence lineage
-- [x] Bounded local talk-to-agent STT pipeline, with standards-based capture,
-  local whisper.cpp, live level/VAD controls, explicit language hint,
-  cancellation, and the normal versioned agent-submit path
-- [ ] Real browser-permission + Mac-microphone acceptance runs in Swedish and
-  English
-- [ ] Camera and robot-mounted microphone transport
-- [ ] Vision and sound-source localization
-- [ ] Multi-controller orchestration across EV3, Robot Inventor, and BOOST
+- [x] Physical EV3 baseline: ev3dev, USB/SSH, Wi-Fi, manual motors, sensors,
+  encoders, and Swedish TTS
+- [x] Local Gemma dialogue, English/Swedish UI, local whisper.cpp STT, and
+  read-only cited research tools
+- [x] Typed RobotAPI, waypoint navigation, verification, replanning, and
+  self-directed exploration in simulation
+- [x] Concurrent simulator navigation, expression, virtual speech, propeller
+  reactions, and serialized wheel ownership
+- [x] Simulator occupancy map and persistent opaque object hypotheses in the
+  read-only GUI map
+- [x] Bounded EV3 navigation worker with persistent SSH transport, exclusive
+  motor ownership, verified stop, interruption, and safe session renewal
+- [x] Host physical goal → structured plan → semantic action → observe →
+  verify → replan runtime with qualitative obstacle memory and swept-path
+  checks
+- [x] Deterministic bilateral IR scan implementation with encoder-derived
+  headings and start-heading restoration
+- [x] Robot/Workbench GUI split with opt-in runtime, episode controls,
+  settings, stop, emergency stop, snapshots, and technical events
+- [x] Bounded asynchronous physical speech scheduler and EV3 Swedish/English
+  voice protocol
+- [ ] Complete physical speech/runtime composition and live Swedish/English
+  TTS acceptance
+- [ ] Calibrate advance, reverse, 90-degree turn, and active IR scan on the
+  assembled EV3RSTORM
+- [ ] Run and publish the first complete autonomous physical obstacle episode
+- [ ] Expose the validated physical composition as an explicit opt-in launch
+  profile
+- [ ] Render qualitative physical obstacle hypotheses in the GUI without
+  inventing metric certainty
+- [ ] Add continuous hands-free STT with turn-taking and echo handling
+- [ ] Add robot-mounted camera and microphone transport
+- [ ] Add vision, object research, and sound-source localization
+- [ ] Coordinate EV3, Robot Inventor 51515, and BOOST as one composite body
 
 The dream demo:
 
@@ -760,15 +625,17 @@ The dream demo:
 ## Repository layout
 
 ```text
-config/                 port map, safety limits, and simulator configuration
-docs/                   architecture, experiment protocols, evidence, and UI captures
-ev3/                    Python 3.5 HAL, supervisor, and manual EV3 tools
-src/robot_agent/        host policy, agent loops, navigation, research, and dashboard
-tests/                  hardware-free test suite
+config/                 robot topology, fixed action profiles, and simulator configuration
+docs/                   architecture, deployment, experiment protocols, evidence, and UI captures
+ev3/                    Python 3.5 HAL, bounded navigation worker, supervisor, and operator tools
+src/robot_agent/        host agent loops, physical runtime, navigation, speech, research, and GUI
+tests/                  hardware-free contracts, scenarios, transport, UI, and failure-path tests
 ```
 
-Robot LLM Lab deliberately stays small and avoids a large robotics framework.
-Abstractions must earn their place through real experiments.
+Robot LLM Lab deliberately avoids a large robotics framework. Abstractions
+must earn their place through measured experiments while the architecture
+remains ready for parallel perception and reasoning across several physical
+controllers.
 
 LEGO, MINDSTORMS, EV3, Robot Inventor, and BOOST are trademarks of the LEGO
 Group. This independent experimental project is not affiliated with or

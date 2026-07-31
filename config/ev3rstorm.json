@@ -116,7 +116,7 @@
       "min_amplitude": 0,
       "max_amplitude": 160,
       "default_amplitude": 140,
-      "allowed_voices": ["sv"],
+      "allowed_voices": ["sv", "en"],
       "max_runtime_ms": 20000
     },
     "heartbeat": {

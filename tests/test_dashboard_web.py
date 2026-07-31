@@ -76,6 +76,9 @@ class DashboardWebContractTests(unittest.TestCase):
         cls.spatial_map_presenter = (
             WEB_ROOT / "spatial_map_presenter.js"
         ).read_text(encoding="utf-8")
+        cls.robot_control = (
+            WEB_ROOT / "robot_control.js"
+        ).read_text(encoding="utf-8")
         cls.javascript = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
         cls.javascript_assets = "\n".join(
             (
@@ -85,6 +88,7 @@ class DashboardWebContractTests(unittest.TestCase):
                 cls.microphone_input,
                 cls.pcm_capture_worklet,
                 cls.spatial_map_presenter,
+                cls.robot_control,
                 cls.javascript,
             )
         )
@@ -488,6 +492,7 @@ process.stdout.write(JSON.stringify({
                 "assets/speech_input_logic.js",
                 "assets/microphone_input.js",
                 "assets/spatial_map_presenter.js",
+                "assets/robot_control.js",
                 "assets/app.js",
             ],
         )
@@ -599,9 +604,9 @@ process.stdout.write(JSON.stringify({
         self.assertNotIn("Ingen fysisk capability", self.html)
         self.assertNotIn("EV3RSTORM är offline just nu", self.html)
         self.assertNotIn("weather.current</span>", self.html)
-        self.assertIn("Redo att chatta · robotstyrning är avstängd", self.i18n)
+        self.assertIn("Arbetsbänken är redo för samtal", self.i18n)
         self.assertNotIn(
-            "Redo att chatta · robotstyrning är avstängd",
+            "Arbetsbänken är redo för samtal",
             self.javascript,
         )
         self.assertNotIn(
@@ -665,7 +670,7 @@ process.stdout.write(JSON.stringify({
             'map.status === "qualitative_only"',
             self.spatial_map_presenter,
         )
-        self.assertLess(len(self.javascript.splitlines()), 1800)
+        self.assertLess(len(self.javascript.splitlines()), 1900)
         self.assertNotIn("function mapProjection", self.javascript)
         self.assertIn("map.reason.observation_gap", self.i18n)
         self.assertIn("SIMULATION", self.i18n)
@@ -1635,12 +1640,12 @@ process.stdout.write(JSON.stringify({
             ),
         )
         self.assertIn(
-            "Physical arming is intentionally handled elsewhere.",
+            "Robot episode settings live in the separate robot control.",
             values["settings.description"],
         )
         self.assertEqual(
             values["settings.safety.description"],
-            "Status information only — not a control.",
+            "Status for the separate execution path.",
         )
         self.assertEqual(
             self.i18n_contract["copySamples"]["en"]["droppedEvents"],
@@ -1762,6 +1767,7 @@ process.stdout.write(JSON.stringify({
                 "spatial_map_presenter.js",
                 self.spatial_map_presenter,
             ),
+            ("robot_control.js", self.robot_control),
             ("app.js", self.javascript),
         ):
             for token in forbidden:
@@ -1804,6 +1810,152 @@ process.stdout.write(JSON.stringify({
         self.assertNotIn('"sv-SE"', self.javascript)
         self.assertIn("i18n.time(", self.javascript)
         self.assertIn("i18n.dateTime(", self.javascript)
+
+    def test_robot_control_module_has_typed_target_and_state_policy(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const window = {};
+vm.runInNewContext(source, { window }, { filename: process.argv[1] });
+const api = window.RobotControlUI;
+const idle = api.normalizeControl({
+  state: "IDLE",
+  enabled: true,
+  accepting: true,
+  settings: {
+    revision: 4,
+    model: "gemma-4bit",
+    max_episode_ms: 120000,
+    speech_enabled: true,
+  },
+  runtime: {
+    plan: ["scan", "advance"],
+    speech_status: "idle",
+  },
+});
+const disabled = api.normalizeControl({ state: "unexpected" });
+process.stdout.write(JSON.stringify({
+  exports: Object.keys(api).sort(),
+  frozen: Object.isFrozen(api),
+  states: Array.from(api.CONTROL_STATES),
+  idle,
+  disabled,
+  robotPolicy: api.composerPolicy(idle, "robot", true, false),
+  workbenchPolicy: api.composerPolicy(idle, "workbench", true, false),
+  workbenchWithoutRobot: api.composerPolicy(
+    disabled,
+    "workbench",
+    true,
+    false,
+  ),
+  lowerSequenceAccepted: api.shouldApplySnapshot(
+    { sequence: 8 },
+    { sequence: 7 },
+  ),
+  equalSequenceAccepted: api.shouldApplySnapshot(
+    { sequence: 8 },
+    { sequence: 8 },
+  ),
+  higherSequenceAccepted: api.shouldApplySnapshot(
+    { sequence: 8 },
+    { sequence: 9 },
+  ),
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(WEB_ROOT / "robot_control.js"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr)
+        contract = json.loads(completed.stdout)
+        self.assertTrue(contract["frozen"])
+        self.assertEqual(
+            contract["exports"],
+            [
+                "ACTIVE_STATES",
+                "CONTROL_STATES",
+                "composerPolicy",
+                "create",
+                "normalizeControl",
+                "shouldApplySnapshot",
+            ],
+        )
+        self.assertEqual(
+            contract["states"],
+            [
+                "DISABLED",
+                "IDLE",
+                "STARTING",
+                "RUNNING",
+                "STOPPING",
+                "FAULTED",
+            ],
+        )
+        self.assertTrue(
+            contract["robotPolicy"]["composerEnabled"]
+        )
+        self.assertFalse(
+            contract["robotPolicy"]["turnModeEnabled"]
+        )
+        self.assertTrue(
+            contract["workbenchPolicy"]["turnModeEnabled"]
+        )
+        self.assertTrue(
+            contract["workbenchWithoutRobot"]["composerEnabled"]
+        )
+        self.assertFalse(contract["lowerSequenceAccepted"])
+        self.assertTrue(contract["equalSequenceAccepted"])
+        self.assertTrue(contract["higherSequenceAccepted"])
+        self.assertIn(
+            "if (!shouldApplySnapshot(control, next))",
+            self.robot_control,
+        )
+        self.assertEqual(
+            contract["disabled"]["state"],
+            "DISABLED",
+        )
+        self.assertIn(
+            "/api/v1/robot/emergency-stop",
+            self.robot_control,
+        )
+        self.assertNotIn("/api/v1/robot/motor", self.robot_control)
+
+    def test_workbench_safety_contract_is_scoped_from_robot_control(self):
+        self.assertIn(
+            "const workbench = safeObject(capabilities.workbench);",
+            self.javascript,
+        )
+        self.assertIn(
+            'workbench.tool_effects === "read_only"',
+            self.javascript,
+        )
+        self.assertNotIn(
+            "bootstrap.physical_control_enabled === false",
+            self.javascript,
+        )
+        submit_turn = self.javascript[
+            self.javascript.index("  async function submitTurn(event) {"):
+            self.javascript.index(
+                "\n  function eventTime(",
+                self.javascript.index("  async function submitTurn(event) {"),
+            )
+        ]
+        self.assertLess(
+            submit_turn.index("robotControl.isRobotTarget()"),
+            submit_turn.index("!state.workbenchReadOnlyInvariant"),
+        )
 
     def test_css_has_responsive_accessible_motion_aware_layout(self):
         self.assertIn("@media (max-width: 1220px)", self.css)

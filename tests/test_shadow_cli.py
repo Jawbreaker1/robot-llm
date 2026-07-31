@@ -157,13 +157,32 @@ class ShadowCLITests(unittest.TestCase):
         transport = EV3SSHTransport("robot@ev3dev.local", runner=runner)
         text = "Vad fan är det där; $(absolut inte kod)"
 
-        result = transport.speak(text)
+        result = transport.speak(text, voice="en")
 
         self.assertEqual(result["status"], "completed")
         argv, kwargs = runner.calls[0]
         self.assertNotIn(text, argv)
         self.assertEqual(kwargs["input"], text + "\n")
-        self.assertEqual(argv[-1], "speak-stdin")
+        self.assertEqual(
+            argv[-3:],
+            ["speak-stdin", "--voice", "en"],
+        )
+
+    def test_speech_voice_is_a_typed_fixed_argument(self):
+        runner = ScriptedRunner(
+            [Completed(stdout='{"status":"completed","characters":3}')]
+        )
+        transport = EV3SSHTransport(
+            "robot@ev3dev.local",
+            runner=runner,
+        )
+
+        transport.speak("Hej", voice="sv")
+
+        argv, _kwargs = runner.calls[0]
+        self.assertEqual(argv[-2:], ["--voice", "sv"])
+        with self.assertRaises(EV3SSHConfigurationError):
+            transport.speak("Hej", voice="sv; touch /tmp/no")
 
     def test_bad_sensor_shape_is_rejected(self):
         bad_payloads = [

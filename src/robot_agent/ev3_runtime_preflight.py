@@ -1,9 +1,9 @@
 """Read-only verification of the code deployed to an EV3 runtime.
 
-The remote command and both deployment manifests are fixed in this module.
-Only the SSH target and the choice between those manifests are operator
-inputs.  The preflight reads files and compares their SHA-256 digests; it
-never starts a daemon or imports EV3 runtime code.
+The remote command and deployment manifests are fixed in this module.  Only
+the SSH target and profile choice are operator inputs.  The preflight reads
+files and compares their SHA-256 digests; it never starts a daemon or imports
+EV3 runtime code.
 """
 
 import ast
@@ -40,11 +40,29 @@ SUPERVISOR_ADDITIONS = (
     "ev3/supervisor_cli.py",
 )
 SUPERVISOR_MANIFEST = PERIPHERAL_MANIFEST + SUPERVISOR_ADDITIONS
+NAVIGATION_WORKER_MANIFEST = (
+    "ev3/navigation_worker_cli.py",
+    "ev3/robot_cli.py",
+    "ev3/navigation_worker.py",
+    "ev3/navigation_worker_protocol.py",
+    "ev3/navigation_profile.py",
+    "ev3/infrared_safety.py",
+    "ev3/supervisor.py",
+    "ev3/robot_hal.py",
+    "ev3/robot_config.py",
+    "ev3/emergency_stop.py",
+    "config/ev3rstorm.json",
+)
 PROFILE_MANIFESTS = {
     "peripheral": PERIPHERAL_MANIFEST,
     "supervisor": SUPERVISOR_MANIFEST,
+    "navigation-worker": NAVIGATION_WORKER_MANIFEST,
 }
-ALL_MANIFEST_PATHS = SUPERVISOR_MANIFEST
+ALL_MANIFEST_PATHS = tuple(
+    dict.fromkeys(
+        SUPERVISOR_MANIFEST + NAVIGATION_WORKER_MANIFEST
+    )
+)
 
 Runner = Callable[..., Any]
 
@@ -80,6 +98,21 @@ def _validate_manifests() -> None:
         raise RuntimeError("Runtime deployment manifest contains duplicates")
     if not set(PERIPHERAL_MANIFEST).issubset(SUPERVISOR_MANIFEST):
         raise RuntimeError("Supervisor manifest omits peripheral files")
+    required_navigation_dependencies = {
+        "ev3/robot_cli.py",
+        "ev3/infrared_safety.py",
+        "ev3/supervisor.py",
+        "ev3/robot_hal.py",
+        "ev3/robot_config.py",
+        "ev3/emergency_stop.py",
+        "config/ev3rstorm.json",
+    }
+    if not required_navigation_dependencies.issubset(
+        NAVIGATION_WORKER_MANIFEST
+    ):
+        raise RuntimeError(
+            "Navigation worker manifest omits runtime dependencies"
+        )
     for relative_path in ALL_MANIFEST_PATHS:
         path = Path(relative_path)
         if (

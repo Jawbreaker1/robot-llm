@@ -729,6 +729,16 @@ class DashboardServiceTests(unittest.TestCase):
         self.assertFalse(
             bootstrap["capabilities"]["physical_control"]
         )
+        self.assertEqual(
+            bootstrap["capabilities"]["workbench"],
+            {
+                "schema": "dashboard-workbench-capabilities/v1",
+                "tool_effects": "read_only",
+                "physical_control": False,
+                "ssh": False,
+                "tts": False,
+            },
+        )
         self.assertFalse(registry["physical_control_enabled"])
         self.assertTrue(
             all(not node["control_exposed"] for node in registry["nodes"])

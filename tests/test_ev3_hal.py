@@ -639,7 +639,7 @@ class RobotHALTests(unittest.TestCase):
             ("", "sv", 135, 100),
             ("   ", "sv", 135, 100),
             ("x" * 161, "sv", 135, 100),
-            ("hej", "en", 135, 100),
+            ("hej", "unknown", 135, 100),
             ("hej", "sv", True, 100),
             ("hej", "sv", 99, 100),
             ("hej", "sv", 221, 100),
