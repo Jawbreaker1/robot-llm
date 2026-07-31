@@ -117,7 +117,7 @@ flowchart LR
     E -->|"one persistent SSH session"| W["EV3 navigation worker<br/>sole motor owner"]
     W --> R["EV3RSTORM<br/>motors · IR · touch · encoders"]
     R --> O
-    T -. "sv/en text via stdin" .-> R
+    T -. "validated WAV over audio-only SSH" .-> R
 ```
 
 The physical implementation uses a foreground, policy-free EV3 worker over a
@@ -146,16 +146,46 @@ but the complete path has not yet run as one physical autonomous episode.
 | Simulator agent | Fully exercised closed loops for waypoint navigation, idle exploration, obstacle avoidance, concurrent expression, and mapping | Simulator measurements are not physical calibration evidence |
 | Physical EV3 baseline | Live-verified ev3dev boot, USB and Wi-Fi SSH, motors A/B/C, encoders, touch, relative IR, reflected light, manual bounded movement, and Swedish TTS | Historical measurements are listed below; they do not validate the new complete autonomous runtime |
 | EV3 navigation worker | The production JSONL worker now runs on the assembled EV3 over persistent Wi-Fi SSH; live sessions have exercised observations, bounded pulses, turns, stop proofs, and active-scan slices | A complete autonomous obstacle-navigation episode still needs a clean acceptance run |
-| Physical closed loop | Goal → structured model plan → short semantic action → observe/verify → replan has begun live validation on the moving EV3, including obstacle approach and reaction | Reliable obstacle analysis and a complete route around or away from the obstacle remain the current acceptance target |
+| Physical closed loop | A goal entered in the Robot UI has reached local Gemma, produced a typed plan, spoken its assessment, and dispatched real EV3 observations and movement; obstacle approach and reaction have both run | Reliable obstacle analysis and a complete route around or away from the obstacle remain the current acceptance target |
 | Encoder-aware degraded motion | Failed or asymmetric drive attempts retain their actual left/right encoder movement; temporal differential-drive odometry updates the estimated pose, cancels stale plan tails, and can apply a bounded EV3-specific catch-up or retry | Live recovery sequences have looked correct, but repeatability still needs measurement; encoders cannot see wheel slip or revive broken hardware |
 | Gemma 4 planner comparison | In one matched-load run, QAT Q4_0 produced `106.633 tok/s` single-flight median server decode versus Q8_0's `91.112 tok/s` (`+17.0%`), with `3.017` versus `3.312 s` median latency; both produced 45/45 schema-valid expected actions | This is one hardware-free planner run, not a moving-robot run or a general model-quality claim; four-way aggregate throughput was effectively tied |
-| Active IR investigation | Bilateral coarse-to-fine front-arc scanning, encoder-derived headings, boundary observations, and restoration to the starting heading are implemented and the first physical scan/restoration has run | The current `682°` mean wheel-encoder estimate for an approximately `90°` body turn is provisional and needs repeated calibration |
+| Active IR investigation | Bilateral coarse-to-fine front-arc scanning, encoder-derived headings, boundary observations, and restoration to the starting heading are implemented; physical turn/restoration slices and stationary IR batches have run | The current `682°` mean wheel-encoder estimate for an approximately `90°` body turn is provisional, and a complete bilateral live scan still needs an acceptance run |
 | Obstacle memory | Physical navigation retains qualitative IR hazard hypotheses after turning and applies swept-path vetoes instead of assuming “not in front” means “gone” | IR-PROX is not metric distance or object identity; the physical map is deliberately qualitative |
-| Robot speech | The host asynchronously asks loopback Piper for bounded Swedish `nst-deep` WAV audio, validates it, and streams it through one persistent audio-only SSH worker per episode; speech failures and cancellation remain isolated from navigation | Swedish host TTS awaits a physical acceptance run; English needs its own configured voice/model and is deliberately not sent through the Swedish NST voice |
-| Robot control GUI | A distinct Robot view and Workbench view, opt-in runtime adapter, episode start, settings, normal stop, emergency stop, snapshots, and technical event streams are implemented and hardware-free tested | Ordinary console startup injects no physical adapter and therefore reports `DISABLED`; the complete production path has not yet been live-validated |
+| Robot speech | The host asynchronously asks loopback Piper for bounded Swedish `nst-deep` WAV audio, validates it, and streams it through one persistent audio-only SSH worker per episode; that voice has now been heard during a live physical agent episode | Repeated move-and-speak runs still need acceptance; English needs its own configured voice/model and is deliberately not sent through the Swedish NST voice |
+| Robot control GUI | The separate Robot and Workbench views, explicit EV3 launch profile, episode controls, settings, stop, emergency stop, snapshots, physical map, and technical event streams are implemented; the Robot path has started real Wi-Fi episodes | Ordinary console startup still injects no physical adapter and reports `DISABLED`; the EV3 launch remains opt-in until a complete obstacle episode passes |
 | Lab Console dialogue and STT | Local Gemma chat, local whisper.cpp STT, microphone selection and sensitivity controls, context, read-only weather, evidence, and English/Swedish UI and text responses | STT text reaches the agent; always-listening robot conversation remains future work |
 | Spatial UI map | The read-only Map view supports both the simulator occupancy map and a live physical LOCAL_ODOMETRY layer fed by the same EV3 pose and hazard hypotheses used for navigation | The EV3 layer is deliberately qualitative: it draws provisional screen-space IR sectors, never invented centimetres, free cells, or object surfaces; its first live acceptance run is pending |
 | Multi-controller architecture | Identity, proposal, and authority contracts are designed to grow to EV3, Robot Inventor 51515, BOOST, cameras, and microphones | Only the EV3 path has a production physical worker today |
+
+### Latest physical run
+
+The latest EV3 session reached the real integration path from the Robot UI:
+local Gemma selected `SCAN_FRONT_ARC` for the box in front of the robot and
+the host-generated Swedish assessment was dispatched to the separate EV3
+speech worker while the physical runtime was active. The episode then stopped
+on its first stationary scan sample, before issuing a scan-turn motor command.
+
+This was separate from an earlier scan-turn failure in the same development
+session. In that run, encoder evidence proved that the first `-30°` turn had
+physically occurred; a later controlled turn restored the starting heading.
+That path led to balanced scan slices and typed, safely stopped non-completion
+receipts. The final run described here exposed the remaining sample-validator
+mismatch before any wheel movement.
+
+That failure was a strict-contract bug, not a sensor or Wi-Fi disconnect. The
+EV3 obstacle gate filters the latest three readings from each five-sample
+batch, while the host validator had recomputed the median over all five. A
+perfectly valid jitter sequence could therefore be rejected, causing the host
+to close the SSH channel and obscure the useful error behind a later shutdown
+failure. The worker and host now publish and validate the same filter window,
+the original fault is retained in dashboard telemetry, and the exact real
+sample pattern is covered by regression tests.
+
+All `1,236` hardware-free tests passed after the correction. Encoder evidence
+also confirmed that the failed attempt had not moved either drive wheel. The
+EV3 batteries expired before the corrected worker files could be copied back
+to the brick, so the next session starts with that deployment followed by the
+same autonomous box experiment—not with another redesign.
 
 On the operator-confirmed `lmlink` path to the gaming computer, matched-load
 QAT Q4_0 and Q8_0 runs both produced `45/45` schema-valid expected first-pass
@@ -210,11 +240,20 @@ session renewal, stop/error paths, GUI control plane, speech scheduling, and
 simulator scenarios against fakes and simulated sysfs. It cannot replace live
 braking, calibration, room geometry, speaker, or network tests.
 
-There is intentionally no advertised one-command autonomous EV3 demo yet.
-The physical runtime is opt-in through an injected adapter, while normal
-dashboard startup remains disabled. The first live run will be promoted to a
-public launch profile only after the complete deployment and observation path
-has passed on the assembled robot.
+### 4. Start the explicit physical EV3 console
+
+After deploying the exact committed worker files and completing the
+motion-free preflight, start the real hardware profile with:
+
+```sh
+scripts/start_ev3rstorm_console.sh \
+  --robot-target 'robot@<EV3-host-or-address>'
+```
+
+This is the opt-in production path used for the current live experiments. It
+does not make the unfinished obstacle run a polished demo: the ordinary Lab
+Console still injects no physical adapter, and the EV3 profile remains an
+operator-controlled experiment until a complete goal-driven episode passes.
 
 ## The Lab Console
 
@@ -283,9 +322,10 @@ bounded and latest-pending-wins; cancellation and playback failure are
 observable but do not become motion authority.
 
 The simulator already exercises richer concurrent navigation, expression,
-speech, and propeller behavior. The physical TTS scheduler and EV3 English/
-Swedish voice seam are implemented, but the full simultaneous
-move-and-speak path remains an explicit live acceptance item.
+speech, and propeller behavior. On the physical path, host-generated Swedish
+speech has now overlapped an active navigation episode without becoming motor
+authority. A complete repeated move-and-speak run remains an acceptance item,
+and English still needs a separately configured and tested host voice.
 
 ## Physical perception and obstacle memory
 
@@ -349,15 +389,16 @@ Enforced in code today:
 
 Still required before calling physical autonomy live-validated:
 
-- deploy the exact navigation-worker manifest to the current EV3;
-- complete one motion-free describe/observe/stop/shutdown session over Wi-Fi;
+- replace the exhausted batteries, deploy the committed scan-filter contract,
+  and repeat the already proven motion-free worker preflight;
 - measure straight and turn profiles, encoder alignment, stop behavior, and
   the provisional scan conversion on this physical build;
 - run obstacle and bilateral-scan scenarios with recorded observations;
 - verify stop, emergency stop, SSH loss, worker death, touch interruption,
   and session renewal while the robot is moving;
-- accept Swedish and English physical speech, including navigation overlap;
-- connect the physical adapter to a documented opt-in application launch
+- repeat Swedish physical speech during completed motion and configure a
+  separate tested English host voice;
+- capture a clean run from the documented `start_ev3rstorm_console.sh`
   profile; and
 - complete one end-to-end goal → model → action → observation → replan → stop
   episode and publish its evidence.
@@ -652,10 +693,12 @@ matched-load records in
   headings and start-heading restoration
 - [x] Robot/Workbench GUI split with opt-in runtime, episode controls,
   settings, stop, emergency stop, snapshots, and technical events
-- [x] Bounded asynchronous physical speech scheduler and EV3 Swedish/English
-  voice protocol
-- [ ] Complete physical speech/runtime composition and live Swedish/English
-  TTS acceptance
+- [x] Bounded asynchronous host-generated Swedish WAV speech transport,
+  scheduler, duplicate suppression, and physical runtime composition
+- [ ] Repeat Swedish TTS during completed motion and add a separately
+  configured, live-tested English host voice
+- [ ] Deploy the corrected scan-filter contract after the battery change and
+  repeat the autonomous box experiment
 - [ ] Calibrate advance, reverse, 90-degree turn, and active IR scan on the
   assembled EV3RSTORM
 - [ ] Live-validate intermittent motor catch-up and record how often each EV3
