@@ -5,11 +5,17 @@
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![STT: local](https://img.shields.io/badge/STT-local%20whisper.cpp-14b8a6)
 ![UI: English + Swedish](https://img.shields.io/badge/UI-English%20%2B%20Swedish-0ea5e9)
-![Physical runtime: code complete](https://img.shields.io/badge/physical%20runtime-code%20complete-2ea44f)
+![EV3 hardware: live](https://img.shields.io/badge/EV3%20hardware-live%20over%20Wi--Fi%2FSSH-2ea44f)
 ![Live autonomous validation: pending](https://img.shields.io/badge/live%20autonomy-pending-f59e0b)
 
 **A local, goal-driven agent that can plan, observe, speak, and control a
 physical LEGO robot through bounded actions.**
+
+> **Running on real hardware:** the project now communicates with an assembled
+> physical EV3RSTORM over Wi-Fi/SSH. ev3dev boot, motors A/B/C, encoders, IR,
+> touch and reflected-light sensors, bounded movement, and robot speech have
+> all been exercised on the actual robot. The first complete autonomous
+> obstacle-navigation episode remains the next live integration milestone.
 
 Robot LLM Lab is an embodied-agent research project built around a LEGO
 EV3RSTORM. A local LLM interprets a goal, produces a short structured plan,
