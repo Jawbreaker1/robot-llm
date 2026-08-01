@@ -120,7 +120,16 @@ class PhysicalNavigationRuntimeAdapter:
     ) -> Optional[Mapping[str, object]]:
         name = event.get("event")
         if name == "model_decision":
-            return {"model_latency_ms": event["model_latency_ms"]}
+            value = {"model_latency_ms": event["model_latency_ms"]}
+            for field in (
+                "planner_context_bytes",
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+            ):
+                if field in event:
+                    value[field] = event[field]
+            return value
         if name == "model_decision_committed":
             value = {
                 "current_action": event["action"],

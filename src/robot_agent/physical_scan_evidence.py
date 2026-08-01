@@ -7,9 +7,14 @@ from .active_ir_scan_contract import ActiveIrScanResult
 from .physical_odometry import PhysicalPose
 
 
-MAX_SCAN_ATTEMPTS_PER_HAZARD = 4
-MAX_SCAN_ATTEMPTS_PER_MAP = 8
+MAX_SCAN_ATTEMPTS_PER_HAZARD = 16
+MAX_SCAN_ATTEMPTS_PER_MAP = 64
+MAX_COLLISION_SUPPORTS_PER_HAZARD = 512
+MAX_COLLISION_SUPPORTS_PER_MAP = 4_096
 BODY_RELATIVE_BEARING_CONVENTION = "POSITIVE_LEFT_NEGATIVE_RIGHT"
+ANGULAR_COLLISION_SUPPORT_PROVENANCE = (
+    "PROVISIONAL_BLOCKED_IR_BEARING_NOT_MEASURED_RANGE_OR_SURFACE"
+)
 
 
 @dataclass(frozen=True)
@@ -85,6 +90,126 @@ class ScanRayEvidence:
 
 
 @dataclass(frozen=True)
+class AngularCollisionSupport:
+    """Materialized qualitative support independent of detail retention.
+
+    The EV3 IR-PROX reading has no trustworthy metric range.  This record
+    therefore persists only a verified scan pose and blocked bearing.  The
+    hazard-map calibration later projects that angular fact onto the same
+    explicitly provisional collision envelope used for forward detections.
+    It is never an object surface or a measured contact/range claim.
+    """
+
+    source_scan_id: str
+    completed_at_ms: int
+    pose_x_mm: int
+    pose_y_mm: int
+    pose_heading_mdeg: int
+    actual_relative_bearing_mdeg: int
+    based_on_map_version: int
+    provenance: str = ANGULAR_COLLISION_SUPPORT_PROVENANCE
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.source_scan_id, str)
+            or not self.source_scan_id
+            or len(self.source_scan_id) > 128
+            or any(ord(character) < 32 for character in self.source_scan_id)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in (
+                    self.completed_at_ms,
+                    self.pose_x_mm,
+                    self.pose_y_mm,
+                    self.pose_heading_mdeg,
+                    self.actual_relative_bearing_mdeg,
+                    self.based_on_map_version,
+                )
+            )
+            or self.completed_at_ms < 0
+            or not -180_000 <= self.pose_heading_mdeg <= 179_999
+            or not -100_000
+            <= self.actual_relative_bearing_mdeg
+            <= 100_000
+            or self.based_on_map_version < 0
+            or self.provenance != ANGULAR_COLLISION_SUPPORT_PROVENANCE
+        ):
+            raise ValueError("angular collision support is invalid")
+
+    @property
+    def spatial_key(self) -> Tuple[int, int, int, int]:
+        """Exact collision geometry, excluding freshness and identifiers."""
+
+        return (
+            self.pose_x_mm,
+            self.pose_y_mm,
+            self.pose_heading_mdeg,
+            self.actual_relative_bearing_mdeg,
+        )
+
+    @classmethod
+    def from_attempt(
+        cls,
+        attempt: "ScanAttemptEvidence",
+    ) -> Tuple["AngularCollisionSupport", ...]:
+        if not isinstance(attempt, ScanAttemptEvidence):
+            raise ValueError("scan attempt support source is invalid")
+        if (
+            attempt.scan_pose is None
+            or attempt.based_on_map_version is None
+            or attempt.hypothesis_relation
+            != "SUPPORTS_BLOCKED_HYPOTHESIS"
+        ):
+            return ()
+        pose = attempt.scan_pose
+        return tuple(
+            cls(
+                source_scan_id=attempt.scan_id,
+                completed_at_ms=attempt.completed_at_ms,
+                pose_x_mm=pose.x_mm,
+                pose_y_mm=pose.y_mm,
+                pose_heading_mdeg=pose.heading_mdeg,
+                actual_relative_bearing_mdeg=(
+                    ray.actual_relative_bearing_mdeg
+                ),
+                based_on_map_version=attempt.based_on_map_version,
+            )
+            for ray in attempt.rays
+            if ray.blocked
+        )
+
+    def to_dict(self) -> Mapping[str, object]:
+        return {
+            "source_scan_id": self.source_scan_id,
+            "completed_at_ms": self.completed_at_ms,
+            "pose_x_mm": self.pose_x_mm,
+            "pose_y_mm": self.pose_y_mm,
+            "pose_heading_mdeg": self.pose_heading_mdeg,
+            "actual_relative_bearing_mdeg": (
+                self.actual_relative_bearing_mdeg
+            ),
+            "based_on_map_version": self.based_on_map_version,
+            "provenance": self.provenance,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]):
+        fields = {
+            "source_scan_id",
+            "completed_at_ms",
+            "pose_x_mm",
+            "pose_y_mm",
+            "pose_heading_mdeg",
+            "actual_relative_bearing_mdeg",
+            "based_on_map_version",
+            "provenance",
+        }
+        if not isinstance(value, dict) or set(value) != fields:
+            raise ValueError("angular collision support fields are invalid")
+        return cls(**value)
+
+
+@dataclass(frozen=True)
 class ScanAttemptEvidence:
     """Structured evidence retained after planner feedback moves on."""
 
@@ -102,6 +227,8 @@ class ScanAttemptEvidence:
         if (
             not isinstance(self.scan_id, str)
             or not self.scan_id
+            or len(self.scan_id) > 128
+            or any(ord(character) < 32 for character in self.scan_id)
             or isinstance(self.completed_at_ms, bool)
             or not isinstance(self.completed_at_ms, int)
             or self.completed_at_ms < 0
@@ -251,14 +378,43 @@ class ScanAttemptEvidence:
         )
 
     @property
-    def evidence_signature(self) -> Tuple[str, str, str, str]:
-        """Classify information content without using language or IDs."""
+    def evidence_signature(self) -> Tuple[object, ...]:
+        """Return exact decision-relevant spatial facts for retention.
 
+        IDs, timestamps, map revisions, free-form reasons, and raw reflection
+        jitter do not make a retry informative.  Verified pose state, actual
+        bearings, blocked/clear classification, boundaries, and the derived
+        hypothesis relation do.  Full ``PhysicalPose`` state is intentional:
+        route evidence from a move-away-and-return trajectory must not silently
+        become interchangeable with evidence from the earlier pose epoch.
+        """
+
+        pose = (
+            None
+            if self.scan_pose is None
+            else (
+                self.scan_pose.x_mm,
+                self.scan_pose.y_mm,
+                self.scan_pose.heading_mdeg,
+                self.scan_pose.verified_motion_count,
+                self.scan_pose.total_forward_mm,
+                self.scan_pose.total_turn_mdeg,
+            )
+        )
+        ray_facts = tuple(sorted(
+            (
+                ray.actual_relative_bearing_mdeg,
+                ray.blocked,
+            )
+            for ray in self.rays
+        ))
         return (
-            self.observation_pattern,
-            self.arc_coverage,
-            self.boundary_coverage,
+            pose,
+            ray_facts,
+            self.left_boundary_mdeg,
+            self.right_boundary_mdeg,
             self.hypothesis_relation,
+            self.status,
         )
 
     def to_dict(self) -> Mapping[str, object]:
@@ -376,11 +532,78 @@ def retain_scan_attempt_diversity(
     ))
 
 
+def collision_supports_from_attempts(
+    attempts: Tuple[ScanAttemptEvidence, ...],
+) -> Tuple[AngularCollisionSupport, ...]:
+    """Materialize every derivable blocked angular fact from legacy detail."""
+
+    if (
+        not isinstance(attempts, tuple)
+        or any(not isinstance(item, ScanAttemptEvidence) for item in attempts)
+    ):
+        raise ValueError("scan attempt support history is invalid")
+    values = tuple(
+        support
+        for attempt in attempts
+        for support in AngularCollisionSupport.from_attempt(attempt)
+    )
+    return retain_collision_support_diversity(
+        values,
+        MAX_COLLISION_SUPPORTS_PER_HAZARD,
+    )
+
+
+def retain_collision_support_diversity(
+    supports: Tuple[AngularCollisionSupport, ...],
+    limit: int = MAX_COLLISION_SUPPORTS_PER_HAZARD,
+) -> Tuple[AngularCollisionSupport, ...]:
+    """Keep the newest provenance for each exact angular support geometry."""
+
+    if (
+        not isinstance(supports, tuple)
+        or any(
+            not isinstance(item, AngularCollisionSupport)
+            for item in supports
+        )
+        or isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or limit <= 0
+    ):
+        raise ValueError("angular collision support retention is invalid")
+    latest_by_spatial_key = {}
+    for support in supports:
+        current = latest_by_spatial_key.get(support.spatial_key)
+        if current is None or (
+            support.completed_at_ms,
+            support.source_scan_id,
+            support.based_on_map_version,
+        ) > (
+            current.completed_at_ms,
+            current.source_scan_id,
+            current.based_on_map_version,
+        ):
+            latest_by_spatial_key[support.spatial_key] = support
+    return tuple(sorted(
+        latest_by_spatial_key.values(),
+        key=lambda item: (
+            item.completed_at_ms,
+            item.source_scan_id,
+            item.spatial_key,
+        ),
+    )[-limit:])
+
+
 __all__ = (
+    "ANGULAR_COLLISION_SUPPORT_PROVENANCE",
+    "AngularCollisionSupport",
     "BODY_RELATIVE_BEARING_CONVENTION",
+    "MAX_COLLISION_SUPPORTS_PER_HAZARD",
+    "MAX_COLLISION_SUPPORTS_PER_MAP",
     "MAX_SCAN_ATTEMPTS_PER_HAZARD",
     "MAX_SCAN_ATTEMPTS_PER_MAP",
     "ScanAttemptEvidence",
     "ScanRayEvidence",
+    "collision_supports_from_attempts",
+    "retain_collision_support_diversity",
     "retain_scan_attempt_diversity",
 )

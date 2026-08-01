@@ -8,6 +8,7 @@
   );
   const SVG_WIDTH = 1000;
   const SVG_HEIGHT = 620;
+  const MAX_RENDERED_QUALITATIVE_OBSERVATIONS = 100;
 
   function create(options = {}) {
     const documentApi = options.document;
@@ -756,7 +757,46 @@
         ],
         [
           t("map.details.scan_attempts"),
-          formatNumber(map.scanEvidenceHistory.length),
+          map.scanEvidenceHistoryEvicted > 0
+            ? t("map.details.scan_attempts_truncated", {
+              count: formatNumber(map.scanEvidenceHistory.length),
+              evicted: formatNumber(map.scanEvidenceHistoryEvicted),
+              total: formatNumber(
+                map.scanEvidenceHistory.length
+                + map.scanEvidenceHistoryEvicted,
+              ),
+            })
+            : formatNumber(map.scanEvidenceHistory.length),
+        ],
+        [
+          t("map.details.scan_memory_retention"),
+          map.scanAttemptRetention
+            ? t("map.details.scan_memory_retention_value", {
+              retained: formatNumber(
+                map.scanAttemptRetention.retainedCount,
+              ),
+              mapCapacity: formatNumber(
+                map.scanAttemptRetention.mapCapacity,
+              ),
+              perHazardCapacity: formatNumber(
+                map.scanAttemptRetention.perHazardCapacity,
+              ),
+              evicted: formatNumber(
+                map.scanAttemptRetention.evictedCount,
+              ),
+              reason: map.scanAttemptRetention.lastEvictionReason,
+            })
+            : t("common.missing"),
+        ],
+        [
+          t("map.details.hazard_retention"),
+          map.hazardRetention
+            ? t("map.details.hazard_retention_value", {
+              capacity: formatNumber(map.hazardRetention.capacity),
+              evicted: formatNumber(map.hazardRetention.evictedCount),
+              retained: formatNumber(map.hazardRetention.retainedCount),
+            })
+            : t("common.missing"),
         ],
         [
           t("map.details.path_points"),
@@ -888,10 +928,25 @@
 
     function renderQualitativeObservations(map) {
       const observations = map.qualitativeObservations;
-      const list = byId("map-qualitative-list");
-      byId("map-qualitative-count").textContent = formatNumber(
-        observations.length,
+      const rendered = observations.slice(
+        -MAX_RENDERED_QUALITATIVE_OBSERVATIONS,
       );
+      const list = byId("map-qualitative-list");
+      const count = byId("map-qualitative-count");
+      const evicted = map.qualitativeObservationsEvicted;
+      const total = observations.length + evicted;
+      const retentionSummary = t("map.qualitative.retention", {
+        shown: formatNumber(rendered.length),
+        retained: formatNumber(observations.length),
+        evicted: formatNumber(evicted),
+        total: formatNumber(total),
+      });
+      count.textContent = (
+        rendered.length < observations.length || evicted > 0
+      )
+        ? retentionSummary
+        : formatNumber(observations.length);
+      count.title = retentionSummary;
       if (observations.length === 0) {
         list.replaceChildren(createElement(
           "p",
@@ -900,7 +955,7 @@
         ));
         return;
       }
-      list.replaceChildren(...observations.map((observation) => {
+      list.replaceChildren(...rendered.map((observation) => {
         const item = createElement(
           "article",
           "map-qualitative-item",
@@ -1193,5 +1248,8 @@
     return Object.freeze({ render });
   }
 
-  global.RobotSpatialMapPresenter = Object.freeze({ create });
+  global.RobotSpatialMapPresenter = Object.freeze({
+    MAX_RENDERED_QUALITATIVE_OBSERVATIONS,
+    create,
+  });
 })(typeof window === "undefined" ? globalThis : window);

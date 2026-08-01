@@ -6,6 +6,11 @@ python_command="${ROBOT_LLM_PYTHON-python3}"
 stt_url="${ROBOT_LLM_STT_URL-http://127.0.0.1:8178/v1}"
 stt_inference_path="${ROBOT_LLM_STT_INFERENCE_PATH-/audio/transcriptions}"
 stt_model_id="${ROBOT_LLM_STT_MODEL_ID-ggml-large-v3-turbo-q5_0}"
+console_access_key_file="${ROBOT_LLM_CONSOLE_ACCESS_KEY_FILE-~/.robot-llm/dashboard-access-key}"
+
+set -- \
+    --console-access-key-file "$console_access_key_file" \
+    "$@"
 
 if [ -n "$stt_url" ]; then
     set -- \

@@ -180,6 +180,7 @@ class ProvisionalHazardFootprintTests(unittest.TestCase):
                     **{
                         **distant_primary.__dict__,
                         "scan_evidence_history": (),
+                        "collision_supports": (),
                     }
                 ),
             ),
@@ -206,6 +207,27 @@ class ProvisionalHazardFootprintTests(unittest.TestCase):
         context = with_scan.context()["navigation_hazard_hypotheses"][0]
         self.assertEqual(context["collision_support_count"], 2)
         self.assertTrue(context["active_for_collision"])
+
+        detail_pruned = ProvisionalHazardMap(
+            frame_id="test-frame",
+            map_generation_id="test-generation",
+            calibration=calibration,
+            hazards=(
+                ProvisionalHazard(
+                    **{
+                        **distant_primary.__dict__,
+                        "scan_evidence_history": (),
+                    }
+                ),
+            ),
+        )
+        retained = detail_pruned.validate_swept_path(
+            self.pose,
+            ADVANCE,
+            EXPECTED_ACTION_SPECS,
+        )
+        self.assertFalse(retained["allowed"])
+        self.assertEqual(retained["hazard_ids"], ["wide-box"])
 
     def test_scan_rotation_detects_arm_sweep_but_circle_adds_no_sweep(self):
         asymmetric = hazard_map(

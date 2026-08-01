@@ -75,6 +75,8 @@ class StartLabConsoleScriptTests(unittest.TestCase):
                 "/audio/transcriptions",
                 "--stt-model-id",
                 "ggml-large-v3-turbo-q5_0",
+                "--console-access-key-file",
+                "~/.robot-llm/dashboard-access-key",
                 "--simulation-map-demo",
             ],
         )
@@ -101,6 +103,8 @@ class StartLabConsoleScriptTests(unittest.TestCase):
                 "/audio/transcribe",
                 "--stt-model-id",
                 "alternate-model",
+                "--console-access-key-file",
+                "~/.robot-llm/dashboard-access-key",
                 "--port",
                 "8877",
             ],
@@ -118,8 +122,28 @@ class StartLabConsoleScriptTests(unittest.TestCase):
             [
                 "-m",
                 "robot_agent.dashboard_cli",
+                "--console-access-key-file",
+                "~/.robot-llm/dashboard-access-key",
                 "--stt-model",
                 "models/ggml-large-v3-turbo-q5_0.bin",
+            ],
+        )
+
+    def test_console_access_key_path_is_portably_overridable(self):
+        _python_path, arguments = self._captured_launch(
+            {
+                "ROBOT_LLM_STT_URL": "",
+                "ROBOT_LLM_CONSOLE_ACCESS_KEY_FILE": "/tmp/test-console-key",
+            },
+        )
+
+        self.assertEqual(
+            arguments,
+            [
+                "-m",
+                "robot_agent.dashboard_cli",
+                "--console-access-key-file",
+                "/tmp/test-console-key",
             ],
         )
 

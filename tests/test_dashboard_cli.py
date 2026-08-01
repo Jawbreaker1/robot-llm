@@ -1,5 +1,6 @@
 import io
 import json
+from pathlib import Path
 import socket
 import threading
 import unittest
@@ -242,7 +243,7 @@ class DashboardCLITests(unittest.TestCase):
         control_service = mock.Mock()
         http_server = mock.Mock()
         router = mock.Mock()
-        router.session_path = "/session/token/"
+        router.session_path = "/live/token/"
 
         with (
             mock.patch(
@@ -278,6 +279,48 @@ class DashboardCLITests(unittest.TestCase):
         control_service.shutdown.assert_called_once_with()
         self.assertTrue(
             json.loads(stdout.getvalue())["physical_control_enabled"]
+        )
+
+    def test_run_reuses_configured_live_console_access_key(self):
+        adapter = mock.Mock()
+        dashboard_service = mock.Mock()
+        control_service = mock.Mock()
+        http_server = mock.Mock()
+        router = mock.Mock(session_path="/live/stable-key/")
+
+        with (
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+                return_value=dashboard_service,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.RobotControlService",
+                return_value=control_service,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.load_or_create_dashboard_access_key",
+                return_value="a" * 64,
+            ) as key_loader,
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+                return_value=(http_server, router),
+            ) as server_factory,
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            result = _run(
+                ["--console-access-key-file", "~/.robot-llm/test-key"],
+                robot_runtime_adapter=adapter,
+            )
+
+        self.assertEqual(result, 0)
+        key_loader.assert_called_once_with(
+            Path("~/.robot-llm/test-key"),
+        )
+        server_factory.assert_called_once_with(
+            dashboard_service,
+            8765,
+            robot_control_service=control_service,
+            session_token="a" * 64,
         )
 
     def test_speech_source_is_explicit_and_mutually_exclusive(self):
@@ -337,7 +380,7 @@ class DashboardCLITests(unittest.TestCase):
         service = mock.Mock()
         http_server = mock.Mock()
         router = mock.Mock()
-        router.session_path = "/session/token/"
+        router.session_path = "/live/token/"
         events = []
         transcriber.probe.side_effect = lambda: events.append("probe")
 
@@ -444,7 +487,7 @@ class DashboardCLITests(unittest.TestCase):
         service = mock.Mock()
         http_server = mock.Mock()
         router = mock.Mock()
-        router.session_path = "/session/token/"
+        router.session_path = "/live/token/"
 
         with (
             mock.patch(
@@ -517,7 +560,7 @@ class DashboardCLITests(unittest.TestCase):
         service = mock.Mock()
         http_server = mock.Mock()
         router = mock.Mock()
-        router.session_path = "/session/token/"
+        router.session_path = "/live/token/"
 
         with (
             mock.patch(
@@ -565,7 +608,7 @@ class DashboardCLITests(unittest.TestCase):
         service.shutdown.side_effect = RuntimeError("shutdown failed")
         http_server = mock.Mock()
         router = mock.Mock()
-        router.session_path = "/session/token/"
+        router.session_path = "/live/token/"
 
         with (
             mock.patch(

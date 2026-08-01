@@ -1,3 +1,4 @@
+import json
 import itertools
 import threading
 import time
@@ -6,6 +7,7 @@ import unittest
 from robot_agent.lm_studio import DEFAULT_MODEL
 from robot_agent.robot_control_contract import (
     DISABLED,
+    EVENT_PAGE_SCHEMA,
     FAULTED,
     IDLE,
     RUNNING,
@@ -14,6 +16,12 @@ from robot_agent.robot_control_contract import (
     RobotControlSettings,
 )
 from robot_agent.robot_control_service import (
+    MAX_EVENT_HISTORY_BYTES,
+    MAX_EVENTS,
+    MAX_ROBOT_PAGE_RESPONSE_BYTES,
+    MAX_REQUEST_HISTORY,
+    MAX_SNAPSHOT_HISTORY_BYTES,
+    MAX_SNAPSHOTS,
     RobotEpisodeOutcome,
     RobotControlService,
     RobotControlServiceError,
@@ -42,6 +50,10 @@ class FakeRuntimeAdapter:
                     "obstacle": {"target_id": "obstacle-1"},
                     "scan": {"state": "pending"},
                     "model_latency_ms": 42,
+                    "planner_context_bytes": 88_000,
+                    "prompt_tokens": 21_000,
+                    "completion_tokens": 120,
+                    "total_tokens": 21_120,
                     "speech_status": "generating",
                 }
             )
@@ -67,6 +79,68 @@ class FakeRuntimeAdapter:
     def emergency_stop(self):
         self.emergency_calls += 1
         self.release.set()
+
+
+class RobotControlRetentionTests(unittest.TestCase):
+    def test_default_observation_histories_are_generous_and_bounded(self):
+        self.assertEqual(MAX_EVENTS, 4_096)
+        self.assertEqual(MAX_SNAPSHOTS, 4_096)
+        self.assertEqual(MAX_REQUEST_HISTORY, 1_024)
+        self.assertEqual(MAX_EVENT_HISTORY_BYTES, 8 * 1024 * 1024)
+        self.assertEqual(MAX_SNAPSHOT_HISTORY_BYTES, 32 * 1024 * 1024)
+
+    def test_observation_histories_are_also_bounded_by_encoded_bytes(self):
+        byte_capacity = 128 * 1024
+        service = RobotControlService(
+            FakeRuntimeAdapter(),
+            event_byte_capacity=byte_capacity,
+            snapshot_byte_capacity=byte_capacity,
+        )
+        try:
+            for revision in range(1, 1_001):
+                service.update_settings(
+                    revision,
+                    {"speech_enabled": revision % 2 == 0},
+                )
+            events = service.events(0, 500)
+            snapshots = service.snapshots(0, 500)
+        finally:
+            service.shutdown()
+
+        for page in (events, snapshots):
+            self.assertEqual(page["byte_capacity"], byte_capacity)
+            self.assertLessEqual(page["retained_bytes"], byte_capacity)
+            self.assertGreater(page["dropped_total"], 0)
+            self.assertTrue(page["gap"])
+
+    def test_page_item_limit_is_secondary_to_exact_http_byte_limit(self):
+        values = tuple(
+            {"sequence": sequence, "payload": "å" * 600_000}
+            for sequence in range(1, 11)
+        )
+        page = RobotControlService._page(
+            values,
+            0,
+            10,
+            0,
+            EVENT_PAGE_SCHEMA,
+            dict,
+            "events",
+            sum(len(item["payload"].encode("utf-8")) for item in values),
+            32 * 1024 * 1024,
+        )
+        encoded = json.dumps(
+            page,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+        self.assertLessEqual(len(encoded), MAX_ROBOT_PAGE_RESPONSE_BYTES)
+        self.assertTrue(page["byte_limited"])
+        self.assertGreater(len(page["events"]), 0)
+        self.assertLess(page["next_after_sequence"], page["newest_sequence"])
 
 
 class BlockingEmergencyAdapter(FakeRuntimeAdapter):
@@ -217,6 +291,23 @@ class RobotControlServiceTests(unittest.TestCase):
             ["advance", "scan"],
         )
         self.assertEqual(running["runtime"]["model_latency_ms"], 42)
+        self.assertEqual(
+            running["runtime"]["planner_context_bytes"],
+            88_000,
+        )
+        self.assertEqual(running["runtime"]["prompt_tokens"], 21_000)
+        self.assertEqual(running["runtime"]["completion_tokens"], 120)
+        self.assertEqual(running["runtime"]["total_tokens"], 21_120)
+        telemetry_event = next(
+            item
+            for item in service.events(0, 100)["events"]
+            if item["event_type"] == "robot.runtime_update"
+            and "planner_context_bytes" in item["data"]["changed_fields"]
+        )
+        self.assertEqual(
+            telemetry_event["data"]["planner_context_bytes"],
+            88_000,
+        )
         self.assertEqual(
             adapter.contexts[0].settings.revision,
             1,

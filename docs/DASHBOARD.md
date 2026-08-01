@@ -1,9 +1,10 @@
 # Lokal Mac-dashboard
 
-Dashboarden är en rörelsefri arbetsbänk för Robot LLM Lab. Den fungerar utan
-EV3-batterier och samlar lokal textdialog och en lokal röstinmatningspipeline,
-read-only research, tekniska händelser, agentbudgetar och ett beskrivande
-register över nuvarande och framtida robotkomponenter.
+Dashboarden är Robot LLM Labs lokala kontroll- och observationsyta. Den fungerar
+även utan EV3-batterier och samlar lokal textdialog och röstinmatning, read-only
+research, tekniska händelser, agentbudgetar och ett beskrivande register över
+nuvarande och framtida robotkomponenter. Fysisk styrning är helt avstängd om
+processen inte uttryckligen startats med en robotadapter.
 
 ## Starta
 
@@ -11,20 +12,42 @@ LM Studio är valfritt för att öppna gränssnittet, men krävs för att få sv
 från Gemma.
 
 ```sh
-PYTHONPATH=src python3 -m robot_agent.dashboard_cli
+scripts/start_lab_console.sh
 ```
 
-Öppna sedan den sessionsunika adress som skrivs ut, i formen
-`http://127.0.0.1:8765/session/<session-token>/`. Länken är en lokal
-bearer-hemlighet: dela den inte. En omstart myntar en ny länk och gör den
-gamla ogiltig.
+Öppna sedan den privata liveadress som skrivs ut, i formen
+`http://127.0.0.1:8765/live/<access-key>/`. Åtkomstnyckeln i länken är en
+lokal bearer-hemlighet: dela den inte. Startprofilen lagrar en
+slumpad 256-bitars nyckel i en owner-only-fil, så samma bookmark fortsätter
+peka på den aktuella konsolen efter en omstart. Äldre
+`/session/<key>/`-länkar omdirigeras till den kanoniska liveadressen.
 
 Servern binder alltid till den numeriska loopback-adressen `127.0.0.1`.
 Porten kan ändras:
 
 ```sh
-PYTHONPATH=src python3 -m robot_agent.dashboard_cli --port 8877
+scripts/start_lab_console.sh --port 8877
 ```
+
+## Fem skilda saker – ingen sessionslista
+
+- **Livekonsolens åtkomstnyckel** låser upp den enda aktuella lokala
+  konsolen. Den identifierar inte ett sparat körläge och är inget man
+  "återupptar".
+- **Workbench-konversationen** är dialogkontext för Gemma. En ny konversation
+  påverkar inte robotens fysiska läge eller världsminne.
+- **Den fysiska episoden** är ett målriktat robotförsök från start till
+  terminalt tillstånd. Gränssnittet visar den pågående episoden, annars den
+  senast avslutade tydligt märkt som historisk.
+- **Experimenthistoriken** är read-only evidens från dokumenterade körningar.
+  Den kan granskas men är inte en gammal fysisk robotinstans som kan startas
+  igen.
+- **Världs-/kartminnet** är separat host-lokal navigationsdata. EV3-profilen
+  kan återanvända samma minnesfil över episoder och processomstarter, välja en
+  annan med `--robot-memory-path` eller tömma den explicit en gång med
+  `--robot-reset-memory`. Dashboardens heta events, snapshots och pose trail
+  är däremot processlokala. Någon GUI-toggle för kartpersistens finns ännu
+  inte.
 
 För att först köra den riktiga 2D-simulatornavigationen och därefter visa dess
 ackumulerade karta i dashboarden:
@@ -202,7 +225,7 @@ blockera dialog, navigation eller den deterministiska säkerhetsloopen.
   loggas inte.
 - **Experiment** reserverar en read-only yta för reproducerbara episoder och
   befintliga experimentartefakter.
-- **Inställningar** ändrar sessionsbundna agentbudgetar och browserlokala
+- **Inställningar** ändrar processbundna agentbudgetar och browserlokala
   mikrofonval. Agentinställningarna versionskontrolleras och återställs när
   servern startas om; mikrofoninställningarna lämnar aldrig browsern.
 
@@ -262,8 +285,11 @@ Den fysiska projektionen visar nu även två nya, strikt faktabaserade lager:
   eller objektyta.
 
 Scanprojektionen använder den persistenta, diversity-bevarande historiken
-från fysisk navigation memory, högst fyra försök per hinder och åtta i
-kartan. Den är alltså inte en animation som browsern själv härleder. Samma
+från fysisk navigation memory, högst 16 försök per hinder och 64 i kartan.
+Det auktoritativa minnet räknar dessutom kumulativt varje äldre scanpost som
+har lämnat detaljhistoriken, med typad senaste orsak; räknaren överlever både
+save/load och att en hel hinderhypotes lämnar kartan. Projektionen är alltså
+inte en animation som browsern själv härleder. Samma
 positiv-vänster/negativ-höger-konvention används av runtime, kontrakt och UI.
 En äldre scan ritas vid sin historiska pose; den flyttas inte till robotens
 nuvarande kropp.
@@ -297,17 +323,38 @@ Event- och snapshotsekvenserna är oberoende. Browsern behåller därför en ege
 cursor per flöde, deduplicerar på typ och sekvens och använder timestamp endast
 för sammanvävning. En snapshot där bara modellatensen ändrats skapar ingen ny
 användarhändelse. `robot.runtime_update` visas inte en andra gång när den rikare
-snapshoten redan beskriver samma förändring. En synlig gapmarkör talar om när
-äldre poster lämnat den begränsade historiken. Panelen visar de 80 senaste
-relevanta tidslinjeposterna och markerar uttryckligen när en längre lokal
-tidslinje har kapats; frekventa duplicerade runtime-event tar inte plats från
-dessa poster.
+snapshoten redan beskriver samma förändring. Hostens separata event- och
+snapshotringar behåller vardera högst 4 096 poster. Browsern behåller de
+senaste 1 000 från vartdera flödet och renderar högst 500 relevanta
+tidslinjeposter. Ringarna har dessutom hårda bytebudgetar på 8 MiB för event
+och 32 MiB för snapshots, och varje historiesida har en exakt gräns på 4 MiB.
+Vid en backlog hämtar browsern högst fyra sidor per omgång och fortsätter
+omedelbart i nästa omgång; statusen visar `hämtar ikapp` tills båda cursorerna
+nått respektive senaste sekvens. En synlig gapmarkör talar om när backend eller
+browser har
+släppt äldre poster, eller när den längre lokala tidslinjen har kapats;
+frekventa duplicerade runtime-event tar inte plats från dessa poster. All
+denna historik är processlokal observabilitet, inte robotens beständiga
+navigationsminne eller rå plannerkontext.
 
-Kartan ritar dessutom `pose_history`, högst 256 lokala odometriposer i ordning.
+Kartan ritar dessutom `pose_history`, högst 2 048 lokala odometriposer i ordning.
 Oförändrad position och riktning dedupliceras exakt, medan rotation på plats
 behålls. Äldre punkter räknas när taket nås och historiken nollställs vid ny
 världsmodell eller koordinatram. Spåret är en uppskattning från encoderodometri,
 inte fysisk ground truth, och det överlever ännu inte en processomstart.
+
+Den fysiska dashboardprojektionen behåller också högst 1 024 kvalitativa
+IR-observationer och 64 posebundna scanposter. Endast de 100 senaste
+kvalitativa observationerna materialiseras som DOM-kort. Panelen visar antal
+renderade, bevarade och borttagna poster; även scanposter som lämnar den heta
+processprojektionen räknas. Separat kartmetadata visar det auktoritativa
+hazard- och scanminnets bevarade antal, kapacitet, kumulativa eviction-antal
+och senaste typade scanorsak. Hela
+det slutliga HTTP-svaret från kart-endpointen har en
+hård gräns på 4 MiB. Dessa generösa men ändliga tak gör att ett längre experiment
+kan inspekteras utan att gamla fakta försvinner efter bara ett fåtal steg,
+samtidigt som pose-eviction och tidslinjegap fortfarande är räknade eller
+synliga.
 
 Detta är ännu inte SLAM, global lokalisering, A*, frontier exploration eller
 ett navigationsfacit. Fysisk navigation använder sitt auktoritativa hazard
@@ -317,23 +364,24 @@ publicera explicita koordinatramar och kalibrerade transformeringar;
 observationer från olika ramar får inte slås ihop bara för att de tillhör samma
 logiska robot.
 
-## Säkerhetsgräns
+## Kontroll- och säkerhetsgräns
 
-Dashboardservern har ingen route för:
+Dashboarden kan starta och stoppa ett mål endast när processen uttryckligen
+har fått en fysisk runtime-adapter, exempelvis via EV3-startprofilen. HTTP-lagret
+skriver aldrig direkt till motorer, SSH eller TTS: det lämnar ett typat mål
+eller stoppkrav till robotkontrolltjänsten, som i sin tur använder den enda
+serialiserade physical runtime som får äga motortransporten. Utan en injicerad
+adapter är kontrollplanet `DISABLED` och muterande robotanrop nekas.
 
-- motorer eller stoppkommandon
-- RobotAPI eller MotionSupervisor
-- SSH
-- TTS
-- uppladdning av events eller robotstatus
-
-Att ett nodkort någon gång visar `online` kommer därför inte att innebära
-att noden kan styras från dashboarden.
+Kartan, komponentregistret och tekniska historikvyer är read-only projektioner.
+Att ett nodkort visar `online` ger därför inte nodkortet egen motorauktoritet,
+och kartan kan aldrig skriva tillbaka ett rörelsebeslut.
 
 Webbgränsen använder dessutom:
 
-- en slumpad 256-bitars sessionstoken per serverstart
-- tokeniserad bootstrap-/asset-sökväg och tokenkrav på samtliga API-anrop,
+- en slumpad 256-bitars åtkomstnyckel i en owner-only-fil för den normala
+  startprofilen
+- en tokeniserad `/live/<access-key>/`-sökväg och samma nyckelkrav på samtliga API-anrop,
   även läsningar
 - exakt `Host`- och `Origin`-kontroll
 - strikt JSON utan dubblettnycklar eller icke-finita tal

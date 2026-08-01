@@ -24,10 +24,25 @@ from .physical_navigation_contract import (
     json_bytes,
     strict_json_loads,
 )
+from .physical_navigation_planner_context import (
+    PhysicalPlannerContextError,
+    project_navigation_context,
+)
 
 
 MAX_MODEL_RESPONSE_BYTES = 64 * 1024
+TARGET_PLANNER_CONTEXT_BYTES = 56 * 1024
 MAX_PLANNER_CONTEXT_BYTES = 64 * 1024
+PLANNER_CONTEXT_WINDOW_TOKENS = 32_768
+PLANNER_MAX_OUTPUT_TOKENS = 520
+PLANNER_CONTEXT_HEADROOM_TOKENS = 1_024
+PLANNER_TOKEN_ESTIMATE_FIXED_OVERHEAD = 512
+PLANNER_REQUEST_WRAPPER_RESERVE_BYTES = 2_048
+# Gemma JSON is denser in practice.  Eleven bytes per four tokens is used only
+# as a deliberately conservative deterministic admission bound; the runtime
+# does not depend on any model tokenizer package.
+PLANNER_ESTIMATE_BYTES_NUMERATOR = 11
+PLANNER_ESTIMATE_TOKENS_DENOMINATOR = 4
 OPENAI_V1_CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 LM_STUDIO_V0_CHAT_COMPLETIONS_PATH = "/api/v0/chat/completions"
 CHAT_COMPLETIONS_PATHS = frozenset(
@@ -162,6 +177,40 @@ class NavigationPlannerResult:
     served_model: Optional[str]
     usage: Optional[Mapping[str, object]]
     stats: Optional[Mapping[str, object]] = None
+    context_byte_count: int = 0
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    estimated_prompt_tokens: int = 0
+    prompt_token_budget: int = 0
+    accounted_prompt_bytes: int = 0
+    context_target_byte_count: int = 0
+    context_hard_byte_count: int = 0
+
+
+def _usage_token_count(usage, field: str) -> Optional[int]:
+    if not isinstance(usage, Mapping):
+        return None
+    value = usage.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _conservative_prompt_token_estimate(accounted_bytes: int) -> int:
+    if (
+        isinstance(accounted_bytes, bool)
+        or not isinstance(accounted_bytes, int)
+        or accounted_bytes < 0
+    ):
+        raise LMStudioNavigationError("Planner prompt size is invalid")
+    numerator = (
+        accounted_bytes * PLANNER_ESTIMATE_TOKENS_DENOMINATOR
+    )
+    estimated = (
+        numerator + PLANNER_ESTIMATE_BYTES_NUMERATOR - 1
+    ) // PLANNER_ESTIMATE_BYTES_NUMERATOR
+    return estimated + PLANNER_TOKEN_ESTIMATE_FIXED_OVERHEAD
 
 
 def _empty_maneuver_schema() -> Mapping[str, object]:
@@ -369,10 +418,18 @@ robot footprint is removed from available_actions before you plan; choose
 among the remaining semantic actions rather than retrying an unavailable one.
 
 navigation.experience_ledger is bounded factual episode history, not an action
-ranking. Use attempt_relation to distinguish an exact action retry on an
-unchanged physical evidence basis from the same action after verified pose,
-sensor, hazard, or scan-evidence change. Do not repeat an unchanged attempt
-unless another published fact provides a concrete new reason.
+ranking. Use attempt_identity and attempt_relation to distinguish an exact
+typed retry on an unchanged physical evidence basis from the same action after
+verified pose, sensor, hazard, or scan-evidence change. Scans of different
+target_hypothesis_id values are different attempts. Do not repeat an unchanged
+attempt unless another published fact provides a concrete new reason.
+current_basis_action_rollups retain typed counts and latest outcomes after
+detailed entries age out; explicit bucket/attempt omission counters disclose
+any bounded distribution detail. navigation.planner_context_projection reports
+exact detail retention and omission counts. Compact current-pose route scan
+records preserve IDs, pose, boundaries, relation, and aggregate ray facts;
+compact scan_evidence_summary values are facts, not inferred object identity or
+host action recommendations.
 
 Infrared is qualitative reflection evidence: do not invent distance, object
 identity, or a measured surface. A remembered provisional hazard remains after
@@ -554,13 +611,45 @@ class LMStudioNavigationPlanner:
             target_ids=scan_target_ids,
             empty_maneuver_required=empty_maneuver_required,
         )
+        prompt_token_budget = (
+            PLANNER_CONTEXT_WINDOW_TOKENS
+            - PLANNER_MAX_OUTPUT_TOKENS
+            - PLANNER_CONTEXT_HEADROOM_TOKENS
+        )
+        fixed_accounted_bytes = (
+            len(SYSTEM_PROMPT.encode("utf-8"))
+            + len(json_bytes(schema))
+            + PLANNER_REQUEST_WRAPPER_RESERVE_BYTES
+        )
+        maximum_accounted_bytes = (
+            (
+                prompt_token_budget
+                - PLANNER_TOKEN_ESTIMATE_FIXED_OVERHEAD
+            )
+            * PLANNER_ESTIMATE_BYTES_NUMERATOR
+        ) // PLANNER_ESTIMATE_TOKENS_DENOMINATOR
+        token_safe_context_bytes = (
+            maximum_accounted_bytes - fixed_accounted_bytes
+        )
+        hard_context_bytes = min(
+            MAX_PLANNER_CONTEXT_BYTES,
+            token_safe_context_bytes,
+        )
+        target_context_bytes = min(
+            TARGET_PLANNER_CONTEXT_BYTES,
+            hard_context_bytes,
+        )
+        if target_context_bytes <= 0:
+            raise LMStudioNavigationError(
+                "Planner schema leaves no safe model context budget"
+            )
         context = {
             "episode_id": episode_id,
             "turn": turn,
             "episode_locale": locale,
             "observation": observation,
             "directional_mission": mission,
-            "navigation": navigation,
+            "navigation": {},
             "maneuver_commitment": maneuver_state,
             "available_actions": actions,
             "latest_tool_result": last_tool_result,
@@ -575,10 +664,48 @@ class LMStudioNavigationPlanner:
                 "recent_committed_utterances": recent_utterances,
             },
         }
-        context_bytes = json_bytes(context)
-        if len(context_bytes) > MAX_PLANNER_CONTEXT_BYTES:
+        empty_navigation_context_bytes = len(json_bytes(context))
+        target_navigation_bytes = (
+            target_context_bytes
+            - empty_navigation_context_bytes
+            + len(json_bytes({}))
+        )
+        hard_navigation_bytes = (
+            hard_context_bytes
+            - empty_navigation_context_bytes
+            + len(json_bytes({}))
+        )
+        if target_navigation_bytes <= 0:
             raise LMStudioNavigationError(
-                "Navigation planner context exceeded its byte limit"
+                "Planner turn facts leave no safe navigation budget"
+            )
+        try:
+            context["navigation"] = project_navigation_context(
+                navigation,
+                maneuver_state=maneuver_state,
+                last_tool_result=last_tool_result,
+                target_budget_bytes=target_navigation_bytes,
+                hard_budget_bytes=hard_navigation_bytes,
+            )
+        except PhysicalPlannerContextError as error:
+            raise LMStudioNavigationError(
+                "Navigation planner context projection failed: {}".format(
+                    error
+                )
+            ) from error
+        context_bytes = json_bytes(context)
+        accounted_prompt_bytes = (
+            len(context_bytes) + fixed_accounted_bytes
+        )
+        estimated_prompt_tokens = _conservative_prompt_token_estimate(
+            accounted_prompt_bytes
+        )
+        if (
+            len(context_bytes) > hard_context_bytes
+            or estimated_prompt_tokens > prompt_token_budget
+        ):
+            raise LMStudioNavigationError(
+                "Navigation planner context exceeded its 32k-safe limit"
             )
         payload = {
             "model": self.model,
@@ -599,7 +726,7 @@ class LMStudioNavigationPlanner:
             },
             "temperature": 0,
             "reasoning_effort": "none",
-            "max_tokens": 520,
+            "max_tokens": PLANNER_MAX_OUTPUT_TOKENS,
             "stream": False,
             "store": False,
         }
@@ -677,4 +804,16 @@ class LMStudioNavigationPlanner:
             served_model=served_model,
             usage=usage,
             stats=stats,
+            context_byte_count=len(context_bytes),
+            prompt_tokens=_usage_token_count(usage, "prompt_tokens"),
+            completion_tokens=_usage_token_count(
+                usage,
+                "completion_tokens",
+            ),
+            total_tokens=_usage_token_count(usage, "total_tokens"),
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            prompt_token_budget=prompt_token_budget,
+            accounted_prompt_bytes=accounted_prompt_bytes,
+            context_target_byte_count=target_context_bytes,
+            context_hard_byte_count=hard_context_bytes,
         )

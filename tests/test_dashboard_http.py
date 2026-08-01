@@ -7,6 +7,7 @@ import unittest
 
 from robot_agent.dashboard_http import (
     DashboardRouter,
+    MAX_SPATIAL_MAP_RESPONSE_BYTES,
     MAX_REQUEST_BYTES,
     STT_LANGUAGE_HEADER,
     STT_REQUEST_ID_HEADER,
@@ -361,9 +362,14 @@ class DashboardHTTPTests(unittest.TestCase):
         return json.loads(response.body.decode("utf-8"))
 
     def test_index_substitutes_token_and_sets_strict_headers(self):
+        self.assertEqual(
+            self.router.access_path,
+            "/live/{}/".format(TOKEN),
+        )
+        self.assertEqual(self.router.session_path, self.router.access_path)
         response = self.router.handle(
             "GET",
-            self.router.session_path,
+            self.router.access_path,
             self.headers(),
         )
 
@@ -383,6 +389,45 @@ class DashboardHTTPTests(unittest.TestCase):
         )
         self.assertEqual(headers["Cache-Control"], "no-store, max-age=0")
         self.assertEqual(headers["X-Frame-Options"], "DENY")
+
+    def test_legacy_session_urls_redirect_only_with_the_right_access_key(self):
+        legacy_index = self.router.handle(
+            "GET",
+            "/session/{}/".format(TOKEN),
+            self.headers(authenticated=False),
+        )
+        legacy_asset = self.router.handle(
+            "GET",
+            "/session/{}/assets/app.js".format(TOKEN),
+            self.headers(authenticated=False),
+        )
+        wrong_live_key = self.router.handle(
+            "GET",
+            "/live/{}/".format("b" * 64),
+            self.headers(authenticated=False),
+        )
+        wrong_legacy_key = self.router.handle(
+            "GET",
+            "/session/{}/".format("b" * 64),
+            self.headers(authenticated=False),
+        )
+
+        self.assertEqual(legacy_index.status, 308)
+        self.assertEqual(
+            dict(legacy_index.headers)["Location"],
+            self.router.access_path,
+        )
+        self.assertEqual(legacy_asset.status, 308)
+        self.assertEqual(
+            dict(legacy_asset.headers)["Location"],
+            self.router.access_path + "assets/app.js",
+        )
+        self.assertEqual(wrong_live_key.status, 403)
+        self.assertEqual(wrong_legacy_key.status, 403)
+        self.assertEqual(
+            self.decoded(wrong_live_key)["error"]["code"],
+            "session_token_rejected",
+        )
 
     def test_bootstrap_and_registry_are_read_only(self):
         bootstrap = self.router.handle(
@@ -456,6 +501,26 @@ class DashboardHTTPTests(unittest.TestCase):
         self.assertEqual(queried.status, 400)
         self.assertEqual(mutation.status, 404)
         self.assertEqual(self.service.calls, [("spatial_map",)])
+
+    def test_spatial_map_limit_applies_to_the_final_http_body(self):
+        self.service.spatial_map = lambda: {
+            "schema": "robot-spatial-map/v1",
+            "read_only": True,
+            "padding": "x" * MAX_SPATIAL_MAP_RESPONSE_BYTES,
+        }
+
+        response = self.router.handle(
+            "GET",
+            "/api/v1/map",
+            self.headers(),
+        )
+
+        self.assertEqual(response.status, 503)
+        self.assertLessEqual(len(response.body), MAX_SPATIAL_MAP_RESPONSE_BYTES)
+        self.assertEqual(
+            self.decoded(response)["error"]["code"],
+            "spatial_map_unavailable",
+        )
 
     def test_every_api_read_and_static_bootstrap_require_session(self):
         unauthenticated_api = self.router.handle(

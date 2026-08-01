@@ -2713,6 +2713,24 @@ class ScanObserveChangedThenScanPlanner(SingleScanPlanner):
 
 
 class PhysicalNavigationRuntimeTests(unittest.TestCase):
+    def test_adapter_carries_planner_context_and_token_telemetry(self):
+        update = PhysicalNavigationRuntimeAdapter._dashboard_update({
+            "event": "model_decision",
+            "model_latency_ms": 321,
+            "planner_context_bytes": 88_000,
+            "prompt_tokens": 21_000,
+            "completion_tokens": 120,
+            "total_tokens": 21_120,
+        })
+
+        self.assertEqual(update, {
+            "model_latency_ms": 321,
+            "planner_context_bytes": 88_000,
+            "prompt_tokens": 21_000,
+            "completion_tokens": 120,
+            "total_tokens": 21_120,
+        })
+
     def test_adapter_exposes_bridge_and_passes_only_its_offer_to_runtime(self):
         class Bridge:
             def offer(self, **_kwargs):

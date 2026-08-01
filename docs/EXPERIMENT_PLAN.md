@@ -731,7 +731,8 @@ Implementation:
 - fem responsiva ytor: Arbetsbänk, Kroppar, Händelser, Experiment och
   Inställningar,
 - loopback-only standardbiblioteksserver med slumpad 256-bitars
-  sessionstoken, tokeniserad bootstrap-/assetväg, autentiserade läs-API:n,
+  konsolens åtkomstnyckel, tokeniserad bootstrap-/assetväg, autentiserade
+  läs-API:n,
   strikt `Host`/`Origin`, CSP, begränsad HTTP-concurrency och exakt
   route-/assetlista,
 - bounded kö med en researchworker; HTTP-status och eventpollning blockeras
@@ -756,7 +757,7 @@ Liveprov 2026-07-27:
 5. researchfrågan om paraply i Stockholm gav `ANSWERED` efter två
    planner-varv, ett `weather.current`-anrop och ett citerat evidence-ID.
 
-Negativtest täcker bland annat DNS-rebinding-form, fel Origin/sessionstoken,
+Negativtest täcker bland annat DNS-rebinding-form, fel Origin/åtkomstnyckel,
 dubblettnycklar, `NaN`, okänd MIME, för stor body, traversal, queue-full,
 settings- och konversationsrace, idempotent retry, stale resultatidentitet,
 rå prompt/exception i eventloggen samt frånvaro av `/move`, `/stop`, `/ssh`
@@ -1209,7 +1210,8 @@ Implementation och acceptans:
 - relaydrop eller mapperfel ger synlig `degraded` status men kan inte stoppa
   eller auktorisera motion;
 - dashboarden får endast en read-only snapshot-provider och exponerar en
-  autentiserad `GET /api/v1/map` med strikt JSON- och 2 MiB-responsgräns;
+  autentiserad `GET /api/v1/map` med strikt JSON; den slutligt kodade
+  HTTP-kroppen, inklusive `map`-envelopen, har en exakt 4 MiB-responsgräns;
 - GUI:t visar fri/upptagen/osäker grid, robotpose, färska strålar,
   objekthypoteser, källa, provenance, ålder och simulator/provisional-status
   på svenska och engelska.
@@ -1265,19 +1267,37 @@ Implementerad slice:
 - Återställda scans sparar faktisk scanpose, kartbasis, requested/actual
   body-relative bearing, blocked/clear och unilateral/bilateral gränsevidens.
   Retention prioriterar olika evidenssignaturer framför duplicerade retries
-  inom gränsen fyra poster per hinder och åtta per karta.
+  inom gränsen 16 poster per hinder och 64 per karta.
+- Varje detaljpost som lämnar 16/64-retentionen räknas med typad orsak på
+  hinder och kumulativt på kartan. Kartnivån inkluderar även scanposter som
+  försvinner med en utkastad hinderhypotes och överlever save/load.
 - Blockerade historiska strålar ger konservativa angular supports med
-  provisorisk fast offset; de är inte metriska objektkonturer. En full
-  bilateral all-clear contestar hypotesen utan att radera historiken.
+  provisorisk fast offset; de är inte metriska objektkonturer. Indexet behåller
+  högst 512 supportfakta per hinder och 4 096 per karta, oberoende av att äldre
+  scannars detaljprojektion roterar. En full bilateral all-clear contestar
+  hypotesen utan att radera historiken, och senare typad blocked-evidens kan
+  återaktivera kollisionshypotesen.
+- Hinderkartan behåller högst 64 hypoteser och navigation-memory-filen högst
+  2 MiB. Kapacitetsbortfall räknas och publiceras med typad orsak i både
+  planner- och dashboardkontext; det får inte ske som en osynlig FIFO-förlust.
+- Persistensformat `v2` läser den tidigare fysiska `v1`-artefakten och migrerar
+  den i minnet. Nästa save skriver `v2`; en kodrollback till en läsare som bara
+  kan `v1` kräver backup av den äldre filen eller en uttrycklig minnesreset.
 - En ruttcommitment kräver kompletterande positiv och negativ gräns från exakt
   robotens aktuella verifierade scanpose. Evidens från en äldre pose får stanna
   i kollisionsminnet men får inte återanvändas som aktuell vänster/höger-gräns.
 - Ett episodlokalt `NavigationExperienceLedger` behåller strukturerade
-  försök/resultat, högst `8 KiB` publicerad detalj och ett LRU-index över
-  43 200 tidigare `(action, evidence basis)`-par. Gränsen motsvarar tre
+  försök/resultat, högst 64 detaljposter/`64 KiB` lokalt och ett LRU-index över
+  43 200 tidigare `(typed attempt, evidence basis)`-par. Gemmas separata
+  projektion behåller högst `24 KiB` detalj med exakta totalsummor, senaste
+  typade utfall, bortfallsräknare och digest. Indexgränsen motsvarar tre
   möjliga handlingar per tillåten runtime-turn under en hel episod. Det
   skiljer första försök,
   oförändrad repetition och retry efter en verifierad förändring i beslutsfakta.
+- Hela planner-användarkontexten har `56 KiB` mål och `64 KiB` hårt tak. En
+  konservativ 32k-admission räknar även systemprompt, dynamiskt output-schema,
+  wrapperreserv, headroom och 520 outputtokens. Maxfixturen med 64 hinder,
+  64 scans och full ledger mäts både med hostestimat och Gemma-4-tokenizer.
 - Evidensbasen ignorerar state-version, tidsstämplar, liten rå IR-jitter,
   duplicerade scan-ID:n och icke-drivande armmotorer. Den använder verifierad
   pose, drivencoders, beslutssensorer, hinder och substantiell scan-evidens.
@@ -1289,7 +1309,10 @@ Hårdvarufria scenarier täcker bland annat att högerarmen ger annan
 svepgeometri än vänstersidan, att en geometriskt omöjlig modellhandling inte
 erbjuds, att äldre scanperspektiv nekas som route evidence, att duplicerade
 scans inte tränger undan unik gränsevidens och att en action/basis-cykel känns
-igen efter att den detaljerade ledgerhistoriken roterat.
+igen efter att den detaljerade ledgerhistoriken roterat. De täcker även
+`v1 → v2`-migrering, att scan-ID:n är persistensbundna och control-safe, att
+maximala runtime-genererade detalj- och supportmängder ryms under 2 MiB samt att
+hypotesbortfall vid karttaket överlever save/load och syns i båda kontexterna.
 
 Fysisk evidensgräns: den föregående lådkörningen observerade att högerarmen
 tog i hindret och motiverade den nya profilen, men hela implementationen ovan

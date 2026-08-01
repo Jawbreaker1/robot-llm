@@ -5,7 +5,10 @@ from robot_agent.robot_control_http import (
     RobotControlHTTPError,
     RobotControlHTTPRouter,
 )
-from robot_agent.robot_control_service import RobotControlServiceError
+from robot_agent.robot_control_service import (
+    MAX_ROBOT_PAGE_RESPONSE_BYTES,
+    RobotControlServiceError,
+)
 
 
 class FakeRobotControlService:
@@ -218,6 +221,28 @@ class RobotControlHTTPRouterTests(unittest.TestCase):
                 "limit=501",
                 b"",
             )
+
+    def test_history_page_has_a_defensive_http_byte_limit(self):
+        self.service.events = lambda _after, _limit: {
+            "events": [{
+                "sequence": 1,
+                "payload": "x" * MAX_ROBOT_PAGE_RESPONSE_BYTES,
+            }],
+            "next_after_sequence": 1,
+        }
+
+        with self.assertRaises(RobotControlHTTPError) as raised:
+            self.router.handle(
+                "GET",
+                "/api/v1/robot/events",
+                "after_sequence=0&limit=500",
+                b"",
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "robot_history_page_too_large",
+        )
 
     def test_unknown_robot_route_fails_closed(self):
         self.assertTrue(

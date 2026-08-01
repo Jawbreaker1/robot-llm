@@ -14,6 +14,7 @@ from typing import Mapping, Optional, Tuple
 
 from .physical_navigation_contract import (
     ACTIONS,
+    SCAN_FRONT_ARC,
     json_bytes,
     validate_observation,
 )
@@ -22,8 +23,8 @@ from .physical_observation_progress import observation_progress_signature
 
 EXPERIENCE_LEDGER_SCHEMA = "robot-physical-navigation-experience/v1"
 EXPERIENCE_BASIS_SCHEMA = "robot-physical-navigation-evidence-basis/v1"
-MAX_EXPERIENCE_ENTRIES = 8
-MAX_EXPERIENCE_CONTEXT_BYTES = 8 * 1024
+MAX_EXPERIENCE_ENTRIES = 64
+MAX_EXPERIENCE_CONTEXT_BYTES = 64 * 1024
 # A runtime turn can execute at most the model-selected action plus two plan
 # tail actions.  14,400 is the runtime's hard turn ceiling, so this bounded
 # index cannot forget an exact action/evidence basis during one legal episode.
@@ -314,7 +315,12 @@ def _optional_code(value, field):
     candidate = value.get(field)
     if candidate is None:
         return None
-    if not isinstance(candidate, str) or not candidate or len(candidate) > 160:
+    if (
+        not isinstance(candidate, str)
+        or not candidate
+        or len(candidate) > 160
+        or any(ord(character) < 32 for character in candidate)
+    ):
         raise NavigationExperienceError("{} is invalid".format(field))
     return candidate
 
@@ -400,8 +406,8 @@ def _outcome_facts(result: Mapping[str, object]) -> Mapping[str, object]:
             ),
             "scan evidence outcome",
         )
-        facts["scan_evidence"] = {
-            key: checked[key]
+        scan_facts = {
+            key: _optional_code(checked, key)
             for key in (
                 "scan_id",
                 "observation_pattern",
@@ -410,7 +416,59 @@ def _outcome_facts(result: Mapping[str, object]) -> Mapping[str, object]:
                 "hypothesis_relation",
             )
         }
+        if any(value is None for value in scan_facts.values()):
+            raise NavigationExperienceError(
+                "scan evidence outcome is invalid"
+            )
+        facts["scan_evidence"] = scan_facts
     return facts
+
+
+def _outcome_classification(
+    outcome: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Return stable categorical facts for a compact result distribution."""
+
+    fields = (
+        "operation",
+        "status",
+        "reason_code",
+        "information_gain",
+        "evidence_disposition",
+        "validation_code",
+        "bilateral_complete",
+        "target_hypothesis_id",
+    )
+    return {
+        field: deepcopy(outcome[field])
+        for field in fields
+        if field in outcome
+    }
+
+
+def _attempt_identity(
+    action: str,
+    outcome: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Return the typed parameters that make one attempt comparable.
+
+    Most physical actions have no planner-selected parameter.  An active scan
+    does: scanning hazard A is not a retry of scanning hazard B, even when the
+    robot and all other evidence are unchanged.
+    """
+
+    value = {"action": action}
+    if action == SCAN_FRONT_ARC:
+        value["target_hypothesis_id"] = outcome.get(
+            "target_hypothesis_id"
+        )
+    return value
+
+
+def _rollup_outcome(outcome: Mapping[str, object]) -> Mapping[str, object]:
+    """Return the bounded typed latest-outcome view used by rollups."""
+
+    return _outcome_classification(outcome)
 
 
 @dataclass(frozen=True)
@@ -419,6 +477,7 @@ class NavigationExperience:
     turn: int
     action: str
     source: str
+    attempt_identity: Mapping[str, object]
     basis_before_id: str
     basis_after_id: str
     basis_before: Mapping[str, object]
@@ -435,6 +494,7 @@ class NavigationExperience:
             "turn": self.turn,
             "action": self.action,
             "source": self.source,
+            "attempt_identity": deepcopy(self.attempt_identity),
             "basis_before_id": self.basis_before_id,
             "basis_after_id": self.basis_after_id,
             "basis_before": deepcopy(self.basis_before),
@@ -459,6 +519,8 @@ class NavigationExperienceLedger:
         if (
             not isinstance(episode_id, str)
             or not episode_id
+            or len(episode_id) > 128
+            or any(ord(character) < 32 for character in episode_id)
             or isinstance(max_entries, bool)
             or not isinstance(max_entries, int)
             or not 1 <= max_entries <= MAX_EXPERIENCE_ENTRIES
@@ -471,7 +533,9 @@ class NavigationExperienceLedger:
         self._entries = []
         self._sequence = 0
         self._last_action_sequence = {}
-        self._seen_action_basis = OrderedDict()
+        self._last_attempt_sequence = {}
+        self._seen_attempt_basis = OrderedDict()
+        self._action_basis_rollups = OrderedDict()
 
     @property
     def entries(self) -> Tuple[NavigationExperience, ...]:
@@ -497,10 +561,16 @@ class NavigationExperienceLedger:
             raise NavigationExperienceError("experience identity is invalid")
         before_id = _basis_id(basis_before)
         after_id = _basis_id(basis_after)
+        outcome = _outcome_facts(result)
+        attempt_identity = _attempt_identity(action, outcome)
+        attempt_key = json_bytes(attempt_identity)
         prior_sequence = self._last_action_sequence.get(action)
-        seen_key = (action, before_id)
-        prior_same_basis_sequence = self._seen_action_basis.get(seen_key)
-        if prior_sequence is None:
+        prior_attempt_sequence = self._last_attempt_sequence.get(attempt_key)
+        seen_attempt_key = (attempt_key, before_id)
+        prior_same_basis_sequence = self._seen_attempt_basis.get(
+            seen_attempt_key
+        )
+        if prior_attempt_sequence is None:
             relation = FIRST_ATTEMPT
         elif prior_same_basis_sequence is not None:
             relation = UNCHANGED_BASIS_REPEAT
@@ -512,6 +582,7 @@ class NavigationExperienceLedger:
             turn=turn,
             action=action,
             source=source,
+            attempt_identity=attempt_identity,
             basis_before_id=before_id,
             basis_after_id=after_id,
             basis_before=_basis_summary(basis_before),
@@ -527,16 +598,111 @@ class NavigationExperienceLedger:
             prior_same_basis_sequence=(
                 prior_same_basis_sequence
             ),
-            outcome=_outcome_facts(result),
+            outcome=outcome,
         )
         self._entries.append(entry)
         self._entries = self._entries[-self.max_entries:]
         self._last_action_sequence[action] = entry.sequence
-        self._seen_action_basis[seen_key] = entry.sequence
-        self._seen_action_basis.move_to_end(seen_key)
-        while len(self._seen_action_basis) > MAX_EXPERIENCE_SEEN_KEYS:
-            self._seen_action_basis.popitem(last=False)
+        self._last_attempt_sequence[attempt_key] = entry.sequence
+        self._seen_attempt_basis[seen_attempt_key] = entry.sequence
+        self._seen_attempt_basis.move_to_end(seen_attempt_key)
+        while len(self._seen_attempt_basis) > MAX_EXPERIENCE_SEEN_KEYS:
+            self._seen_attempt_basis.popitem(last=False)
+        seen_key = (action, before_id)
+        prior_rollup = self._action_basis_rollups.get(seen_key)
+        classification = _outcome_classification(outcome)
+        classification_key = json_bytes(classification)
+        if prior_rollup is None:
+            prior_rollup = {
+                "attempt_count": 0,
+                "first_sequence": entry.sequence,
+                "latest_sequence": entry.sequence,
+                "outcome_distribution": OrderedDict(),
+                "latest_outcome": None,
+            }
+        prior_rollup["attempt_count"] += 1
+        prior_rollup["latest_sequence"] = entry.sequence
+        distribution = prior_rollup["outcome_distribution"]
+        bucket = distribution.get(classification_key)
+        if bucket is None:
+            bucket = {"outcome": classification, "count": 0}
+            distribution[classification_key] = bucket
+        bucket["count"] += 1
+        prior_rollup["latest_outcome"] = deepcopy(outcome)
+        self._action_basis_rollups[seen_key] = prior_rollup
+        self._action_basis_rollups.move_to_end(seen_key)
+        while len(self._action_basis_rollups) > MAX_EXPERIENCE_SEEN_KEYS:
+            self._action_basis_rollups.popitem(last=False)
         return entry
+
+    def _current_basis_action_rollups(
+        self,
+        current_basis_id: str,
+        retained_bucket_keys=None,
+    ) -> list[Mapping[str, object]]:
+        retained_bucket_keys = retained_bucket_keys or {}
+        values = []
+        for action in sorted(ACTIONS):
+            rollup = self._action_basis_rollups.get(
+                (action, current_basis_id)
+            )
+            if rollup is None:
+                values.append({
+                    "action": action,
+                    "attempt_count": 0,
+                    "first_sequence": None,
+                    "latest_sequence": None,
+                    "outcome_bucket_count": 0,
+                    "outcome_bucket_retained_count": 0,
+                    "outcome_bucket_omitted_count": 0,
+                    "outcome_attempt_retained_count": 0,
+                    "outcome_attempt_omitted_count": 0,
+                    "outcome_distribution": [],
+                    "latest_outcome": None,
+                })
+                continue
+            distribution = rollup["outcome_distribution"]
+            selected = retained_bucket_keys.get(action, frozenset())
+            retained = [
+                deepcopy(distribution[key])
+                for key in sorted(distribution)
+                if key in selected
+            ]
+            retained_attempts = sum(item["count"] for item in retained)
+            values.append({
+                "action": action,
+                "attempt_count": rollup["attempt_count"],
+                "first_sequence": rollup["first_sequence"],
+                "latest_sequence": rollup["latest_sequence"],
+                "outcome_bucket_count": len(distribution),
+                "outcome_bucket_retained_count": len(retained),
+                "outcome_bucket_omitted_count": (
+                    len(distribution) - len(retained)
+                ),
+                "outcome_attempt_retained_count": retained_attempts,
+                "outcome_attempt_omitted_count": (
+                    rollup["attempt_count"] - retained_attempts
+                ),
+                "outcome_distribution": retained,
+                "latest_outcome": _rollup_outcome(
+                    rollup["latest_outcome"]
+                ),
+            })
+        return values
+
+    def _current_basis_bucket_candidates(self, current_basis_id: str):
+        values = []
+        for action in sorted(ACTIONS):
+            rollup = self._action_basis_rollups.get(
+                (action, current_basis_id)
+            )
+            if rollup is None:
+                continue
+            values.extend(
+                (action, key)
+                for key in sorted(rollup["outcome_distribution"])
+            )
+        return values
 
     def context(
         self,
@@ -544,23 +710,38 @@ class NavigationExperienceLedger:
         current_basis: Mapping[str, object],
     ) -> Mapping[str, object]:
         entries = [item.to_dict() for item in self._entries]
-        while True:
-            value = {
+        current_basis_id = _basis_id(current_basis)
+        retained_bucket_keys = {}
+
+        def value_with(entries_value):
+            current_rollups = self._current_basis_action_rollups(
+                current_basis_id,
+                retained_bucket_keys,
+            )
+            return {
                 "schema": EXPERIENCE_LEDGER_SCHEMA,
                 "episode_id": self.episode_id,
                 "scope": "EPISODE",
                 "persisted": False,
                 "host_ranked_or_selected_action": False,
                 "capacity": self.max_entries,
-                "retained_count": len(entries),
+                "retained_count": len(entries_value),
                 "total_recorded_count": self._sequence,
                 "seen_action_basis_capacity": MAX_EXPERIENCE_SEEN_KEYS,
                 "seen_action_basis_retained_count": len(
-                    self._seen_action_basis
+                    self._action_basis_rollups
                 ),
-                "current_basis_id": _basis_id(current_basis),
-                "entries": entries,
+                "seen_attempt_basis_capacity": MAX_EXPERIENCE_SEEN_KEYS,
+                "seen_attempt_basis_retained_count": len(
+                    self._seen_attempt_basis
+                ),
+                "current_basis_id": current_basis_id,
+                "current_basis_action_rollups": current_rollups,
+                "entries": entries_value,
             }
+
+        while True:
+            value = value_with(entries)
             if len(json_bytes(value)) <= MAX_EXPERIENCE_CONTEXT_BYTES:
                 break
             if not entries:
@@ -568,6 +749,20 @@ class NavigationExperienceLedger:
                     "experience context exceeded its byte limit"
                 )
             entries = entries[1:]
+
+        for action, key in self._current_basis_bucket_candidates(
+            current_basis_id
+        ):
+            selected = retained_bucket_keys.setdefault(action, set())
+            selected.add(key)
+            candidate = value_with(entries)
+            if len(json_bytes(candidate)) <= MAX_EXPERIENCE_CONTEXT_BYTES:
+                value = candidate
+                continue
+            selected.remove(key)
+            # Stable prefix retention keeps the projection deterministic and
+            # avoids a size-based semantic ranking of later outcome buckets.
+            break
         return deepcopy(value)
 
 

@@ -14,6 +14,7 @@ from robot_agent.dashboard_contract import (
     REGISTRY_DISPLAY_NAME_KEYS,
 )
 from robot_agent.dashboard_service import (
+    MAX_SPATIAL_MAP_BYTES,
     DashboardService,
     DashboardServiceError,
 )
@@ -207,6 +208,9 @@ class DashboardServiceTests(unittest.TestCase):
         service = DashboardService(**kwargs)
         self.services.append(service)
         return service
+
+    def test_spatial_map_payload_has_generous_bounded_headroom(self):
+        self.assertEqual(MAX_SPATIAL_MAP_BYTES, 4 * 1024 * 1024)
 
     def submit(
         self,
@@ -798,6 +802,11 @@ class DashboardServiceTests(unittest.TestCase):
         self.assertIsNone(snapshot["robot_pose"])
         self.assertEqual(snapshot["pose_history"], [])
         self.assertEqual(snapshot["pose_history_evicted"], 0)
+        self.assertEqual(snapshot["scan_evidence_history"], [])
+        self.assertEqual(snapshot["scan_evidence_history_evicted"], 0)
+        self.assertEqual(snapshot["qualitative_observations_evicted"], 0)
+        self.assertIsNone(snapshot["hazard_retention"])
+        self.assertIsNone(snapshot["scan_attempt_retention"])
         self.assertEqual(snapshot["cells"], [])
         self.assertEqual(snapshot["sensor_rays"], [])
         self.assertEqual(snapshot["object_hypotheses"], [])

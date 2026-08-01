@@ -252,6 +252,21 @@ const physicalEvidenceMap = logic.normalizeSpatialMap({
     calibration_status: "provisional",
     calibration_evidence: "assembled right arm observed",
   },
+  qualitative_observations_evicted: 23,
+  scan_evidence_history_evicted: 7,
+  hazard_retention: {
+    capacity: 64,
+    retained_count: 12,
+    evicted_count: 3,
+    last_eviction_reason: "MAP_CAPACITY_OLDEST_HAZARD",
+  },
+  scan_attempt_retention: {
+    per_hazard_capacity: 16,
+    map_capacity: 64,
+    retained_count: 41,
+    evicted_count: 9,
+    last_eviction_reason: "MAP_CAPACITY_OLDEST_ATTEMPT",
+  },
   scan_evidence_history: [{
     target_hypothesis_id: "hazard-1",
     frame_id: "local-odometry",
@@ -324,6 +339,11 @@ const physicalEvidenceMap = logic.normalizeSpatialMap({
 
 process.stdout.write(JSON.stringify({
   exports: Object.keys(logic).sort(),
+  limits: {
+    poseHistory: logic.MAX_POSE_HISTORY,
+    qualitativeObservations: logic.MAX_QUALITATIVE_OBSERVATIONS,
+    scanEvidence: logic.MAX_SCAN_EVIDENCE,
+  },
   frozen: Object.isFrozen(logic),
   policy: logic.TURN_POLL_POLICY,
   policyFrozen: Object.isFrozen(logic.TURN_POLL_POLICY),
@@ -427,6 +447,9 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(
             self.runtime["exports"],
             [
+                "MAX_POSE_HISTORY",
+                "MAX_QUALITATIVE_OBSERVATIONS",
+                "MAX_SCAN_EVIDENCE",
                 "SPATIAL_MAP_SCHEMA",
                 "TURN_POLL_POLICY",
                 "createDashboardRequest",
@@ -436,6 +459,14 @@ process.stdout.write(JSON.stringify({
                 "replaceRenderedItems",
                 "transitionTurnPoll",
             ],
+        )
+        self.assertEqual(
+            self.runtime["limits"],
+            {
+                "poseHistory": 2_048,
+                "qualitativeObservations": 1_024,
+                "scanEvidence": 64,
+            },
         )
         self.assertTrue(self.runtime["frozen"])
         self.assertTrue(self.runtime["policyFrozen"])
@@ -767,6 +798,21 @@ function response(status, payload) {
             physical["collisionGeometry"]["leftExtentMm"],
         )
         self.assertEqual(len(physical["scanEvidenceHistory"]), 2)
+        self.assertEqual(physical["scanEvidenceHistoryEvicted"], 7)
+        self.assertEqual(physical["qualitativeObservationsEvicted"], 23)
+        self.assertEqual(physical["hazardRetention"], {
+            "capacity": 64,
+            "retainedCount": 12,
+            "evictedCount": 3,
+            "lastEvictionReason": "MAP_CAPACITY_OLDEST_HAZARD",
+        })
+        self.assertEqual(physical["scanAttemptRetention"], {
+            "perHazardCapacity": 16,
+            "mapCapacity": 64,
+            "retainedCount": 41,
+            "evictedCount": 9,
+            "lastEvictionReason": "MAP_CAPACITY_OLDEST_ATTEMPT",
+        })
         current, legacy = physical["scanEvidenceHistory"]
         self.assertTrue(current["spatiallyRenderable"])
         self.assertEqual(current["scanPose"], {

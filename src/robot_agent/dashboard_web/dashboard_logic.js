@@ -15,9 +15,9 @@
   const MAX_SPATIAL_CELLS = 10000;
   const MAX_SENSOR_RAYS = 256;
   const MAX_OBJECT_HYPOTHESES = 256;
-  const MAX_QUALITATIVE_OBSERVATIONS = 256;
-  const MAX_POSE_HISTORY = 256;
-  const MAX_SCAN_EVIDENCE = 8;
+  const MAX_QUALITATIVE_OBSERVATIONS = 1024;
+  const MAX_POSE_HISTORY = 2048;
+  const MAX_SCAN_EVIDENCE = 64;
   const MAX_SCAN_RAYS_PER_EVIDENCE = 16;
   const SESSION_REJECTED_CODE = "session_token_rejected";
   const BODY_RELATIVE_BEARING_CONVENTION = (
@@ -345,6 +345,80 @@
     const collisionGeometry = contractValid
       ? normalizeCollisionGeometry(map.collision_geometry)
       : null;
+    const hazardRetentionValue = record(map.hazard_retention);
+    const hazardCapacity = Number.isSafeInteger(
+      hazardRetentionValue.capacity,
+    ) && hazardRetentionValue.capacity > 0
+      ? hazardRetentionValue.capacity
+      : null;
+    const hazardRetainedCount = Number.isSafeInteger(
+      hazardRetentionValue.retained_count,
+    ) && hazardRetentionValue.retained_count >= 0
+      ? hazardRetentionValue.retained_count
+      : null;
+    const hazardEvictedCount = Number.isSafeInteger(
+      hazardRetentionValue.evicted_count,
+    ) && hazardRetentionValue.evicted_count >= 0
+      ? hazardRetentionValue.evicted_count
+      : null;
+    const hazardRetention = (
+      contractValid
+      && hazardCapacity !== null
+      && hazardRetainedCount !== null
+      && hazardRetainedCount <= hazardCapacity
+      && hazardEvictedCount !== null
+    )
+      ? Object.freeze({
+        capacity: hazardCapacity,
+        retainedCount: hazardRetainedCount,
+        evictedCount: hazardEvictedCount,
+        lastEvictionReason: text(
+          hazardRetentionValue.last_eviction_reason,
+        ),
+      })
+      : null;
+    const scanAttemptRetentionValue = record(
+      map.scan_attempt_retention,
+    );
+    const scanPerHazardCapacity = Number.isSafeInteger(
+      scanAttemptRetentionValue.per_hazard_capacity,
+    ) && scanAttemptRetentionValue.per_hazard_capacity > 0
+      ? scanAttemptRetentionValue.per_hazard_capacity
+      : null;
+    const scanMapCapacity = Number.isSafeInteger(
+      scanAttemptRetentionValue.map_capacity,
+    ) && scanAttemptRetentionValue.map_capacity > 0
+      ? scanAttemptRetentionValue.map_capacity
+      : null;
+    const retainedScanAttemptCount = Number.isSafeInteger(
+      scanAttemptRetentionValue.retained_count,
+    ) && scanAttemptRetentionValue.retained_count >= 0
+      ? scanAttemptRetentionValue.retained_count
+      : null;
+    const evictedScanAttemptCount = Number.isSafeInteger(
+      scanAttemptRetentionValue.evicted_count,
+    ) && scanAttemptRetentionValue.evicted_count >= 0
+      ? scanAttemptRetentionValue.evicted_count
+      : null;
+    const scanAttemptRetention = (
+      contractValid
+      && scanPerHazardCapacity !== null
+      && scanMapCapacity !== null
+      && scanPerHazardCapacity <= scanMapCapacity
+      && retainedScanAttemptCount !== null
+      && retainedScanAttemptCount <= scanMapCapacity
+      && evictedScanAttemptCount !== null
+    )
+      ? Object.freeze({
+        perHazardCapacity: scanPerHazardCapacity,
+        mapCapacity: scanMapCapacity,
+        retainedCount: retainedScanAttemptCount,
+        evictedCount: evictedScanAttemptCount,
+        lastEvictionReason: text(
+          scanAttemptRetentionValue.last_eviction_reason,
+        ),
+      })
+      : null;
     const resolutionMm = positive(map.resolution_mm);
     const rawCells = contractValid && Array.isArray(map.cells)
       ? map.cells.slice(0, MAX_SPATIAL_CELLS)
@@ -481,8 +555,7 @@
       && Array.isArray(map.qualitative_observations)
     )
       ? map.qualitative_observations.slice(
-        0,
-        MAX_QUALITATIVE_OBSERVATIONS,
+        -MAX_QUALITATIVE_OBSERVATIONS,
       )
       : [];
     const qualitativeObservations = rawQualitative.flatMap((rawValue) => {
@@ -632,6 +705,8 @@
       bounds,
       resolutionMm,
       collisionGeometry,
+      hazardRetention,
+      scanAttemptRetention,
       robotPose,
       poseHistory: Object.freeze(poseHistory),
       poseHistoryEvicted: (
@@ -646,7 +721,19 @@
       qualitativeObservations: Object.freeze(
         qualitativeObservations,
       ),
+      qualitativeObservationsEvicted: (
+        Number.isSafeInteger(map.qualitative_observations_evicted)
+        && map.qualitative_observations_evicted >= 0
+          ? map.qualitative_observations_evicted
+          : 0
+      ),
       scanEvidenceHistory: Object.freeze(scanEvidenceHistory),
+      scanEvidenceHistoryEvicted: (
+        Number.isSafeInteger(map.scan_evidence_history_evicted)
+        && map.scan_evidence_history_evicted >= 0
+          ? map.scan_evidence_history_evicted
+          : 0
+      ),
     });
   }
 
@@ -886,6 +973,9 @@
   }
 
   global.RobotDashboardLogic = Object.freeze({
+    MAX_POSE_HISTORY,
+    MAX_QUALITATIVE_OBSERVATIONS,
+    MAX_SCAN_EVIDENCE,
     SPATIAL_MAP_SCHEMA,
     TURN_POLL_POLICY,
     createDashboardRequest,

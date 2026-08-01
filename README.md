@@ -105,7 +105,7 @@ reinterpret the user's sentence into motor power or duration.
 
 ```mermaid
 flowchart LR
-    U["Human goal<br/>Robot view or voice"] --> A["Local LLM agent<br/>interpret · plan · explain"]
+    U["Human goal<br/>Robot control or voice"] --> A["Local LLM agent<br/>interpret · plan · explain"]
     O["Fresh observations<br/>IR · touch · encoders · memory"] --> A
     A --> P["Typed short plan<br/>semantic actions only"]
 
@@ -156,9 +156,9 @@ but the complete path has not yet run as one physical autonomous episode.
 | Body-aware obstacle memory | The EV3 profile now has a provisional asymmetric body envelope, including the wider right arm. Motion and scan feasibility use the swept body rather than only the IR ray, while pose-stamped blocked rays add qualitative angular supports to persistent hazards | The extents are conservative operator estimates, not physical measurements. IR-PROX still provides neither metric range nor object identity, and the new geometry has not yet completed a live obstacle rerun |
 | Route evidence and attempt memory | A route may start only from complementary boundary evidence applicable at the current verified scan pose. An episode-local, bounded attempt/result ledger publishes encoder outcomes and exact evidence-basis changes to Gemma without ranking or selecting an action | Older viewpoints still inform collision hypotheses but cannot be silently reused as current body-relative route evidence. Detailed ledger history is process-local and bounded; the live box episode must still be repeated with this implementation |
 | Robot speech | The host asynchronously asks loopback Piper for bounded Swedish `nst-deep` WAV audio, validates it, and streams it through one persistent audio-only SSH worker per episode; that voice has now been heard during a live physical agent episode | Repeated move-and-speak runs still need acceptance; English needs its own configured voice/model and is deliberately not sent through the Swedish NST voice |
-| Robot control GUI | The separate Robot and Workbench views, explicit EV3 launch profile, episode controls, settings, stop, emergency stop, snapshots, physical map, and technical event streams are implemented. The Map view now keeps the goal, current action, ordered plan, speech state, and a deduplicated episode timeline beside the robot; the Robot path has started real Wi-Fi episodes | Control history is bounded and process-local. Ordinary console startup still injects no physical adapter and reports `DISABLED`; the EV3 launch remains opt-in until a complete obstacle episode passes |
+| Robot control GUI | Workbench keeps ordinary dialogue and direct robot goals explicitly separated while showing one current physical control plane. The EV3 launch profile, goal controls, settings, stop, emergency stop, snapshots, physical map, and technical event streams are implemented. The Map view keeps the goal, current action, ordered plan, speech state, and the latest episode timeline beside the robot. Its hot observability buffers allow up to 4,096 host events and 4,096 snapshots, additionally bounded to 8 MiB and 32 MiB; the browser retains 1,000 of each and renders at most 500 timeline entries. Bounded multi-page catch-up is shown explicitly instead of presenting stale history as live | A physical episode is an audit boundary, not a resumable robot session. Control history remains bounded and process-local; it is deliberately separate from durable navigation memory and planner context. Each history API response also has an exact 4 MiB byte ceiling. Ordinary console startup still injects no physical adapter and reports `DISABLED`; the EV3 launch remains opt-in until a complete obstacle episode passes |
 | Lab Console dialogue and STT | Local Gemma chat, local whisper.cpp STT, microphone selection and sensitivity controls, context, read-only weather, evidence, and English/Swedish UI and text responses | STT text reaches the agent; always-listening robot conversation remains future work |
-| Spatial UI map | The read-only Map view supports both the simulator occupancy map and a live physical LOCAL_ODOMETRY layer fed by the same EV3 pose and hazard hypotheses used for navigation. It renders the configured asymmetric body envelope, bounded odometry trail, pose-stamped scan rays, and scan-history facts alongside the mission panel | The EV3 layer is deliberately qualitative: scan rays show actual body-relative bearings and blocked/clear classification, never measured length or an object surface. The footprint is configured geometry, not evidence that a side contact was sensed. Live acceptance of the new projection remains pending |
+| Spatial UI map | The read-only Map view supports both the simulator occupancy map and a live physical LOCAL_ODOMETRY layer fed by the same EV3 pose and hazard hypotheses used for navigation. It renders the configured asymmetric body envelope, up to 2,048 changed odometry poses, pose-stamped scan rays, scan-history facts, and authoritative hazard-retention counts alongside the mission panel. The host retains up to 1,024 qualitative observations while the DOM renders only the latest 100 | The EV3 layer is deliberately qualitative: scan rays show actual body-relative bearings and blocked/clear classification, never measured length or an object surface. Projected pose, scan, qualitative-history, and hazard evictions are counted and visible; all UI history remains process-local. The final `/api/v1/map` HTTP body is capped at 4 MiB. The footprint is configured geometry, not evidence that a side contact was sensed. Live acceptance of the new projection remains pending |
 | Multi-controller architecture | Identity, proposal, and authority contracts are designed to grow to EV3, Robot Inventor 51515, BOOST, cameras, and microphones | Only the EV3 path has a production physical worker today |
 
 ### Latest physical run
@@ -194,7 +194,7 @@ physical evidence basis or follows a real pose, sensor, hazard, or scan change.
 Fresh IDs, timestamps, IR jitter, propeller-arm encoder movement, and duplicate
 scan IDs do not manufacture navigation progress. This is factual context only:
 the host neither ranks nor substitutes the next action. The implementation and
-its failure cases pass the current hardware-free quality gate (`1,299` tests);
+its failure cases pass the current hardware-free quality gate (`1,341` tests);
 the same physical obstacle episode is the pending acceptance run.
 
 The live scan JSON retained in `docs/data` is intentionally historical. It
@@ -229,8 +229,8 @@ PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
   --simulation-map-demo
 ```
 
-Open the unique session URL printed by the server. The **Robot** view shows the
-episode control plane and its disabled/live state; the **Map** view shows the
+Open the private live-console URL printed by the server. The **Workbench** shows the
+current physical control plane and its disabled/live state; the **Map** view shows the
 completed simulator episode and its estimated route. When a robot control
 adapter is active, the same view also shows the current goal, action, ordered
 plan, speech state, and a structured episode timeline. The map episode uses
@@ -290,6 +290,15 @@ The split prevents “talking to the development workbench” from being confuse
 with “talking directly to the embodied robot.” The Robot routes exist today,
 but they fail closed as `DISABLED` unless the application was constructed
 with the physical runtime adapter.
+
+The private URL is access control, not a resumable application session. The
+console always presents the current process and the active physical episode,
+or the most recently completed episode when nothing is running. A Workbench
+conversation is only dialogue context. Read-only experiment entries are
+historical evidence, not old robot states to resume. The EV3 world model is a
+separate host-local navigation memory that can survive console restarts; it can
+be selected with `--robot-memory-path` or deliberately cleared once with
+`--robot-reset-memory`. Hot UI timelines and pose trails remain process-local.
 
 ![The experiment register separating verified results from a waiting physical preflight](docs/images/dashboard-experiments-en.jpg)
 
@@ -378,13 +387,25 @@ negative boundaries must apply at the current verified pose. This prevents a
 body-relative left/right observation from an old viewpoint being reused after
 the robot has moved.
 
-Separate from the persisted map, an episode-local experience ledger keeps the
-latest detailed action/result records under an `8 KiB` publication ceiling and
-a bounded index of previously seen `(action, evidence basis)` pairs. It records
-pose and decision-relevant sensor facts, encoder results, scan relationships,
-and typed change codes. It deliberately ignores freshness-only versions,
-timestamps, small raw IR jitter, and non-drive motors. Gemma receives this as
-evidence; `host_ranked_or_selected_action` remains false.
+Separate from the persisted map, an episode-local experience ledger keeps up
+to 64 detailed action/result records under a `64 KiB` local ceiling plus a
+bounded index of previously seen `(typed attempt, evidence basis)` pairs. The
+model receives a deterministic projection capped at `24 KiB`: exact totals,
+latest typed outcomes and omission counters remain even when older detail or
+outcome buckets are replaced by a SHA-256 disclosure digest. It records pose
+and decision-relevant sensor facts, encoder results, scan relationships, and
+typed change codes while ignoring freshness-only versions, timestamps, small
+raw IR jitter, and non-drive motors. `host_ranked_or_selected_action` remains
+false.
+
+The complete Gemma user context targets `56 KiB` and has a `64 KiB` hard byte
+ceiling. Admission also accounts for the system prompt, generated response
+schema, request-wrapper reserve and 520 output tokens with a conservative
+32k-window estimate. In the legal 64-hazard/64-scan/maximum-ledger stress case,
+the installed Gemma-4 tokenizer measured 19,435 tokens including output
+reserve; the host's deliberately conservative estimate was 26,546 against a
+30,200-token prompt budget. Rich authoritative map memory therefore stays on
+the host instead of being blindly copied into every model call.
 
 The fixed scan profile currently derives an approximately 90-degree body turn
 from a provisional target of 682 mean absolute wheel-encoder degrees. The
@@ -435,7 +456,7 @@ Enforced in code today:
 - Swedish physical speech uses the explicit loopback Piper profile
   `piper-sv` / `nst-deep`, then streams bounded mono PCM16 WAV to the EV3
   without creating a remote temporary file;
-- the local GUI has bounded request sizes, a unique loopback session URL,
+- the local GUI has bounded request sizes, a private loopback live-console URL,
   Host/Origin checks, strict route and asset allowlists, and no physical
   runtime unless one is explicitly injected; and
 - natural-language routing belongs to schema-constrained model inference, not
@@ -483,17 +504,20 @@ settings for that process:
 scripts/start_lab_console.sh --model 'EXACT-MODEL-ID-FROM-LM-STUDIO'
 ```
 
-Open the unique loopback session URL printed by the server:
+Open the private loopback live-console URL printed by the server:
 
 ```text
-http://127.0.0.1:8765/session/<session-token>/
+http://127.0.0.1:8765/live/<access-key>/
 ```
 
-Restarting the server invalidates the token. The ordinary command launches
-the complete UI but deliberately injects no EV3 runtime; the Robot view must
-therefore report physical control as disabled. Model IDs are explicit
-configuration values. Loading or benchmarking a model is a separate operator
-decision on the intended LM Studio host.
+The normal start script keeps that random 256-bit key in an owner-only local
+file, so the bookmark remains valid across server restarts. The key grants
+access to the current console; it is not a saved run identifier. Legacy
+`/session/<key>/` bookmarks redirect to the canonical `/live/<key>/` URL. The
+ordinary command launches the complete UI but deliberately injects no EV3
+runtime; the Workbench control plane must therefore report physical control as disabled.
+Model IDs are explicit configuration values. Loading or benchmarking a model
+is a separate operator decision on the intended LM Studio host.
 
 The normal voice profile reuses a warm local `whisper.cpp` service at
 `http://127.0.0.1:8178/v1`, posts to the separately validated
@@ -754,8 +778,9 @@ matched-load records in
   freshness, and a bounded structured action/result ledger
 - [x] Read-only dashboard rendering of the physical body envelope and actual
   blocked/clear scan bearings without invented range
-- [x] Robot/Workbench GUI split with opt-in runtime, episode controls,
-  settings, stop, emergency stop, snapshots, and technical events
+- [x] Explicit Workbench/robot conversation target with one live physical
+  control plane, opt-in runtime, episode controls, settings, stop, emergency
+  stop, snapshots, and technical events
 - [x] Bounded asynchronous host-generated Swedish WAV speech transport,
   scheduler, hardware-free-verified duplicate suppression, and physical
   runtime composition

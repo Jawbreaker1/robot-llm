@@ -16,7 +16,7 @@
     transitionTurnPoll,
   } = window.RobotDashboardLogic;
   const EVENT_LIMIT = 100;
-  const MAX_LOCAL_EVENTS = 500;
+  const MAX_LOCAL_EVENTS = 2000;
   const MAP_POLL_INTERVAL_MS = 2000;
   let microphoneInput = null;
   let robotControl = null;

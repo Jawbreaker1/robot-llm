@@ -410,6 +410,26 @@ const translations = {
   "map.details.path_points_truncated": ({ count, evicted }) => (
     `${count} shown · ${evicted} older removed`
   ),
+  "map.details.hazard_retention": "Hazard hypotheses",
+  "map.details.hazard_retention_value": ({ retained, capacity, evicted }) => (
+    `${retained} / ${capacity} retained · ${evicted} evicted`
+  ),
+  "map.details.scan_attempts": "Retained scan attempts",
+  "map.details.scan_attempts_truncated": ({ count, evicted, total }) => (
+    `${count} retained · ${evicted} evicted · ${total} observed`
+  ),
+  "map.details.scan_memory_retention": "Persistent scan memory",
+  "map.details.scan_memory_retention_value": ({
+    retained,
+    mapCapacity,
+    perHazardCapacity,
+    evicted,
+    reason,
+  }) => (
+    `${retained} / ${mapCapacity} retained · up to `
+    + `${perHazardCapacity} per hazard · ${evicted} evicted`
+    + (reason ? ` · latest reason: ${reason}` : "")
+  ),
   "map.details.source": "Source",
   "map.details.state_version": "State version",
   "map.details.age": "Age",
@@ -446,6 +466,9 @@ const translations = {
   "map.qualitative.provisional": "Provisional",
   "map.qualitative.raw": "Raw IR",
   "map.qualitative.raw_value": ({ value }) => `${value} / 100`,
+  "map.qualitative.retention": ({ shown, retained, evicted, total }) => (
+    `${shown} shown · ${retained} retained · ${evicted} evicted · ${total} observed`
+  ),
   "map.qualitative.relation.near_obstacle": "Near reflection",
   "map.qualitative.relation.no_near_reflection": "No near reflection",
   "map.qualitative.relation.unknown": "Unknown relation",
@@ -477,6 +500,17 @@ const presenter = context.RobotSpatialMapPresenter.create({
   translate,
   formatNumber: (value) => String(value),
 });
+const qualitativeHistory = Array.from({ length: 150 }, (_value, index) => ({
+  bearing: "FORWARD",
+  relation: "NEAR_OBSTACLE",
+  raw_ir_proximity: index % 101,
+  confidence_milli: 250,
+  source_id: "physical_ir_reflection",
+  provenance: "PROVISIONAL_IR",
+  provisional: true,
+  observed_at_unix_ms: 1900,
+  age_ms: 1,
+}));
 
 const qualitative = presenter.render({
   schema: "robot-spatial-map/v1",
@@ -509,17 +543,23 @@ const qualitative = presenter.render({
     provisional: true,
     observed_at_unix_ms: 1900,
   }],
-  qualitative_observations: [{
-    bearing: "FORWARD",
-    relation: "NEAR_OBSTACLE",
-    raw_ir_proximity: 81,
-    confidence_milli: 250,
-    source_id: "physical_ir_reflection",
-    provenance: "PROVISIONAL_IR",
-    provisional: true,
-    observed_at_unix_ms: 1900,
-    age_ms: 1,
-  }],
+  qualitative_observations: qualitativeHistory,
+  qualitative_observations_evicted: 17,
+  scan_evidence_history: [],
+  scan_evidence_history_evicted: 4,
+  hazard_retention: {
+    capacity: 64,
+    retained_count: 9,
+    evicted_count: 2,
+    last_eviction_reason: "MAP_CAPACITY_OLDEST_HAZARD",
+  },
+  scan_attempt_retention: {
+    per_hazard_capacity: 16,
+    map_capacity: 64,
+    retained_count: 31,
+    evicted_count: 6,
+    last_eviction_reason: "PER_HAZARD_CAPACITY_DIVERSITY_RETENTION",
+  },
 }, "connected", 2000);
 const qualitativeResult = {
   status: qualitative.status,
@@ -529,6 +569,8 @@ const qualitativeResult = {
   emptyTitle: nodes["map-empty-title"].textContent,
   emptyBody: nodes["map-empty-body"].textContent,
   count: nodes["map-qualitative-count"].textContent,
+  renderedCount: nodes["map-qualitative-list"].children.length,
+  metadataText: nodes["map-metadata"].textContent,
   panelText: nodes["map-qualitative-list"].textContent,
   objectCount: nodes["map-object-count"].textContent,
   objectPanelText: nodes["map-object-list"].textContent,
@@ -731,7 +773,27 @@ process.stdout.write(JSON.stringify({
             qualitative["emptyBody"],
             "Qualitative evidence panel",
         )
-        self.assertEqual(qualitative["count"], "1")
+        self.assertEqual(
+            qualitative["count"],
+            "100 shown · 150 retained · 17 evicted · 167 observed",
+        )
+        self.assertEqual(qualitative["renderedCount"], 100)
+        self.assertIn(
+            "0 retained · 4 evicted · 4 observed",
+            qualitative["metadataText"],
+        )
+        self.assertIn(
+            "9 / 64 retained · 2 evicted",
+            qualitative["metadataText"],
+        )
+        self.assertIn(
+            "31 / 64 retained · up to 16 per hazard · 6 evicted",
+            qualitative["metadataText"],
+        )
+        self.assertIn(
+            "PER_HAZARD_CAPACITY_DIVERSITY_RETENTION",
+            qualitative["metadataText"],
+        )
         self.assertEqual(qualitative["objectCount"], "1")
         for expected in (
             "UNKNOWN",

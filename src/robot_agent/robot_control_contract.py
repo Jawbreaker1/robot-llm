@@ -61,6 +61,10 @@ RUNTIME_UPDATE_FIELDS = frozenset(
         "plan",
         "scan",
         "model_latency_ms",
+        "planner_context_bytes",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
         "speech_status",
         "message",
     )
@@ -255,6 +259,10 @@ class RobotRuntimeUpdate:
     plan: Tuple[str, ...] = ()
     scan: object = None
     model_latency_ms: Optional[int] = None
+    planner_context_bytes: Optional[int] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
     speech_status: str = "idle"
     message: Optional[str] = None
 
@@ -288,6 +296,14 @@ class RobotRuntimeUpdate:
                 0,
                 10 * 60 * 1_000,
             )
+        for name, value in (
+            ("planner_context_bytes", self.planner_context_bytes),
+            ("prompt_tokens", self.prompt_tokens),
+            ("completion_tokens", self.completion_tokens),
+            ("total_tokens", self.total_tokens),
+        ):
+            if value is not None:
+                _integer(name, value)
         if self.speech_status not in SPEECH_STATES:
             raise DashboardContractError(
                 "invalid_robot_speech_status",
@@ -328,6 +344,22 @@ class RobotRuntimeUpdate:
                 "model_latency_ms",
                 prior.model_latency_ms,
             ),
+            planner_context_bytes=value.get(
+                "planner_context_bytes",
+                prior.planner_context_bytes,
+            ),
+            prompt_tokens=value.get(
+                "prompt_tokens",
+                prior.prompt_tokens,
+            ),
+            completion_tokens=value.get(
+                "completion_tokens",
+                prior.completion_tokens,
+            ),
+            total_tokens=value.get(
+                "total_tokens",
+                prior.total_tokens,
+            ),
             speech_status=value.get(
                 "speech_status",
                 prior.speech_status,
@@ -342,6 +374,10 @@ class RobotRuntimeUpdate:
             "plan": list(self.plan),
             "scan": thaw_json(self.scan),
             "model_latency_ms": self.model_latency_ms,
+            "planner_context_bytes": self.planner_context_bytes,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
             "speech_status": self.speech_status,
             "message": self.message,
         }

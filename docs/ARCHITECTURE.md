@@ -239,13 +239,36 @@ Varje återställd aktiv scan kan sparas på hinderhypotesen med:
 - blocked/clear, unilateral/bilateral täckning och eventuell gräns,
 - typad relation som stödjer eller motsäger den blockerade hypotesen.
 
-Historiken är begränsad till fyra försöksposter per hinder och åtta i hela
-kartan. Retention prioriterar olika evidenssignaturer före duplicerade
-retries. Blockerade strålar kan lägga till konservativa vinkelsupporter vid
-samma provisoriska offset som den ursprungliga IR-hypotesen; de blir aldrig
-metriska objektytor. En full bilateral all-clear contestar hypotesen och
-pausar dess kollisionsenvelope tills nyare blocked-evidens åter stöder den,
-men historiken raderas inte.
+Detaljhistoriken är begränsad till 16 försöksposter per hinder och 64 i hela
+kartan. Retention prioriterar olika pose- och evidenssignaturer före
+duplicerade retries. Blockerade strålar materialiseras dessutom i ett separat
+beständigt index med högst 512 vinkelsupporter per hinder och 4 096 per karta.
+Därmed ändrar beskärning av scan-detaljer inte den kollisionsgeometri som redan
+har härletts. Supporterna använder samma provisoriska offset som den
+ursprungliga IR-hypotesen och blir aldrig metriska objektytor. En full bilateral
+all-clear contestar hypotesen och pausar dess kollisionsenvelope tills nyare
+blocked-evidens åter stöder den, men historiken raderas inte.
+
+När detaljposter ändå måste lämna 16/64-retentionen räknas bortfallet både på
+berörd hinderhypotes och kumulativt på kartan med typad orsak. Kartans räknare
+inkluderar även kvarvarande scanposter som försvinner tillsammans med en
+utkastad hinderhypotes och persisteras i navigation memory. Planner och
+dashboard kan därför skilja "inga äldre försök" från "äldre försök har
+komprimerats bort" även efter en processomstart.
+
+Den auktoritativa kartan behåller högst 64 hinderhypoteser och hela
+navigation-memory-filen högst 2 MiB. Om den 65:e distinkta hypotesen tillkommer
+tas den äldsta bort deterministiskt; ett persisterat antal och en typad orsak
+publiceras både till plannerkontexten och dashboardens read-only-karta. Förlust
+vid kapacitetsgränsen är alltså synlig och får inte beskrivas som om kartan
+fortfarande vore fullständig.
+
+Persistensformatet är `robot-physical-navigation-memory/v2`. Läsaren migrerar
+befintliga `v1`-filer genom att härleda materialiserade support- och
+contest-fakta när källdatan räcker; nästa save skriver `v2`. Migrationen är
+avsiktligt framåtriktad: en äldre checkout som bara förstår `v1` kan inte läsa
+en fil som redan skrivits om som `v2`. Kodrollback kräver därför en bevarad
+`v1`-kopia eller en explicit minnesreset, aldrig tyst feltolkning.
 
 Ruttvalets färskhet är strängare än kollisionsminnet. Positiv och negativ
 gränsevidens får komplettera varandra endast vid exakt samma verifierade pose
@@ -255,8 +278,8 @@ fortsätta påverka den konservativa kollisionshypotesen men kan inte tyst
 
 Ett separat `NavigationExperienceLedger` publicerar vad som faktiskt
 försöktes och vad verktyget returnerade. Detaljerna är episodlokala,
-begränsade av både antal och `8 KiB`, och kompletteras av ett begränsat index
-över 43 200 tidigare `(handling, evidensbasis)`-par. Gränsen motsvarar tre
+begränsade till 64 poster och `64 KiB`, och kompletteras av ett begränsat index
+över 43 200 tidigare `(typat försök, evidensbasis)`-par. Gränsen motsvarar tre
 möjliga handlingar per tillåten runtime-turn under en hel episod. Därmed kan
 modellen skilja
 `FIRST_ATTEMPT`, `UNCHANGED_BASIS_REPEAT` och
@@ -266,6 +289,17 @@ beslutsrelevanta sensorfakta, hindergeometri och substantiell scan-evidens.
 State-version, tidsstämpel, liten rå IR-jitter, nya scan-ID:n och rörelse i en
 icke-drivande arm räknas inte ensamma som navigationsframsteg. Ledgern har
 `host_ranked_or_selected_action: false` och får aldrig välja rutt.
+
+Gemma får inte hela den auktoritativa kartan eller hela ledgerprojektionen
+oreflekterat. Plannerlagret behåller högst `24 KiB` ledgerdetalj med exakta
+totalsummor, senaste typade utfall, bortfallsräknare och digest. Hela
+användarkontexten har `56 KiB` mål och `64 KiB` hårt tak. En separat
+32k-admission räknar konservativt även systemprompt, dynamiskt JSON-schema,
+wrapperreserv, 2 048 tokens headroom och 520 outputtokens. Goal-/feasibility-
+referenser publicerar kompakta scan-sammanfattningar; aktivt mål, senaste
+verktygsmål och aktuell rutt behåller exakt nödvändig scan-ID, pose, gränser,
+relation och aggregerade strålfakta. Det är en deterministisk projektion av ett
+rikare hostminne, inte heuristisk handlingsrankning.
 
 Denna slice är implementerad och hårdvarufritt testad. Den senaste fysiska
 lådkörningen motiverade kroppskonturen men genomfördes före hela kedjan ovan;
@@ -668,10 +702,14 @@ flowchart LR
     B -.->|"ingen direktkontakt"| P
 ```
 
-Servern binder exakt till `127.0.0.1`, myntar en ny 256-bitars
-sessionsnyckel per start och serverar index/assets endast under dess
-tokeniserade bootstrap-sökväg. Samtliga API-anrop, även läsningar, kräver
-nyckeln. Gränsen kontrollerar dessutom `Host`, `Origin`, JSON-MIME,
+Servern binder exakt till `127.0.0.1`. Den normala startprofilen laddar eller
+skapar en slumpad 256-bitars livekonsolnyckel i en owner-only-fil och serverar
+index/assets under `/live/<access-key>/`. Nyckeln är en stabil lokal
+access-capability, inte identitet för ett återupptagbart körläge. Gamla
+`/session/<key>/`-bootstrap- och assetlänkar valideras med samma nyckel och
+omdirigeras till den kanoniska liveadressen; interna `session_token`-namn finns
+kvar endast för kompatibilitet. Samtliga API-anrop, även läsningar, kräver
+samma nyckel. Gränsen kontrollerar dessutom `Host`, `Origin`, JSON-MIME,
 bodygräns och strikt JSON samt begränsar samtidiga HTTP-handlers. Browsern
 får endast tala med samma host; den kontaktar inte LM Studio, Open-Meteo
 eller en robotnod direkt. Statiska filer och API-routes ligger i explicita
@@ -685,7 +723,8 @@ korrelations-ID:n, typade transitions och budgetutfall men inte rå prompt,
 rå modelltext, full evidence-URL eller traceback.
 
 Kartvyn projicerar robotkontrollen som en separat read-only uppdragspanel.
-Aktuell status kommer från samma snapshot som Robot-vyn; historiken hämtar
+Aktuell status kommer från samma snapshot som Workbenchens robotkontroll;
+historiken hämtar
 `robot-control-event-page/v1` och `robot-control-snapshot-page/v1` med varsin
 cursor eftersom deras sekvenser är oberoende. Frontend skapar tidslinjeposter
 genom strukturell jämförelse av typade fält, inte regex eller tolkning av

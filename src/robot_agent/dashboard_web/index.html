@@ -20,8 +20,8 @@
 <body>
   <a class="skip-link" href="#main-content" data-i18n="shell.skip_to_content">Hoppa till innehållet</a>
   <div class="session-expired-notice" id="session-expired-notice" role="alert" aria-live="assertive" hidden>
-    <strong data-i18n="session.expired.title">Den här dashboard-sessionen har avslutats.</strong>
-    <span data-i18n="session.expired.body">Öppna den nya sessionslänken som visas i terminalen.</span>
+    <strong data-i18n="session.expired.title">Åtkomsten till livekonsolen avvisades.</strong>
+    <span data-i18n="session.expired.body">Ladda om den aktuella liveadressen. Om det inte hjälper, öppna liveadressen som visas i terminalen.</span>
   </div>
 
   <div class="app-shell">
@@ -135,7 +135,7 @@
         <div class="conversation-panel">
           <header class="panel-header conversation-header">
             <div>
-              <p class="eyebrow" data-i18n="workbench.session.eyebrow">Aktiv session</p>
+              <p class="eyebrow" data-i18n="workbench.session.eyebrow">Aktuell konversation</p>
               <h2 id="workbench-heading" data-i18n="workbench.title">Arbetsbänk</h2>
               <p class="panel-subtitle" id="conversation-subtitle" data-i18n="workbench.subtitle">Lokal Gemma · samtal och robotmål är separata</p>
             </div>
@@ -152,7 +152,7 @@
           <section class="robot-control-panel" id="robot-control-panel" aria-labelledby="robot-control-heading">
             <header class="robot-control-header">
               <div>
-                <p class="eyebrow" data-i18n="robot.control.eyebrow">Fysisk episod</p>
+                <p class="eyebrow" data-i18n="robot.control.eyebrow">Robotens nuläge</p>
                 <h3 id="robot-control-heading" data-i18n="robot.control.title">Robotkontroll</h3>
               </div>
               <span class="state-chip state-idle" id="robot-control-state" role="status">DISABLED</span>
@@ -197,7 +197,7 @@
               </div>
               <p class="eyebrow" data-i18n="workbench.welcome.eyebrow">Redo när du är</p>
               <h3 data-i18n="workbench.welcome.title">Hallå! Vad ska vi hitta på?</h3>
-              <p data-i18n="workbench.welcome.body">Jag kör lokalt på din Mac. Välj Arbetsbänk för samtal eller Robot för att ge EV3RSTORM ett autonomt mål.</p>
+              <p data-i18n="workbench.welcome.body">Jag kör lokalt på din Mac. Välj vem du vill prata med; när en fysisk runtime finns väljs roboten först.</p>
               <div class="starter-prompts" aria-label="Exempelfrågor" data-i18n-aria-label="workbench.starter.aria_label">
                 <button type="button" data-prompt="Behöver jag paraply i Stockholm just nu?" data-prompt-mode="research_required" data-i18n="workbench.starter.weather.label" data-i18n-prompt="workbench.starter.weather.prompt">Behöver jag paraply i Stockholm?</button>
                 <button type="button" data-prompt="Förklara vad du kan göra i det här läget." data-prompt-mode="conversation" data-i18n="workbench.starter.capabilities.label" data-i18n-prompt="workbench.starter.capabilities.prompt">Vad kan du göra just nu?</button>
@@ -466,11 +466,11 @@
                 </section>
                 <section class="map-mission-history-panel" aria-labelledby="map-mission-history-heading">
                   <div class="map-mission-history-heading">
-                    <h4 id="map-mission-history-heading" data-i18n="mission.history.title">Senaste episodens tidslinje</h4>
+                    <h4 id="map-mission-history-heading" data-i18n="mission.history.title">Senaste uppdragets tidslinje</h4>
                   </div>
                   <p class="map-mission-history-gap" id="map-mission-history-gap" data-i18n="mission.history.gap" hidden>Äldre poster har hunnit lämna den begränsade historiken.</p>
                   <ol class="map-mission-timeline" id="map-mission-timeline">
-                    <li class="map-mission-timeline-empty" data-i18n="mission.timeline.empty">Ingen episodaktivitet ännu.</li>
+                    <li class="map-mission-timeline-empty" data-i18n="mission.timeline.empty">Ingen uppdragsaktivitet ännu.</li>
                   </ol>
                 </section>
               </div>

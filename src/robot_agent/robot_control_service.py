@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import json
 import secrets
 import threading
 import time
@@ -33,9 +34,13 @@ from .robot_control_contract import (
 )
 
 
-MAX_EVENTS = 512
-MAX_SNAPSHOTS = 128
-MAX_REQUEST_HISTORY = 128
+MAX_EVENTS = 4_096
+MAX_SNAPSHOTS = 4_096
+MAX_REQUEST_HISTORY = 1_024
+MAX_EVENT_HISTORY_BYTES = 8 * 1024 * 1024
+MAX_SNAPSHOT_HISTORY_BYTES = 32 * 1024 * 1024
+MAX_ROBOT_PAGE_RESPONSE_BYTES = 4 * 1024 * 1024
+MIN_HISTORY_BYTE_CAPACITY = 128 * 1024
 MAX_ERROR_MESSAGE_CHARACTERS = 240
 
 Clock = Callable[[], int]
@@ -102,6 +107,20 @@ def _default_clock_ms() -> int:
 
 def _default_id() -> str:
     return secrets.token_hex(12)
+
+
+def _json_size(value: object) -> int:
+    """Return the exact compact UTF-8 size used at the HTTP boundary."""
+
+    to_dict = getattr(value, "to_dict", None)
+    supplied = to_dict() if callable(to_dict) else value
+    return len(json.dumps(
+        supplied,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8"))
 
 
 def _validated_id(prefix: str, factory: IDFactory) -> str:
@@ -192,6 +211,8 @@ class RobotControlService:
         settings: Optional[RobotControlSettings] = None,
         event_capacity: int = MAX_EVENTS,
         snapshot_capacity: int = MAX_SNAPSHOTS,
+        event_byte_capacity: int = MAX_EVENT_HISTORY_BYTES,
+        snapshot_byte_capacity: int = MAX_SNAPSHOT_HISTORY_BYTES,
         clock_ms: Clock = _default_clock_ms,
         id_factory: IDFactory = _default_id,
     ):
@@ -202,6 +223,16 @@ class RobotControlService:
             or isinstance(snapshot_capacity, bool)
             or not isinstance(snapshot_capacity, int)
             or not 1 <= snapshot_capacity <= 10_000
+            or isinstance(event_byte_capacity, bool)
+            or not isinstance(event_byte_capacity, int)
+            or not MIN_HISTORY_BYTE_CAPACITY
+            <= event_byte_capacity
+            <= 256 * 1024 * 1024
+            or isinstance(snapshot_byte_capacity, bool)
+            or not isinstance(snapshot_byte_capacity, int)
+            or not MIN_HISTORY_BYTE_CAPACITY
+            <= snapshot_byte_capacity
+            <= 256 * 1024 * 1024
             or not callable(clock_ms)
             or not callable(id_factory)
         ):
@@ -241,8 +272,14 @@ class RobotControlService:
         self._control_signals_inflight = 0
         self._event_capacity = event_capacity
         self._snapshot_capacity = snapshot_capacity
+        self._event_byte_capacity = event_byte_capacity
+        self._snapshot_byte_capacity = snapshot_byte_capacity
         self._events = deque()
         self._snapshots = deque()
+        self._event_sizes = deque()
+        self._snapshot_sizes = deque()
+        self._event_retained_bytes = 0
+        self._snapshot_retained_bytes = 0
         self._event_sequence = 0
         self._snapshot_sequence = 0
         self._event_dropped_total = 0
@@ -273,18 +310,39 @@ class RobotControlService:
     def _append_bounded(
         self,
         target,
+        sizes,
         value,
         capacity: int,
+        byte_capacity: int,
+        retained_bytes_attribute: str,
         dropped_attribute: str,
     ) -> None:
-        if len(target) == capacity:
+        size = _json_size(value)
+        if size > byte_capacity:
+            raise RobotControlServiceError(
+                500,
+                "robot_history_item_too_large",
+                "Robot history item exceeds its bounded byte capacity",
+            )
+        retained_bytes = getattr(self, retained_bytes_attribute)
+        while target and (
+            len(target) >= capacity
+            or retained_bytes + size > byte_capacity
+        ):
             target.popleft()
+            retained_bytes -= sizes.popleft()
             setattr(
                 self,
                 dropped_attribute,
                 getattr(self, dropped_attribute) + 1,
             )
         target.append(value)
+        sizes.append(size)
+        setattr(
+            self,
+            retained_bytes_attribute,
+            retained_bytes + size,
+        )
 
     def _append_event_locked(
         self,
@@ -309,8 +367,11 @@ class RobotControlService:
         }
         self._append_bounded(
             self._events,
+            self._event_sizes,
             event,
             self._event_capacity,
+            self._event_byte_capacity,
+            "_event_retained_bytes",
             "_event_dropped_total",
         )
 
@@ -345,8 +406,11 @@ class RobotControlService:
         snapshot = self._snapshot_value_locked(self._snapshot_sequence)
         self._append_bounded(
             self._snapshots,
+            self._snapshot_sizes,
             snapshot,
             self._snapshot_capacity,
+            self._snapshot_byte_capacity,
+            "_snapshot_retained_bytes",
             "_snapshot_dropped_total",
         )
         return snapshot
@@ -609,6 +673,12 @@ class RobotControlService:
                     "changed_fields": sorted(update),
                     "current_action": self._runtime.current_action,
                     "model_latency_ms": self._runtime.model_latency_ms,
+                    "planner_context_bytes": (
+                        self._runtime.planner_context_bytes
+                    ),
+                    "prompt_tokens": self._runtime.prompt_tokens,
+                    "completion_tokens": self._runtime.completion_tokens,
+                    "total_tokens": self._runtime.total_tokens,
                     "speech_status": self._runtime.speech_status,
                 },
                 level="debug",
@@ -874,11 +944,14 @@ class RobotControlService:
         dropped_total: int,
         schema: str,
         serializer,
+        collection_name: str,
+        retained_bytes: int,
+        byte_capacity: int,
     ):
         if (
             isinstance(after_sequence, bool)
             or not isinstance(after_sequence, int)
-            or after_sequence < 0
+            or not 0 <= after_sequence <= 2**63 - 1
             or isinstance(limit, bool)
             or not isinstance(limit, int)
             or not 1 <= limit <= 500
@@ -896,7 +969,7 @@ class RobotControlService:
             values[-1],
             dict,
         ) else values[-1].sequence if values else 0
-        selected = []
+        candidates = []
         for value in values:
             sequence = (
                 value["sequence"]
@@ -904,27 +977,61 @@ class RobotControlService:
                 else value.sequence
             )
             if sequence > after_sequence:
-                selected.append(serializer(value))
-            if len(selected) == limit:
+                candidates.append(serializer(value))
+            if len(candidates) == limit:
                 break
-        next_after = (
-            selected[-1]["sequence"]
-            if selected
-            else after_sequence
-        )
-        return {
+        # The page cap is a byte boundary, not merely an item count.  Reserve
+        # the exact compact-JSON envelope with a worst-case cursor, then fill
+        # the collection without ever creating an oversized HTTP response.
+        envelope = {
             "schema": schema,
             "after_sequence": after_sequence,
             "oldest_sequence": oldest,
             "newest_sequence": newest,
-            "next_after_sequence": next_after,
+            "next_after_sequence": 2**63 - 1,
             "gap": (
                 oldest is not None
                 and after_sequence < oldest - 1
             ),
             "dropped_total": dropped_total,
-            "items": selected,
+            "retained_bytes": retained_bytes,
+            "byte_capacity": byte_capacity,
+            "response_byte_capacity": MAX_ROBOT_PAGE_RESPONSE_BYTES,
+            "byte_limited": False,
+            collection_name: [],
         }
+        remaining_bytes = (
+            MAX_ROBOT_PAGE_RESPONSE_BYTES - _json_size(envelope)
+        )
+        selected = []
+        selected_bytes = 0
+        for candidate in candidates:
+            increment = _json_size(candidate) + (1 if selected else 0)
+            if selected_bytes + increment > remaining_bytes:
+                break
+            selected.append(candidate)
+            selected_bytes += increment
+        if candidates and not selected:
+            raise RobotControlServiceError(
+                500,
+                "robot_history_item_too_large",
+                "Robot history item exceeds the HTTP page byte capacity",
+            )
+        next_after = (
+            selected[-1]["sequence"]
+            if selected
+            else after_sequence
+        )
+        envelope["next_after_sequence"] = next_after
+        envelope["byte_limited"] = len(selected) < len(candidates)
+        envelope[collection_name] = selected
+        if _json_size(envelope) > MAX_ROBOT_PAGE_RESPONSE_BYTES:
+            raise RobotControlServiceError(
+                500,
+                "robot_history_page_too_large",
+                "Robot history page exceeds its bounded byte capacity",
+            )
+        return envelope
 
     def events(self, after_sequence: int, limit: int):
         with self._lock:
@@ -935,8 +1042,10 @@ class RobotControlService:
                 self._event_dropped_total,
                 EVENT_PAGE_SCHEMA,
                 lambda value: dict(value),
+                "events",
+                self._event_retained_bytes,
+                self._event_byte_capacity,
             )
-        page["events"] = page.pop("items")
         return page
 
     def snapshots(self, after_sequence: int, limit: int):
@@ -948,8 +1057,10 @@ class RobotControlService:
                 self._snapshot_dropped_total,
                 SNAPSHOT_PAGE_SCHEMA,
                 lambda value: value.to_dict(),
+                "snapshots",
+                self._snapshot_retained_bytes,
+                self._snapshot_byte_capacity,
             )
-        page["snapshots"] = page.pop("items")
         return page
 
     def shutdown(self, timeout_seconds: float = 2.0) -> None:

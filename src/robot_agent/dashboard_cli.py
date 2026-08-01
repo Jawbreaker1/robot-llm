@@ -13,6 +13,7 @@ import sys
 import threading
 from typing import Optional, Sequence
 
+from .dashboard_access_key import load_or_create_dashboard_access_key
 from .dashboard_http import (
     DashboardHTTPResponse,
     DashboardRouter,
@@ -301,6 +302,13 @@ def _parser() -> argparse.ArgumentParser:
         help="Loopback-port (default: %(default)s)",
     )
     parser.add_argument(
+        "--console-access-key-file",
+        help=(
+            "Owner-only file used to keep the private live-console URL "
+            "stable across server restarts"
+        ),
+    )
+    parser.add_argument(
         "--lm-studio-url",
         default=DEFAULT_BASE_URL,
         help="Loopback-URL till LM Studio (default: %(default)s)",
@@ -585,10 +593,19 @@ def _run(
             robot_runtime_adapter,
             settings=RobotControlSettings(model=args.model),
         )
+        server_options = {
+            "robot_control_service": robot_control_service,
+        }
+        if args.console_access_key_file:
+            server_options["session_token"] = (
+                load_or_create_dashboard_access_key(
+                    Path(args.console_access_key_file),
+                )
+            )
         server, _router = build_server(
             service,
             args.port,
-            robot_control_service=robot_control_service,
+            **server_options,
         )
 
         address = "http://{}:{}{}".format(

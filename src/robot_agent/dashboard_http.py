@@ -22,6 +22,7 @@ from .stt_contract import MAX_STT_AUDIO_BYTES
 API_VERSION = "robot-dashboard/v1"
 MAX_REQUEST_BYTES = 16 * 1024
 MAX_EVENT_LIMIT = 500
+MAX_SPATIAL_MAP_RESPONSE_BYTES = 4 * 1024 * 1024
 TOKEN_HEADER = "x-robot-dashboard-token"
 TOKEN_PLACEHOLDER = b"__ROBOT_DASHBOARD_TOKEN__"
 STT_REQUEST_ID_HEADER = "x-robot-stt-request-id"
@@ -214,7 +215,8 @@ class DashboardRouter:
             raise ValueError("Dashboard router configuration is invalid")
         self._service = service
         self._session_token = session_token
-        self._session_path = "/session/{}/".format(session_token)
+        self._access_path = "/live/{}/".format(session_token)
+        self._legacy_session_path = "/session/{}/".format(session_token)
         self._expected_host = expected_host
         self._expected_origin = "http://" + expected_host
         self._robot_control_router = robot_control_router
@@ -226,19 +228,25 @@ class DashboardRouter:
         self._assets = self._load_assets()
 
     @property
-    def session_path(self) -> str:
-        """Capability-bearing path used for the initial browser load."""
+    def access_path(self) -> str:
+        """Canonical capability-bearing path for the live console."""
 
-        return self._session_path
+        return self._access_path
+
+    @property
+    def session_path(self) -> str:
+        """Backward-compatible name for the canonical live-console path."""
+
+        return self._access_path
 
     def _load_assets(self):
         assets = {}
         index = (self._web_root / "index.html").read_bytes()
         if index.count(TOKEN_PLACEHOLDER) != 1:
             raise ValueError(
-                "Dashboard index must contain one session token placeholder"
+                "Dashboard index must contain one access-key placeholder"
             )
-        assets[self._session_path] = (
+        assets[self._access_path] = (
             index.replace(
                 TOKEN_PLACEHOLDER,
                 self._session_token.encode("ascii"),
@@ -253,11 +261,21 @@ class DashboardRouter:
                         "Dashboard index references a missing asset"
                     )
                 continue
-            assets[self._session_path + route] = (
+            assets[self._access_path + route] = (
                 path.read_bytes(),
                 content_type,
             )
         return assets
+
+    def _legacy_location(self, path: str) -> Optional[str]:
+        """Map an allowlisted legacy session path to its live URL."""
+
+        if path == self._legacy_session_path:
+            return self._access_path
+        for route in self._STATIC_ROUTES:
+            if path == self._legacy_session_path + route:
+                return self._access_path + route
+        return None
 
     @staticmethod
     def _security_headers(content_type: str):
@@ -347,7 +365,7 @@ class DashboardRouter:
                 "Request host is not accepted",
             )
 
-        if path.startswith("/session/"):
+        if path.startswith(("/live/", "/session/")):
             parts = path.split("/")
             path_token = parts[2] if len(parts) > 2 else ""
             if not secrets.compare_digest(
@@ -357,7 +375,7 @@ class DashboardRouter:
                 raise DashboardHTTPError(
                     403,
                     "session_token_rejected",
-                    "Dashboard session token is invalid",
+                    "Live-console access key is invalid",
                 )
             return
 
@@ -368,7 +386,7 @@ class DashboardRouter:
             raise DashboardHTTPError(
                 403,
                 "session_token_rejected",
-                "Dashboard session token is invalid",
+                "Live-console access key is invalid",
             )
         origin = headers.get("origin")
         if origin not in (None, self._expected_origin):
@@ -534,6 +552,17 @@ class DashboardRouter:
         path = parsed.path
         segments = self._path_segments(path)
 
+        legacy_location = self._legacy_location(path)
+        if method == "GET" and not parsed.query and legacy_location is not None:
+            return DashboardHTTPResponse(
+                status=308,
+                headers=(
+                    self._security_headers("text/plain; charset=utf-8")
+                    + (("Location", legacy_location),)
+                ),
+                body=b"",
+            )
+
         if method == "GET" and not parsed.query and path in self._assets:
             asset, content_type = self._assets[path]
             return DashboardHTTPResponse(
@@ -614,7 +643,14 @@ class DashboardRouter:
                     "Map endpoint accepts no query",
                 )
             value = self._service_call(self._service.spatial_map)
-            return self._response(200, {"map": value})
+            response = self._response(200, {"map": value})
+            if len(response.body) > MAX_SPATIAL_MAP_RESPONSE_BYTES:
+                raise DashboardHTTPError(
+                    503,
+                    "spatial_map_unavailable",
+                    "Spatial map response exceeds its byte capacity",
+                )
+            return response
 
         if method == "POST" and path == STT_TRANSCRIPTIONS_PATH:
             if parsed.query:
@@ -941,6 +977,6 @@ class DashboardRouter:
 
 
 def new_session_token() -> str:
-    """Return a process-local 256-bit browser session token."""
+    """Return a random 256-bit access key (legacy public function name)."""
 
     return secrets.token_hex(32)

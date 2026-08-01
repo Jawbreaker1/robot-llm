@@ -30,7 +30,7 @@ from .spatial_contract_validation import (
 SPATIAL_MAP_SNAPSHOT_SCHEMA = "robot-spatial-map-snapshot/v1"
 SPATIAL_MAP_UPDATE_SCHEMA = "robot-spatial-map-update/v1"
 DASHBOARD_SPATIAL_MAP_SCHEMA = "robot-spatial-map/v1"
-MAX_POSE_HISTORY = 256
+MAX_POSE_HISTORY = 2_048
 MAX_SPATIAL_SCAN_EVIDENCE = MAX_SCAN_ATTEMPTS_PER_MAP
 
 CELL_UNKNOWN = "UNKNOWN"

@@ -13,6 +13,11 @@ from typing import Callable, Mapping
 
 from .navigation_memory_store import NavigationMemoryStore
 from .physical_navigation_contract import validate_observation
+from .physical_scan_evidence import (
+    MAX_SCAN_ATTEMPTS_PER_HAZARD,
+    MAX_SCAN_ATTEMPTS_PER_MAP,
+)
+from .provisional_hazard_map import MAX_HAZARDS_PER_MAP
 from .spatial_map_contract import (
     DASHBOARD_SPATIAL_MAP_SCHEMA,
     LOCAL_ODOMETRY,
@@ -30,7 +35,7 @@ from .spatial_map_contract import (
 )
 
 
-MAX_QUALITATIVE_OBSERVATIONS = 128
+MAX_QUALITATIVE_OBSERVATIONS = 1_024
 PHYSICAL_IR_CONFIDENCE_MILLI = 250
 PHYSICAL_IR_TTL_MS = 5_000
 
@@ -77,10 +82,25 @@ def _empty_snapshot(robot_id: str, controller_instance_id: str):
         "pose_history_evicted": 0,
         "collision_geometry": None,
         "scan_evidence_history": [],
+        "scan_evidence_history_evicted": 0,
         "sensor_rays": [],
         "cells": [],
         "qualitative_observations": [],
+        "qualitative_observations_evicted": 0,
         "object_hypotheses": [],
+        "hazard_retention": {
+            "capacity": MAX_HAZARDS_PER_MAP,
+            "retained_count": 0,
+            "evicted_count": 0,
+            "last_eviction_reason": None,
+        },
+        "scan_attempt_retention": {
+            "per_hazard_capacity": MAX_SCAN_ATTEMPTS_PER_HAZARD,
+            "map_capacity": MAX_SCAN_ATTEMPTS_PER_MAP,
+            "retained_count": 0,
+            "evicted_count": 0,
+            "last_eviction_reason": None,
+        },
         "captured_at_unix_ms": None,
         "observed_at_unix_ms": None,
         "observed_age_ms": None,
@@ -117,8 +137,11 @@ class PhysicalSpatialMapBridge:
         self._publication_sequence = 0
         self._last_captured_at_ms = 0
         self._qualitative = []
+        self._qualitative_evicted = 0
         self._pose_history = []
         self._pose_history_evicted = 0
+        self._retained_scan_ids = set()
+        self._scan_evidence_evicted = 0
         self._snapshot = _empty_snapshot(
             self.robot_id,
             self.controller_instance_id,
@@ -161,8 +184,11 @@ class PhysicalSpatialMapBridge:
         self._generation_revision = memory.hazard_map.revision
         self._world_model_version += 1
         self._qualitative.clear()
+        self._qualitative_evicted = 0
         self._pose_history.clear()
         self._pose_history_evicted = 0
+        self._retained_scan_ids.clear()
+        self._scan_evidence_evicted = 0
 
     def _retain_pose(self, pose: Mapping[str, object]) -> None:
         """Retain changed valid poses without heuristic thresholds."""
@@ -271,6 +297,13 @@ class PhysicalSpatialMapBridge:
                 self._begin_generation(memory)
             else:
                 self._generation_revision = memory.hazard_map.revision
+            retained_scan_ids = {
+                item["scan_id"] for item in scan_evidence_history
+            }
+            self._scan_evidence_evicted += len(
+                self._retained_scan_ids - retained_scan_ids
+            )
+            self._retained_scan_ids = retained_scan_ids
             captured = captured_at_ms
             self._last_captured_at_ms = captured
             self._publication_sequence += 1
@@ -289,6 +322,9 @@ class PhysicalSpatialMapBridge:
                 else "NO_NEAR_REFLECTION"
             )
             if has_current_ir:
+                if len(self._qualitative) == MAX_QUALITATIVE_OBSERVATIONS:
+                    del self._qualitative[0]
+                    self._qualitative_evicted += 1
                 self._qualitative.append({
                     "evidence_id": "physical-ir-{}-{}".format(
                         world_version,
@@ -304,9 +340,6 @@ class PhysicalSpatialMapBridge:
                     "observed_at_unix_ms": captured,
                     "age_ms": 0,
                 })
-                self._qualitative = self._qualitative[
-                    -MAX_QUALITATIVE_OBSERVATIONS:
-                ]
 
             hazards = []
             for hazard in memory.hazard_map.hazards:
@@ -432,10 +465,22 @@ class PhysicalSpatialMapBridge:
                 "scan_evidence_history": deepcopy(
                     scan_evidence_history
                 ),
+                "scan_evidence_history_evicted": (
+                    self._scan_evidence_evicted
+                ),
                 "sensor_rays": sensor_rays,
                 "cells": [],
                 "qualitative_observations": deepcopy(self._qualitative),
+                "qualitative_observations_evicted": (
+                    self._qualitative_evicted
+                ),
                 "object_hypotheses": hazards,
+                "hazard_retention": dict(
+                    memory.hazard_map.hazard_retention()
+                ),
+                "scan_attempt_retention": dict(
+                    memory.hazard_map.scan_attempt_retention()
+                ),
                 "captured_at_unix_ms": captured,
                 "observed_at_unix_ms": captured,
                 "observed_age_ms": 0,

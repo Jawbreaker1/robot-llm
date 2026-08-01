@@ -68,7 +68,7 @@ RUNTIME_SCHEMA = "dashboard-runtime/v1"
 SPATIAL_MAP_SCHEMA = "robot-spatial-map/v1"
 MAX_CHAT_JOBS = 8
 MAX_HISTORY_MESSAGES = 20
-MAX_SPATIAL_MAP_BYTES = 2 * 1024 * 1024
+MAX_SPATIAL_MAP_BYTES = 4 * 1024 * 1024
 LM_PROBE_TIMEOUT_SECONDS = 2.0
 LM_PROBE_MAX_BYTES = 64 * 1024
 _LEVEL_ORDER = {
@@ -349,10 +349,15 @@ def _empty_spatial_map() -> Mapping[str, object]:
         "robot_pose": None,
         "pose_history": [],
         "pose_history_evicted": 0,
+        "scan_evidence_history": [],
+        "scan_evidence_history_evicted": 0,
         "cells": [],
         "sensor_rays": [],
         "qualitative_observations": [],
+        "qualitative_observations_evicted": 0,
         "object_hypotheses": [],
+        "hazard_retention": None,
+        "scan_attempt_retention": None,
     }
 
 

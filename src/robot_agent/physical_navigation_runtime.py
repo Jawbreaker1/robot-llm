@@ -951,10 +951,17 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
                 decision = planner_result.decision
                 latency_ms = planner_result.latency_ms
                 served_model = planner_result.served_model
+                planner_telemetry = {
+                    "planner_context_bytes": planner_result.context_byte_count,
+                    "prompt_tokens": planner_result.prompt_tokens,
+                    "completion_tokens": planner_result.completion_tokens,
+                    "total_tokens": planner_result.total_tokens,
+                }
             elif isinstance(planner_result, NavigationDecision):
                 decision = planner_result
                 latency_ms = 0
                 served_model = None
+                planner_telemetry = {}
             else:
                 self._post_planner_gate(deadline, "after_planner_return")
                 raise PhysicalNavigationRuntimeError(
@@ -974,6 +981,7 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
                 model_latency_ms=latency_ms,
                 served_model=served_model,
                 decision_status="proposed",
+                **planner_telemetry,
             )
             try:
                 if (

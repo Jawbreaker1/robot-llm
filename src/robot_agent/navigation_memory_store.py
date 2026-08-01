@@ -31,8 +31,9 @@ from .provisional_hazard_map import (
 )
 
 
-MEMORY_SCHEMA = "robot-physical-navigation-memory/v1"
-MAX_MEMORY_BYTES = 128 * 1024
+LEGACY_MEMORY_SCHEMA = "robot-physical-navigation-memory/v1"
+MEMORY_SCHEMA = "robot-physical-navigation-memory/v2"
+MAX_MEMORY_BYTES = 2 * 1024 * 1024
 
 
 class NavigationMemoryError(RuntimeError):
@@ -187,7 +188,7 @@ class NavigationMemoryStore:
         odometry_calibration,
         hazard_calibration,
     ):
-        fields = {
+        legacy_fields = {
             "schema",
             "robot_id",
             "controller_instance_id",
@@ -202,11 +203,30 @@ class NavigationMemoryStore:
             "localization_valid",
             "localization_error",
         }
-        if not isinstance(value, dict) or set(value) != fields:
+        initial_v2_fields = legacy_fields | {
+            "hazards_evicted",
+            "hazards_eviction_reason",
+        }
+        current_fields = initial_v2_fields | {
+            "scan_attempts_evicted",
+            "scan_attempts_eviction_reason",
+        }
+        if not isinstance(value, dict):
+            raise ValueError("memory fields are invalid")
+        schema = value.get("schema")
+        if schema == LEGACY_MEMORY_SCHEMA:
+            expected_fields = legacy_fields
+        elif (
+            schema == MEMORY_SCHEMA
+            and set(value) in (initial_v2_fields, current_fields)
+        ):
+            expected_fields = set(value)
+        else:
+            expected_fields = None
+        if expected_fields is None or set(value) != expected_fields:
             raise ValueError("memory fields are invalid")
         if (
-            value["schema"] != MEMORY_SCHEMA
-            or value["robot_id"] != expected_robot_id
+            value["robot_id"] != expected_robot_id
             or value["controller_instance_id"]
             != expected_controller_instance_id
         ):
@@ -246,6 +266,16 @@ class NavigationMemoryStore:
             ),
             revision=value["map_revision"],
             calibration=hazard_calibration,
+            hazards_evicted=value.get("hazards_evicted", 0),
+            hazards_eviction_reason=value.get(
+                "hazards_eviction_reason"
+            ),
+            scan_attempts_evicted=value.get(
+                "scan_attempts_evicted"
+            ),
+            scan_attempts_eviction_reason=value.get(
+                "scan_attempts_eviction_reason"
+            ),
         )
         return cls(
             path=path,
@@ -273,6 +303,16 @@ class NavigationMemoryStore:
             "updated_at_ms": self.updated_at_ms,
             "pose": self.pose.to_dict(),
             "map_revision": self.hazard_map.revision,
+            "hazards_evicted": self.hazard_map.hazards_evicted,
+            "hazards_eviction_reason": (
+                self.hazard_map.hazards_eviction_reason
+            ),
+            "scan_attempts_evicted": (
+                self.hazard_map.scan_attempts_evicted
+            ),
+            "scan_attempts_eviction_reason": (
+                self.hazard_map.scan_attempts_eviction_reason
+            ),
             "hazards": [
                 item.to_dict() for item in self.hazard_map.hazards
             ],

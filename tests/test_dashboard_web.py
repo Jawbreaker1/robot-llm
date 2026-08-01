@@ -664,6 +664,26 @@ process.stdout.write(JSON.stringify({
             with self.subTest(key=key):
                 self.assertIn('"{}"'.format(key), self.i18n)
 
+        values = self.i18n_contract["catalogs"]
+        self.assertEqual(
+            values["sv"]["values"]["workbench.session.eyebrow"],
+            "Aktuell konversation",
+        )
+        self.assertEqual(
+            values["en"]["values"]["workbench.session.eyebrow"],
+            "Current conversation",
+        )
+        self.assertEqual(
+            values["sv"]["values"]["errors.session_token_rejected"],
+            "Livekonsolens åtkomstnyckel avvisades.",
+        )
+        self.assertEqual(
+            values["en"]["values"]["errors.session_token_rejected"],
+            "The live-console access key was rejected.",
+        )
+        self.assertNotIn("Aktiv session", self.html)
+        self.assertNotIn("Active session", self.i18n)
+
         self.assertIn("createDashboardRequest", self.dashboard_logic)
         self.assertIn("createSessionGuard", self.dashboard_logic)
         self.assertIn(
@@ -2018,6 +2038,10 @@ const idle = api.normalizeControl({
   },
   runtime: {
     plan: ["scan", "advance"],
+    planner_context_bytes: 88000,
+    prompt_tokens: 21000,
+    completion_tokens: 120,
+    total_tokens: 21120,
     speech_status: "idle",
   },
 });
@@ -2028,6 +2052,9 @@ process.stdout.write(JSON.stringify({
   states: Array.from(api.CONTROL_STATES),
   idle,
   disabled,
+  preferredLiveTarget: api.preferredInitialTarget(idle, false),
+  preferredDisabledTarget: api.preferredInitialTarget(disabled, false),
+  preferredAfterUserChoice: api.preferredInitialTarget(idle, true),
   robotPolicy: api.composerPolicy(idle, "robot", true, false),
   workbenchPolicy: api.composerPolicy(idle, "workbench", true, false),
   workbenchWithoutRobot: api.composerPolicy(
@@ -2082,6 +2109,7 @@ process.stdout.write(JSON.stringify({
                 "createConversationTargetState",
                 "defaultConversationTarget",
                 "normalizeControl",
+                "preferredInitialTarget",
                 "shouldApplySnapshot",
             ],
         )
@@ -2099,6 +2127,9 @@ process.stdout.write(JSON.stringify({
             },
         )
         self.assertTrue(contract["invalidTargetRejected"])
+        self.assertEqual(contract["preferredLiveTarget"], "robot")
+        self.assertEqual(contract["preferredDisabledTarget"], "workbench")
+        self.assertEqual(contract["preferredAfterUserChoice"], "workbench")
         self.assertEqual(
             contract["states"],
             [
@@ -2125,6 +2156,22 @@ process.stdout.write(JSON.stringify({
         self.assertFalse(contract["lowerSequenceAccepted"])
         self.assertTrue(contract["equalSequenceAccepted"])
         self.assertTrue(contract["higherSequenceAccepted"])
+        self.assertEqual(
+            contract["idle"]["runtime"]["planner_context_bytes"],
+            88_000,
+        )
+        self.assertEqual(
+            contract["idle"]["runtime"]["prompt_tokens"],
+            21_000,
+        )
+        self.assertEqual(
+            contract["idle"]["runtime"]["completion_tokens"],
+            120,
+        )
+        self.assertEqual(
+            contract["idle"]["runtime"]["total_tokens"],
+            21_120,
+        )
         self.assertIn(
             "if (!shouldApplySnapshot(control, next))",
             self.robot_control,
@@ -2290,6 +2337,37 @@ const resetAccepted = resetStore.ingestEvents({
   next_after_sequence: 4,
   events: [],
 });
+const catchingUp = api.createHistoryStore(10);
+catchingUp.ingestEvents({
+  ...eventPage,
+  newest_sequence: 1000,
+  next_after_sequence: 500,
+  events: [],
+});
+catchingUp.ingestSnapshots({
+  ...snapshotPage,
+  newest_sequence: 1000,
+  next_after_sequence: 500,
+  snapshots: [],
+});
+const catchUpBefore = {
+  caughtUp: catchingUp.caughtUp(),
+  progress: catchingUp.progress(),
+};
+catchingUp.ingestEvents({
+  ...eventPage,
+  after_sequence: 500,
+  newest_sequence: 1000,
+  next_after_sequence: 1000,
+  events: [],
+});
+catchingUp.ingestSnapshots({
+  ...snapshotPage,
+  after_sequence: 500,
+  newest_sequence: 1000,
+  next_after_sequence: 1000,
+  snapshots: [],
+});
 
 process.stdout.write(JSON.stringify({
   exports: Object.keys(api).sort(),
@@ -2320,6 +2398,10 @@ process.stdout.write(JSON.stringify({
   liveCountAfterHistory: liveFirst.values().snapshots.length,
   resetAccepted,
   resetCursor: resetStore.cursors().event,
+  catchUpBefore,
+  catchUpAfter: catchingUp.caughtUp(),
+  catchUpPages: api.MAX_CATCH_UP_PAGES,
+  catchUpPollMs: api.POLL_CATCH_UP_MS,
 }));
 """
         completed = subprocess.run(
@@ -2374,6 +2456,18 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(result["liveCountAfterHistory"], 5)
         self.assertFalse(result["resetAccepted"])
         self.assertEqual(result["resetCursor"], 0)
+        self.assertFalse(result["catchUpBefore"]["caughtUp"])
+        self.assertEqual(
+            result["catchUpBefore"]["progress"],
+            {
+                "event": {"cursor": 500, "newest": 1_000},
+                "snapshot": {"cursor": 500, "newest": 1_000},
+            },
+        )
+        self.assertTrue(result["catchUpAfter"])
+        self.assertEqual(result["catchUpPages"], 4)
+        self.assertEqual(result["catchUpPollMs"], 0)
+        self.assertIn('connection = "catching_up";', self.robot_mission_panel)
         self.assertIn(
             "/api/v1/robot/events?after_sequence=",
             self.robot_mission_panel,
@@ -2383,6 +2477,124 @@ process.stdout.write(JSON.stringify({
             self.robot_mission_panel,
         )
         self.assertNotIn("innerHTML", self.robot_mission_panel)
+
+    def test_robot_mission_history_retention_is_generous_and_explicit(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const context = {};
+vm.runInNewContext(source, context, { filename: process.argv[1] });
+const api = context.RobotMissionPanelUI;
+const count = api.HISTORY_CAPACITY + 2;
+const snapshots = Array.from({ length: count }, (_value, index) => {
+  const sequence = index + 1;
+  return {
+    sequence,
+    state: "RUNNING",
+    enabled: true,
+    episode: {
+      episode_id: "episode-retention",
+      goal: "Retain a useful local mission history",
+      started_at_unix_ms: 1,
+      terminal_reason: null,
+    },
+    updated_at_unix_ms: sequence,
+    runtime: {
+      current_action: sequence % 2 ? "OBSERVE" : "ADVANCE",
+      plan: [sequence % 2 ? "OBSERVE" : "ADVANCE"],
+      speech_status: "idle",
+      message: `step-${sequence}`,
+    },
+  };
+});
+const events = Array.from({ length: count }, (_value, index) => {
+  const sequence = index + 1;
+  return {
+    sequence,
+    occurred_at_unix_ms: sequence,
+    event_type: "robot.test_progress",
+    message: `event-${sequence}`,
+    episode_id: "episode-retention",
+    state: "RUNNING",
+    level: "info",
+    data: {},
+  };
+});
+const store = api.createHistoryStore();
+store.ingestEvents({
+  schema: api.EVENT_PAGE_SCHEMA,
+  after_sequence: 0,
+  oldest_sequence: 1,
+  newest_sequence: count,
+  next_after_sequence: count,
+  gap: false,
+  dropped_total: 0,
+  events,
+});
+store.ingestSnapshots({
+  schema: api.SNAPSHOT_PAGE_SCHEMA,
+  after_sequence: 0,
+  oldest_sequence: 1,
+  newest_sequence: count,
+  next_after_sequence: count,
+  gap: false,
+  dropped_total: 0,
+  snapshots,
+});
+const values = store.values();
+const timeline = api.buildTimeline(
+  values,
+  api.normalizeSnapshot(snapshots[snapshots.length - 1]),
+);
+process.stdout.write(JSON.stringify({
+  historyCapacity: api.HISTORY_CAPACITY,
+  timelineCapacity: api.TIMELINE_CAPACITY,
+  eventCount: values.events.length,
+  eventFirst: values.events[0].sequence,
+  snapshotCount: values.snapshots.length,
+  snapshotFirst: values.snapshots[0].sequence,
+  gaps: store.gaps(),
+  timelineCount: timeline.entries.length,
+  timelineTotal: timeline.totalEntries,
+  timelineTruncated: timeline.truncated,
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(WEB_ROOT / "robot_mission_panel.js"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["historyCapacity"], 1_000)
+        self.assertEqual(result["timelineCapacity"], 500)
+        self.assertEqual(result["eventCount"], 1_000)
+        self.assertEqual(result["snapshotCount"], 1_000)
+        self.assertEqual(result["eventFirst"], 3)
+        self.assertEqual(result["snapshotFirst"], 3)
+        self.assertEqual(result["gaps"], {"event": True, "snapshot": True})
+        self.assertEqual(result["timelineCount"], 500)
+        self.assertGreater(result["timelineTotal"], 500)
+        self.assertTrue(result["timelineTruncated"])
+        self.assertIn(
+            "/api/v1/robot/events?after_sequence=${cursors.event}&limit=500",
+            self.robot_mission_panel,
+        )
+        self.assertIn(
+            "/api/v1/robot/snapshots?after_sequence=${cursors.snapshot}&limit=500",
+            self.robot_mission_panel,
+        )
+        self.assertIn("const MAX_LOCAL_EVENTS = 2000;", self.javascript)
 
     def test_workbench_safety_contract_is_scoped_from_robot_control(self):
         self.assertIn(

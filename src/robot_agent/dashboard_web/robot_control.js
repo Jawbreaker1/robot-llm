@@ -127,6 +127,18 @@
         model_latency_ms: Number.isSafeInteger(runtime.model_latency_ms)
           ? runtime.model_latency_ms
           : null,
+        planner_context_bytes: Number.isSafeInteger(
+          runtime.planner_context_bytes,
+        ) ? runtime.planner_context_bytes : null,
+        prompt_tokens: Number.isSafeInteger(runtime.prompt_tokens)
+          ? runtime.prompt_tokens
+          : null,
+        completion_tokens: Number.isSafeInteger(runtime.completion_tokens)
+          ? runtime.completion_tokens
+          : null,
+        total_tokens: Number.isSafeInteger(runtime.total_tokens)
+          ? runtime.total_tokens
+          : null,
         speech_status: safeText(runtime.speech_status, "idle"),
         message: safeText(runtime.message, ""),
       },
@@ -155,6 +167,16 @@
     const current = normalizeControl(currentValue);
     const candidate = normalizeControl(candidateValue);
     return candidate.sequence >= current.sequence;
+  }
+
+  function preferredInitialTarget(controlValue, userSelectedTarget) {
+    if (typeof userSelectedTarget !== "boolean") {
+      throw new TypeError("Target-selection state is invalid");
+    }
+    const candidate = normalizeControl(controlValue);
+    return candidate.enabled && !userSelectedTarget
+      ? "robot"
+      : "workbench";
   }
 
   function create(options) {
@@ -205,6 +227,7 @@
     let chatEnabled = false;
     let pollTimer = null;
     let stopped = false;
+    let userSelectedTarget = false;
     const conversationTarget = createConversationTargetState(
       options.initialConversationView || "workbench",
     );
@@ -276,7 +299,15 @@
       byId("robot-model-latency").textContent = (
         runtime.model_latency_ms === null
           ? translate("common.missing")
-          : `${runtime.model_latency_ms} ms`
+          : [
+            `${runtime.model_latency_ms} ms`,
+            runtime.planner_context_bytes === null
+              ? null
+              : `${runtime.planner_context_bytes} B`,
+            runtime.total_tokens === null
+              ? null
+              : `${runtime.total_tokens} tok`,
+          ].filter(Boolean).join(" · ")
       );
       const speechKey = `robot.speech.${runtime.speech_status}`;
       const speechValue = translate(speechKey);
@@ -601,6 +632,7 @@
         return;
       }
       byId("composer-target").addEventListener("change", (event) => {
+        userSelectedTarget = true;
         overrideTarget(event.currentTarget.value);
       });
       byId("message-input").addEventListener("input", renderComposer);
@@ -637,6 +669,11 @@
       await refresh(false);
       if (stopped) {
         return;
+      }
+      if (
+        preferredInitialTarget(control, userSelectedTarget) === "robot"
+      ) {
+        overrideTarget("robot");
       }
       renderSettings(true);
       void missionPanel.initialize();
@@ -683,6 +720,7 @@
     createConversationTargetState,
     defaultConversationTarget,
     normalizeControl,
+    preferredInitialTarget,
     shouldApplySnapshot,
   });
 })(window);

@@ -7,11 +7,19 @@ from robot_agent.navigation_memory_store import NavigationMemoryStore
 from robot_agent.physical_odometry import DriveMotorRoles, PhysicalPose
 from robot_agent.physical_footprint import RobotFootprint
 from robot_agent.physical_scan_evidence import (
+    MAX_SCAN_ATTEMPTS_PER_HAZARD,
+    MAX_SCAN_ATTEMPTS_PER_MAP,
     ScanAttemptEvidence,
     ScanRayEvidence,
 )
-from robot_agent.physical_spatial_map import PhysicalSpatialMapBridge
+from robot_agent.physical_spatial_map import (
+    MAX_QUALITATIVE_OBSERVATIONS,
+    PhysicalSpatialMapBridge,
+)
 from robot_agent.provisional_hazard_map import (
+    HAZARD_CAPACITY_EVICTION,
+    MAX_HAZARDS_PER_MAP,
+    PER_HAZARD_SCAN_EVICTION,
     HazardMapCalibration,
     ProvisionalHazard,
     ProvisionalHazardMap,
@@ -147,6 +155,19 @@ class PhysicalSpatialMapBridgeTests(unittest.TestCase):
         ):
             self.assertIsNone(ray[field])
         self.assertEqual(len(snapshot["object_hypotheses"]), 1)
+        self.assertEqual(snapshot["hazard_retention"], {
+            "capacity": MAX_HAZARDS_PER_MAP,
+            "retained_count": 1,
+            "evicted_count": 0,
+            "last_eviction_reason": None,
+        })
+        self.assertEqual(snapshot["scan_attempt_retention"], {
+            "per_hazard_capacity": MAX_SCAN_ATTEMPTS_PER_HAZARD,
+            "map_capacity": MAX_SCAN_ATTEMPTS_PER_MAP,
+            "retained_count": 0,
+            "evicted_count": 0,
+            "last_eviction_reason": None,
+        })
         projected = snapshot["object_hypotheses"][0]
         self.assertEqual(projected["hypothesis_id"], hazard.hypothesis_id)
         self.assertEqual(
@@ -156,6 +177,48 @@ class PhysicalSpatialMapBridgeTests(unittest.TestCase):
         self.assertIsNone(projected["x_mm"])
         self.assertIsNone(projected["y_mm"])
         self.assertNotIn("simulation", json.dumps(snapshot).lower())
+
+    def test_projects_authoritative_hazard_eviction_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = self.memory(directory, map_revision=7)
+            memory.hazard_map = ProvisionalHazardMap(
+                frame_id=memory.frame_id,
+                map_generation_id=memory.generation_id,
+                revision=7,
+                hazards_evicted=3,
+                hazards_eviction_reason=HAZARD_CAPACITY_EVICTION,
+                scan_attempts_evicted=5,
+                scan_attempts_eviction_reason=(
+                    PER_HAZARD_SCAN_EVICTION
+                ),
+            )
+            bridge = PhysicalSpatialMapBridge(
+                robot_id=memory.robot_id,
+                controller_instance_id=memory.controller_instance_id,
+                clock_ms=FixedClock(1_100),
+            )
+
+            self.assertTrue(bridge.offer(
+                memory=memory,
+                observation=observation(),
+                episode_id="episode-retention",
+                captured_at_ms=1_000,
+            ))
+            snapshot = bridge.snapshot()
+
+        self.assertEqual(snapshot["hazard_retention"], {
+            "capacity": MAX_HAZARDS_PER_MAP,
+            "retained_count": 0,
+            "evicted_count": 3,
+            "last_eviction_reason": HAZARD_CAPACITY_EVICTION,
+        })
+        self.assertEqual(snapshot["scan_attempt_retention"], {
+            "per_hazard_capacity": MAX_SCAN_ATTEMPTS_PER_HAZARD,
+            "map_capacity": MAX_SCAN_ATTEMPTS_PER_MAP,
+            "retained_count": 0,
+            "evicted_count": 5,
+            "last_eviction_reason": PER_HAZARD_SCAN_EVICTION,
+        })
 
     def test_projects_authoritative_asymmetric_collision_geometry(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -260,6 +323,7 @@ class PhysicalSpatialMapBridgeTests(unittest.TestCase):
             snapshot = bridge.snapshot()
 
         self.assertEqual(len(snapshot["scan_evidence_history"]), 1)
+        self.assertEqual(snapshot["scan_evidence_history_evicted"], 0)
         evidence = snapshot["scan_evidence_history"][0]
         self.assertEqual(evidence["hypothesis_anchor_pose"], {
             "x_mm": 25,
@@ -547,6 +611,78 @@ class PhysicalSpatialMapBridgeTests(unittest.TestCase):
         self.assertEqual(len(snapshot["pose_history"]), MAX_POSE_HISTORY)
         self.assertEqual(snapshot["pose_history_evicted"], 2)
         self.assertEqual(snapshot["pose_history"][0]["x_mm"], 3)
+        self.assertEqual(
+            len(snapshot["qualitative_observations"]),
+            MAX_QUALITATIVE_OBSERVATIONS,
+        )
+        self.assertEqual(
+            snapshot["qualitative_observations_evicted"],
+            MAX_POSE_HISTORY + 2 - MAX_QUALITATIVE_OBSERVATIONS,
+        )
+
+    def test_scan_projection_counts_evidence_that_leaves_the_hot_view(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = self.memory(directory)
+            attempt = ScanAttemptEvidence(
+                scan_id="scan-before-eviction",
+                completed_at_ms=950,
+                status="CANCELLED",
+                reason="bilateral_boundaries_not_observed",
+                rays=(ScanRayEvidence(0, 0, True, 24, 25),),
+                left_boundary_mdeg=None,
+                right_boundary_mdeg=None,
+                scan_pose=PhysicalPose(),
+                based_on_map_version=1,
+            )
+            hazard = ProvisionalHazard(
+                hypothesis_id="hazard-with-scan",
+                frame_id=memory.frame_id,
+                anchor_x_mm=0,
+                anchor_y_mm=0,
+                anchor_heading_mdeg=0,
+                centroid_x_mm=140,
+                centroid_y_mm=0,
+                radius_mm=70,
+                first_seen_at_ms=900,
+                last_seen_at_ms=900,
+                evidence_count=1,
+                last_state_version=1,
+                last_raw_ir_proximity=24,
+                last_filtered_ir_proximity=25,
+                scan_evidence_history=(attempt,),
+            )
+            memory.hazard_map = ProvisionalHazardMap(
+                frame_id=memory.frame_id,
+                map_generation_id=memory.generation_id,
+                hazards=(hazard,),
+                revision=2,
+            )
+            bridge = PhysicalSpatialMapBridge(
+                robot_id=memory.robot_id,
+                controller_instance_id=memory.controller_instance_id,
+                clock_ms=FixedClock(2_000),
+            )
+            self.assertTrue(bridge.offer(
+                memory=memory,
+                observation=observation(version=1),
+                episode_id="episode-scan-eviction",
+                captured_at_ms=1_000,
+            ))
+            memory.hazard_map = ProvisionalHazardMap(
+                frame_id=memory.frame_id,
+                map_generation_id=memory.generation_id,
+                revision=3,
+            )
+            self.assertTrue(bridge.offer(
+                memory=memory,
+                observation=observation(version=2),
+                episode_id="episode-scan-eviction",
+                captured_at_ms=1_100,
+            ))
+            snapshot = bridge.snapshot()
+
+        self.assertEqual(snapshot["scan_evidence_history"], [])
+        self.assertEqual(snapshot["scan_evidence_history_evicted"], 1)
 
     def test_rejects_non_increasing_same_generation_map_revisions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -822,6 +958,15 @@ class PhysicalSpatialMapBridgeTests(unittest.TestCase):
         self.assertEqual(empty["pose_history_evicted"], 0)
         self.assertIsNone(empty["collision_geometry"])
         self.assertEqual(empty["scan_evidence_history"], [])
+        self.assertEqual(empty["scan_evidence_history_evicted"], 0)
+        self.assertEqual(empty["scan_attempt_retention"], {
+            "per_hazard_capacity": MAX_SCAN_ATTEMPTS_PER_HAZARD,
+            "map_capacity": MAX_SCAN_ATTEMPTS_PER_MAP,
+            "retained_count": 0,
+            "evicted_count": 0,
+            "last_eviction_reason": None,
+        })
+        self.assertEqual(empty["qualitative_observations_evicted"], 0)
         self.assertTrue(bridge.close())
         with tempfile.TemporaryDirectory() as directory:
             memory = self.memory(directory)

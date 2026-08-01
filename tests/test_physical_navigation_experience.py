@@ -225,6 +225,115 @@ class NavigationEvidenceBasisTests(unittest.TestCase):
 
 
 class NavigationExperienceLedgerTests(unittest.TestCase):
+    def test_scan_repeat_identity_is_scoped_to_its_typed_target(self):
+        basis = navigation_evidence_basis(navigation(), observation(1))
+        ledger = NavigationExperienceLedger(episode_id="episode-targets")
+
+        def record(turn, target):
+            return ledger.record(
+                turn=turn,
+                action=SCAN_FRONT_ARC,
+                source=PLANNER_ACTION_SOURCE,
+                result={
+                    "operation": SCAN_FRONT_ARC,
+                    "status": "DENIED",
+                    "reason": "INTERVENING_NAVIGATION_PROGRESS_REQUIRED",
+                    "target_hypothesis_id": target,
+                },
+                basis_before=basis,
+                basis_after=basis,
+            )
+
+        first_a = record(1, "hazard-a")
+        first_b = record(2, "hazard-b")
+        repeated_a = record(3, "hazard-a")
+
+        self.assertEqual(first_a.attempt_relation, FIRST_ATTEMPT)
+        self.assertEqual(first_b.attempt_relation, FIRST_ATTEMPT)
+        self.assertEqual(first_b.prior_same_action_sequence, 1)
+        self.assertEqual(
+            first_b.attempt_identity,
+            {
+                "action": SCAN_FRONT_ARC,
+                "target_hypothesis_id": "hazard-b",
+            },
+        )
+        self.assertEqual(
+            repeated_a.attempt_relation,
+            UNCHANGED_BASIS_REPEAT,
+        )
+        self.assertEqual(repeated_a.prior_same_basis_sequence, 1)
+        rollup = next(
+            item
+            for item in ledger.context(current_basis=basis)[
+                "current_basis_action_rollups"
+            ]
+            if item["action"] == SCAN_FRONT_ARC
+        )
+        self.assertEqual(
+            {
+                item["outcome"]["target_hypothesis_id"]
+                for item in rollup["outcome_distribution"]
+            },
+            {"hazard-a", "hazard-b"},
+        )
+
+    def test_rollup_distribution_is_bounded_with_explicit_omission_counts(self):
+        basis = navigation_evidence_basis(navigation(), observation(1))
+        ledger = NavigationExperienceLedger(episode_id="episode-many-outcomes")
+        for turn in range(1, 501):
+            ledger.record(
+                turn=turn,
+                action=OBSERVE,
+                source=PLANNER_ACTION_SOURCE,
+                result={
+                    "operation": "observe",
+                    "status": "observed",
+                    "reason": "OUTCOME_{:04d}_{}".format(
+                        turn,
+                        "x" * 120,
+                    ),
+                    "information_gain": "NO_DECISION_RELEVANT_CHANGE",
+                },
+                basis_before=basis,
+                basis_after=basis,
+            )
+
+        context = ledger.context(current_basis=basis)
+        rollup = next(
+            item
+            for item in context["current_basis_action_rollups"]
+            if item["action"] == OBSERVE
+        )
+
+        self.assertLessEqual(
+            len(json.dumps(
+                context,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")),
+            MAX_EXPERIENCE_CONTEXT_BYTES,
+        )
+        self.assertEqual(rollup["attempt_count"], 500)
+        self.assertEqual(rollup["outcome_bucket_count"], 500)
+        self.assertGreater(rollup["outcome_bucket_omitted_count"], 0)
+        self.assertEqual(
+            rollup["outcome_bucket_retained_count"]
+            + rollup["outcome_bucket_omitted_count"],
+            500,
+        )
+        self.assertEqual(
+            rollup["outcome_attempt_retained_count"]
+            + rollup["outcome_attempt_omitted_count"],
+            500,
+        )
+        self.assertTrue(
+            rollup["latest_outcome"]["reason_code"].startswith(
+                "OUTCOME_0500_"
+            )
+        )
+
     def test_exact_repeat_is_distinct_from_retry_after_pose_change(self):
         at_origin = navigation_evidence_basis(
             navigation(x_mm=0),
@@ -320,6 +429,104 @@ class NavigationExperienceLedgerTests(unittest.TestCase):
             UNCHANGED_BASIS_REPEAT,
         )
         self.assertEqual(repeated.prior_same_basis_sequence, 1)
+
+    def test_current_basis_rollup_survives_detailed_history_eviction(self):
+        ledger = NavigationExperienceLedger(episode_id="episode-rollup")
+        origin = navigation_evidence_basis(
+            navigation(x_mm=0),
+            observation(1),
+        )
+        ledger.record(
+            turn=1,
+            action=ADVANCE,
+            source=PLANNER_ACTION_SOURCE,
+            result=pulse_result(status="verification_failed"),
+            basis_before=origin,
+            basis_after=origin,
+        )
+        for turn in range(2, MAX_EXPERIENCE_ENTRIES + 5):
+            changed = navigation_evidence_basis(
+                navigation(x_mm=turn),
+                observation(
+                    turn,
+                    left_position=turn,
+                    right_position=turn,
+                ),
+            )
+            ledger.record(
+                turn=turn,
+                action=OBSERVE,
+                source=PLANNER_ACTION_SOURCE,
+                result={
+                    "operation": "observe",
+                    "status": "observed",
+                    "information_gain": "DECISION_RELEVANT_CHANGE",
+                },
+                basis_before=changed,
+                basis_after=changed,
+            )
+
+        context = ledger.context(current_basis=origin)
+        by_action = {
+            item["action"]: item
+            for item in context["current_basis_action_rollups"]
+        }
+
+        self.assertNotIn(1, [item["sequence"] for item in context["entries"]])
+        self.assertEqual(by_action[ADVANCE]["attempt_count"], 1)
+        self.assertEqual(by_action[ADVANCE]["first_sequence"], 1)
+        self.assertEqual(by_action[ADVANCE]["latest_sequence"], 1)
+        self.assertEqual(
+            by_action[ADVANCE]["latest_outcome"]["status"],
+            "verification_failed",
+        )
+        self.assertEqual(
+            by_action[ADVANCE]["outcome_distribution"],
+            [{
+                "outcome": {
+                    "operation": "pulse",
+                    "status": "verification_failed",
+                    "reason_code": "completed_all_slices",
+                },
+                "count": 1,
+            }],
+        )
+
+    def test_current_basis_rollup_counts_typed_outcomes(self):
+        ledger = NavigationExperienceLedger(episode_id="episode-rollup")
+        basis = navigation_evidence_basis(navigation(), observation(1))
+        for turn, status in enumerate(
+            ("verification_failed", "verification_failed", "completed"),
+            start=1,
+        ):
+            ledger.record(
+                turn=turn,
+                action=ADVANCE,
+                source=PLANNER_ACTION_SOURCE,
+                result=pulse_result(status=status),
+                basis_before=basis,
+                basis_after=basis,
+            )
+
+        rollup = next(
+            item
+            for item in ledger.context(current_basis=basis)[
+                "current_basis_action_rollups"
+            ]
+            if item["action"] == ADVANCE
+        )
+
+        self.assertEqual(rollup["attempt_count"], 3)
+        self.assertEqual(rollup["first_sequence"], 1)
+        self.assertEqual(rollup["latest_sequence"], 3)
+        self.assertEqual(rollup["latest_outcome"]["status"], "completed")
+        self.assertEqual(
+            {
+                item["outcome"]["status"]: item["count"]
+                for item in rollup["outcome_distribution"]
+            },
+            {"completed": 1, "verification_failed": 2},
+        )
 
     def test_published_outcome_is_structured_and_omits_arbitrary_text(self):
         basis = navigation_evidence_basis(navigation(), observation(1))

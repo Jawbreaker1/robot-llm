@@ -8,11 +8,15 @@ and translates them into typed service calls.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Mapping
 from urllib.parse import parse_qs
 
 from .dashboard_contract import DashboardContractError, strict_json_loads
-from .robot_control_service import RobotControlServiceError
+from .robot_control_service import (
+    MAX_ROBOT_PAGE_RESPONSE_BYTES,
+    RobotControlServiceError,
+)
 
 
 ROBOT_API_PREFIX = "/api/v1/robot/"
@@ -101,6 +105,16 @@ def _integer_query(query, name, default):
             "Robot query is invalid",
         )
     return int(values[0])
+
+
+def _response_size(value: Mapping[str, object]) -> int:
+    return len(json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8"))
 
 
 class RobotControlHTTPRouter:
@@ -271,6 +285,12 @@ class RobotControlHTTPRouter:
                         after_sequence,
                         limit,
                     )
+                )
+            if _response_size(value) > MAX_ROBOT_PAGE_RESPONSE_BYTES:
+                raise RobotControlHTTPError(
+                    500,
+                    "robot_history_page_too_large",
+                    "Robot history page exceeds its HTTP byte capacity",
                 )
             return RobotControlHTTPResponse(200, value)
 

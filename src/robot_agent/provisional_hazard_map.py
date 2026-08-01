@@ -24,15 +24,40 @@ from .physical_odometry import (
     normalize_heading_mdeg,
 )
 from .physical_scan_evidence import (
+    MAX_COLLISION_SUPPORTS_PER_HAZARD,
+    MAX_COLLISION_SUPPORTS_PER_MAP,
     MAX_SCAN_ATTEMPTS_PER_HAZARD,
     MAX_SCAN_ATTEMPTS_PER_MAP,
+    AngularCollisionSupport,
     ScanAttemptEvidence,
+    collision_supports_from_attempts,
+    retain_collision_support_diversity,
     retain_scan_attempt_diversity,
 )
 
 
 PROVISIONAL_QUALITATIVE = "PROVISIONAL_QUALITATIVE"
 GEOMETRY_BASIS = "CONSERVATIVE_COLLISION_ENVELOPE_NOT_OBJECT_SURFACE"
+MAX_HAZARDS_PER_MAP = 64
+HAZARD_CAPACITY_EVICTION = "MAP_CAPACITY_OLDEST_HYPOTHESIS"
+PER_HAZARD_SCAN_EVICTION = (
+    "PER_HAZARD_CAPACITY_DIVERSITY_RETENTION"
+)
+MAP_SCAN_EVICTION = "MAP_CAPACITY_OLDEST_ATTEMPT"
+HAZARD_SCAN_EVICTION = "HAZARD_CAPACITY_WITH_HYPOTHESIS"
+SCAN_ATTEMPT_EVICTION_REASONS = frozenset((
+    PER_HAZARD_SCAN_EVICTION,
+    MAP_SCAN_EVICTION,
+    HAZARD_SCAN_EVICTION,
+))
+PER_HAZARD_SUPPORT_EVICTION = (
+    "PER_HAZARD_CAPACITY_OR_STRUCTURAL_DUPLICATE"
+)
+MAP_SUPPORT_EVICTION = "MAP_CAPACITY_OLDEST_DISTINCT_SUPPORT"
+COLLISION_SUPPORT_EVICTION_REASONS = frozenset((
+    PER_HAZARD_SUPPORT_EVICTION,
+    MAP_SUPPORT_EVICTION,
+))
 
 @dataclass(frozen=True)
 class HazardMapCalibration:
@@ -93,6 +118,12 @@ class ProvisionalHazard:
     scan_left_boundary_mdeg: Optional[int] = None
     scan_right_boundary_mdeg: Optional[int] = None
     scan_evidence_history: Tuple[ScanAttemptEvidence, ...] = ()
+    scan_attempts_evicted: int = 0
+    scan_attempts_eviction_reason: Optional[str] = None
+    collision_supports: Tuple[AngularCollisionSupport, ...] = ()
+    collision_supports_evicted: int = 0
+    collision_supports_eviction_reason: Optional[str] = None
+    collision_contested_at_ms: Optional[int] = None
 
     def __post_init__(self) -> None:
         if (
@@ -161,38 +192,120 @@ class ProvisionalHazard:
             != self.scan_evidence_history
         ):
             raise ValueError("hazard scan history is invalid")
+        if (
+            isinstance(self.scan_attempts_evicted, bool)
+            or not isinstance(self.scan_attempts_evicted, int)
+            or self.scan_attempts_evicted < 0
+            or (
+                self.scan_attempts_evicted == 0
+                and self.scan_attempts_eviction_reason is not None
+            )
+            or (
+                self.scan_attempts_evicted > 0
+                and self.scan_attempts_eviction_reason not in (
+                    PER_HAZARD_SCAN_EVICTION,
+                    MAP_SCAN_EVICTION,
+                )
+            )
+        ):
+            raise ValueError("hazard scan attempt eviction is invalid")
+        derived_supports = collision_supports_from_attempts(
+            self.scan_evidence_history
+        )
+        if not self.collision_supports and derived_supports:
+            # Backward-compatible materialization for pre-index memories and
+            # direct construction from retained detail evidence.
+            object.__setattr__(
+                self,
+                "collision_supports",
+                derived_supports,
+            )
+        if (
+            not isinstance(self.collision_supports, tuple)
+            or len(self.collision_supports)
+            > MAX_COLLISION_SUPPORTS_PER_HAZARD
+            or any(
+                not isinstance(item, AngularCollisionSupport)
+                for item in self.collision_supports
+            )
+            or tuple(sorted(
+                self.collision_supports,
+                key=lambda item: (
+                    item.completed_at_ms,
+                    item.source_scan_id,
+                    item.spatial_key,
+                ),
+            )) != self.collision_supports
+            or len({
+                item.spatial_key for item in self.collision_supports
+            }) != len(self.collision_supports)
+        ):
+            raise ValueError("hazard collision support index is invalid")
+        if (
+            isinstance(self.collision_supports_evicted, bool)
+            or not isinstance(self.collision_supports_evicted, int)
+            or self.collision_supports_evicted < 0
+            or (
+                self.collision_supports_evicted == 0
+                and self.collision_supports_eviction_reason is not None
+            )
+            or (
+                self.collision_supports_evicted > 0
+                and self.collision_supports_eviction_reason
+                not in COLLISION_SUPPORT_EVICTION_REASONS
+            )
+        ):
+            raise ValueError("hazard collision support eviction is invalid")
+        history_conflict = max(
+            (
+                attempt.completed_at_ms
+                for attempt in self.scan_evidence_history
+                if attempt.hypothesis_relation
+                == "CONFLICTS_BLOCKED_HYPOTHESIS"
+            ),
+            default=None,
+        )
+        if self.collision_contested_at_ms is None:
+            if history_conflict is not None:
+                object.__setattr__(
+                    self,
+                    "collision_contested_at_ms",
+                    history_conflict,
+                )
+        elif (
+            isinstance(self.collision_contested_at_ms, bool)
+            or not isinstance(self.collision_contested_at_ms, int)
+            or self.collision_contested_at_ms < self.first_seen_at_ms
+        ):
+            raise ValueError("hazard collision conflict is invalid")
+        elif (
+            history_conflict is not None
+            and history_conflict > self.collision_contested_at_ms
+        ):
+            object.__setattr__(
+                self,
+                "collision_contested_at_ms",
+                history_conflict,
+            )
 
     @property
     def bilateral_scan_complete(self) -> bool:
-        latest = (
-            self.scan_evidence_history[-1]
-            if self.scan_evidence_history
-            else None
-        )
         return (
             self.scan_completed_at_ms is not None
             and self.scan_left_boundary_mdeg is not None
             and self.scan_right_boundary_mdeg is not None
             and self.scan_left_boundary_mdeg > 0
             and self.scan_right_boundary_mdeg < 0
-            # A later all-clear arc is explicit conflict evidence against the
-            # old blocked hypothesis. Keep history, not stale geometry.
             and (
-                latest is None
-                or latest.hypothesis_relation
-                != "CONFLICTS_BLOCKED_HYPOTHESIS"
+                self.collision_contested_at_ms is None
+                or self.scan_completed_at_ms
+                > self.collision_contested_at_ms
             )
         )
 
     @property
     def latest_conflicting_scan_at_ms(self) -> Optional[int]:
-        conflicts = [
-            attempt.completed_at_ms
-            for attempt in self.scan_evidence_history
-            if attempt.hypothesis_relation
-            == "CONFLICTS_BLOCKED_HYPOTHESIS"
-        ]
-        return max(conflicts) if conflicts else None
+        return self.collision_contested_at_ms
 
     @property
     def active_for_collision(self) -> bool:
@@ -205,9 +318,25 @@ class ProvisionalHazard:
         """
 
         conflict_at_ms = self.latest_conflicting_scan_at_ms
+        latest_blocked_support_at_ms = max(
+            (
+                support.completed_at_ms
+                for support in self.collision_supports
+            ),
+            default=-1,
+        )
+        latest_bilateral_boundary_at_ms = (
+            self.scan_completed_at_ms
+            if self.bilateral_scan_complete
+            else -1
+        )
         return (
             conflict_at_ms is None
-            or self.last_seen_at_ms > conflict_at_ms
+            or max(
+                self.last_seen_at_ms,
+                latest_blocked_support_at_ms,
+                latest_bilateral_boundary_at_ms,
+            ) > conflict_at_ms
         )
 
     def to_dict(self) -> Mapping[str, object]:
@@ -237,6 +366,20 @@ class ProvisionalHazard:
             "scan_evidence_history": [
                 item.to_dict() for item in self.scan_evidence_history
             ],
+            "scan_attempts_evicted": self.scan_attempts_evicted,
+            "scan_attempts_eviction_reason": (
+                self.scan_attempts_eviction_reason
+            ),
+            "collision_supports": [
+                item.to_dict() for item in self.collision_supports
+            ],
+            "collision_supports_evicted": (
+                self.collision_supports_evicted
+            ),
+            "collision_supports_eviction_reason": (
+                self.collision_supports_eviction_reason
+            ),
+            "collision_contested_at_ms": self.collision_contested_at_ms,
         }
 
     @classmethod
@@ -266,9 +409,25 @@ class ProvisionalHazard:
         }
         history_fields = legacy | {"scan_evidence_history"}
         expected = history_fields | {"bilateral_scan_complete"}
+        indexed = expected | {
+            "collision_supports",
+            "collision_supports_evicted",
+            "collision_supports_eviction_reason",
+            "collision_contested_at_ms",
+        }
+        retained = indexed | {
+            "scan_attempts_evicted",
+            "scan_attempts_eviction_reason",
+        }
         if (
             not isinstance(value, dict)
-            or set(value) not in (legacy, history_fields, expected)
+            or set(value) not in (
+                legacy,
+                history_fields,
+                expected,
+                indexed,
+                retained,
+            )
         ):
             raise ValueError("hazard fields are invalid")
         if (
@@ -285,6 +444,12 @@ class ProvisionalHazard:
             "geometry_basis",
             "scan_evidence_history",
             "bilateral_scan_complete",
+            "scan_attempts_evicted",
+            "scan_attempts_eviction_reason",
+            "collision_supports",
+            "collision_supports_evicted",
+            "collision_supports_eviction_reason",
+            "collision_contested_at_ms",
         }
         arguments = {
             key: value[key]
@@ -296,6 +461,30 @@ class ProvisionalHazard:
             raise ValueError("hazard scan history is invalid")
         arguments["scan_evidence_history"] = tuple(
             ScanAttemptEvidence.from_dict(item) for item in history
+        )
+        arguments["scan_attempts_evicted"] = value.get(
+            "scan_attempts_evicted",
+            0,
+        )
+        arguments["scan_attempts_eviction_reason"] = value.get(
+            "scan_attempts_eviction_reason"
+        )
+        raw_supports = value.get("collision_supports", [])
+        if not isinstance(raw_supports, list):
+            raise ValueError("hazard collision supports are invalid")
+        arguments["collision_supports"] = tuple(
+            AngularCollisionSupport.from_dict(item)
+            for item in raw_supports
+        )
+        arguments["collision_supports_evicted"] = value.get(
+            "collision_supports_evicted",
+            0,
+        )
+        arguments["collision_supports_eviction_reason"] = value.get(
+            "collision_supports_eviction_reason"
+        )
+        arguments["collision_contested_at_ms"] = value.get(
+            "collision_contested_at_ms"
         )
         hazard = cls(**arguments)
         if (
@@ -339,6 +528,10 @@ class ProvisionalHazardMap:
         hazards: Iterable[ProvisionalHazard] = (),
         revision: int = 0,
         calibration: HazardMapCalibration = HazardMapCalibration(),
+        hazards_evicted: int = 0,
+        hazards_eviction_reason: Optional[str] = None,
+        scan_attempts_evicted: Optional[int] = None,
+        scan_attempts_eviction_reason: Optional[str] = None,
     ):
         if not isinstance(frame_id, str) or not frame_id:
             raise ValueError("frame_id is invalid")
@@ -346,8 +539,25 @@ class ProvisionalHazardMap:
             raise ValueError("map_generation_id is invalid")
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
             raise ValueError("map revision is invalid")
+        if (
+            isinstance(hazards_evicted, bool)
+            or not isinstance(hazards_evicted, int)
+            or hazards_evicted < 0
+            or (
+                hazards_evicted == 0
+                and hazards_eviction_reason is not None
+            )
+            or (
+                hazards_evicted > 0
+                and hazards_eviction_reason != HAZARD_CAPACITY_EVICTION
+            )
+        ):
+            raise ValueError("hazard eviction state is invalid")
         values = tuple(hazards)
-        if len(values) > 32 or len({item.hypothesis_id for item in values}) != len(values):
+        if (
+            len(values) > MAX_HAZARDS_PER_MAP
+            or len({item.hypothesis_id for item in values}) != len(values)
+        ):
             raise ValueError("hazard set is invalid")
         if any(item.frame_id != frame_id for item in values):
             raise ValueError("hazard frame does not match map frame")
@@ -355,11 +565,50 @@ class ProvisionalHazardMap:
             len(item.scan_evidence_history) for item in values
         ) > MAX_SCAN_ATTEMPTS_PER_MAP:
             raise ValueError("hazard scan histories exceed map bound")
+        retained_hazard_evictions = sum(
+            item.scan_attempts_evicted for item in values
+        )
+        if scan_attempts_evicted is None:
+            scan_attempts_evicted = retained_hazard_evictions
+            if scan_attempts_evicted:
+                reasons = {
+                    item.scan_attempts_eviction_reason
+                    for item in values
+                    if item.scan_attempts_evicted
+                }
+                scan_attempts_eviction_reason = (
+                    next(iter(reasons)) if len(reasons) == 1 else MAP_SCAN_EVICTION
+                )
+        if (
+            isinstance(scan_attempts_evicted, bool)
+            or not isinstance(scan_attempts_evicted, int)
+            or scan_attempts_evicted < retained_hazard_evictions
+            or (
+                scan_attempts_evicted == 0
+                and scan_attempts_eviction_reason is not None
+            )
+            or (
+                scan_attempts_evicted > 0
+                and scan_attempts_eviction_reason
+                not in SCAN_ATTEMPT_EVICTION_REASONS
+            )
+        ):
+            raise ValueError("map scan attempt eviction state is invalid")
+        if sum(
+            len(item.collision_supports) for item in values
+        ) > MAX_COLLISION_SUPPORTS_PER_MAP:
+            raise ValueError("hazard collision supports exceed map bound")
         self.frame_id = frame_id
         self.map_generation_id = map_generation_id
         self.revision = revision
         self.calibration = calibration
         self._hazards = values
+        self.hazards_evicted = hazards_evicted
+        self.hazards_eviction_reason = hazards_eviction_reason
+        self.scan_attempts_evicted = scan_attempts_evicted
+        self.scan_attempts_eviction_reason = (
+            scan_attempts_eviction_reason
+        )
 
     @property
     def hazards(self) -> Tuple[ProvisionalHazard, ...]:
@@ -466,7 +715,21 @@ class ProvisionalHazardMap:
                 last_raw_ir_proximity=infrared["raw"],
                 last_filtered_ir_proximity=infrared["filtered"],
             )
-            self._hazards = (self._hazards + (updated,))[-32:]
+            candidates = self._hazards + (updated,)
+            evicted = max(0, len(candidates) - MAX_HAZARDS_PER_MAP)
+            discarded = candidates[:evicted]
+            self._hazards = candidates[-MAX_HAZARDS_PER_MAP:]
+            if evicted:
+                self.hazards_evicted += evicted
+                self.hazards_eviction_reason = HAZARD_CAPACITY_EVICTION
+                scan_attempts_discarded = sum(
+                    len(item.scan_evidence_history) for item in discarded
+                )
+                if scan_attempts_discarded:
+                    self.scan_attempts_evicted += scan_attempts_discarded
+                    self.scan_attempts_eviction_reason = (
+                        HAZARD_SCAN_EVICTION
+                    )
             return updated
         updated = replace(
             nearest,
@@ -559,7 +822,9 @@ class ProvisionalHazardMap:
                         signature_counts.get(attempt.evidence_signature, 0)
                         + 1
                     )
-                for attempt in hazard.scan_evidence_history:
+                for attempt_ordinal, attempt in enumerate(
+                    hazard.scan_evidence_history
+                ):
                     if attempt.scan_id == protected_scan_id:
                         continue
                     candidates.append((
@@ -569,22 +834,92 @@ class ProvisionalHazardMap:
                         attempt.completed_at_ms,
                         hazard.hypothesis_id,
                         attempt.scan_id,
+                        attempt_ordinal,
+                        attempt,
                     ))
             if not candidates:
                 raise ValueError("scan history bound cannot be enforced")
-            _redundancy, _completed_at_ms, hypothesis_id, scan_id = min(
-                candidates
-            )
+            (
+                _redundancy,
+                _completed_at_ms,
+                hypothesis_id,
+                _scan_id,
+                _attempt_ordinal,
+                discarded,
+            ) = min(candidates)
             hazard = self.get(hypothesis_id)
-            retained = tuple(
-                attempt
-                for attempt in hazard.scan_evidence_history
-                if attempt.scan_id != scan_id
+            retained_values = list(hazard.scan_evidence_history)
+            retained_values.remove(discarded)
+            updated = replace(
+                hazard,
+                scan_evidence_history=tuple(retained_values),
+                scan_attempts_evicted=hazard.scan_attempts_evicted + 1,
+                scan_attempts_eviction_reason=MAP_SCAN_EVICTION,
             )
             self._hazards = tuple(
-                replace(item, scan_evidence_history=retained)
-                if item.hypothesis_id == hypothesis_id
-                else item
+                updated if item.hypothesis_id == hypothesis_id else item
+                for item in self._hazards
+            )
+            self.scan_attempts_evicted += 1
+            self.scan_attempts_eviction_reason = MAP_SCAN_EVICTION
+
+    def _prune_collision_supports(
+        self,
+        *,
+        protected_source_scan_id: Optional[str] = None,
+    ) -> None:
+        """Enforce the map-wide materialized-support bound deterministically.
+
+        Detail history is not consulted.  Each retained support is already a
+        distinct angular/geometric fact.  Prefer removing the oldest support
+        from a hypothesis that has alternatives, and protect the scan being
+        committed so new physical evidence cannot disappear immediately.
+        """
+
+        while sum(
+            len(hazard.collision_supports) for hazard in self._hazards
+        ) > MAX_COLLISION_SUPPORTS_PER_MAP:
+            candidates = []
+            for hazard in self._hazards:
+                for support in hazard.collision_supports:
+                    if support.source_scan_id == protected_source_scan_id:
+                        continue
+                    candidates.append((
+                        0 if len(hazard.collision_supports) > 1 else 1,
+                        support.completed_at_ms,
+                        hazard.hypothesis_id,
+                        support.source_scan_id,
+                        support.spatial_key,
+                        support,
+                    ))
+            if not candidates:
+                raise ValueError(
+                    "collision support map bound cannot be enforced"
+                )
+            (
+                _single_support_priority,
+                _completed_at_ms,
+                hypothesis_id,
+                _source_scan_id,
+                _spatial_key,
+                discarded,
+            ) = min(candidates)
+            hazard = self.get(hypothesis_id)
+            retained = tuple(
+                support
+                for support in hazard.collision_supports
+                if support != discarded
+            )
+            updated = replace(
+                hazard,
+                collision_supports=retained,
+                collision_supports_evicted=(
+                    hazard.collision_supports_evicted + 1
+                ),
+                collision_supports_eviction_reason=MAP_SUPPORT_EVICTION,
+            )
+            self._hazards = tuple(
+                updated if item.hypothesis_id == hypothesis_id else item
                 for item in self._hazards
             )
 
@@ -630,11 +965,51 @@ class ProvisionalHazardMap:
             result,
             scan_pose=scan_pose,
         )
+        history_candidates = hazard.scan_evidence_history + (attempt,)
         history = retain_scan_attempt_diversity(
-            hazard.scan_evidence_history + (attempt,),
+            history_candidates,
             MAX_SCAN_ATTEMPTS_PER_HAZARD,
         )
-        updates = {"scan_evidence_history": history}
+        scan_attempt_evictions = len(history_candidates) - len(history)
+        support_candidates = (
+            hazard.collision_supports
+            + AngularCollisionSupport.from_attempt(attempt)
+        )
+        collision_supports = retain_collision_support_diversity(
+            support_candidates,
+            MAX_COLLISION_SUPPORTS_PER_HAZARD,
+        )
+        support_evictions = (
+            len(support_candidates) - len(collision_supports)
+        )
+        updates = {
+            "scan_evidence_history": history,
+            "collision_supports": collision_supports,
+        }
+        if scan_attempt_evictions:
+            updates.update({
+                "scan_attempts_evicted": (
+                    hazard.scan_attempts_evicted
+                    + scan_attempt_evictions
+                ),
+                "scan_attempts_eviction_reason": (
+                    PER_HAZARD_SCAN_EVICTION
+                ),
+            })
+            self.scan_attempts_evicted += scan_attempt_evictions
+            self.scan_attempts_eviction_reason = (
+                PER_HAZARD_SCAN_EVICTION
+            )
+        if support_evictions:
+            updates.update({
+                "collision_supports_evicted": (
+                    hazard.collision_supports_evicted
+                    + support_evictions
+                ),
+                "collision_supports_eviction_reason": (
+                    PER_HAZARD_SUPPORT_EVICTION
+                ),
+            })
         if result.bilateral_complete:
             updates.update({
                 "scan_completed_at_ms": result.completed_at_ms,
@@ -646,6 +1021,10 @@ class ProvisionalHazardMap:
                 "scan_completed_at_ms": None,
                 "scan_left_boundary_mdeg": None,
                 "scan_right_boundary_mdeg": None,
+                "collision_contested_at_ms": max(
+                    hazard.collision_contested_at_ms or 0,
+                    attempt.completed_at_ms,
+                ),
             })
         updated = replace(hazard, **updates)
         self._hazards = tuple(
@@ -655,6 +1034,9 @@ class ProvisionalHazardMap:
             for item in self._hazards
         )
         self._prune_scan_histories(protected_scan_id=result.scan_id)
+        self._prune_collision_supports(
+            protected_source_scan_id=result.scan_id
+        )
         self.revision += 1
         return self.get(result.target_hypothesis_id)
 
@@ -673,45 +1055,29 @@ class ProvisionalHazardMap:
         if not hazard.active_for_collision:
             return ()
         values = [(hazard.centroid_x_mm, hazard.centroid_y_mm)]
-        conflict_cutoff = max(
-            (
-                attempt.completed_at_ms
-                for attempt in hazard.scan_evidence_history
-                if attempt.hypothesis_relation
-                == "CONFLICTS_BLOCKED_HYPOTHESIS"
-            ),
-            default=-1,
-        )
-        for attempt in hazard.scan_evidence_history:
-            if (
-                attempt.completed_at_ms <= conflict_cutoff
-                or attempt.scan_pose is None
-                or attempt.hypothesis_relation
-                != "SUPPORTS_BLOCKED_HYPOTHESIS"
-            ):
+        conflict_cutoff = hazard.collision_contested_at_ms or -1
+        for support in hazard.collision_supports:
+            if support.completed_at_ms <= conflict_cutoff:
                 continue
-            for ray in attempt.rays:
-                if not ray.blocked:
-                    continue
-                heading = math.radians(
-                    (
-                        attempt.scan_pose.heading_mdeg
-                        + ray.actual_relative_bearing_mdeg
-                    )
-                    / 1000.0
+            heading = math.radians(
+                (
+                    support.pose_heading_mdeg
+                    + support.actual_relative_bearing_mdeg
                 )
-                values.append((
-                    attempt.scan_pose.x_mm
-                    + int(round(
-                        math.cos(heading)
-                        * self.calibration.provisional_hazard_offset_mm
-                    )),
-                    attempt.scan_pose.y_mm
-                    + int(round(
-                        math.sin(heading)
-                        * self.calibration.provisional_hazard_offset_mm
-                    )),
-                ))
+                / 1000.0
+            )
+            values.append((
+                support.pose_x_mm
+                + int(round(
+                    math.cos(heading)
+                    * self.calibration.provisional_hazard_offset_mm
+                )),
+                support.pose_y_mm
+                + int(round(
+                    math.sin(heading)
+                    * self.calibration.provisional_hazard_offset_mm
+                )),
+            ))
         # Exact coordinate de-duplication is deterministic and does not infer
         # object identity beyond the parent hypothesis.
         return tuple(dict.fromkeys(values))
@@ -1109,6 +1475,11 @@ class ProvisionalHazardMap:
         hypotheses = []
         for item in self._hazards:
             value = dict(item.to_dict())
+            # The materialized angular index is authoritative persisted state,
+            # not repeated planner detail.  Publish its factual health and the
+            # derived geometry count while scan history remains the bounded
+            # human/model-readable evidence projection.
+            value.pop("collision_supports")
             value.update({
                 "active_for_collision": item.active_for_collision,
                 "collision_support_count": len(
@@ -1123,6 +1494,31 @@ class ProvisionalHazardMap:
             "map_generation_id": self.map_generation_id,
             "map_version": self.revision,
             "frame_id": self.frame_id,
+            "hazard_retention": self.hazard_retention(),
+            "scan_attempt_retention": self.scan_attempt_retention(),
             "collision_geometry": self.calibration.collision_geometry(),
             "navigation_hazard_hypotheses": hypotheses,
+        }
+
+    def hazard_retention(self) -> Mapping[str, object]:
+        """Publish bounded-map loss explicitly without inventing geometry."""
+
+        return {
+            "capacity": MAX_HAZARDS_PER_MAP,
+            "retained_count": len(self._hazards),
+            "evicted_count": self.hazards_evicted,
+            "last_eviction_reason": self.hazards_eviction_reason,
+        }
+
+    def scan_attempt_retention(self) -> Mapping[str, object]:
+        """Publish exact persisted scan-detail loss and both hard caps."""
+
+        return {
+            "per_hazard_capacity": MAX_SCAN_ATTEMPTS_PER_HAZARD,
+            "map_capacity": MAX_SCAN_ATTEMPTS_PER_MAP,
+            "retained_count": sum(
+                len(item.scan_evidence_history) for item in self._hazards
+            ),
+            "evicted_count": self.scan_attempts_evicted,
+            "last_eviction_reason": self.scan_attempts_eviction_reason,
         }

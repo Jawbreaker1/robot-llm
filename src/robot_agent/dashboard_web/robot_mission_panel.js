@@ -12,10 +12,12 @@
   ]);
   const EVENT_PAGE_SCHEMA = "robot-control-event-page/v1";
   const SNAPSHOT_PAGE_SCHEMA = "robot-control-snapshot-page/v1";
-  const HISTORY_CAPACITY = 160;
-  const TIMELINE_CAPACITY = 80;
+  const HISTORY_CAPACITY = 1000;
+  const TIMELINE_CAPACITY = 500;
+  const MAX_CATCH_UP_PAGES = 4;
   const POLL_ACTIVE_MS = 1000;
   const POLL_IDLE_MS = 2500;
+  const POLL_CATCH_UP_MS = 0;
 
   function record(value) {
     return value && typeof value === "object" && !Array.isArray(value)
@@ -80,6 +82,22 @@
       modelLatencyMs: integer(
         runtime.model_latency_ms,
         integer(runtime.modelLatencyMs),
+      ),
+      plannerContextBytes: integer(
+        runtime.planner_context_bytes,
+        integer(runtime.plannerContextBytes),
+      ),
+      promptTokens: integer(
+        runtime.prompt_tokens,
+        integer(runtime.promptTokens),
+      ),
+      completionTokens: integer(
+        runtime.completion_tokens,
+        integer(runtime.completionTokens),
+      ),
+      totalTokens: integer(
+        runtime.total_tokens,
+        integer(runtime.totalTokens),
       ),
       speechStatus: text(
         runtime.speech_status,
@@ -150,6 +168,8 @@
     const snapshots = new Map();
     let eventCursor = 0;
     let snapshotCursor = 0;
+    let eventNewest = null;
+    let snapshotNewest = null;
     let eventGap = false;
     let snapshotGap = false;
 
@@ -157,9 +177,14 @@
       const sequences = Array.from(items.keys()).sort((left, right) => (
         left - right
       ));
-      sequences.slice(0, Math.max(0, sequences.length - capacity)).forEach(
+      const evicted = sequences.slice(
+        0,
+        Math.max(0, sequences.length - capacity),
+      );
+      evicted.forEach(
         (sequence) => items.delete(sequence),
       );
+      return evicted.length;
     }
 
     function pageSequence(page, name, fallback) {
@@ -176,8 +201,10 @@
         events.clear();
         eventCursor = 0;
         eventGap = false;
+        eventNewest = newest;
         return false;
       }
+      eventNewest = newest;
       page.events.forEach((item) => {
         const event = normalizeEvent(item);
         if (event && event.eventType !== "robot.runtime_update") {
@@ -189,7 +216,9 @@
         pageSequence(page, "next_after_sequence", eventCursor),
       );
       eventGap = eventGap || page.gap === true;
-      trim(events);
+      if (trim(events) > 0) {
+        eventGap = true;
+      }
       return true;
     }
 
@@ -206,8 +235,10 @@
         snapshots.clear();
         snapshotCursor = 0;
         snapshotGap = false;
+        snapshotNewest = newest;
         return false;
       }
+      snapshotNewest = newest;
       page.snapshots.forEach((item) => {
         const snapshot = normalizeSnapshot(item);
         if (snapshot.sequence > 0) {
@@ -219,7 +250,9 @@
         pageSequence(page, "next_after_sequence", snapshotCursor),
       );
       snapshotGap = snapshotGap || page.gap === true;
-      trim(snapshots);
+      if (trim(snapshots) > 0) {
+        snapshotGap = true;
+      }
       return true;
     }
 
@@ -227,13 +260,21 @@
       const snapshot = normalizeSnapshot(value);
       if (snapshot.sequence > 0) {
         snapshots.set(snapshot.sequence, snapshot);
-        trim(snapshots);
+        if (trim(snapshots) > 0) {
+          snapshotGap = true;
+        }
       }
       return snapshot;
     }
 
     return Object.freeze({
       addSnapshot,
+      caughtUp: () => (
+        eventNewest !== null
+        && snapshotNewest !== null
+        && eventCursor >= eventNewest
+        && snapshotCursor >= snapshotNewest
+      ),
       cursors: () => Object.freeze({
         event: eventCursor,
         snapshot: snapshotCursor,
@@ -244,6 +285,16 @@
       }),
       ingestEvents,
       ingestSnapshots,
+      progress: () => Object.freeze({
+        event: Object.freeze({
+          cursor: eventCursor,
+          newest: eventNewest,
+        }),
+        snapshot: Object.freeze({
+          cursor: snapshotCursor,
+          newest: snapshotNewest,
+        }),
+      }),
       values: () => Object.freeze({
         events: Object.freeze(
           Array.from(events.values()).sort((left, right) => (
@@ -283,11 +334,28 @@
         snapshot.primaryErrorMessage,
       ].filter(Boolean).join(" · ");
     };
+    const plannerValue = (snapshot) => {
+      if (!snapshot) {
+        return {};
+      }
+      const value = {
+        contextBytes: snapshot.plannerContextBytes,
+        promptTokens: snapshot.promptTokens,
+        completionTokens: snapshot.completionTokens,
+        totalTokens: snapshot.totalTokens,
+      };
+      return Object.values(value).some(Number.isSafeInteger) ? value : {};
+    };
     const comparable = [
       ["action", previous && previous.currentAction, current.currentAction],
       ["plan", previous && previous.plan, current.plan],
       ["obstacle", previous && previous.obstacle, current.obstacle],
       ["scan", previous && previous.scan, current.scan],
+      [
+        "planner",
+        plannerValue(previous),
+        plannerValue(current),
+      ],
       ["speech", previous && previous.speechStatus, current.speechStatus],
       ["message", previous && previous.message, current.message],
       [
@@ -699,6 +767,9 @@
       if (connection === "live") {
         node.classList.add("state-ready");
         node.textContent = translate("mission.history.live");
+      } else if (connection === "catching_up") {
+        node.classList.add("state-running");
+        node.textContent = translate("mission.history.catching_up");
       } else if (connection === "partial") {
         node.classList.add("state-locked");
         node.textContent = translate("mission.history.partial");
@@ -792,45 +863,61 @@
         return false;
       }
       busy = true;
-      const cursors = history.cursors();
       try {
-        const results = await Promise.allSettled([
-          request(
-            `/api/v1/robot/events?after_sequence=${cursors.event}&limit=500`,
-            { timeout: 5000 },
-          ),
-          request(
-            `/api/v1/robot/snapshots?after_sequence=${cursors.snapshot}&limit=128`,
-            { timeout: 5000 },
-          ),
-        ]);
-        if (stopped) {
-          return false;
-        }
-        let accepted = 0;
-        if (results[0].status === "fulfilled") {
-          try {
-            history.ingestEvents(results[0].value);
-            accepted += 1;
-          } catch (_error) {
-            // The independent snapshot stream may still be usable.
+        for (let page = 0; page < MAX_CATCH_UP_PAGES; page += 1) {
+          const cursors = history.cursors();
+          const results = await Promise.allSettled([
+            request(
+              `/api/v1/robot/events?after_sequence=${cursors.event}&limit=500`,
+              { timeout: 5000 },
+            ),
+            request(
+              `/api/v1/robot/snapshots?after_sequence=${cursors.snapshot}&limit=500`,
+              { timeout: 5000 },
+            ),
+          ]);
+          if (stopped) {
+            return false;
           }
-        }
-        if (results[1].status === "fulfilled") {
-          try {
-            history.ingestSnapshots(results[1].value);
-            accepted += 1;
-          } catch (_error) {
-            // The independent event stream may still be usable.
+          let accepted = 0;
+          if (results[0].status === "fulfilled") {
+            try {
+              if (history.ingestEvents(results[0].value)) {
+                accepted += 1;
+              }
+            } catch (_error) {
+              // The independent snapshot stream may still be usable.
+            }
           }
+          if (results[1].status === "fulfilled") {
+            try {
+              if (history.ingestSnapshots(results[1].value)) {
+                accepted += 1;
+              }
+            } catch (_error) {
+              // The independent event stream may still be usable.
+            }
+          }
+          if (accepted < 2) {
+            connection = accepted === 1 ? "partial" : "offline";
+            break;
+          }
+          if (history.caughtUp()) {
+            connection = "live";
+            break;
+          }
+          const advanced = history.cursors();
+          if (
+            advanced.event <= cursors.event
+            && advanced.snapshot <= cursors.snapshot
+          ) {
+            connection = "partial";
+            break;
+          }
+          connection = "catching_up";
         }
-        connection = accepted === 2
-          ? "live"
-          : accepted === 1
-            ? "partial"
-            : "offline";
         render();
-        return accepted === 2;
+        return connection === "live";
       } catch (_error) {
         connection = "offline";
         renderConnection();
@@ -847,9 +934,11 @@
       if (pollTimer !== null) {
         global.clearTimeout(pollTimer);
       }
-      const delay = ACTIVE_STATES.has(control.state)
-        ? POLL_ACTIVE_MS
-        : POLL_IDLE_MS;
+      const delay = connection === "catching_up"
+        ? POLL_CATCH_UP_MS
+        : ACTIVE_STATES.has(control.state)
+          ? POLL_ACTIVE_MS
+          : POLL_IDLE_MS;
       pollTimer = global.setTimeout(async () => {
         await refreshHistory();
         schedulePoll();
@@ -914,7 +1003,9 @@
     ACTIVE_STATES,
     EVENT_PAGE_SCHEMA,
     HISTORY_CAPACITY,
+    MAX_CATCH_UP_PAGES,
     POLL_ACTIVE_MS,
+    POLL_CATCH_UP_MS,
     POLL_IDLE_MS,
     SNAPSHOT_PAGE_SCHEMA,
     TIMELINE_CAPACITY,
