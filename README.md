@@ -81,6 +81,9 @@ The distinction matters:
 - a goal survives across many observations and actions;
 - the model may revise its plan when physical evidence contradicts it;
 - obstacle hypotheses remain relevant after the robot turns away from them;
+- a bounded, structured attempt/result ledger tells the planner whether the
+  same action is being retried on unchanged physical evidence or after a
+  verified change in pose, sensors, hazards, or scan evidence;
 - perception, mapping, dialogue, and speech can run without serializing every
   function behind one model call;
 - every proposal carries typed identity and freshness information; and
@@ -134,7 +137,7 @@ a verified safe boundary, and never gives the model raw motor parameters.
 
 ## What works today
 
-Status snapshot: **2026-07-31**.
+Status snapshot: **2026-08-01**.
 
 “Verified” below means either observed on the assembled EV3RSTORM or exercised
 by the hardware-free quality suite. “Awaiting live validation” means the
@@ -149,51 +152,57 @@ but the complete path has not yet run as one physical autonomous episode.
 | Physical closed loop | A goal entered in the Robot UI has reached local Gemma, produced a typed plan, spoken its assessment, and dispatched real EV3 observations and movement; obstacle approach and reaction have both run | Reliable obstacle analysis and a complete route around or away from the obstacle remain the current acceptance target |
 | Encoder-aware degraded motion | Failed or asymmetric drive attempts retain their actual left/right encoder movement; temporal differential-drive odometry updates the estimated pose, cancels stale plan tails, and can apply a bounded EV3-specific catch-up or retry | Live recovery sequences have looked correct, but repeatability still needs measurement; encoders cannot see wheel slip or revive broken hardware |
 | Gemma 4 planner comparison | In one matched-load run, QAT Q4_0 produced `106.633 tok/s` single-flight median server decode versus Q8_0's `91.112 tok/s` (`+17.0%`), with `3.017` versus `3.312 s` median latency; both produced 45/45 schema-valid expected actions | This is one hardware-free planner run, not a moving-robot run or a general model-quality claim; four-way aggregate throughput was effectively tied |
-| Active IR investigation | Bilateral coarse-to-fine front-arc scanning, encoder-derived headings, boundary observations, and restoration to the starting heading are implemented; physical turn/restoration slices and stationary IR batches have run | The current `682°` mean wheel-encoder estimate for an approximately `90°` body turn is provisional, and a complete bilateral live scan still needs an acceptance run |
-| Obstacle memory | Physical navigation retains qualitative IR hazard hypotheses after turning and applies swept-path vetoes instead of assuming “not in front” means “gone” | IR-PROX is not metric distance or object identity; the physical map is deliberately qualitative |
+| Active IR investigation | Bilateral coarse-to-fine scanning and pose-stamped scan evidence are implemented. Distinct unilateral, bilateral, and contradictory attempts accumulate per hazard instead of being replaced by the last retry; physical scan slices have run | The current `682°` mean wheel-encoder estimate and EV3-specific `10°` restoration tolerance remain provisional. The checked-in live artifact preserves an earlier `2.5°` failure but does not contain correlated raw evidence for the later tolerance trials; a fresh acceptance artifact is still required |
+| Body-aware obstacle memory | The EV3 profile now has a provisional asymmetric body envelope, including the wider right arm. Motion and scan feasibility use the swept body rather than only the IR ray, while pose-stamped blocked rays add qualitative angular supports to persistent hazards | The extents are conservative operator estimates, not physical measurements. IR-PROX still provides neither metric range nor object identity, and the new geometry has not yet completed a live obstacle rerun |
+| Route evidence and attempt memory | A route may start only from complementary boundary evidence applicable at the current verified scan pose. An episode-local, bounded attempt/result ledger publishes encoder outcomes and exact evidence-basis changes to Gemma without ranking or selecting an action | Older viewpoints still inform collision hypotheses but cannot be silently reused as current body-relative route evidence. Detailed ledger history is process-local and bounded; the live box episode must still be repeated with this implementation |
 | Robot speech | The host asynchronously asks loopback Piper for bounded Swedish `nst-deep` WAV audio, validates it, and streams it through one persistent audio-only SSH worker per episode; that voice has now been heard during a live physical agent episode | Repeated move-and-speak runs still need acceptance; English needs its own configured voice/model and is deliberately not sent through the Swedish NST voice |
-| Robot control GUI | The separate Robot and Workbench views, explicit EV3 launch profile, episode controls, settings, stop, emergency stop, snapshots, physical map, and technical event streams are implemented; the Robot path has started real Wi-Fi episodes | Ordinary console startup still injects no physical adapter and reports `DISABLED`; the EV3 launch remains opt-in until a complete obstacle episode passes |
+| Robot control GUI | The separate Robot and Workbench views, explicit EV3 launch profile, episode controls, settings, stop, emergency stop, snapshots, physical map, and technical event streams are implemented. The Map view now keeps the goal, current action, ordered plan, speech state, and a deduplicated episode timeline beside the robot; the Robot path has started real Wi-Fi episodes | Control history is bounded and process-local. Ordinary console startup still injects no physical adapter and reports `DISABLED`; the EV3 launch remains opt-in until a complete obstacle episode passes |
 | Lab Console dialogue and STT | Local Gemma chat, local whisper.cpp STT, microphone selection and sensitivity controls, context, read-only weather, evidence, and English/Swedish UI and text responses | STT text reaches the agent; always-listening robot conversation remains future work |
-| Spatial UI map | The read-only Map view supports both the simulator occupancy map and a live physical LOCAL_ODOMETRY layer fed by the same EV3 pose and hazard hypotheses used for navigation | The EV3 layer is deliberately qualitative: it draws provisional screen-space IR sectors, never invented centimetres, free cells, or object surfaces; its first live acceptance run is pending |
+| Spatial UI map | The read-only Map view supports both the simulator occupancy map and a live physical LOCAL_ODOMETRY layer fed by the same EV3 pose and hazard hypotheses used for navigation. It renders the configured asymmetric body envelope, bounded odometry trail, pose-stamped scan rays, and scan-history facts alongside the mission panel | The EV3 layer is deliberately qualitative: scan rays show actual body-relative bearings and blocked/clear classification, never measured length or an object surface. The footprint is configured geometry, not evidence that a side contact was sensed. Live acceptance of the new projection remains pending |
 | Multi-controller architecture | Identity, proposal, and authority contracts are designed to grow to EV3, Robot Inventor 51515, BOOST, cameras, and microphones | Only the EV3 path has a production physical worker today |
 
 ### Latest physical run
 
-The latest EV3 session reached the real integration path from the Robot UI:
-local Gemma selected `SCAN_FRONT_ARC` for the box in front of the robot and
-the host-generated Swedish assessment was dispatched to the separate EV3
-speech worker while the physical runtime was active. The episode then stopped
-on its first stationary scan sample, before issuing a scan-turn motor command.
+The physical box experiment has reached obstacle approach, active scanning,
+turning, replanning, speech, and real encoder feedback, but it has not yet
+produced a clean autonomous route around or away from the box. During the
+latest work the operator observed the protruding right arm touch the box and
+alter a turn. That is useful evidence that a centre-point or symmetric-radius
+model is insufficient; it is not evidence that the replacement geometry has
+already succeeded on hardware.
 
-This was separate from an earlier scan-turn failure in the same development
-session. In that run, encoder evidence proved that the first `-30°` turn had
-physically occurred; a later controlled turn restored the starting heading.
-That path led to balanced scan slices and typed, safely stopped non-completion
-receipts. The final run described here exposed the remaining sample-validator
-mismatch before any wheel movement.
+The checked-in EV3 profile now describes a deliberately conservative,
+asymmetric envelope around the differential-drive origin. The host checks the
+complete swept envelope before offering motion or an in-place scan to Gemma,
+then repeats the check immediately before execution. This removes physically
+impossible choices from a slow planner request without letting the host choose
+the route. The dimensions are still unmeasured provisional values and the
+box experiment must be rerun before this can be called live-validated.
 
-That failure was a strict-contract bug, not a sensor or Wi-Fi disconnect. The
-EV3 obstacle gate filters the latest three readings from each five-sample
-batch, while the host validator had recomputed the median over all five. A
-perfectly valid jitter sequence could therefore be rejected, causing the host
-to close the SSH channel and obscure the useful error behind a later shutdown
-failure. The worker and host now publish and validate the same filter window,
-the original fault is retained in dashboard telemetry, and the exact real
-sample pattern is covered by regression tests.
+Scan memory has also moved from “latest result” to bounded cumulative evidence.
+Each restored attempt records the verified scan pose, requested and actual
+body-relative bearings, blocked/clear classifications, boundary coverage, and
+its map basis. Duplicate information cannot evict a distinct unilateral or
+contradictory observation. Complementary left/right boundaries authorize a
+route only when they apply at the same current verified pose; evidence from an
+older viewpoint remains useful to the collision hypothesis but is not treated
+as a fresh body-relative route measurement.
 
-The session also exposed a separate no-progress speech loop in which the same
-assessment was heard repeatedly. Speech now drops the same normalized
-utterance within an unchanged episode/locale/progress revision as
-`duplicate_without_progress`, and an uninformative repeated `OBSERVE` is no
-longer offered to the next model turn. These are generic state/progress rules,
-not phrase, regular-expression, or Swedish-specific routing. They pass the
-quality suite and still need one live recheck after the battery change.
+Finally, the planner now receives a small structured history of attempts and
+results. It can see encoder outcomes and whether an action repeats an unchanged
+physical evidence basis or follows a real pose, sensor, hazard, or scan change.
+Fresh IDs, timestamps, IR jitter, propeller-arm encoder movement, and duplicate
+scan IDs do not manufacture navigation progress. This is factual context only:
+the host neither ranks nor substitutes the next action. The implementation and
+its failure cases pass the current hardware-free quality gate (`1,299` tests);
+the same physical obstacle episode is the pending acceptance run.
 
-All `1,236` hardware-free tests passed after the correction. Encoder evidence
-also confirmed that the failed attempt had not moved either drive wheel. The
-EV3 batteries expired before the corrected worker files could be copied back
-to the brick, so the next session starts with that deployment followed by the
-same autonomous box experiment—not with another redesign.
+The live scan JSON retained in `docs/data` is intentionally historical. It
+proves an earlier stopped `2.5°`-tolerance failure and records its actual rays
+and encoder residual. It does not contain the correlated raw output from later
+`5°` or `10°` trials, so the repository does not promote those follow-ups to a
+machine-verifiable acceptance result. The checked-in EV3 profile currently
+uses a provisional `10°` tolerance and still needs a fresh evidence capture.
 
 On the operator-confirmed `lmlink` path to the gaming computer, matched-load
 QAT Q4_0 and Q8_0 runs both produced `45/45` schema-valid expected first-pass
@@ -222,9 +231,11 @@ PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
 
 Open the unique session URL printed by the server. The **Robot** view shows the
 episode control plane and its disabled/live state; the **Map** view shows the
-completed simulator episode. The map episode uses deterministic reference
-behavior, so it validates orchestration, supervision, verification, and
-mapping—not live model planning or physical calibration.
+completed simulator episode and its estimated route. When a robot control
+adapter is active, the same view also shows the current goal, action, ordered
+plan, speech state, and a structured episode timeline. The map episode uses
+deterministic reference behavior, so it validates orchestration, supervision,
+verification, and mapping—not live model planning or physical calibration.
 
 ### 2. Let local Gemma select a bounded simulator objective
 
@@ -342,12 +353,38 @@ not centimeters, object identification, or proof that an unseen direction is
 clear. The physical runtime therefore stores qualitative hazard hypotheses
 with evidence lineage instead of inventing metric geometry.
 
+The assembled EV3RSTORM is not symmetric around its wheel axis. Its current
+profile therefore describes separate front, rear, left, and right extents plus
+a clearance margin; the right side is wider to include the protruding arm that
+contacted the test box. Translation, turns, and scan rotation are checked as a
+swept asymmetric rectangle. These dimensions are explicitly marked
+`provisional-unmeasured-operator-observed`: they are a conservative working
+model, not a claim of millimetre-accurate calibration or touch sensing.
+
 When an obstacle blocks progress, the model can request `SCAN_FRONT_ARC`. The
 deterministic scan executor samples a fixed bilateral arc, optionally refines
 blocked/clear transitions, records encoder-derived headings, and restores the
 robot to its starting orientation before publishing a result. A later route
 must respect the retained obstacle boundary and swept robot footprint; turning
 until the IR sensor no longer sees the box does not erase the box.
+
+Restored scans are stored with their verified odometry pose. The bounded
+retention favors distinct evidence shapes over duplicate retries, so a useful
+one-sided boundary is not immediately displaced by another identical
+all-clear result. Blocked rays can extend the qualitative collision hypothesis
+at the same fixed provisional offset used by the forward IR envelope; they do
+not create a measured contour. For route choice, complementary positive and
+negative boundaries must apply at the current verified pose. This prevents a
+body-relative left/right observation from an old viewpoint being reused after
+the robot has moved.
+
+Separate from the persisted map, an episode-local experience ledger keeps the
+latest detailed action/result records under an `8 KiB` publication ceiling and
+a bounded index of previously seen `(action, evidence basis)` pairs. It records
+pose and decision-relevant sensor facts, encoder results, scan relationships,
+and typed change codes. It deliberately ignores freshness-only versions,
+timestamps, small raw IR jitter, and non-drive motors. Gemma receives this as
+evidence; `host_ranked_or_selected_action` remains false.
 
 The fixed scan profile currently derives an approximately 90-degree body turn
 from a provisional target of 682 mean absolute wheel-encoder degrees. The
@@ -359,8 +396,11 @@ The dashboard now keeps those two trust levels visibly separate. Simulator
 ranges can populate the metric occupancy layer. Physical EV3 observations feed
 a dedicated `LOCAL_ODOMETRY` layer with the encoder-derived robot pose and the
 same opaque hazard IDs used by navigation. IR reflections appear as fixed
-screen-space qualitative sectors anchored at the observing pose, never as
-invented centimetre ranges, cleared cells, or object surfaces.
+screen-space qualitative sectors anchored at the observing pose. The physical
+layer additionally renders the configured body envelope and actual
+body-relative scan-ray angles at their recorded scan poses. Ray length remains
+purely presentational: the UI never turns IR reflection into centimetre range,
+cleared cells, or an object surface.
 
 ## Safety and authority boundaries
 
@@ -381,6 +421,12 @@ Enforced in code today:
 - touch, worker cancellation, signal, SSH EOF, request/session budgets, and
   emergency stop do not wait for an LLM response;
 - strict schemas bind controller, request, state version, sequence, and result;
+- the model is offered only motion and scan actions whose provisional swept
+  body fits the current hazard evidence, with the same geometry checked again
+  immediately before dispatch;
+- route commitments require complementary scan evidence applicable at the
+  current verified pose, and restored duplicate scans cannot masquerade as
+  progress merely by carrying a new ID;
 - stale plans, changed localization, unsafe swept paths, and unverifiable
   finishes fail closed;
 - session renewal occurs only through bounded cleanup and re-observation;
@@ -397,10 +443,11 @@ Enforced in code today:
 
 Still required before calling physical autonomy live-validated:
 
-- replace the exhausted batteries, deploy the committed scan-filter contract,
-  and repeat the already proven motion-free worker preflight;
+- physically measure the assembled asymmetric body envelope, then rerun the
+  box scenario to verify that the right arm clears the retained obstacle;
 - measure straight and turn profiles, encoder alignment, stop behavior, and
-  the provisional scan conversion on this physical build;
+  the provisional scan conversion and `10°` restoration tolerance on this
+  physical build;
 - run obstacle and bilateral-scan scenarios with recorded observations;
 - verify stop, emergency stop, SSH loss, worker death, touch interruption,
   and session renewal while the robot is moving;
@@ -689,6 +736,8 @@ matched-load records in
   read-only GUI map
 - [x] Live physical-map pipeline with local odometry and non-metric,
   provisional EV3 IR hypotheses in a separate read-only GUI layer
+- [x] Bounded odometry trail plus a Map-view mission panel with current goal,
+  action, ordered plan, speech state, and deduplicated episode history
 - [x] Bounded EV3 navigation worker with persistent SSH transport, exclusive
   motor ownership, verified stop, interruption, and safe session renewal
 - [x] Host physical goal → structured plan → semantic action → observe →
@@ -699,6 +748,12 @@ matched-load records in
   in hardware-free tests
 - [x] Deterministic bilateral IR scan implementation with encoder-derived
   headings and start-heading restoration
+- [x] Provisional asymmetric EV3 body envelope with swept-volume feasibility
+  before planning and a final pre-dispatch geometry check
+- [x] Pose-stamped, diversity-preserving scan evidence, current-pose route
+  freshness, and a bounded structured action/result ledger
+- [x] Read-only dashboard rendering of the physical body envelope and actual
+  blocked/clear scan bearings without invented range
 - [x] Robot/Workbench GUI split with opt-in runtime, episode controls,
   settings, stop, emergency stop, snapshots, and technical events
 - [x] Bounded asynchronous host-generated Swedish WAV speech transport,
@@ -706,10 +761,10 @@ matched-load records in
   runtime composition
 - [ ] Repeat Swedish TTS during completed motion and add a separately
   configured, live-tested English host voice
-- [ ] Deploy the corrected scan-filter contract after the battery change and
-  repeat the autonomous box experiment
-- [ ] Calibrate advance, reverse, 90-degree turn, and active IR scan on the
-  assembled EV3RSTORM
+- [ ] Rerun and capture the autonomous box experiment with the new footprint,
+  cumulative evidence, and attempt memory
+- [ ] Measure the assembled body extents and calibrate advance, reverse,
+  90-degree turn, and active IR scan on the EV3RSTORM
 - [ ] Live-validate intermittent motor catch-up and record how often each EV3
   drive side misses or under-runs a command
 - [ ] Run and publish the first complete autonomous physical obstacle episode

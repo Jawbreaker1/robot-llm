@@ -294,6 +294,14 @@ def asset_directory():
         '"use strict";\n/* spatial map presenter fixture */',
         encoding="utf-8",
     )
+    (root / "robot_mission_panel.js").write_text(
+        '"use strict";\n/* robot mission panel fixture */',
+        encoding="utf-8",
+    )
+    (root / "robot_control.js").write_text(
+        '"use strict";\n/* robot control fixture */',
+        encoding="utf-8",
+    )
     (root / "speech_input_logic.js").write_text(
         '"use strict";\n/* speech input logic fixture */',
         encoding="utf-8",
@@ -513,6 +521,12 @@ class DashboardHTTPTests(unittest.TestCase):
             + "assets/spatial_map_presenter.js",
             self.headers(authenticated=False),
         )
+        mission_panel_asset = self.router.handle(
+            "GET",
+            self.router.session_path
+            + "assets/robot_mission_panel.js",
+            self.headers(authenticated=False),
+        )
         speech_logic_asset = self.router.handle(
             "GET",
             self.router.session_path
@@ -589,6 +603,11 @@ class DashboardHTTPTests(unittest.TestCase):
             presenter_asset.body,
             b'"use strict";\n/* spatial map presenter fixture */',
         )
+        self.assertEqual(mission_panel_asset.status, 200)
+        self.assertEqual(
+            mission_panel_asset.body,
+            b'"use strict";\n/* robot mission panel fixture */',
+        )
         self.assertEqual(speech_logic_asset.status, 200)
         self.assertEqual(microphone_asset.status, 200)
         self.assertEqual(worklet_asset.status, 200)
@@ -607,6 +626,14 @@ class DashboardHTTPTests(unittest.TestCase):
         )
         self.assertLess(
             static_routes.index("assets/spatial_map_presenter.js"),
+            static_routes.index("assets/robot_mission_panel.js"),
+        )
+        self.assertLess(
+            static_routes.index("assets/robot_mission_panel.js"),
+            static_routes.index("assets/robot_control.js"),
+        )
+        self.assertLess(
+            static_routes.index("assets/robot_control.js"),
             static_routes.index("assets/speech_input_logic.js"),
         )
         self.assertLess(

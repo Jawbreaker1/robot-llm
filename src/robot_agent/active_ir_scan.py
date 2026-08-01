@@ -267,17 +267,6 @@ class ActiveIrScanExecutor:
                 "invalid_or_late_scan_turn",
                 "Active scan turn was invalid or late",
             )
-        derived_offset = (
-            current_offset_mdeg + receipt["actual_delta_mdeg"]
-        )
-        if (
-            abs(derived_offset - target_offset_mdeg)
-            > request.calibration.alignment_tolerance_mdeg
-        ):
-            raise ActiveIrScanContractError(
-                "scan_pose_misaligned",
-                "Active scan turn did not reach the requested bearing",
-            )
         # Keep the command lattice nominal.  The rig and the immediately
         # following snapshot carry the encoder-derived physical heading.
         # Feeding small encoder residuals into the next command would turn a
@@ -602,8 +591,13 @@ class ActiveIrScanExecutor:
             stop_confirmed=stop_confirmed,
             restored_start_heading=restored,
             rays=tuple(rays),
-            left_boundary_mdeg=left if status == "COMPLETED" else None,
-            right_boundary_mdeg=right if status == "COMPLETED" else None,
+            # A restored scan can still contribute one-sided boundary
+            # evidence even when it cannot prove a complete bilateral
+            # obstacle envelope.  Keep every boundary derived from the
+            # sampled rays; ``bilateral_complete`` remains the stricter gate
+            # for committing to a detour side.
+            left_boundary_mdeg=left,
+            right_boundary_mdeg=right,
         )
         release_scan = getattr(self.rig, "release_scan", None)
         if callable(release_scan):

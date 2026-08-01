@@ -209,6 +209,69 @@ backend för en pollande flerpulsloop. En fysisk adapter kräver därför en
 senare protokollgrind med batterier, persistent heartbeat/preemption,
 kalibrering, stopplatens och felinjektion – inte en SSH-session per tick.
 
+Styckena ovan beskriver den äldre simulator-/RobotAPI-gränsen. Projektet har
+nu också en separat, explicit opt-in fysisk EV3-navigationsväg över en
+persistent foreground-SSH-session. Den ersätter inte kravet på lokal
+motorägare eller verifierat stopp och den ska inte läsas som att de
+provisoriska måtten nedan redan är fysiskt kalibrerade.
+
+### Aktuell fysisk EV3-navigation och erfarenhetsminne
+
+`PhysicalNavigationRuntime` ger den lokala modellen ett mål, en strukturerad
+världsbild och endast semantiska handlingar. Före planneranropet beräknar
+hosten faktabaserad genomförbarhet för varje rörelse och för en aktiv scan.
+En geometriskt omöjlig handling tas bort ur modellens meny utan att hosten
+väljer en ersättare. Omedelbart före dispatch görs samma kontroll igen mot
+den aktuella kartan för att fånga TOCTOU-förändringar.
+
+EV3RSTORM-profilen använder en asymmetrisk rektangel runt
+differential-drive-origo med separata extents fram, bak, vänster och höger.
+Högersidan är större eftersom den monterade armen observerades träffa
+testlådan. Både translation och rotation validerar hela den interpolerade
+svepta kroppen med marginal, inte bara mittpunkten eller IR-strålen. Profilen
+är märkt `provisional-unmeasured-operator-observed`; dashboardens kontur är
+konfigurerad geometri och får inte presenteras som en känd fysisk kontaktyta.
+
+Varje återställd aktiv scan kan sparas på hinderhypotesen med:
+
+- exakt verifierad scanpose och kartversion som försöket byggde på,
+- begärd och encoderhärledd faktisk kroppsvinkel per stråle,
+- blocked/clear, unilateral/bilateral täckning och eventuell gräns,
+- typad relation som stödjer eller motsäger den blockerade hypotesen.
+
+Historiken är begränsad till fyra försöksposter per hinder och åtta i hela
+kartan. Retention prioriterar olika evidenssignaturer före duplicerade
+retries. Blockerade strålar kan lägga till konservativa vinkelsupporter vid
+samma provisoriska offset som den ursprungliga IR-hypotesen; de blir aldrig
+metriska objektytor. En full bilateral all-clear contestar hypotesen och
+pausar dess kollisionsenvelope tills nyare blocked-evidens åter stöder den,
+men historiken raderas inte.
+
+Ruttvalets färskhet är strängare än kollisionsminnet. Positiv och negativ
+gränsevidens får komplettera varandra endast vid exakt samma verifierade pose
+som roboten har när manövern startas. En scan från ett äldre perspektiv kan
+fortsätta påverka den konservativa kollisionshypotesen men kan inte tyst
+återanvändas som aktuell vänster/höger-geometri.
+
+Ett separat `NavigationExperienceLedger` publicerar vad som faktiskt
+försöktes och vad verktyget returnerade. Detaljerna är episodlokala,
+begränsade av både antal och `8 KiB`, och kompletteras av ett begränsat index
+över 43 200 tidigare `(handling, evidensbasis)`-par. Gränsen motsvarar tre
+möjliga handlingar per tillåten runtime-turn under en hel episod. Därmed kan
+modellen skilja
+`FIRST_ATTEMPT`, `UNCHANGED_BASIS_REPEAT` och
+`RETRY_AFTER_BASIS_CHANGE` även efter att den detaljerade ringhistoriken
+roterat. Basis byggs av verifierad pose, drivmotorpositioner,
+beslutsrelevanta sensorfakta, hindergeometri och substantiell scan-evidens.
+State-version, tidsstämpel, liten rå IR-jitter, nya scan-ID:n och rörelse i en
+icke-drivande arm räknas inte ensamma som navigationsframsteg. Ledgern har
+`host_ranked_or_selected_action: false` och får aldrig välja rutt.
+
+Denna slice är implementerad och hårdvarufritt testad. Den senaste fysiska
+lådkörningen motiverade kroppskonturen men genomfördes före hela kedjan ovan;
+en ny end-to-end-körning runt eller bort från hindret återstår. Fysiskt
+propelleruttryck är inte integrerat i denna navigationsväg.
+
 ### Asynkront spatialt världsminne
 
 Navigationens immutabla snapshots kan nu förgrenas till en separat
@@ -620,6 +683,23 @@ Varje tur fångar en immutable settingsrevision innan köning. Eventloggen är
 en begränsad ringbuffer med monoton hostsekvens och gapmarkör. Den loggar
 korrelations-ID:n, typade transitions och budgetutfall men inte rå prompt,
 rå modelltext, full evidence-URL eller traceback.
+
+Kartvyn projicerar robotkontrollen som en separat read-only uppdragspanel.
+Aktuell status kommer från samma snapshot som Robot-vyn; historiken hämtar
+`robot-control-event-page/v1` och `robot-control-snapshot-page/v1` med varsin
+cursor eftersom deras sekvenser är oberoende. Frontend skapar tidslinjeposter
+genom strukturell jämförelse av typade fält, inte regex eller tolkning av
+naturligt språk. Den rumsliga snapshoten bär samtidigt en begränsad
+`pose_history` med encoderbaserad odometri. Båda projektionerna är
+observationsytor och har ingen motorauktoritet.
+
+Den fysiska spatiala snapshoten bär dessutom samma `collision_geometry` som
+hostens sveptest och en bounded `scan_evidence_history`. Browsern ritar den
+asymmetriska konturen med kalibreringsprovenance och återger blocked/clear vid
+varje stråles faktiska encoderhärledda kroppsvinkel från dess historiska
+scanpose. SVG-längden är presentationsgeometri, aldrig uppmätt IR-avstånd.
+Action/result-ledgern är tills vidare plannerkontext och runtime-telemetri,
+inte ett separat dashboardkontrakt eller en alternativ motorauktoritet.
 
 Konversationsminnet är ett eget versionerat kontrakt. Tidigare synliga
 `user`-/`assistant`-meddelanden skickas som

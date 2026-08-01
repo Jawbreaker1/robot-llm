@@ -166,6 +166,11 @@
       || typeof options.randomId !== "function"
       || typeof options.showToast !== "function"
       || typeof options.getLocale !== "function"
+      || !options.sessionGuard
+      || typeof options.sessionGuard.subscribe !== "function"
+      || typeof options.sessionGuard.isExpired !== "function"
+      || !global.RobotMissionPanelUI
+      || typeof global.RobotMissionPanelUI.create !== "function"
     ) {
       throw new Error("Robot control UI configuration is invalid");
     }
@@ -175,6 +180,7 @@
     const randomId = options.randomId;
     const showToast = options.showToast;
     const getLocale = options.getLocale;
+    const sessionGuard = options.sessionGuard;
     const formatError = typeof options.formatError === "function"
       ? options.formatError
       : () => translate("errors.generic");
@@ -187,11 +193,18 @@
       ? options.onGoalAccepted
       : () => {};
     const byId = (id) => document.getElementById(id);
+    const missionPanel = global.RobotMissionPanelUI.create({
+      document,
+      request,
+      translate,
+      getLocale,
+    });
     let control = normalizeControl({});
     let busy = false;
     let settingsDirty = false;
     let chatEnabled = false;
     let pollTimer = null;
+    let stopped = false;
     const conversationTarget = createConversationTargetState(
       options.initialConversationView || "workbench",
     );
@@ -273,7 +286,12 @@
     }
 
     function renderSettings(force = false) {
-      const idle = control.enabled && control.state === "IDLE" && !busy;
+      const idle = (
+        control.enabled
+        && control.state === "IDLE"
+        && !busy
+        && !stopped
+      );
       const model = byId("robot-setting-model");
       const maximum = byId("robot-setting-max-episode-ms");
       const speech = byId("robot-setting-speech-enabled");
@@ -336,7 +354,7 @@
         control,
         selectedTarget(),
         chatEnabled,
-        busy,
+        busy || stopped,
       );
       const input = byId("message-input");
       const hasGoal = input.value.trim().length > 0;
@@ -398,7 +416,7 @@
       const active = ACTIVE_STATES.has(control.state);
       byId("robot-stop-button").disabled = busy || !active;
       byId("robot-emergency-stop-button").disabled = (
-        !control.enabled
+        stopped || !control.enabled
       );
       renderRuntime();
       renderSettings();
@@ -414,10 +432,14 @@
       control = next;
       renderSettings(forceSettings);
       render();
+      missionPanel.setControl(value);
       return true;
     }
 
     async function refresh(silent = true) {
+      if (stopped) {
+        return;
+      }
       try {
         const payload = await request("/api/v1/robot/status", {
           timeout: 5000,
@@ -431,6 +453,9 @@
     }
 
     function schedulePoll() {
+      if (stopped) {
+        return;
+      }
       if (pollTimer !== null) {
         global.clearTimeout(pollTimer);
       }
@@ -443,13 +468,27 @@
       }, delay);
     }
 
+    function stopPolling() {
+      if (stopped) {
+        return;
+      }
+      stopped = true;
+      chatEnabled = false;
+      if (pollTimer !== null) {
+        global.clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+      missionPanel.stopPolling();
+      render();
+    }
+
     async function startGoal(goal, locale = getLocale()) {
       const cleanGoal = typeof goal === "string" ? goal.trim() : "";
       const policy = composerPolicy(
         control,
         "robot",
         chatEnabled,
-        busy,
+        busy || stopped,
       );
       if (!cleanGoal || !policy.robotStartEnabled) {
         showToast(
@@ -557,6 +596,10 @@
 
     async function initialize() {
       syncTargetSelector();
+      sessionGuard.subscribe(stopPolling);
+      if (stopped) {
+        return;
+      }
       byId("composer-target").addEventListener("change", (event) => {
         overrideTarget(event.currentTarget.value);
       });
@@ -592,23 +635,28 @@
         byId(id).addEventListener("change", markSettingsDirty);
       });
       await refresh(false);
+      if (stopped) {
+        return;
+      }
       renderSettings(true);
+      void missionPanel.initialize();
       schedulePoll();
     }
 
     function reconcileComposer(nextChatEnabled) {
-      chatEnabled = nextChatEnabled === true;
+      chatEnabled = !stopped && nextChatEnabled === true;
       renderComposer();
       return composerPolicy(
         control,
         selectedTarget(),
         chatEnabled,
-        busy,
+        busy || stopped,
       ).composerEnabled;
     }
 
     function renderLocale() {
       render();
+      missionPanel.renderLocale();
     }
 
     return Object.freeze({
@@ -621,6 +669,7 @@
       selectConversationView,
       selectedTarget,
       startGoal,
+      stopPolling,
     });
   }
 

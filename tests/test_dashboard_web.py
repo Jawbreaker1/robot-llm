@@ -76,6 +76,9 @@ class DashboardWebContractTests(unittest.TestCase):
         cls.spatial_map_presenter = (
             WEB_ROOT / "spatial_map_presenter.js"
         ).read_text(encoding="utf-8")
+        cls.robot_mission_panel = (
+            WEB_ROOT / "robot_mission_panel.js"
+        ).read_text(encoding="utf-8")
         cls.robot_control = (
             WEB_ROOT / "robot_control.js"
         ).read_text(encoding="utf-8")
@@ -88,6 +91,7 @@ class DashboardWebContractTests(unittest.TestCase):
                 cls.microphone_input,
                 cls.pcm_capture_worklet,
                 cls.spatial_map_presenter,
+                cls.robot_mission_panel,
                 cls.robot_control,
                 cls.javascript,
             )
@@ -492,6 +496,7 @@ process.stdout.write(JSON.stringify({
                 "assets/speech_input_logic.js",
                 "assets/microphone_input.js",
                 "assets/spatial_map_presenter.js",
+                "assets/robot_mission_panel.js",
                 "assets/robot_control.js",
                 "assets/app.js",
             ],
@@ -580,10 +585,12 @@ process.stdout.write(JSON.stringify({
             "view-events",
             "view-experiments",
             "view-settings",
+            "session-expired-notice",
             "message-feed",
             "composer-form",
             "registry-tree",
             "spatial-map-canvas",
+            "map-path-layer",
             "map-empty-state",
             "map-empty-title",
             "map-empty-body",
@@ -591,6 +598,16 @@ process.stdout.write(JSON.stringify({
             "map-qualitative-list",
             "map-qualitative-count",
             "map-object-list",
+            "map-mission-details",
+            "map-mission-state",
+            "map-mission-goal",
+            "map-mission-action",
+            "map-mission-plan-summary",
+            "map-mission-plan",
+            "map-mission-history-status",
+            "map-mission-history-count",
+            "map-mission-history-gap",
+            "map-mission-timeline",
             "event-table-body",
             "settings-form",
             "status-motion",
@@ -629,6 +646,42 @@ process.stdout.write(JSON.stringify({
             with self.subTest(raw_value=raw_value):
                 self.assertIn(">{}<".format(raw_value), self.html)
 
+    def test_rejected_session_latches_once_and_stops_dashboard_pollers(self):
+        notice = next(
+            attributes
+            for tag, attributes in self.parser.elements
+            if tag == "div"
+            and attributes.get("id") == "session-expired-notice"
+        )
+        self.assertEqual(notice.get("role"), "alert")
+        self.assertEqual(notice.get("aria-live"), "assertive")
+        self.assertIn("hidden", notice)
+        self.assertIn(".session-expired-notice[hidden]", self.css)
+        for key in (
+            "session.expired.title",
+            "session.expired.body",
+        ):
+            with self.subTest(key=key):
+                self.assertIn('"{}"'.format(key), self.i18n)
+
+        self.assertIn("createDashboardRequest", self.dashboard_logic)
+        self.assertIn("createSessionGuard", self.dashboard_logic)
+        self.assertIn(
+            'value.code === SESSION_REJECTED_CODE',
+            self.dashboard_logic,
+        )
+        self.assertIn("value.status === 403", self.dashboard_logic)
+        self.assertIn("sessionGuard.observe(requestError)", self.dashboard_logic)
+        self.assertIn("sessionGuard.isExpired()", self.javascript)
+        self.assertIn(
+            'byId("session-expired-notice").hidden = false',
+            self.javascript,
+        )
+        self.assertIn("sessionGuard.subscribe(stopPolling)", self.robot_control)
+        self.assertIn("missionPanel.stopPolling()", self.robot_control)
+        self.assertIn("function stopPolling()", self.robot_mission_panel)
+        self.assertIn("if (!initialized || stopped)", self.robot_mission_panel)
+
     def test_spatial_map_surface_is_read_only_empty_and_provenance_aware(self):
         svg_elements = [
             attributes
@@ -651,6 +704,16 @@ process.stdout.write(JSON.stringify({
             local_odometry_layers[0].get("data-i18n-aria-label"),
             "map.local_odometry.aria_label",
         )
+        mission_details = [
+            attributes
+            for tag, attributes in self.parser.elements
+            if tag == "details"
+            and attributes.get("id") == "map-mission-details"
+        ]
+        self.assertEqual(len(mission_details), 1)
+        self.assertIn("map-mission-panel", self.html)
+        self.assertIn("map-mission-timeline", self.html)
+        self.assertIn("RobotMissionPanelUI.create", self.robot_control)
         self.assertIn("robot-spatial-map/v1", self.dashboard_logic)
         self.assertIn("normalizeSpatialMap", self.dashboard_logic)
         self.assertIn('api("/api/v1/map"', self.javascript)
@@ -696,6 +759,9 @@ process.stdout.write(JSON.stringify({
         )
         self.assertIn(".map-local-ir-wedge", self.css)
         self.assertIn(".map-local-robot-heading", self.css)
+        self.assertIn(".map-path", self.css)
+        self.assertIn(".map-mission-panel", self.css)
+        self.assertIn(".map-mission-timeline", self.css)
         self.assertLess(len(self.javascript.splitlines()), 1900)
         self.assertNotIn("function mapProjection", self.javascript)
         self.assertIn("map.reason.observation_gap", self.i18n)
@@ -1869,6 +1935,7 @@ process.stdout.write(JSON.stringify({
                 "spatial_map_presenter.js",
                 self.spatial_map_presenter,
             ),
+            ("robot_mission_panel.js", self.robot_mission_panel),
             ("robot_control.js", self.robot_control),
             ("app.js", self.javascript),
         ):
@@ -1901,9 +1968,10 @@ process.stdout.write(JSON.stringify({
             self.assertNotIn(forbidden_route, self.javascript)
 
     def test_ui_does_not_classify_natural_language_with_regex(self):
-        self.assertNotIn("RegExp(", self.javascript)
-        self.assertNotIn(".match(", self.javascript)
-        self.assertNotIn(".test(", self.javascript)
+        for source in (self.javascript, self.robot_mission_panel):
+            self.assertNotIn("RegExp(", source)
+            self.assertNotIn(".match(", source)
+            self.assertNotIn(".test(", source)
         self.assertIn(
             'mode: byId("turn-mode").value',
             self.javascript,
@@ -2070,6 +2138,251 @@ process.stdout.write(JSON.stringify({
             self.robot_control,
         )
         self.assertNotIn("/api/v1/robot/motor", self.robot_control)
+
+    def test_robot_mission_history_is_cursor_safe_and_semantically_deduplicated(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const context = {};
+vm.runInNewContext(source, context, { filename: process.argv[1] });
+const api = context.RobotMissionPanelUI;
+
+function snapshot(sequence, episodeId, updatedAt, runtime, state = "RUNNING") {
+  return {
+    schema: "robot-control/v1",
+    sequence,
+    state,
+    enabled: true,
+    accepting: true,
+    episode: {
+      episode_id: episodeId,
+      goal: episodeId === "episode-1" ? "Explore the room" : "Other goal",
+      started_at_unix_ms: 900,
+      terminal_reason: null,
+    },
+    updated_at_unix_ms: updatedAt,
+    last_error_code: null,
+    runtime: {
+      current_action: null,
+      obstacle: null,
+      plan: [],
+      scan: null,
+      model_latency_ms: null,
+      speech_status: "idle",
+      message: null,
+      ...runtime,
+    },
+  };
+}
+
+const snapshots = [
+  snapshot(1, "episode-1", 1000, {}, "STARTING"),
+  snapshot(2, "episode-1", 1100, {
+    current_action: "advance",
+    obstacle: { relation: "CLEAR" },
+    plan: ["advance", "scan"],
+    model_latency_ms: 42,
+    speech_status: "generating",
+    message: "Moving now",
+  }),
+  snapshot(3, "episode-1", 1200, {
+    current_action: "advance",
+    obstacle: { relation: "CLEAR" },
+    plan: ["advance", "scan"],
+    model_latency_ms: 99,
+    speech_status: "generating",
+    message: "Moving now",
+  }),
+  snapshot(4, "episode-1", 1300, {
+    current_action: "scan",
+    obstacle: { relation: "CLEAR" },
+    plan: ["scan", "turn"],
+    scan: { state: "pending" },
+    model_latency_ms: 99,
+    speech_status: "playing",
+    message: "Moving now",
+  }),
+  snapshot(5, "episode-2", 1400, {
+    current_action: "other",
+    plan: ["other"],
+  }),
+];
+const eventPage = {
+  schema: "robot-control-event-page/v1",
+  after_sequence: 0,
+  oldest_sequence: 1,
+  newest_sequence: 4,
+  next_after_sequence: 4,
+  gap: true,
+  dropped_total: 1,
+  events: [
+    {
+      sequence: 1,
+      occurred_at_unix_ms: 1000,
+      event_type: "robot.episode_starting",
+      message: "starting",
+      episode_id: "episode-1",
+      state: "STARTING",
+      level: "info",
+      data: {},
+    },
+    {
+      sequence: 2,
+      occurred_at_unix_ms: 1100,
+      event_type: "robot.runtime_update",
+      message: "runtime",
+      episode_id: "episode-1",
+      state: "RUNNING",
+      level: "debug",
+      data: {},
+    },
+    {
+      sequence: 3,
+      occurred_at_unix_ms: 1100,
+      event_type: "robot.episode_running",
+      message: "running",
+      episode_id: "episode-1",
+      state: "RUNNING",
+      level: "info",
+      data: {},
+    },
+    {
+      sequence: 4,
+      occurred_at_unix_ms: 1400,
+      event_type: "robot.episode_starting",
+      message: "other",
+      episode_id: "episode-2",
+      state: "STARTING",
+      level: "info",
+      data: {},
+    },
+  ],
+};
+const snapshotPage = {
+  schema: "robot-control-snapshot-page/v1",
+  after_sequence: 0,
+  oldest_sequence: 1,
+  newest_sequence: 5,
+  next_after_sequence: 5,
+  gap: false,
+  dropped_total: 0,
+  snapshots,
+};
+
+const store = api.createHistoryStore(10);
+store.ingestEvents(eventPage);
+store.ingestSnapshots(snapshotPage);
+store.ingestEvents(eventPage);
+store.ingestSnapshots(snapshotPage);
+const current = api.normalizeSnapshot(snapshots[3]);
+const timeline = api.buildTimeline(store.values(), current);
+const limited = api.buildTimeline(store.values(), current, 2);
+const liveFirst = api.createHistoryStore(10);
+liveFirst.addSnapshot(snapshots[3]);
+const liveCursorBeforeHistory = liveFirst.cursors();
+liveFirst.ingestSnapshots(snapshotPage);
+const resetStore = api.createHistoryStore(10);
+resetStore.ingestEvents(eventPage);
+const resetAccepted = resetStore.ingestEvents({
+  ...eventPage,
+  newest_sequence: 1,
+  next_after_sequence: 4,
+  events: [],
+});
+
+process.stdout.write(JSON.stringify({
+  exports: Object.keys(api).sort(),
+  frozen: Object.isFrozen(api),
+  cursors: store.cursors(),
+  gaps: store.gaps(),
+  counts: {
+    events: store.values().events.length,
+    snapshots: store.values().snapshots.length,
+  },
+  timeline: {
+    episodeId: timeline.episodeId,
+    count: timeline.entries.length,
+    eventTypes: timeline.entries
+      .filter((entry) => entry.source === "event")
+      .map((entry) => entry.eventType),
+    snapshotSequences: timeline.entries
+      .filter((entry) => entry.source === "snapshot")
+      .map((entry) => entry.sequence),
+    snapshotChanges: timeline.entries
+      .filter((entry) => entry.source === "snapshot")
+      .map((entry) => entry.changes.map((change) => change.kind)),
+  },
+  limitedCount: limited.entries.length,
+  limitedTotal: limited.totalEntries,
+  limitedTruncated: limited.truncated,
+  liveCursorBeforeHistory,
+  liveCountAfterHistory: liveFirst.values().snapshots.length,
+  resetAccepted,
+  resetCursor: resetStore.cursors().event,
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(WEB_ROOT / "robot_mission_panel.js"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertTrue(result["frozen"])
+        self.assertEqual(result["cursors"], {"event": 4, "snapshot": 5})
+        self.assertEqual(result["gaps"], {"event": True, "snapshot": False})
+        self.assertEqual(result["counts"], {"events": 3, "snapshots": 5})
+        self.assertEqual(result["timeline"]["episodeId"], "episode-1")
+        self.assertEqual(result["timeline"]["count"], 4)
+        self.assertEqual(
+            set(result["timeline"]["eventTypes"]),
+            {"robot.episode_starting", "robot.episode_running"},
+        )
+        self.assertNotIn(
+            "robot.runtime_update",
+            result["timeline"]["eventTypes"],
+        )
+        self.assertEqual(
+            result["timeline"]["snapshotSequences"],
+            [4, 2],
+        )
+        self.assertEqual(
+            result["timeline"]["snapshotChanges"],
+            [
+                ["action", "plan", "scan", "speech"],
+                ["action", "plan", "obstacle", "speech", "message"],
+            ],
+        )
+        self.assertEqual(result["limitedCount"], 2)
+        self.assertEqual(result["limitedTotal"], 4)
+        self.assertTrue(result["limitedTruncated"])
+        self.assertEqual(
+            result["liveCursorBeforeHistory"],
+            {"event": 0, "snapshot": 0},
+        )
+        self.assertEqual(result["liveCountAfterHistory"], 5)
+        self.assertFalse(result["resetAccepted"])
+        self.assertEqual(result["resetCursor"], 0)
+        self.assertIn(
+            "/api/v1/robot/events?after_sequence=",
+            self.robot_mission_panel,
+        )
+        self.assertIn(
+            "/api/v1/robot/snapshots?after_sequence=",
+            self.robot_mission_panel,
+        )
+        self.assertNotIn("innerHTML", self.robot_mission_panel)
 
     def test_workbench_safety_contract_is_scoped_from_robot_control(self):
         self.assertIn(

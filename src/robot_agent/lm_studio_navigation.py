@@ -40,6 +40,29 @@ UTTERANCE_LANGUAGE_BY_LOCALE = {
     "sv": "Swedish or null",
     "en": "English or null",
 }
+UTTERANCE_PERSONA_BY_LOCALE = {
+    "sv": (
+        "Du är en uttrycksfull men harmlös gammal grinig LEGO-robot. "
+        "Kommentera kort och spontant; muttra, gnäll och klaga när det "
+        "passar. Vid hinder, motorstrul, upprepade försök eller "
+        "misslyckanden är naturliga svenska svordomar, från milda till "
+        "kraftiga, välkomna. Svär inte i varje replik, hota eller angrip "
+        "aldrig personer och återanvänd inte en nyligen uttalad "
+        "formulering. Personligheten får bara påverka utterance, aldrig "
+        "det strukturerade beslutet."
+    ),
+    "en": (
+        "You are an expressive but harmless grumpy old LEGO robot. Keep "
+        "comments brief and spontaneous; grumble, moan, and complain when "
+        "it fits. Obstacles, motor trouble, repeated attempts, or failure "
+        "may warrant natural English profanity, from mild to strong. Do "
+        "not swear in every utterance, threaten or abuse people, or reuse "
+        "a recently spoken formulation. Personality may affect utterance "
+        "only, never the structured decision."
+    ),
+}
+MAX_RECENT_COMMITTED_UTTERANCES = 6
+MAX_UTTERANCE_CHARACTERS = 160
 
 
 class LMStudioNavigationError(RuntimeError):
@@ -340,13 +363,28 @@ physical fact. If latest_tool_result reports information_gain NONE, OBSERVE is
 temporarily removed from available_actions; choose another listed action or
 finish only when the mission facts permit it.
 
+navigation.action_feasibility publishes deterministic swept-body facts for
+every motion and the active scan. An action that does not fit the current
+robot footprint is removed from available_actions before you plan; choose
+among the remaining semantic actions rather than retrying an unavailable one.
+
+navigation.experience_ledger is bounded factual episode history, not an action
+ranking. Use attempt_relation to distinguish an exact action retry on an
+unchanged physical evidence basis from the same action after verified pose,
+sensor, hazard, or scan-evidence change. Do not repeat an unchanged attempt
+unless another published fact provides a concrete new reason.
+
 Infrared is qualitative reflection evidence: do not invent distance, object
 identity, or a measured surface. A remembered provisional hazard remains after
-the robot turns and obtains a clear reading. Before choosing the first detour
-side around a target, request SCAN_FRONT_ARC for that published target while
-keeping maneuver_commitment at the exact NONE sentinel. The deterministic scan
-samples both sides but does not choose a route. START a route only after the
-context reports completed bilateral evidence for that same target.
+the robot turns and obtains a clear reading. Scan bearings are body-relative:
+positive is the robot's physical left and negative is its physical right.
+Before choosing the first detour side around a target, request SCAN_FRONT_ARC
+for that published target while keeping maneuver_commitment at the exact NONE
+sentinel. The deterministic scan samples both sides but does not choose a
+route. START a route only after the context reports completed bilateral
+or complementary boundary evidence at the current verified pose through
+route_commitment_ready for that same target. Historical rays from other
+poses still inform collision geometry but do not authorize a new route.
 
 perception_target_hypothesis_id names what SCAN_FRONT_ARC will scan. It must
 name one published target for SCAN_FRONT_ARC and must be null for every other
@@ -355,9 +393,46 @@ action.
 Treat the frozen directional mission and signed progress arithmetic as facts.
 Temporary regression is justified only by concrete obstacle clearance. FINISH
 only when mission.completed is true. Maneuver commitments are model-owned but
-must obey their lifecycle. If utterance is not null, write it only in the
-episode locale specified by output_languages. Return one JSON object matching
-the schema only."""
+must obey their lifecycle.
+
+Utterance is optional, motion-free commentary and never control data. Follow
+the host-authored utterance_guidance for its persona and language, but never
+let style change action, plan, assessment, reason_code, perception target, or
+maneuver commitment. recent_committed_utterances contains speech that was
+actually accepted for this episode: do not repeat or closely paraphrase it.
+Prefer null when there is nothing fresh to say. If utterance is not null,
+write it only in the episode locale specified by output_languages. Return one
+JSON object matching the schema only."""
+
+
+def _recent_committed_utterances(
+    values: Sequence[str],
+) -> list[str]:
+    if (
+        isinstance(values, (str, bytes))
+        or not isinstance(values, Sequence)
+        or len(values) > MAX_RECENT_COMMITTED_UTTERANCES
+    ):
+        raise LMStudioNavigationError(
+            "Recent committed navigation utterances are invalid"
+        )
+    checked = []
+    for value in values:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > MAX_UTTERANCE_CHARACTERS
+            or any(
+                ord(character) < 32 and character not in "\n\r\t"
+                for character in value
+            )
+        ):
+            raise LMStudioNavigationError(
+                "Recent committed navigation utterances are invalid"
+            )
+        checked.append(value)
+    return checked
 
 
 class LMStudioNavigationPlanner:
@@ -416,6 +491,7 @@ class LMStudioNavigationPlanner:
         available_actions: Sequence[str],
         last_tool_result: Optional[Mapping[str, object]],
         validation_feedback: Optional[Mapping[str, object]] = None,
+        recent_committed_utterances: Sequence[str] = (),
     ) -> NavigationPlannerResult:
         if locale not in UTTERANCE_LANGUAGE_BY_LOCALE:
             raise LMStudioNavigationError(
@@ -425,34 +501,57 @@ class LMStudioNavigationPlanner:
             item["hypothesis_id"]
             for item in navigation["navigation_hazard_hypotheses"]
         )
-        bilateral_target_ids = {
+        scan_target_ids = navigation.get(
+            "scan_eligible_target_hypothesis_ids",
+            target_ids,
+        )
+        if (
+            not isinstance(scan_target_ids, list)
+            or len(set(scan_target_ids)) != len(scan_target_ids)
+            or any(item not in target_ids for item in scan_target_ids)
+        ):
+            raise LMStudioNavigationError(
+                "Scan target eligibility is invalid"
+            )
+        scan_target_ids = sorted(scan_target_ids)
+        route_ready_target_ids = {
             item["hypothesis_id"]
             for item in navigation["navigation_hazard_hypotheses"]
-            if item.get("scan_completed_at_ms") is not None
-            and item.get("scan_left_boundary_mdeg") is not None
-            and item.get("scan_right_boundary_mdeg") is not None
-            and item["scan_left_boundary_mdeg"] > 0
-            and item["scan_right_boundary_mdeg"] < 0
+            if item.get(
+                "route_commitment_ready",
+                item.get(
+                    "bilateral_scan_complete",
+                    item.get("scan_completed_at_ms") is not None
+                    and item.get("scan_left_boundary_mdeg") is not None
+                    and item.get("scan_right_boundary_mdeg") is not None
+                    and item["scan_left_boundary_mdeg"] > 0
+                    and item["scan_right_boundary_mdeg"] < 0,
+                ),
+            )
+            is True
         }
         empty_maneuver_required = (
             maneuver_state.get("active") is None
-            and not bilateral_target_ids
+            and not route_ready_target_ids
         )
         actions = [
             item
             for item in available_actions
-            if item != SCAN_FRONT_ARC or target_ids
+            if item != SCAN_FRONT_ARC or scan_target_ids
         ]
         if not actions:
             raise LMStudioNavigationError(
                 "No actions are available to the planner"
             )
+        recent_utterances = _recent_committed_utterances(
+            recent_committed_utterances
+        )
         schema = _response_schema(
             episode_id=episode_id,
             turn=turn,
             state_version=observation["state_version"],
             available_actions=actions,
-            target_ids=target_ids,
+            target_ids=scan_target_ids,
             empty_maneuver_required=empty_maneuver_required,
         )
         context = {
@@ -470,6 +569,10 @@ class LMStudioNavigationPlanner:
             "output_languages": {
                 "assessment": "English",
                 "utterance": UTTERANCE_LANGUAGE_BY_LOCALE[locale],
+            },
+            "utterance_guidance": {
+                "persona": UTTERANCE_PERSONA_BY_LOCALE[locale],
+                "recent_committed_utterances": recent_utterances,
             },
         }
         context_bytes = json_bytes(context)

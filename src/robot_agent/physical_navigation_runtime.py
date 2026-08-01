@@ -1,5 +1,6 @@
 """Bounded host runtime for model-planned, worker-executed EV3 navigation."""
 
+from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
 import math
@@ -9,12 +10,10 @@ import time
 from typing import Callable, Mapping, Optional, Tuple
 
 from .active_ir_scan_contract import (
-    ModelScanChoice,
-    build_scan_request,
-    validate_scan_result,
-    worst_case_scan_budget,
+    ActiveIrScanCalibration,
 )
 from .lm_studio_navigation import (
+    MAX_RECENT_COMMITTED_UTTERANCES,
     LMStudioNavigationDecisionError,
     LMStudioNavigationError,
     NavigationPlannerResult,
@@ -31,9 +30,24 @@ from .navigation_memory_store import (
     NavigationMemoryStore,
 )
 from .navigation_plan_tail import NavigationPlanTail
+from .physical_action_feasibility import navigation_action_feasibility
+from .physical_navigation_experience import (
+    NavigationExperienceLedger,
+    PLANNER_ACTION_SOURCE,
+    PLAN_TAIL_ACTION_SOURCE,
+    navigation_evidence_basis,
+)
 from .physical_observation_progress import (
     observation_information_result,
     observe_without_information_gain,
+)
+from .physical_navigation_runtime_errors import (
+    EpisodeCancelled as _EpisodeCancelled,
+    PhysicalNavigationRuntimeError,
+)
+from .physical_navigation_scan_runtime import (
+    DEFAULT_SCAN_BUDGET,
+    PhysicalNavigationScanRuntimeMixin,
 )
 from .physical_navigation_contract import (
     ACTIONS,
@@ -67,23 +81,10 @@ MAX_EPISODE_SECONDS = 60.0 * 60.0
 SUPPORTED_EPISODE_LOCALES = frozenset(("sv", "en"))
 HOST_PER_SLICE_HEADROOM_SECONDS = 0.25
 HOST_RESPONSE_HEADROOM_SECONDS = 0.75
-DEFAULT_SCAN_BUDGET = worst_case_scan_budget()
 DEFAULT_SCAN_TIMEOUT_SECONDS = (
     (DEFAULT_SCAN_BUDGET["minimum_deadline_ms"] + 999) // 1000
 )
 MAX_SCAN_TIMEOUT_SECONDS = 120.0
-
-class PhysicalNavigationRuntimeError(RuntimeError):
-    def __init__(self, code: str, message: str, *, primary_error=None):
-        self.code = code
-        self.primary_error = primary_error
-        super().__init__(message)
-
-class _EpisodeCancelled(Exception):
-    def __init__(self, stage: str):
-        self.stage = stage
-        super().__init__(stage)
-
 
 class _LogicalEpisodeTermination(Exception):
     def __init__(self, reason: str):
@@ -188,7 +189,7 @@ class PhysicalNavigationResult:
         }
 
 
-class PhysicalNavigationRuntime:
+class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
     """Serializes physical execution while model reasoning stays replaceable."""
 
     def __init__(
@@ -204,6 +205,9 @@ class PhysicalNavigationRuntime:
         active_scan_executor_factory: Optional[
             Callable[[object], object]
         ] = None,
+        active_scan_calibration: ActiveIrScanCalibration = (
+            ActiveIrScanCalibration()
+        ),
         monotonic: Callable[[], float] = time.monotonic,
         unix_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
         event_sink: Optional[Callable[[Mapping[str, object]], None]] = None,
@@ -228,6 +232,11 @@ class PhysicalNavigationRuntime:
             and not callable(active_scan_executor_factory)
         ):
             raise ValueError("active scan executor factory is invalid")
+        if not isinstance(
+            active_scan_calibration,
+            ActiveIrScanCalibration,
+        ):
+            raise ValueError("active scan calibration is invalid")
         if not callable(getattr(planner, "decide", None)):
             raise ValueError("navigation planner is invalid")
         if not isinstance(memory, NavigationMemoryStore):
@@ -251,6 +260,7 @@ class PhysicalNavigationRuntime:
         self.memory = memory
         self.active_scan_executor = active_scan_executor
         self.active_scan_executor_factory = active_scan_executor_factory
+        self.active_scan_calibration = active_scan_calibration
         self.monotonic = monotonic
         self.unix_ms = unix_ms
         self.event_sink = event_sink
@@ -266,6 +276,13 @@ class PhysicalNavigationRuntime:
         self._latest_validated_observation = None
         self._worker_absolute_max_ms = None
         self._all_sessions_clean = True
+        self._recent_committed_utterances = deque(
+            maxlen=MAX_RECENT_COMMITTED_UTTERANCES
+        )
+        self._restored_scan_progress_barriers = {}
+        self._experience_ledger = NavigationExperienceLedger(
+            episode_id=episode_id,
+        )
 
     def request_stop(self) -> None:
         self._stop_requested.set()
@@ -427,6 +444,8 @@ class PhysicalNavigationRuntime:
                 speech_status="failed",
                 reason=type(error).__name__,
             )
+        else:
+            self._recent_committed_utterances.append(decision.utterance)
 
     def _active_request(
         self,
@@ -665,7 +684,60 @@ class PhysicalNavigationRuntime:
         navigation = dict(self.memory.context())
         navigation["goal_geometry"] = geometry
         navigation["fact_values"] = deepcopy(fact_values)
+        feasibility = navigation_action_feasibility(
+            hazard_map=self.memory.hazard_map,
+            pose=self.memory.pose,
+            action_specs=action_specs,
+            odometry_calibration=self.memory.odometry_calibration,
+            active_scan_calibration=self.active_scan_calibration,
+        )
+        navigation["action_feasibility"] = deepcopy(feasibility)
+        # Keep the focused field during the dashboard/planner contract
+        # transition while publishing every motion action in the generic
+        # feasibility table above.
+        navigation["scan_front_arc_feasibility"] = deepcopy(
+            feasibility["active_scan"]
+        )
+        navigation["experience_ledger"] = self._experience_ledger.context(
+            current_basis=navigation_evidence_basis(
+                navigation,
+                observation,
+            )
+        )
         return mission_value, navigation
+
+    def _experience_basis(
+        self,
+        observation: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        return navigation_evidence_basis(
+            self.memory.context(),
+            observation,
+        )
+
+    def _record_experience(
+        self,
+        *,
+        turn: int,
+        action: str,
+        source: str,
+        result: Mapping[str, object],
+        basis_before: Mapping[str, object],
+        observation_after: Mapping[str, object],
+    ) -> None:
+        entry = self._experience_ledger.record(
+            turn=turn,
+            action=action,
+            source=source,
+            result=result,
+            basis_before=basis_before,
+            basis_after=self._experience_basis(observation_after),
+        )
+        self._emit(
+            "navigation_experience_recorded",
+            experience=entry.to_dict(),
+            host_ranked_or_selected_action=False,
+        )
 
     @staticmethod
     def _validate_mission_decision(
@@ -801,6 +873,9 @@ class PhysicalNavigationRuntime:
                     available_actions=available_actions,
                     last_tool_result=last_tool_result,
                     validation_feedback=feedback,
+                    recent_committed_utterances=tuple(
+                        self._recent_committed_utterances
+                    ),
                 )
             except LMStudioNavigationDecisionError as error:
                 # The request completed, but the model-authored proposal did
@@ -901,6 +976,24 @@ class PhysicalNavigationRuntime:
                 decision_status="proposed",
             )
             try:
+                if (
+                    decision.action == SCAN_FRONT_ARC
+                    and decision.perception_target_hypothesis_id
+                    not in navigation.get(
+                        "scan_eligible_target_hypothesis_ids",
+                        tuple(
+                            item["hypothesis_id"]
+                            for item in navigation.get(
+                                "navigation_hazard_hypotheses",
+                                (),
+                            )
+                        ),
+                    )
+                ):
+                    raise PhysicalNavigationRuntimeError(
+                        "scan_target_requires_progress",
+                        "Selected scan target requires intervening progress",
+                    )
                 self._validate_mission_decision(
                     decision,
                     mission,
@@ -911,6 +1004,7 @@ class PhysicalNavigationRuntime:
                     action=decision.action,
                     turn=turn,
                     hazard_map=self.memory.hazard_map,
+                    pose=self.memory.pose,
                     fact_values=navigation["fact_values"],
                     perception_target_hypothesis_id=(
                         decision.perception_target_hypothesis_id
@@ -1001,189 +1095,6 @@ class PhysicalNavigationRuntime:
             navigation=self.memory.context(),
         )
         return observation, feedback
-
-    def _execute_scan(
-        self,
-        decision: NavigationDecision,
-        *,
-        observation: Mapping[str, object],
-        deadline: float,
-    ) -> Tuple[Mapping[str, object], Mapping[str, object]]:
-        self._raise_if_cancelled("immediately_before_scan")
-        if self.active_scan_executor is None:
-            feedback = {
-                "operation": SCAN_FRONT_ARC,
-                "status": "unavailable",
-                "reason": "physical_active_scan_not_configured",
-                "host_selected_route_or_side": False,
-            }
-            self._emit("scan_unavailable", scan=feedback)
-            return observation, feedback
-        now_ms = self.unix_ms()
-        now_monotonic = self.monotonic()
-        now_monotonic_ms = int(now_monotonic * 1000)
-        scan_window_ms = min(
-            int(self.config.scan_timeout_seconds * 1000),
-            max(0, int((deadline - now_monotonic) * 1000)),
-        )
-        request = build_scan_request(
-            choice=ModelScanChoice(
-                decision.perception_target_hypothesis_id
-            ),
-            frame_id=self.memory.frame_id,
-            map_generation_id=self.memory.generation_id,
-            map_version=self.memory.hazard_map.revision,
-            start_pose=self.memory.pose,
-            start_state_version=observation["state_version"],
-            created_at_ms=now_ms,
-            deadline_ms=now_ms + scan_window_ms,
-            created_monotonic_ms=now_monotonic_ms,
-            deadline_monotonic_ms=now_monotonic_ms + scan_window_ms,
-        )
-        try:
-            result = self.active_scan_executor.execute(
-                request,
-                cancel_requested=self._cancelled,
-            )
-        except Exception:
-            self._invalidate_localization(
-                "Active scan failed before heading restoration was verified",
-                publication_stage="scan_execution_invalidated",
-            )
-            raise
-        try:
-            validate_scan_result(
-                result,
-                request,
-                current_frame_id=self.memory.frame_id,
-                current_map_generation_id=self.memory.generation_id,
-                current_map_version=self.memory.hazard_map.revision,
-            )
-        except Exception:
-            self._invalidate_localization(
-                "Active scan result could not be validated",
-                publication_stage="scan_validation_invalidated",
-            )
-            raise
-        if not result.restored_start_heading or not result.stop_confirmed:
-            # A validated cancelled result still contains the exact scan
-            # reason and every verified ray. Publish it before escalating an
-            # unknown heading/stop state so dashboard evidence survives the
-            # terminal fault transition.
-            self._emit("scan_result", scan=result.to_dict())
-            self._invalidate_localization(
-                "Active scan did not verify restoration to its start heading",
-                publication_stage="scan_restoration_invalidated",
-            )
-            self._raise_if_cancelled("scan_cancelled_without_restoration")
-            raise PhysicalNavigationRuntimeError(
-                "scan_heading_unrestored",
-                "Active scan ended without verified heading restoration",
-            )
-        if self._cancelled():
-            self._invalidate_localization(
-                "Scan completed but cancellation prevented encoder re-anchoring",
-                publication_stage="scan_reanchor_cancelled",
-            )
-            self._raise_if_cancelled("after_scan_before_encoder_reanchor")
-        try:
-            self._raise_if_cancelled(
-                "immediately_before_post_scan_observe"
-            )
-            response = self._active_request(
-                "observe",
-                {},
-                self.config.request_timeout_seconds,
-            )
-            fresh = self._observation_from_response("observe", response)
-            captured_at_ms = self.unix_ms()
-            self.memory.ingest_verified_scan_completion(
-                fresh,
-                result,
-                captured_at_ms,
-            )
-        except _EpisodeCancelled:
-            self._invalidate_localization(
-                "Cancellation interrupted post-scan encoder re-anchoring",
-                publication_stage="post_scan_observe_cancelled",
-            )
-            raise
-        except Exception:
-            if self.memory.localization_valid:
-                self._invalidate_localization(
-                    "Post-scan encoder re-anchoring failed",
-                    publication_stage="post_scan_reanchor_invalidated",
-                )
-            else:
-                self._offer_invalid_localization(
-                    captured_at_ms=captured_at_ms,
-                    publication_stage="post_scan_reanchor_invalidated",
-                    observation=fresh,
-                )
-            raise
-        if result.bilateral_complete:
-            try:
-                self.memory.hazard_map.record_scan_boundaries(
-                    result.target_hypothesis_id,
-                    evidence_frame_id=result.frame_id,
-                    evidence_map_generation_id=result.map_generation_id,
-                    based_on_map_version=result.based_on_map_version,
-                    completed_at_ms=result.completed_at_ms,
-                    left_boundary_mdeg=result.left_boundary_mdeg,
-                    right_boundary_mdeg=result.right_boundary_mdeg,
-                )
-            except ValueError as error:
-                # Physical stop, heading restoration, and the mandatory fresh
-                # encoder anchor were already verified above. A rejected map
-                # fusion is therefore logical discarded evidence, never a
-                # physical fault or a reason to invalidate localization.
-                feedback = {
-                    "operation": SCAN_FRONT_ARC,
-                    "status": "CANCELLED",
-                    "reason": "scan_boundary_map_integration_rejected",
-                    "target_hypothesis_id": (
-                        result.target_hypothesis_id
-                    ),
-                    "bilateral_complete": False,
-                    "evidence_disposition": "DISCARDED",
-                    "integration_error": type(error).__name__,
-                    "scan": result.to_dict(),
-                }
-                self._offer_observation(
-                    fresh,
-                    captured_at_ms=captured_at_ms,
-                    publication_stage="scan_reanchor",
-                )
-                self._emit(
-                    "scan_result",
-                    scan=result.to_dict(),
-                    evidence_disposition="DISCARDED",
-                    map_integration={
-                        "status": "rejected",
-                        "reason": feedback["reason"],
-                    },
-                )
-                return fresh, feedback
-            self.memory.updated_at_ms = max(
-                self.memory.updated_at_ms,
-                result.completed_at_ms,
-            )
-            self.memory.save()
-        self._offer_observation(
-            fresh,
-            captured_at_ms=captured_at_ms,
-            publication_stage="scan_reanchor",
-        )
-        feedback = {
-            "operation": SCAN_FRONT_ARC,
-            "status": result.status,
-            "reason": result.reason,
-            "target_hypothesis_id": result.target_hypothesis_id,
-            "bilateral_complete": result.bilateral_complete,
-            "scan": result.to_dict(),
-        }
-        self._emit("scan_result", scan=result.to_dict())
-        return fresh, feedback
 
     @staticmethod
     def _transport_is_valid(transport) -> bool:
@@ -1345,31 +1256,6 @@ class PhysicalNavigationRuntime:
             observation["budgets"]["process_ms_remaining"] - elapsed_ms,
         )
 
-    def _scan_budget_allows(
-        self,
-        observation: Mapping[str, object],
-        action_specs: Mapping[str, Mapping[str, object]],
-        deadline: float,
-    ) -> bool:
-        budgets = observation["budgets"]
-        scan_headroom_ms = self._session_renewal_headroom_ms(
-            action_specs,
-            include_scan=True,
-        )
-        return (
-            self.active_scan_executor is not None
-            and budgets["pulse_count_remaining"]
-            >= DEFAULT_SCAN_BUDGET["turn_slice_count"]
-            and budgets["pulse_duration_ms_remaining"]
-            >= DEFAULT_SCAN_BUDGET["turn_duration_ms"]
-            and self._effective_worker_process_ms(observation)
-            >= scan_headroom_ms
-            and self._worker_absolute_max_ms is not None
-            and scan_headroom_ms <= self._worker_absolute_max_ms
-            and self._remaining_seconds(deadline) * 1000
-            >= scan_headroom_ms
-        )
-
     def _worker_session_needs_renewal(
         self,
         observation: Mapping[str, object],
@@ -1525,7 +1411,28 @@ class PhysicalNavigationRuntime:
                     action_specs,
                 )
                 final_mission = mission_value
-                repeated_uninformative_observe = observe_without_information_gain(last_tool_result)
+                action_feasibility = navigation["action_feasibility"]
+                scan_rotation_sweep = action_feasibility["active_scan"]
+                repeated_uninformative_observe = (
+                    observe_without_information_gain(last_tool_result)
+                )
+                scan_blocked_targets = self._scan_blocked_target_ids(
+                    observation
+                )
+                scan_eligible_targets = sorted(
+                    hypothesis["hypothesis_id"]
+                    for hypothesis in navigation[
+                        "navigation_hazard_hypotheses"
+                    ]
+                    if hypothesis["hypothesis_id"]
+                    not in scan_blocked_targets
+                )
+                navigation["scan_eligible_target_hypothesis_ids"] = (
+                    scan_eligible_targets
+                )
+                navigation["scan_progress_blocked_target_hypothesis_ids"] = (
+                    sorted(scan_blocked_targets)
+                )
                 available = [
                     action
                     for action in sorted(ACTIONS)
@@ -1535,18 +1442,27 @@ class PhysicalNavigationRuntime:
                     )
                     and (
                         action not in MOTION_ACTIONS
-                        or motion_budget_allows(
-                            action,
-                            observation,
-                            action_specs,
+                        or (
+                            action_feasibility["motion_actions"][action][
+                                "allowed"
+                            ]
+                            and motion_budget_allows(
+                                action,
+                                observation,
+                                action_specs,
+                            )
                         )
                     )
                     and (
                         action != SCAN_FRONT_ARC
-                        or self._scan_budget_allows(
-                            observation,
-                            action_specs,
-                            deadline,
+                        or (
+                            bool(scan_eligible_targets)
+                            and scan_rotation_sweep["allowed"]
+                            and self._scan_budget_allows(
+                                observation,
+                                action_specs,
+                                deadline,
+                            )
                         )
                     )
                 ]
@@ -1575,6 +1491,7 @@ class PhysicalNavigationRuntime:
                     self._raise_if_cancelled("immediately_before_observe")
                     self._commit_decision(decision, turn=turn)
                     previous_observation = observation
+                    basis_before = self._experience_basis(observation)
                     response = self._active_request(
                         "observe",
                         {},
@@ -1608,6 +1525,10 @@ class PhysicalNavigationRuntime:
                     information = observation_information_result(
                         previous_observation,
                         observation,
+                        motor_roles=(
+                            self.memory.drive_roles.left,
+                            self.memory.drive_roles.right,
+                        ),
                     )
                     last_tool_result = {
                         "operation": "observe",
@@ -1621,18 +1542,36 @@ class PhysicalNavigationRuntime:
                         "observation_information_assessed",
                         **information,
                     )
+                    self._record_experience(
+                        turn=turn,
+                        action=OBSERVE,
+                        source=PLANNER_ACTION_SOURCE,
+                        result=last_tool_result,
+                        basis_before=basis_before,
+                        observation_after=observation,
+                    )
                     continue
                 if decision.action == SCAN_FRONT_ARC:
                     self._raise_if_cancelled("immediately_before_scan_dispatch")
                     self._commit_decision(decision, turn=turn)
+                    basis_before = self._experience_basis(observation)
                     observation, last_tool_result = self._execute_scan(
                         decision,
                         observation=observation,
                         deadline=deadline,
                     )
                     actions.append(SCAN_FRONT_ARC)
+                    self._record_experience(
+                        turn=turn,
+                        action=SCAN_FRONT_ARC,
+                        source=PLANNER_ACTION_SOURCE,
+                        result=last_tool_result,
+                        basis_before=basis_before,
+                        observation_after=observation,
+                    )
                     continue
 
+                basis_before = self._experience_basis(observation)
                 veto = self._execution_veto(
                     action=decision.action,
                     observation=observation,
@@ -1650,6 +1589,14 @@ class PhysicalNavigationRuntime:
                         action=decision.action,
                         validation=veto,
                     )
+                    self._record_experience(
+                        turn=turn,
+                        action=decision.action,
+                        source=PLANNER_ACTION_SOURCE,
+                        result=last_tool_result,
+                        basis_before=basis_before,
+                        observation_after=observation,
+                    )
                     continue
                 tail = NavigationPlanTail.from_decision(
                     decision,
@@ -1666,6 +1613,14 @@ class PhysicalNavigationRuntime:
                     action_specs=action_specs,
                 )
                 actions.append(decision.action)
+                self._record_experience(
+                    turn=turn,
+                    action=decision.action,
+                    source=PLANNER_ACTION_SOURCE,
+                    result=last_tool_result,
+                    basis_before=basis_before,
+                    observation_after=observation,
+                )
                 if last_tool_result["status"] != "completed":
                     if tail is not None:
                         tail.cancel("first_motion_not_completed")
@@ -1697,6 +1652,7 @@ class PhysicalNavigationRuntime:
                             source_plan=list(tail.source_plan),
                         )
                         break
+                    basis_before = self._experience_basis(observation)
                     veto = self._execution_veto(
                         action=next_action,
                         observation=observation,
@@ -1716,6 +1672,14 @@ class PhysicalNavigationRuntime:
                             reason=tail.cancelled_reason,
                             source_plan=list(tail.source_plan),
                         )
+                        self._record_experience(
+                            turn=turn,
+                            action=next_action,
+                            source=PLAN_TAIL_ACTION_SOURCE,
+                            result=last_tool_result,
+                            basis_before=basis_before,
+                            observation_after=observation,
+                        )
                         break
                     self._raise_if_cancelled(
                         "immediately_before_plan_tail_motion"
@@ -1725,6 +1689,14 @@ class PhysicalNavigationRuntime:
                         action_specs=action_specs,
                     )
                     actions.append(next_action)
+                    self._record_experience(
+                        turn=turn,
+                        action=next_action,
+                        source=PLAN_TAIL_ACTION_SOURCE,
+                        result=last_tool_result,
+                        basis_before=basis_before,
+                        observation_after=observation,
+                    )
                     if last_tool_result["status"] != "completed":
                         tail.cancel("tail_motion_not_completed")
                         counters["tails_cancelled"] += 1
@@ -1785,6 +1757,13 @@ class PhysicalNavigationRuntime:
                     "Physical worker shutdown could not be verified",
                     primary_error=primary_error,
                 ) from cleanup_error
+        final_navigation = dict(self.memory.context())
+        if observation is not None:
+            final_navigation["experience_ledger"] = (
+                self._experience_ledger.context(
+                    current_basis=self._experience_basis(observation),
+                )
+            )
         return PhysicalNavigationResult(
             terminal_reason=terminal_reason,
             completed=completed,
@@ -1795,6 +1774,6 @@ class PhysicalNavigationRuntime:
             plan_tails_completed=counters["tails_completed"],
             plan_tails_cancelled=counters["tails_cancelled"],
             final_mission=deepcopy(final_mission),
-            final_navigation=self.memory.context(),
+            final_navigation=final_navigation,
             shutdown_clean=shutdown_clean,
         )

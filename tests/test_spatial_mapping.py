@@ -16,6 +16,7 @@ from robot_agent.spatial_map_contract import (
     LOCAL_ODOMETRY,
     MAP_PROVISIONAL_IR,
     MAP_SIMULATION_METRIC,
+    MAX_POSE_HISTORY,
     LOCAL_ODOMETRY_POSE,
     PHYSICAL_IR_REFLECTION,
     QUALITATIVE_FORWARD_ENVELOPE,
@@ -23,6 +24,7 @@ from robot_agent.spatial_map_contract import (
     SEMANTIC_UNKNOWN,
     SIMULATION_WORLD,
     STALE_STATE_VERSION,
+    STALE_TIMESTAMP,
 )
 from robot_agent.spatial_mapping import (
     BoundedOccupancyGrid,
@@ -128,6 +130,82 @@ def simulator_grid(max_cells=128, resolution_mm=50):
 
 
 class MetricSpatialMappingTests(unittest.TestCase):
+    def test_rejects_regressing_pose_observation_before_mutating_history(self):
+        grid = simulator_grid()
+        self.assertTrue(grid.ingest(metric_snapshot(
+            state_version=1,
+            pose=PoseEstimate(0, 0, 0),
+        )).applied)
+        regressing = replace(
+            metric_snapshot(
+                state_version=2,
+                pose=PoseEstimate(50, 0, 0),
+            ),
+            state_observed_at_ms=50,
+        )
+
+        update = grid.ingest(regressing)
+        snapshot = grid.snapshot()
+
+        self.assertFalse(update.applied)
+        self.assertEqual(update.reason_code, STALE_TIMESTAMP)
+        self.assertEqual(len(snapshot.pose_history), 1)
+        self.assertEqual(snapshot.latest_robot_pose.x_mm, 0)
+
+    def test_pose_history_keeps_only_exact_geometry_changes(self):
+        grid = simulator_grid()
+        grid.ingest(metric_snapshot(
+            state_version=1,
+            pose=PoseEstimate(0, 0, 0),
+        ))
+        grid.ingest(metric_snapshot(
+            state_version=2,
+            pose=PoseEstimate(0, 0, 0),
+        ))
+        grid.ingest(metric_snapshot(
+            state_version=3,
+            pose=PoseEstimate(50, 0, 0),
+        ))
+        grid.ingest(metric_snapshot(
+            state_version=4,
+            pose=PoseEstimate(50, 0, 90_000),
+        ))
+
+        snapshot = grid.snapshot()
+        self.assertEqual(
+            [
+                (item.x_mm, item.y_mm, item.heading_mdeg)
+                for item in snapshot.pose_history
+            ],
+            [
+                (0, 0, 0),
+                (50, 0, 0),
+                (50, 0, 90_000),
+            ],
+        )
+        self.assertEqual(
+            [item.state_version for item in snapshot.pose_history],
+            [1, 3, 4],
+        )
+        self.assertEqual(snapshot.pose_history_evicted, 0)
+
+    def test_pose_history_has_a_hard_deterministic_capacity(self):
+        grid = simulator_grid()
+        for version in range(1, MAX_POSE_HISTORY + 3):
+            grid.ingest(metric_snapshot(
+                state_version=version,
+                pose=PoseEstimate(version, 0, 0),
+            ))
+
+        snapshot = grid.snapshot()
+        self.assertEqual(len(snapshot.pose_history), MAX_POSE_HISTORY)
+        self.assertEqual(snapshot.pose_history_evicted, 2)
+        self.assertEqual(snapshot.pose_history[0].x_mm, 3)
+        self.assertEqual(
+            snapshot.pose_history[-1].x_mm,
+            MAX_POSE_HISTORY + 2,
+        )
+
     def test_correlated_rays_update_each_cell_once_with_endpoint_dominance(
         self,
     ):
@@ -366,6 +444,9 @@ class MetricSpatialMappingTests(unittest.TestCase):
             },
             {"new-box"},
         )
+        self.assertEqual(len(after.pose_history), 1)
+        self.assertEqual(after.pose_history[0].world_model_version, 2)
+        self.assertEqual(after.pose_history_evicted, 0)
 
     def test_reused_sensor_timestamp_updates_pose_without_refusion(
         self,

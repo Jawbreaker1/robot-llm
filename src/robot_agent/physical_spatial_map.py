@@ -17,12 +17,16 @@ from .spatial_map_contract import (
     DASHBOARD_SPATIAL_MAP_SCHEMA,
     LOCAL_ODOMETRY,
     LOCAL_ODOMETRY_POSE,
+    MAX_POSE_HISTORY,
     MAP_EMPTY,
     MAP_PROVISIONAL_IR,
+    MAX_SPATIAL_SCAN_EVIDENCE,
     PHYSICAL_IR_REFLECTION,
     PROVISIONAL_QUALITATIVE,
     QUALITATIVE_FORWARD_ENVELOPE,
     SEMANTIC_UNKNOWN,
+    SpatialCollisionGeometry,
+    SpatialScanEvidence,
 )
 
 
@@ -69,6 +73,10 @@ def _empty_snapshot(robot_id: str, controller_instance_id: str):
         "provenance": None,
         "bounds": None,
         "robot_pose": None,
+        "pose_history": [],
+        "pose_history_evicted": 0,
+        "collision_geometry": None,
+        "scan_evidence_history": [],
         "sensor_rays": [],
         "cells": [],
         "qualitative_observations": [],
@@ -101,12 +109,16 @@ class PhysicalSpatialMapBridge:
         self._lock = threading.RLock()
         self._accepting = True
         self._generation_id = None
+        self._frame_id = None
         self._generation_revision = None
         self._retired_generation_ids = set()
+        self._retired_generation_keys = set()
         self._world_model_version = 0
         self._publication_sequence = 0
         self._last_captured_at_ms = 0
         self._qualitative = []
+        self._pose_history = []
+        self._pose_history_evicted = 0
         self._snapshot = _empty_snapshot(
             self.robot_id,
             self.controller_instance_id,
@@ -128,15 +140,49 @@ class PhysicalSpatialMapBridge:
         )
 
     def _generation_changed(self, memory: NavigationMemoryStore) -> bool:
-        return self._generation_id != memory.generation_id
+        return (
+            self._generation_id,
+            self._frame_id,
+        ) != (
+            memory.generation_id,
+            memory.frame_id,
+        )
 
     def _begin_generation(self, memory: NavigationMemoryStore) -> None:
         if self._generation_id is not None:
-            self._retired_generation_ids.add(self._generation_id)
+            self._retired_generation_keys.add((
+                self._generation_id,
+                self._frame_id,
+            ))
+            if self._generation_id != memory.generation_id:
+                self._retired_generation_ids.add(self._generation_id)
         self._generation_id = memory.generation_id
+        self._frame_id = memory.frame_id
         self._generation_revision = memory.hazard_map.revision
         self._world_model_version += 1
         self._qualitative.clear()
+        self._pose_history.clear()
+        self._pose_history_evicted = 0
+
+    def _retain_pose(self, pose: Mapping[str, object]) -> None:
+        """Retain changed valid poses without heuristic thresholds."""
+
+        if self._pose_history:
+            previous = self._pose_history[-1]
+            if (
+                pose["x_mm"],
+                pose["y_mm"],
+                pose["heading_mdeg"],
+            ) == (
+                previous["x_mm"],
+                previous["y_mm"],
+                previous["heading_mdeg"],
+            ):
+                return
+        if len(self._pose_history) == MAX_POSE_HISTORY:
+            del self._pose_history[0]
+            self._pose_history_evicted += 1
+        self._pose_history.append(dict(pose))
 
     def offer(
         self,
@@ -166,12 +212,51 @@ class PhysicalSpatialMapBridge:
         checked = validate_observation(dict(observation))
         if memory.drive_roles is None:
             raise ValueError("physical map drive roles are unavailable")
+        # Validate all observation-derived metadata before mutating bridge
+        # state. A malformed sample must remain safely retryable at the same
+        # map revision.
+        left_encoder_mdeg = self._motor_position(
+            checked,
+            memory.drive_roles.left,
+        )
+        right_encoder_mdeg = self._motor_position(
+            checked,
+            memory.drive_roles.right,
+        )
+        motors_running = self._motors_running(checked)
+        collision_geometry = SpatialCollisionGeometry.from_mapping(
+            memory.hazard_map.calibration.collision_geometry()
+        ).to_dict()
+        scan_evidence_history = sorted(
+            (
+                SpatialScanEvidence.from_navigation_evidence(
+                    target_hypothesis_id=hazard.hypothesis_id,
+                    frame_id=hazard.frame_id,
+                    anchor_x_mm=hazard.anchor_x_mm,
+                    anchor_y_mm=hazard.anchor_y_mm,
+                    anchor_heading_mdeg=hazard.anchor_heading_mdeg,
+                    attempt=attempt,
+                ).to_dict()
+                for hazard in memory.hazard_map.hazards
+                for attempt in hazard.scan_evidence_history
+            ),
+            key=lambda item: (
+                item["completed_at_unix_ms"],
+                item["scan_id"],
+            ),
+        )[-MAX_SPATIAL_SCAN_EVIDENCE:]
 
         with self._lock:
             if not self._accepting:
                 return False
             generation_changed = self._generation_changed(memory)
-            if memory.generation_id in self._retired_generation_ids:
+            if (
+                memory.generation_id in self._retired_generation_ids
+                or (
+                    memory.generation_id,
+                    memory.frame_id,
+                ) in self._retired_generation_keys
+            ):
                 return False
             if captured_at_ms < self._last_captured_at_ms:
                 return False
@@ -293,6 +378,7 @@ class PhysicalSpatialMapBridge:
                     "observed_at_unix_ms": captured,
                     "age_ms": 0,
                 }
+                self._retain_pose(pose)
             sensor_rays = []
             if has_current_ir:
                 sensor_rays.append({
@@ -311,16 +397,6 @@ class PhysicalSpatialMapBridge:
                     "age_ms": 0,
                 })
 
-            # Encoder values are retained as observation metadata without
-            # pretending they are spatial sensor geometry.
-            left_encoder_mdeg = self._motor_position(
-                checked,
-                memory.drive_roles.left,
-            )
-            right_encoder_mdeg = self._motor_position(
-                checked,
-                memory.drive_roles.right,
-            )
             self._snapshot = {
                 "schema": DASHBOARD_SPATIAL_MAP_SCHEMA,
                 "read_only": True,
@@ -350,6 +426,12 @@ class PhysicalSpatialMapBridge:
                 ),
                 "bounds": None,
                 "robot_pose": pose,
+                "pose_history": deepcopy(self._pose_history),
+                "pose_history_evicted": self._pose_history_evicted,
+                "collision_geometry": deepcopy(collision_geometry),
+                "scan_evidence_history": deepcopy(
+                    scan_evidence_history
+                ),
                 "sensor_rays": sensor_rays,
                 "cells": [],
                 "qualitative_observations": deepcopy(self._qualitative),
@@ -365,7 +447,7 @@ class PhysicalSpatialMapBridge:
                 "drive_observation": {
                     "left_encoder_mdeg": left_encoder_mdeg,
                     "right_encoder_mdeg": right_encoder_mdeg,
-                    "motors_running": self._motors_running(checked),
+                    "motors_running": motors_running,
                     "touch_pressed": checked["touch"]["pressed"],
                     "motion_fault_latched": checked["budgets"][
                         "motion_fault_latched"
@@ -392,6 +474,7 @@ class PhysicalSpatialMapBridge:
                 if isinstance(observed, int):
                     item["age_ms"] = max(0, now - observed)
         for collection in (
+            value["pose_history"],
             value["sensor_rays"],
             value["qualitative_observations"],
             value["object_hypotheses"],
@@ -400,6 +483,10 @@ class PhysicalSpatialMapBridge:
                 observed = item.get("observed_at_unix_ms")
                 if isinstance(observed, int):
                     item["age_ms"] = max(0, now - observed)
+        for item in value["scan_evidence_history"]:
+            completed = item.get("completed_at_unix_ms")
+            if isinstance(completed, int):
+                item["age_ms"] = max(0, now - completed)
         return value
 
     def close(self, drain: bool = True, timeout_s: float = 5.0) -> bool:

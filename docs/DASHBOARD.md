@@ -249,9 +249,65 @@ riktning och fasta screen-space-sektorer vid observationsposerna. Sektorlängden
 objektidentitet eller positivt fri väg. Om encoderlokaliseringen blir ogiltig
 markeras kartan `degraded` och den osäkra posen ritas inte som aktuell.
 
+Den fysiska projektionen visar nu även två nya, strikt faktabaserade lager:
+
+- `collision_geometry` ritas som den konfigurerade asymmetriska EV3-kroppen
+  med separata extents fram, bak, vänster och höger samt clearance-marginal.
+  Provenance och kalibreringsstatus följer snapshoten. Konturen betyder inte
+  att roboten kan känna sidokontakt och måtten är fortfarande provisoriska.
+- `scan_evidence_history` ritar varje bevarad scans faktiska
+  encoderhärledda kroppsvinklar från den pose där scannen utfördes. Blockerade
+  och klara strålar skiljs visuellt, och panelen visar täckning,
+  hypotesrelation och gränsstatus. Strålarna får ingen uppfunnen fysisk längd
+  eller objektyta.
+
+Scanprojektionen använder den persistenta, diversity-bevarande historiken
+från fysisk navigation memory, högst fyra försök per hinder och åtta i
+kartan. Den är alltså inte en animation som browsern själv härleder. Samma
+positiv-vänster/negativ-höger-konvention används av runtime, kontrakt och UI.
+En äldre scan ritas vid sin historiska pose; den flyttas inte till robotens
+nuvarande kropp.
+
+Det strukturerade action/result-ledger som Gemma använder är däremot ännu
+inte en egen dashboardpanel. Den är episodlokal plannerkontext och
+runtime-telemetri, medan kartan visar dess fysiska underlag: pose, kropp,
+hinder och scan-evidens. Detta undviker att dokumentationen lovar en
+redigerbar eller fullständig beslutslogg i kartvyn.
+
 Kartpublicering är best effort och har ingen motorauktoritet. Ett avvisat eller
 felande kartanrop loggas som telemetri men kan varken rulla tillbaka fysisk
 navigation memory eller stoppa nästa motorbeslut.
+
+### Uppdrag, plan och tidslinje
+
+Kartvyn visar även robotkontrollens aktuella uppdrag utan att blanda ihop
+visning och exekvering. Den alltid synliga sammanfattningen innehåller mål,
+kontrolltillstånd, aktuell semantisk handling, den ordnade modellplanen,
+talstatus och runtime:ns senaste lägeskommentar. När episoden är avslutad märks
+panelen uttryckligen som det senaste avslutade uppdraget så att en gammal plan
+inte ser aktiv ut.
+
+Den utfällbara delen cursor-pollar två separata, autentiserade read-only-flöden:
+
+- `GET /api/v1/robot/snapshots` för strukturerade ändringar av plan, handling,
+  hinderbedömning, scan, tal, kommentar och fel,
+- `GET /api/v1/robot/events` för typade livscykel-, stopp- och felhändelser.
+
+Event- och snapshotsekvenserna är oberoende. Browsern behåller därför en egen
+cursor per flöde, deduplicerar på typ och sekvens och använder timestamp endast
+för sammanvävning. En snapshot där bara modellatensen ändrats skapar ingen ny
+användarhändelse. `robot.runtime_update` visas inte en andra gång när den rikare
+snapshoten redan beskriver samma förändring. En synlig gapmarkör talar om när
+äldre poster lämnat den begränsade historiken. Panelen visar de 80 senaste
+relevanta tidslinjeposterna och markerar uttryckligen när en längre lokal
+tidslinje har kapats; frekventa duplicerade runtime-event tar inte plats från
+dessa poster.
+
+Kartan ritar dessutom `pose_history`, högst 256 lokala odometriposer i ordning.
+Oförändrad position och riktning dedupliceras exakt, medan rotation på plats
+behålls. Äldre punkter räknas när taket nås och historiken nollställs vid ny
+världsmodell eller koordinatram. Spåret är en uppskattning från encoderodometri,
+inte fysisk ground truth, och det överlever ännu inte en processomstart.
 
 Detta är ännu inte SLAM, global lokalisering, A*, frontier exploration eller
 ett navigationsfacit. Fysisk navigation använder sitt auktoritativa hazard

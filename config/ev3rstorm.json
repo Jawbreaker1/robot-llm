@@ -37,6 +37,16 @@
     "move_motor_roles": ["arm"]
   },
   "calibration": {
+    "physical_footprint": {
+      "status": "provisional-unmeasured-operator-observed",
+      "reference_point": "differential-drive-origin",
+      "front_extent_mm": 110,
+      "rear_extent_mm": 90,
+      "left_extent_mm": 105,
+      "right_extent_mm": 160,
+      "clearance_margin_mm": 10,
+      "evidence": "The assembled right arm contacted the obstacle during an in-place scan; extents remain conservative until physically measured"
+    },
     "turn_in_place": {
       "status": "single-visual-estimate",
       "surface": "unspecified-indoor-surface",

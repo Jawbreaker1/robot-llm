@@ -3,6 +3,7 @@
 import threading
 from typing import Callable, Mapping, Optional
 
+from .active_ir_scan_contract import ActiveIrScanCalibration
 from .navigation_memory_store import NavigationMemoryStore
 from .physical_navigation_runtime import (
     DEFAULT_SCAN_TIMEOUT_SECONDS,
@@ -36,6 +37,9 @@ class PhysicalNavigationRuntimeAdapter:
         startup_timeout_seconds: float = 30.0,
         request_timeout_seconds: float = 8.0,
         scan_timeout_seconds: float = float(DEFAULT_SCAN_TIMEOUT_SECONDS),
+        active_scan_calibration: ActiveIrScanCalibration = (
+            ActiveIrScanCalibration()
+        ),
         event_mapper: Optional[
             Callable[[Mapping[str, object]], Optional[Mapping[str, object]]]
         ] = None,
@@ -86,6 +90,11 @@ class PhysicalNavigationRuntimeAdapter:
             <= MAX_SCAN_TIMEOUT_SECONDS
         ):
             raise ValueError("runtime scan timeout is invalid")
+        if not isinstance(
+            active_scan_calibration,
+            ActiveIrScanCalibration,
+        ):
+            raise ValueError("active scan calibration is invalid")
         self.transport_factory = transport_factory
         self.planner_factory = planner_factory
         self.memory_factory = memory_factory
@@ -100,6 +109,7 @@ class PhysicalNavigationRuntimeAdapter:
         self.startup_timeout_seconds = float(startup_timeout_seconds)
         self.request_timeout_seconds = float(request_timeout_seconds)
         self.scan_timeout_seconds = float(scan_timeout_seconds)
+        self.active_scan_calibration = active_scan_calibration
         self.event_mapper = event_mapper or self._dashboard_update
         self._lock = threading.Lock()
         self._active = None
@@ -271,6 +281,7 @@ class PhysicalNavigationRuntimeAdapter:
                 memory=memory,
                 active_scan_executor=scan_executor,
                 active_scan_executor_factory=self.scan_executor_factory,
+                active_scan_calibration=self.active_scan_calibration,
                 event_sink=publish,
                 observation_sink=self._spatial_map_offer,
                 validated_utterance_sink=(

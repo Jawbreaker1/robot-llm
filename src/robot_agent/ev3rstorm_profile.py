@@ -4,9 +4,12 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import threading
-from typing import Callable
+from typing import Callable, Optional
 
-from .active_ir_scan_contract import worst_case_scan_budget
+from .active_ir_scan_contract import (
+    ActiveIrScanCalibration,
+    worst_case_scan_budget,
+)
 from .controller_runtime_profile import (
     ControllerRuntimeBinding,
     ControllerRuntimeDescriptor,
@@ -22,8 +25,10 @@ from .host_piper_speech import (
     PiperSpeechProfile,
 )
 from .navigation_memory_store import NavigationMemoryStore
+from .physical_footprint import RobotFootprint
 from .physical_navigation_adapter import PhysicalNavigationRuntimeAdapter
 from .physical_spatial_map import PhysicalSpatialMapBridge
+from .provisional_hazard_map import HazardMapCalibration
 from .robot_speech_runtime import RobotSpeechRuntime
 
 
@@ -41,7 +46,16 @@ EV3RSTORM_REQUEST_TIMEOUT_SECONDS = 30.0
 EV3RSTORM_SCAN_REQUEST_ROUND_TRIP_HEADROOM_MS = 2_500
 EV3RSTORM_SCAN_RESTORATION_HEADROOM_MS = 15_000
 EV3RSTORM_SCAN_REQUEST_TIMEOUT_SECONDS = 30.0
+EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION = ActiveIrScanCalibration(
+    # Two live bilateral sweeps left the chassis about four and six degrees
+    # from its starting heading.  EV3's coarse timed body turns therefore use
+    # the contract's bounded ten-degree maximum.  Every ray still publishes
+    # its exact encoder-derived bearing; other controllers retain the generic
+    # 2.5-degree default.
+    alignment_tolerance_mdeg=10_000,
+)
 EV3RSTORM_SCAN_BUDGET = worst_case_scan_budget(
+    calibration=EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION,
     request_round_trip_headroom_ms=(
         EV3RSTORM_SCAN_REQUEST_ROUND_TRIP_HEADROOM_MS
     )
@@ -126,6 +140,53 @@ def _identity(value: object, name: str) -> str:
     return value
 
 
+def _physical_footprint(value: object) -> Optional[RobotFootprint]:
+    # schema_version 1 predates host-side swept-volume geometry.  Existing
+    # copied configs therefore retain the generic symmetric-circle fallback;
+    # the checked-in assembled EV3RSTORM profile opts into the new shape.
+    if value is None:
+        return None
+    expected = {
+        "status",
+        "reference_point",
+        "front_extent_mm",
+        "rear_extent_mm",
+        "left_extent_mm",
+        "right_extent_mm",
+        "clearance_margin_mm",
+        "evidence",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ControllerRuntimeProfileError(
+            "EV3RSTORM physical footprint is incomplete"
+        )
+    if (
+        value["status"]
+        != "provisional-unmeasured-operator-observed"
+        or value["reference_point"] != "differential-drive-origin"
+        or not isinstance(value["evidence"], str)
+        or not value["evidence"]
+        or len(value["evidence"]) > 512
+    ):
+        raise ControllerRuntimeProfileError(
+            "EV3RSTORM physical footprint provenance is invalid"
+        )
+    try:
+        return RobotFootprint(
+            front_extent_mm=value["front_extent_mm"],
+            rear_extent_mm=value["rear_extent_mm"],
+            left_extent_mm=value["left_extent_mm"],
+            right_extent_mm=value["right_extent_mm"],
+            clearance_margin_mm=value["clearance_margin_mm"],
+            calibration_status=value["status"],
+            calibration_evidence=value["evidence"],
+        )
+    except ValueError as error:
+        raise ControllerRuntimeProfileError(
+            "EV3RSTORM physical footprint extents are invalid"
+        ) from error
+
+
 def _load_profile_config(path: Path):
     resolved = Path(path).expanduser().resolve()
     try:
@@ -164,6 +225,7 @@ def _load_profile_config(path: Path):
     motors = value.get("motors")
     sensors = value.get("sensors")
     geometry = value.get("drive_geometry")
+    calibration = value.get("calibration")
     if (
         not isinstance(motors, dict)
         or not {"arm", "drive_b", "drive_c"} <= set(motors)
@@ -172,11 +234,15 @@ def _load_profile_config(path: Path):
         or not isinstance(geometry, dict)
         or geometry.get("left_motor_role") not in motors
         or geometry.get("right_motor_role") not in motors
+        or not isinstance(calibration, dict)
     ):
         raise ControllerRuntimeProfileError(
             "EV3RSTORM topology is incomplete"
         )
-    return resolved, robot_id, controller_id
+    footprint = _physical_footprint(
+        calibration.get("physical_footprint")
+    )
+    return resolved, robot_id, controller_id, footprint
 
 
 @dataclass(frozen=True)
@@ -233,9 +299,17 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             raise ControllerRuntimeProfileError(
                 "EV3RSTORM speech profile is invalid"
             )
-        resolved, robot_id, controller_id = _load_profile_config(config_path)
+        (
+            resolved,
+            robot_id,
+            controller_id,
+            footprint,
+        ) = _load_profile_config(config_path)
         self.config_path = resolved
         self.speech_profile = speech_profile
+        self.hazard_calibration = HazardMapCalibration(
+            robot_footprint=footprint,
+        )
         self._descriptor = ControllerRuntimeDescriptor(
             profile_id=EV3RSTORM_PROFILE_ID,
             robot_id=robot_id,
@@ -299,6 +373,7 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
                     robot_id=self.descriptor.robot_id,
                     controller_instance_id=self.descriptor.controller_id,
                     reset=reset_pending,
+                    hazard_calibration=self.hazard_calibration,
                 )
                 if reset_pending:
                     memory.save()
@@ -347,6 +422,9 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             startup_timeout_seconds=EV3RSTORM_STARTUP_TIMEOUT_SECONDS,
             request_timeout_seconds=EV3RSTORM_REQUEST_TIMEOUT_SECONDS,
             scan_timeout_seconds=EV3RSTORM_SCAN_TIMEOUT_SECONDS,
+            active_scan_calibration=(
+                EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION
+            ),
         )
 
 
@@ -354,6 +432,7 @@ __all__ = (
     "DEFAULT_EV3RSTORM_CONFIG_PATH",
     "DEFAULT_EV3RSTORM_MEMORY_PATH",
     "EV3RSTORM_PROFILE_ID",
+    "EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION",
     "EV3RSTORM_REMOTE_WORKER_PATH",
     "EV3RSTORM_REQUEST_TIMEOUT_SECONDS",
     "EV3RSTORM_SCAN_TIMEOUT_SECONDS",

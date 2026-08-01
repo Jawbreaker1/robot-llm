@@ -513,15 +513,6 @@ class EV3ActiveIrScanRig:
                 / SCAN_TURN_REFERENCE_ENCODER_DEGREES
             )
         )
-        if (
-            abs(actual_delta_mdeg - relative_delta_mdeg)
-            > calibration.alignment_tolerance_mdeg
-        ):
-            self.transport.abort()
-            raise ActiveIrScanContractError(
-                "scan_encoder_pose_mismatch",
-                "Encoder-derived scan heading missed its target",
-            )
         completed_at_ms = self._now_ms()
         if completed_at_ms > deadline_ms:
             self.transport.abort()

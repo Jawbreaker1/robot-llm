@@ -13,11 +13,16 @@
   <script src="assets/speech_input_logic.js" defer></script>
   <script src="assets/microphone_input.js" defer></script>
   <script src="assets/spatial_map_presenter.js" defer></script>
+  <script src="assets/robot_mission_panel.js" defer></script>
   <script src="assets/robot_control.js" defer></script>
   <script src="assets/app.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main-content" data-i18n="shell.skip_to_content">Hoppa till innehållet</a>
+  <div class="session-expired-notice" id="session-expired-notice" role="alert" aria-live="assertive" hidden>
+    <strong data-i18n="session.expired.title">Den här dashboard-sessionen har avslutats.</strong>
+    <span data-i18n="session.expired.body">Öppna den nya sessionslänken som visas i terminalen.</span>
+  </div>
 
   <div class="app-shell">
     <header class="topbar">
@@ -404,6 +409,74 @@
         </header>
 
         <div class="map-layout">
+          <section class="instrument-panel map-mission-panel" aria-labelledby="map-mission-heading">
+            <header class="map-mission-header">
+              <div>
+                <p class="eyebrow" id="map-mission-mode" data-i18n="mission.mode.none">Inget aktivt uppdrag</p>
+                <h3 id="map-mission-heading" data-i18n="mission.title">Vad roboten gör</h3>
+              </div>
+              <div class="map-mission-live-status">
+                <span class="state-chip state-idle" id="map-mission-state" data-i18n="robot.state.DISABLED">inte ansluten</span>
+                <time id="map-mission-updated">—</time>
+              </div>
+            </header>
+            <p class="sr-only" id="map-mission-live-announcement" role="status" aria-live="polite" aria-atomic="true"></p>
+
+            <div class="map-mission-summary">
+              <div class="map-mission-summary-item is-goal">
+                <span data-i18n="mission.goal.label">Mål</span>
+                <strong id="map-mission-goal" data-i18n="mission.goal.empty">Inget uppdrag har startats ännu.</strong>
+              </div>
+              <div class="map-mission-summary-item">
+                <span id="map-mission-action-label" data-i18n="mission.action.label">Gör nu</span>
+                <strong id="map-mission-action">—</strong>
+              </div>
+              <div class="map-mission-summary-item is-plan">
+                <span id="map-mission-plan-label" data-i18n="mission.plan.label">Aktuell plan</span>
+                <strong id="map-mission-plan-summary">—</strong>
+              </div>
+              <div class="map-mission-summary-item">
+                <span data-i18n="mission.speech.label">Tal</span>
+                <strong id="map-mission-speech">—</strong>
+              </div>
+              <div class="map-mission-summary-item is-message">
+                <span data-i18n="mission.message.label">Robotens lägeskommentar</span>
+                <strong id="map-mission-message" data-i18n="mission.message.idle">Väntar på nästa uppdrag.</strong>
+              </div>
+            </div>
+
+            <details class="map-mission-details" id="map-mission-details">
+              <summary>
+                <span>
+                  <strong data-i18n="mission.details.title">Plan och händelsehistorik</strong>
+                  <small data-i18n="mission.details.description">Följ beslut, handlingar, perception och tal i samma ordning som de inträffar.</small>
+                </span>
+                <span class="map-mission-details-meta">
+                  <span class="state-chip state-idle" id="map-mission-history-status" data-i18n="mission.history.waiting">väntar</span>
+                  <span class="map-mission-history-count" id="map-mission-history-count">0</span>
+                  <span class="map-mission-details-chevron" aria-hidden="true">›</span>
+                </span>
+              </summary>
+              <div class="map-mission-details-grid">
+                <section class="map-mission-plan-panel" aria-labelledby="map-mission-plan-heading">
+                  <h4 id="map-mission-plan-heading" data-i18n="mission.plan.title">Planen just nu</h4>
+                  <ol class="map-mission-plan" id="map-mission-plan">
+                    <li class="map-mission-plan-empty" data-i18n="mission.plan.empty">Ingen plan har publicerats.</li>
+                  </ol>
+                </section>
+                <section class="map-mission-history-panel" aria-labelledby="map-mission-history-heading">
+                  <div class="map-mission-history-heading">
+                    <h4 id="map-mission-history-heading" data-i18n="mission.history.title">Senaste episodens tidslinje</h4>
+                  </div>
+                  <p class="map-mission-history-gap" id="map-mission-history-gap" data-i18n="mission.history.gap" hidden>Äldre poster har hunnit lämna den begränsade historiken.</p>
+                  <ol class="map-mission-timeline" id="map-mission-timeline">
+                    <li class="map-mission-timeline-empty" data-i18n="mission.timeline.empty">Ingen episodaktivitet ännu.</li>
+                  </ol>
+                </section>
+              </div>
+            </details>
+          </section>
+
           <section class="spatial-map-panel" aria-labelledby="spatial-map-panel-heading">
             <header class="instrument-header">
               <div>
@@ -424,6 +497,7 @@
                 <rect class="map-grid-background" x="0" y="0" width="1000" height="620" fill="url(#spatial-map-grid-pattern)"></rect>
                 <g id="map-local-odometry-layer" role="group" aria-label="Provisorisk lokal odometri" data-i18n-aria-label="map.local_odometry.aria_label"></g>
                 <g id="map-cell-layer" aria-hidden="true"></g>
+                <g id="map-path-layer" aria-hidden="true"></g>
                 <g id="map-ray-layer" aria-hidden="true"></g>
                 <g id="map-object-layer" aria-hidden="true"></g>
                 <g id="map-robot-layer" aria-hidden="true"></g>
@@ -438,6 +512,7 @@
               <span><i class="legend-swatch is-occupied" aria-hidden="true"></i><span data-i18n="map.legend.occupied">Upptagen</span></span>
               <span><i class="legend-swatch is-uncertain" aria-hidden="true"></i><span data-i18n="map.legend.uncertain">Osäker</span></span>
               <span><i class="legend-line" aria-hidden="true"></i><span data-i18n="map.legend.sensor_ray">Färsk sensorstråle</span></span>
+              <span><i class="legend-path" aria-hidden="true"></i><span data-i18n="map.legend.path">Beräknad färdväg</span></span>
               <span><i class="legend-robot" aria-hidden="true"></i><span data-i18n="map.legend.robot">Robot och riktning</span></span>
               <span><i class="legend-provisional-local" aria-hidden="true"></i><span data-i18n="map.legend.provisional_local">Provisorisk lokal odometri</span></span>
             </div>

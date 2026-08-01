@@ -156,6 +156,10 @@ class DashboardRouter:
             "spatial_map_presenter.js",
             "text/javascript; charset=utf-8",
         ),
+        "assets/robot_mission_panel.js": (
+            "robot_mission_panel.js",
+            "text/javascript; charset=utf-8",
+        ),
         "assets/robot_control.js": (
             "robot_control.js",
             "text/javascript; charset=utf-8",

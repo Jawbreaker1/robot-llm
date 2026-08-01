@@ -8,6 +8,8 @@
     "failed",
   ]);
   const {
+    createDashboardRequest,
+    createSessionGuard,
     normalizeSpatialMap,
     TURN_POLL_POLICY,
     replaceRenderedItems,
@@ -110,6 +112,17 @@
   };
 
   const byId = (id) => document.getElementById(id);
+  const sessionGuard = createSessionGuard();
+  sessionGuard.subscribe(() => {
+    byId("session-expired-notice").hidden = false;
+    if (microphoneInput) {
+      microphoneInput.cancel();
+    }
+  });
+  const api = createDashboardRequest({
+    sessionToken: SESSION_TOKEN,
+    sessionGuard,
+  });
   const welcomeMessage = byId("welcome-message");
   const safeArray = (value) => (Array.isArray(value) ? value : []);
   const safeObject = (value) => (
@@ -189,86 +202,6 @@
     translate: t,
     formatNumber: (value, options) => i18n.number(value, options),
   });
-
-  function requestError(code, status = null, cause = null) {
-    const error = new Error(code);
-    error.code = code;
-    error.status = status;
-    if (cause) {
-      error.cause = cause;
-    }
-    return error;
-  }
-
-  async function api(path, options = {}) {
-    const method = options.method || "GET";
-    const headers = { Accept: "application/json" };
-    const request = {
-      method,
-      headers,
-      cache: "no-store",
-      credentials: "same-origin",
-    };
-    if (path.startsWith("/api/")) {
-      if (!SESSION_TOKEN || SESSION_TOKEN === "__ROBOT_DASHBOARD_TOKEN__") {
-        throw requestError("dashboard_session_missing");
-      }
-      headers["X-Robot-Dashboard-Token"] = SESSION_TOKEN;
-    }
-    if (method === "POST" || method === "PUT") {
-      if (Object.hasOwn(options, "rawBody")) {
-        Object.assign(headers, options.headers || {});
-        request.body = options.rawBody;
-      } else {
-        headers["Content-Type"] = "application/json";
-        request.body = JSON.stringify(options.body || {});
-      }
-    }
-    const controller = new AbortController();
-    const parentAbort = () => controller.abort();
-    if (options.signal) {
-      if (options.signal.aborted) {
-        controller.abort();
-      } else {
-        options.signal.addEventListener("abort", parentAbort, { once: true });
-      }
-    }
-    const timer = window.setTimeout(() => controller.abort(), options.timeout || 15000);
-    request.signal = controller.signal;
-    try {
-      const response = await fetch(path, request);
-      const raw = await response.text();
-      let payload = {};
-      if (raw) {
-        try {
-          payload = JSON.parse(raw);
-        } catch (_error) {
-          throw requestError("invalid_server_json", response.status);
-        }
-      }
-      if (!response.ok) {
-        const error = safeObject(payload.error);
-        throw requestError(
-          safeText(error.code, "http_error"),
-          response.status,
-        );
-      }
-      return payload;
-    } catch (error) {
-      if (error && error.name === "AbortError") {
-        throw requestError("request_timeout", null, error);
-      }
-      if (error && error.code) {
-        throw error;
-      }
-      throw requestError("network_error", null, error);
-    } finally {
-      window.clearTimeout(timer);
-      if (options.signal) {
-        options.signal.removeEventListener("abort", parentAbort);
-      }
-    }
-  }
 
   function showToast(message, isError = false) {
     const region = byId("toast-region");
@@ -1157,7 +1090,10 @@
   }
 
   async function pollTurn(turnId, generation) {
-    if (generation !== state.turnPollGeneration) {
+    if (
+      sessionGuard.isExpired()
+      || generation !== state.turnPollGeneration
+    ) {
       return;
     }
     try {
@@ -1185,6 +1121,9 @@
         return;
       }
     } catch (error) {
+      if (sessionGuard.isExpired()) {
+        return;
+      }
       const transition = transitionTurnPoll(
         {
           failures: state.turnPollFailures,
@@ -1466,6 +1405,9 @@
   }
 
   async function pollEvents() {
+    if (sessionGuard.isExpired()) {
+      return;
+    }
     if (!state.eventsPaused) {
       try {
         const payload = await api(`/api/v1/events?after_sequence=${state.afterSequence}&limit=${EVENT_LIMIT}`);
@@ -1477,7 +1419,9 @@
         renderEventStreamStatus();
       }
     }
-    window.setTimeout(pollEvents, document.hidden ? 5000 : 1500);
+    if (!sessionGuard.isExpired()) {
+      window.setTimeout(pollEvents, document.hidden ? 5000 : 1500);
+    }
   }
 
   function toggleEventsPaused() {
@@ -1595,7 +1539,7 @@
   }
 
   async function refreshBootstrap(silent = true) {
-    if (state.bootstrapBusy) {
+    if (sessionGuard.isExpired() || state.bootstrapBusy) {
       return;
     }
     state.bootstrapBusy = true;
@@ -1613,7 +1557,7 @@
   }
 
   async function refreshSpatialMap(silent = true) {
-    if (state.mapBusy) {
+    if (sessionGuard.isExpired() || state.mapBusy) {
       return;
     }
     state.mapBusy = true;
@@ -1852,6 +1796,7 @@
       randomId,
       showToast,
       getLocale: () => i18n.locale,
+      sessionGuard,
       formatError: (error) => localizedError(
         error,
         "errors.robot_control_failed",
@@ -1885,6 +1830,9 @@
     } catch (error) {
       byId("composer-status").textContent = t("server.start_failed");
       showToast(localizedError(error, "server.start_failed"), true);
+    }
+    if (sessionGuard.isExpired()) {
+      return;
     }
     pollEvents();
     window.setInterval(() => refreshBootstrap(true), 10000);

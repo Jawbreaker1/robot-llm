@@ -31,6 +31,9 @@ if (
   !logic
   || !logic.TURN_POLL_POLICY
   || logic.SPATIAL_MAP_SCHEMA !== "robot-spatial-map/v1"
+  || typeof logic.createDashboardRequest !== "function"
+  || typeof logic.createSessionGuard !== "function"
+  || typeof logic.isTerminalSessionError !== "function"
   || typeof logic.normalizeSpatialMap !== "function"
   || typeof logic.replaceRenderedItems !== "function"
   || typeof logic.transitionTurnPoll !== "function"
@@ -233,6 +236,91 @@ const qualitativeOnlyMap = logic.normalizeSpatialMap({
     age_ms: 90,
   }],
 }, spatialNow);
+const physicalEvidenceMap = logic.normalizeSpatialMap({
+  schema: "robot-spatial-map/v1",
+  read_only: true,
+  status: "qualitative_only",
+  frame_id: "local-odometry",
+  collision_geometry: {
+    geometry: "ASYMMETRIC_RECTANGLE",
+    reference_point: "DIFFERENTIAL_DRIVE_ORIGIN",
+    front_extent_mm: 110,
+    rear_extent_mm: 90,
+    left_extent_mm: 105,
+    right_extent_mm: 160,
+    clearance_margin_mm: 10,
+    calibration_status: "provisional",
+    calibration_evidence: "assembled right arm observed",
+  },
+  scan_evidence_history: [{
+    target_hypothesis_id: "hazard-1",
+    frame_id: "local-odometry",
+    hypothesis_anchor_pose: {
+      x_mm: 10,
+      y_mm: 20,
+      heading_mdeg: 30000,
+    },
+    scan_pose: {
+      x_mm: 80,
+      y_mm: -35,
+      heading_mdeg: 45000,
+    },
+    based_on_map_version: 3,
+    scan_id: "scan-with-pose",
+    completed_at_unix_ms: 1900,
+    status: "CANCELLED",
+    reason: "bilateral_boundaries_not_observed",
+    bearing_convention: "POSITIVE_LEFT_NEGATIVE_RIGHT",
+    geometry_kind: "ANGULAR_NONMETRIC_IR_SCAN",
+    observation_pattern: "MIXED",
+    arc_coverage: "BILATERAL_ARC",
+    boundary_coverage: "NO_BOUNDARIES",
+    hypothesis_relation: "SUPPORTS_BLOCKED_HYPOTHESIS",
+    left_boundary_mdeg: null,
+    right_boundary_mdeg: null,
+    provisional: true,
+    read_only: true,
+    rays: [{
+      requested_relative_bearing_mdeg: -30000,
+      actual_relative_bearing_mdeg: -28500,
+      blocked: true,
+      raw_ir_proximity: 24,
+      filtered_ir_proximity: 25,
+      measured_distance_mm: 999,
+    }, {
+      requested_relative_bearing_mdeg: 30000,
+      actual_relative_bearing_mdeg: 31500,
+      blocked: false,
+      raw_ir_proximity: 56,
+      filtered_ir_proximity: 55,
+    }],
+  }, {
+    target_hypothesis_id: "hazard-1",
+    frame_id: "local-odometry",
+    hypothesis_anchor_pose: {
+      x_mm: 10,
+      y_mm: 20,
+      heading_mdeg: 30000,
+    },
+    scan_pose: null,
+    based_on_map_version: null,
+    scan_id: "legacy-scan-without-pose",
+    completed_at_unix_ms: 1800,
+    status: "CANCELLED",
+    reason: "bilateral_boundaries_not_observed",
+    bearing_convention: "POSITIVE_LEFT_NEGATIVE_RIGHT",
+    geometry_kind: "ANGULAR_NONMETRIC_IR_SCAN",
+    observation_pattern: "ALL_CLEAR",
+    arc_coverage: "BILATERAL_ARC",
+    boundary_coverage: "NO_BOUNDARIES",
+    hypothesis_relation: "CONFLICTS_BLOCKED_HYPOTHESIS",
+    left_boundary_mdeg: null,
+    right_boundary_mdeg: null,
+    provisional: true,
+    read_only: true,
+    rays: [],
+  }],
+}, spatialNow);
 
 process.stdout.write(JSON.stringify({
   exports: Object.keys(logic).sort(),
@@ -274,6 +362,14 @@ process.stdout.write(JSON.stringify({
     emptyMap,
     wrongSchemaMap,
     qualitativeOnlyMap,
+    physicalEvidenceMap,
+    physicalEvidenceFrozen: (
+      Object.isFrozen(physicalEvidenceMap.collisionGeometry)
+      && Object.isFrozen(physicalEvidenceMap.scanEvidenceHistory)
+      && Object.isFrozen(
+        physicalEvidenceMap.scanEvidenceHistory[0].rays,
+      )
+    ),
   },
 }));
 """
@@ -333,6 +429,9 @@ process.stdout.write(JSON.stringify({
             [
                 "SPATIAL_MAP_SCHEMA",
                 "TURN_POLL_POLICY",
+                "createDashboardRequest",
+                "createSessionGuard",
+                "isTerminalSessionError",
                 "normalizeSpatialMap",
                 "replaceRenderedItems",
                 "transitionTurnPoll",
@@ -396,6 +495,163 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(polling["recoveredTerminal"]["terminal"])
         self.assertFalse(polling["recoveredTerminal"]["retry"])
         self.assertTrue(polling["invalidEventRejected"])
+
+    def test_rejected_session_is_a_terminal_request_circuit_breaker(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const context = {};
+vm.runInNewContext(source, context, { filename: process.argv[1] });
+const logic = context.RobotDashboardLogic;
+
+class FakeAbortController {
+  constructor() {
+    this.signal = {
+      aborted: false,
+      addEventListener() {},
+      removeEventListener() {},
+    };
+  }
+  abort() {
+    this.signal.aborted = true;
+  }
+}
+
+function response(status, payload) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    async text() {
+      return JSON.stringify(payload);
+    },
+  };
+}
+
+(async () => {
+  const replies = [
+    response(500, { error: { code: "server_busy" } }),
+    response(200, { ready: true }),
+    response(403, { error: { code: "origin_rejected" } }),
+    new Error("temporary network failure"),
+    response(403, {
+      error: { code: "session_token_rejected" },
+    }),
+  ];
+  const calls = [];
+  const guard = logic.createSessionGuard();
+  let expiryAnnouncements = 0;
+  guard.subscribe(() => {
+    expiryAnnouncements += 1;
+  });
+  const request = logic.createDashboardRequest({
+    sessionToken: "a".repeat(64),
+    sessionGuard: guard,
+    fetchRequest: async (path, options) => {
+      calls.push({ path, headers: options.headers });
+      const reply = replies.shift();
+      if (reply instanceof Error) {
+        throw reply;
+      }
+      return reply;
+    },
+    AbortController: FakeAbortController,
+    setTimeout: () => 1,
+    clearTimeout() {},
+  });
+  const errors = [];
+  for (let index = 0; index < 5; index += 1) {
+    try {
+      await request("/api/v1/bootstrap");
+    } catch (error) {
+      errors.push({ code: error.code, status: error.status });
+    }
+  }
+  const fetchesAtExpiry = calls.length;
+  for (let index = 0; index < 100; index += 1) {
+    try {
+      await request("/api/v1/map");
+    } catch (error) {
+      if (
+        error.code !== "session_token_rejected"
+        || error.status !== 403
+      ) {
+        throw error;
+      }
+    }
+  }
+  let lateAnnouncement = 0;
+  guard.subscribe(() => {
+    lateAnnouncement += 1;
+  });
+  process.stdout.write(JSON.stringify({
+    calls: calls.length,
+    errors,
+    expired: guard.isExpired(),
+    expiryAnnouncements,
+    fetchesAtExpiry,
+    frozen: Object.isFrozen(guard),
+    lateAnnouncement,
+    terminalChecks: {
+      exact: logic.isTerminalSessionError({
+        code: "session_token_rejected",
+        status: 403,
+      }),
+      wrongCode: logic.isTerminalSessionError({
+        code: "origin_rejected",
+        status: 403,
+      }),
+      wrongStatus: logic.isTerminalSessionError({
+        code: "session_token_rejected",
+        status: 401,
+      }),
+    },
+    tokenHeader: calls[0].headers["X-Robot-Dashboard-Token"],
+  }));
+})().catch((error) => {
+  process.stderr.write(String(error && error.stack || error));
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(LOGIC_ASSET),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["calls"], 5)
+        self.assertEqual(result["fetchesAtExpiry"], 5)
+        self.assertTrue(result["expired"])
+        self.assertTrue(result["frozen"])
+        self.assertEqual(result["expiryAnnouncements"], 1)
+        self.assertEqual(result["lateAnnouncement"], 1)
+        self.assertEqual(
+            result["errors"],
+            [
+                {"code": "server_busy", "status": 500},
+                {"code": "origin_rejected", "status": 403},
+                {"code": "network_error", "status": None},
+                {
+                    "code": "session_token_rejected",
+                    "status": 403,
+                },
+            ],
+        )
+        self.assertEqual(result["tokenHeader"], "a" * 64)
+        self.assertEqual(
+            result["terminalChecks"],
+            {"exact": True, "wrongCode": False, "wrongStatus": False},
+        )
 
     def test_spatial_map_normalization_is_bounded_fresh_and_defensive(self):
         spatial = self.runtime["spatial"]
@@ -495,6 +751,37 @@ process.stdout.write(JSON.stringify({
             qualitative["qualitativeObservations"][0]["ageMs"],
             90,
         )
+
+        physical = spatial["physicalEvidenceMap"]
+        self.assertTrue(spatial["physicalEvidenceFrozen"])
+        self.assertEqual(
+            physical["collisionGeometry"]["geometry"],
+            "ASYMMETRIC_RECTANGLE",
+        )
+        self.assertEqual(
+            physical["collisionGeometry"]["rightExtentMm"],
+            160,
+        )
+        self.assertGreater(
+            physical["collisionGeometry"]["rightExtentMm"],
+            physical["collisionGeometry"]["leftExtentMm"],
+        )
+        self.assertEqual(len(physical["scanEvidenceHistory"]), 2)
+        current, legacy = physical["scanEvidenceHistory"]
+        self.assertTrue(current["spatiallyRenderable"])
+        self.assertEqual(current["scanPose"], {
+            "xMm": 80,
+            "yMm": -35,
+            "headingMdeg": 45000,
+        })
+        self.assertNotEqual(
+            current["scanPose"],
+            current["hypothesisAnchorPose"],
+        )
+        self.assertEqual(current["ageMs"], 100)
+        self.assertNotIn("measuredDistanceMm", current["rays"][0])
+        self.assertFalse(legacy["spatiallyRenderable"])
+        self.assertIsNone(legacy["scanPose"])
 
 
 if __name__ == "__main__":

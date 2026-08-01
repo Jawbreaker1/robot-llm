@@ -796,6 +796,8 @@ class DashboardServiceTests(unittest.TestCase):
         )
         self.assertIs(snapshot["read_only"], True)
         self.assertIsNone(snapshot["robot_pose"])
+        self.assertEqual(snapshot["pose_history"], [])
+        self.assertEqual(snapshot["pose_history_evicted"], 0)
         self.assertEqual(snapshot["cells"], [])
         self.assertEqual(snapshot["sensor_rays"], [])
         self.assertEqual(snapshot["object_hypotheses"], [])

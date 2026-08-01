@@ -13,11 +13,25 @@ from .navigation_contract import (
     identifier,
     integer,
 )
+from .physical_scan_evidence import (
+    BODY_RELATIVE_BEARING_CONVENTION,
+    MAX_SCAN_ATTEMPTS_PER_MAP,
+    ScanAttemptEvidence,
+)
+from .spatial_contract_validation import (
+    boolean as _boolean,
+    is_unique_identifier_tuple,
+    normalize_collision_geometry_mapping,
+    optional_identifier as _optional_identifier,
+    validate_evidence_sources,
+)
 
 
 SPATIAL_MAP_SNAPSHOT_SCHEMA = "robot-spatial-map-snapshot/v1"
 SPATIAL_MAP_UPDATE_SCHEMA = "robot-spatial-map-update/v1"
 DASHBOARD_SPATIAL_MAP_SCHEMA = "robot-spatial-map/v1"
+MAX_POSE_HISTORY = 256
+MAX_SPATIAL_SCAN_EVIDENCE = MAX_SCAN_ATTEMPTS_PER_MAP
 
 CELL_UNKNOWN = "UNKNOWN"
 CELL_FREE = "FREE"
@@ -44,24 +58,10 @@ STALE_TIMESTAMP = "STALE_TIMESTAMP"
 
 _MAX_INT = 2**63 - 1
 
-
-def _optional_identifier(
-    name: str,
-    value: Optional[str],
-    maximum: int = 128,
-) -> Optional[str]:
-    if value is not None:
-        identifier(name, value, maximum)
-    return value
-
-
-def _boolean(name: str, value: bool) -> bool:
-    if type(value) is not bool:
-        raise NavigationContractError(
-            "invalid_boolean",
-            "{} is invalid".format(name),
-        )
-    return value
+ASYMMETRIC_RECTANGLE = "ASYMMETRIC_RECTANGLE"
+SYMMETRIC_CIRCLE = "SYMMETRIC_CIRCLE"
+DIFFERENTIAL_DRIVE_ORIGIN = "DIFFERENTIAL_DRIVE_ORIGIN"
+ANGULAR_NONMETRIC_IR_SCAN = "ANGULAR_NONMETRIC_IR_SCAN"
 
 
 @dataclass(frozen=True)
@@ -147,6 +147,412 @@ class SpatialRobotPose:
             "captured_at_host_ms": self.captured_at_host_ms,
             "state_version": self.state_version,
             "world_model_version": self.world_model_version,
+        }
+
+
+@dataclass(frozen=True)
+class SpatialCollisionGeometry:
+    """Trusted robot-body dimensions used by navigation collision checks.
+
+    These dimensions describe the robot around its drive origin.  They are
+    deliberately separate from IR evidence: a real body extent is metric,
+    while a reflected IR ray still carries no range or endpoint.
+    """
+
+    geometry: str
+    reference_point: str
+    radius_mm: Optional[int] = None
+    front_extent_mm: Optional[int] = None
+    rear_extent_mm: Optional[int] = None
+    left_extent_mm: Optional[int] = None
+    right_extent_mm: Optional[int] = None
+    clearance_margin_mm: Optional[int] = None
+    calibration_status: Optional[str] = None
+    calibration_evidence: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.reference_point != DIFFERENTIAL_DRIVE_ORIGIN:
+            raise NavigationContractError(
+                "invalid_collision_geometry",
+                "Collision geometry reference point is invalid",
+            )
+        extents = (
+            self.front_extent_mm,
+            self.rear_extent_mm,
+            self.left_extent_mm,
+            self.right_extent_mm,
+        )
+        if self.geometry == SYMMETRIC_CIRCLE:
+            integer("radius_mm", self.radius_mm, 1, 1_000)
+            if any(value is not None for value in extents) or any(
+                value is not None
+                for value in (
+                    self.clearance_margin_mm,
+                    self.calibration_status,
+                    self.calibration_evidence,
+                )
+            ):
+                raise NavigationContractError(
+                    "invalid_collision_geometry",
+                    "Circular collision geometry has rectangle fields",
+                )
+            return
+        if self.geometry != ASYMMETRIC_RECTANGLE:
+            raise NavigationContractError(
+                "invalid_collision_geometry",
+                "Collision geometry kind is invalid",
+            )
+        if self.radius_mm is not None:
+            raise NavigationContractError(
+                "invalid_collision_geometry",
+                "Rectangular collision geometry has a radius",
+            )
+        for name, value in (
+            ("front_extent_mm", self.front_extent_mm),
+            ("rear_extent_mm", self.rear_extent_mm),
+            ("left_extent_mm", self.left_extent_mm),
+            ("right_extent_mm", self.right_extent_mm),
+        ):
+            integer(name, value, 1, 1_000)
+        integer(
+            "clearance_margin_mm",
+            self.clearance_margin_mm,
+            0,
+            500,
+        )
+        _optional_identifier(
+            "calibration_status",
+            self.calibration_status,
+            512,
+        )
+        _optional_identifier(
+            "calibration_evidence",
+            self.calibration_evidence,
+            512,
+        )
+        if (
+            self.calibration_status is None
+            or self.calibration_evidence is None
+        ):
+            raise NavigationContractError(
+                "invalid_collision_geometry",
+                "Rectangular collision calibration provenance is missing",
+            )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]):
+        return cls(**normalize_collision_geometry_mapping(value))
+
+    def to_dict(self) -> Mapping[str, object]:
+        if self.geometry == SYMMETRIC_CIRCLE:
+            return {
+                "geometry": self.geometry,
+                "reference_point": self.reference_point,
+                "radius_mm": self.radius_mm,
+            }
+        return {
+            "geometry": self.geometry,
+            "reference_point": self.reference_point,
+            "front_extent_mm": self.front_extent_mm,
+            "rear_extent_mm": self.rear_extent_mm,
+            "left_extent_mm": self.left_extent_mm,
+            "right_extent_mm": self.right_extent_mm,
+            "clearance_margin_mm": self.clearance_margin_mm,
+            "calibration_status": self.calibration_status,
+            "calibration_evidence": self.calibration_evidence,
+        }
+
+
+@dataclass(frozen=True)
+class SpatialScanRayEvidence:
+    """One body-relative scan direction, explicitly without distance."""
+
+    requested_relative_bearing_mdeg: int
+    actual_relative_bearing_mdeg: int
+    blocked: bool
+    raw_ir_proximity: Optional[int]
+    filtered_ir_proximity: Optional[int]
+
+    def __post_init__(self) -> None:
+        integer(
+            "requested_relative_bearing_mdeg",
+            self.requested_relative_bearing_mdeg,
+            -90_000,
+            90_000,
+        )
+        integer(
+            "actual_relative_bearing_mdeg",
+            self.actual_relative_bearing_mdeg,
+            -100_000,
+            100_000,
+        )
+        _boolean("blocked", self.blocked)
+        for name, value in (
+            ("raw_ir_proximity", self.raw_ir_proximity),
+            ("filtered_ir_proximity", self.filtered_ir_proximity),
+        ):
+            if value is not None:
+                integer(name, value, 0, 100)
+
+    def to_dict(self) -> Mapping[str, object]:
+        # No range, endpoint, or free-space claim belongs in this contract.
+        return {
+            "requested_relative_bearing_mdeg": (
+                self.requested_relative_bearing_mdeg
+            ),
+            "actual_relative_bearing_mdeg": (
+                self.actual_relative_bearing_mdeg
+            ),
+            "blocked": self.blocked,
+            "raw_ir_proximity": self.raw_ir_proximity,
+            "filtered_ir_proximity": self.filtered_ir_proximity,
+        }
+
+
+@dataclass(frozen=True)
+class SpatialScanEvidence:
+    """A bounded, read-only projection of one restored active IR scan."""
+
+    target_hypothesis_id: str
+    frame_id: str
+    hypothesis_anchor_x_mm: int
+    hypothesis_anchor_y_mm: int
+    hypothesis_anchor_heading_mdeg: int
+    scan_x_mm: Optional[int]
+    scan_y_mm: Optional[int]
+    scan_heading_mdeg: Optional[int]
+    based_on_map_version: Optional[int]
+    scan_id: str
+    completed_at_unix_ms: int
+    status: str
+    reason: str
+    observation_pattern: str
+    arc_coverage: str
+    boundary_coverage: str
+    hypothesis_relation: str
+    left_boundary_mdeg: Optional[int]
+    right_boundary_mdeg: Optional[int]
+    rays: Tuple[SpatialScanRayEvidence, ...]
+    bearing_convention: str = BODY_RELATIVE_BEARING_CONVENTION
+    geometry_kind: str = ANGULAR_NONMETRIC_IR_SCAN
+    provisional: bool = True
+    read_only: bool = True
+
+    def __post_init__(self) -> None:
+        identifier("target_hypothesis_id", self.target_hypothesis_id)
+        identifier("frame_id", self.frame_id, 96)
+        identifier("scan_id", self.scan_id)
+        integer(
+            "hypothesis_anchor_x_mm",
+            self.hypothesis_anchor_x_mm,
+            -1_000_000,
+            1_000_000,
+        )
+        integer(
+            "hypothesis_anchor_y_mm",
+            self.hypothesis_anchor_y_mm,
+            -1_000_000,
+            1_000_000,
+        )
+        integer(
+            "hypothesis_anchor_heading_mdeg",
+            self.hypothesis_anchor_heading_mdeg,
+            -180_000,
+            179_999,
+        )
+        scan_pose = (
+            self.scan_x_mm,
+            self.scan_y_mm,
+            self.scan_heading_mdeg,
+        )
+        has_scan_pose = all(value is not None for value in scan_pose)
+        if any(value is not None for value in scan_pose) != has_scan_pose:
+            raise NavigationContractError(
+                "invalid_spatial_scan_evidence",
+                "Spatial scan pose is incomplete",
+            )
+        if has_scan_pose:
+            integer("scan_x_mm", self.scan_x_mm, -1_000_000, 1_000_000)
+            integer("scan_y_mm", self.scan_y_mm, -1_000_000, 1_000_000)
+            integer(
+                "scan_heading_mdeg",
+                self.scan_heading_mdeg,
+                -180_000,
+                179_999,
+            )
+            integer(
+                "based_on_map_version",
+                self.based_on_map_version,
+                0,
+                _MAX_INT,
+            )
+        elif self.based_on_map_version is not None:
+            raise NavigationContractError(
+                "invalid_spatial_scan_evidence",
+                "Map basis without a scan pose is invalid",
+            )
+        integer(
+            "completed_at_unix_ms",
+            self.completed_at_unix_ms,
+            0,
+            _MAX_INT,
+        )
+        if (
+            self.status not in ("COMPLETED", "CANCELLED")
+            or not isinstance(self.reason, str)
+            or not self.reason
+            or len(self.reason) > 160
+            or self.observation_pattern
+            not in ("NO_RAYS", "ALL_CLEAR", "ALL_BLOCKED", "MIXED")
+            or self.arc_coverage
+            not in (
+                "NO_ARC",
+                "CENTER_ONLY",
+                "NEGATIVE_ARC_ONLY",
+                "POSITIVE_ARC_ONLY",
+                "BILATERAL_ARC",
+            )
+            or self.boundary_coverage
+            not in (
+                "NO_BOUNDARIES",
+                "POSITIVE_BOUNDARY_ONLY",
+                "NEGATIVE_BOUNDARY_ONLY",
+                "BILATERAL_BOUNDARIES",
+            )
+            or self.hypothesis_relation
+            not in (
+                "NO_EVIDENCE",
+                "SUPPORTS_BLOCKED_HYPOTHESIS",
+                "CONFLICTS_BLOCKED_HYPOTHESIS",
+            )
+            or self.bearing_convention
+            != BODY_RELATIVE_BEARING_CONVENTION
+            or self.geometry_kind != ANGULAR_NONMETRIC_IR_SCAN
+            or self.provisional is not True
+            or self.read_only is not True
+            or not isinstance(self.rays, tuple)
+            or len(self.rays) > 16
+            or any(
+                not isinstance(ray, SpatialScanRayEvidence)
+                for ray in self.rays
+            )
+            or len({
+                ray.requested_relative_bearing_mdeg for ray in self.rays
+            }) != len(self.rays)
+        ):
+            raise NavigationContractError(
+                "invalid_spatial_scan_evidence",
+                "Spatial scan evidence is invalid",
+            )
+        if self.left_boundary_mdeg is not None:
+            integer(
+                "left_boundary_mdeg",
+                self.left_boundary_mdeg,
+                1,
+                90_000,
+            )
+        if self.right_boundary_mdeg is not None:
+            integer(
+                "right_boundary_mdeg",
+                self.right_boundary_mdeg,
+                -90_000,
+                -1,
+            )
+
+    @classmethod
+    def from_navigation_evidence(
+        cls,
+        *,
+        target_hypothesis_id: str,
+        frame_id: str,
+        anchor_x_mm: int,
+        anchor_y_mm: int,
+        anchor_heading_mdeg: int,
+        attempt: ScanAttemptEvidence,
+    ):
+        if not isinstance(attempt, ScanAttemptEvidence):
+            raise NavigationContractError(
+                "invalid_spatial_scan_evidence",
+                "Navigation scan evidence is invalid",
+            )
+        return cls(
+            target_hypothesis_id=target_hypothesis_id,
+            frame_id=frame_id,
+            hypothesis_anchor_x_mm=anchor_x_mm,
+            hypothesis_anchor_y_mm=anchor_y_mm,
+            hypothesis_anchor_heading_mdeg=anchor_heading_mdeg,
+            scan_x_mm=(
+                None if attempt.scan_pose is None else attempt.scan_pose.x_mm
+            ),
+            scan_y_mm=(
+                None if attempt.scan_pose is None else attempt.scan_pose.y_mm
+            ),
+            scan_heading_mdeg=(
+                None
+                if attempt.scan_pose is None
+                else attempt.scan_pose.heading_mdeg
+            ),
+            based_on_map_version=attempt.based_on_map_version,
+            scan_id=attempt.scan_id,
+            completed_at_unix_ms=attempt.completed_at_ms,
+            status=attempt.status,
+            reason=attempt.reason,
+            observation_pattern=attempt.observation_pattern,
+            arc_coverage=attempt.arc_coverage,
+            boundary_coverage=attempt.boundary_coverage,
+            hypothesis_relation=attempt.hypothesis_relation,
+            left_boundary_mdeg=attempt.left_boundary_mdeg,
+            right_boundary_mdeg=attempt.right_boundary_mdeg,
+            rays=tuple(
+                SpatialScanRayEvidence(
+                    requested_relative_bearing_mdeg=(
+                        ray.requested_relative_bearing_mdeg
+                    ),
+                    actual_relative_bearing_mdeg=(
+                        ray.actual_relative_bearing_mdeg
+                    ),
+                    blocked=ray.blocked,
+                    raw_ir_proximity=ray.raw,
+                    filtered_ir_proximity=ray.filtered,
+                )
+                for ray in attempt.rays
+            ),
+        )
+
+    def to_dict(self) -> Mapping[str, object]:
+        return {
+            "target_hypothesis_id": self.target_hypothesis_id,
+            "frame_id": self.frame_id,
+            "hypothesis_anchor_pose": {
+                "x_mm": self.hypothesis_anchor_x_mm,
+                "y_mm": self.hypothesis_anchor_y_mm,
+                "heading_mdeg": self.hypothesis_anchor_heading_mdeg,
+            },
+            "scan_pose": (
+                None
+                if self.scan_x_mm is None
+                else {
+                    "x_mm": self.scan_x_mm,
+                    "y_mm": self.scan_y_mm,
+                    "heading_mdeg": self.scan_heading_mdeg,
+                }
+            ),
+            "based_on_map_version": self.based_on_map_version,
+            "scan_id": self.scan_id,
+            "completed_at_unix_ms": self.completed_at_unix_ms,
+            "status": self.status,
+            "reason": self.reason,
+            "bearing_convention": self.bearing_convention,
+            "geometry_kind": self.geometry_kind,
+            "observation_pattern": self.observation_pattern,
+            "arc_coverage": self.arc_coverage,
+            "boundary_coverage": self.boundary_coverage,
+            "hypothesis_relation": self.hypothesis_relation,
+            "left_boundary_mdeg": self.left_boundary_mdeg,
+            "right_boundary_mdeg": self.right_boundary_mdeg,
+            "rays": [ray.to_dict() for ray in self.rays],
+            "provisional": self.provisional,
+            "read_only": self.read_only,
         }
 
 
@@ -433,13 +839,11 @@ class OccupancyCell:
                 "Occupancy cells require fused metric evidence",
             )
         if (
-            not isinstance(self.provenance, tuple)
-            or not self.provenance
-            or any(
-                identifier("cell_provenance", item, 96) != item
-                for item in self.provenance
+            not is_unique_identifier_tuple(
+                "cell_provenance",
+                self.provenance,
+                require_nonempty=True,
             )
-            or len(set(self.provenance)) != len(self.provenance)
         ):
             raise NavigationContractError(
                 "invalid_cell_provenance",
@@ -656,13 +1060,11 @@ class ObjectHypothesis:
             1_000,
         )
         if (
-            not isinstance(self.provenance, tuple)
-            or not self.provenance
-            or any(
-                identifier("hypothesis_provenance", item, 96) != item
-                for item in self.provenance
+            not is_unique_identifier_tuple(
+                "hypothesis_provenance",
+                self.provenance,
+                require_nonempty=True,
             )
-            or len(set(self.provenance)) != len(self.provenance)
         ):
             raise NavigationContractError(
                 "invalid_hypothesis_provenance",
@@ -796,16 +1198,14 @@ class ProvisionalObjectHypothesis:
         integer("evidence_count", self.evidence_count, 1, _MAX_INT)
         integer("confidence_milli", self.confidence_milli, 1, 400)
         if (
-            not isinstance(self.provenance, tuple)
-            or any(
-                identifier("hypothesis_provenance", item, 96) != item
-                for item in self.provenance
+            not is_unique_identifier_tuple(
+                "hypothesis_provenance",
+                self.provenance,
+                required_members=(
+                    LOCAL_ODOMETRY_POSE,
+                    PHYSICAL_IR_REFLECTION,
+                ),
             )
-            or len(set(self.provenance)) != len(self.provenance)
-            or not {
-                LOCAL_ODOMETRY_POSE,
-                PHYSICAL_IR_REFLECTION,
-            }.issubset(self.provenance)
         ):
             raise NavigationContractError(
                 "invalid_hypothesis_provenance",
@@ -885,6 +1285,10 @@ class SpatialMapSnapshot:
     cells: Tuple[OccupancyCell, ...]
     qualitative_evidence: Tuple[QualitativeObstacleEvidence, ...]
     object_hypotheses: Tuple[SpatialObjectHypothesis, ...]
+    pose_history: Tuple[SpatialRobotPose, ...] = ()
+    pose_history_evicted: int = 0
+    collision_geometry: Optional[SpatialCollisionGeometry] = None
+    scan_evidence_history: Tuple[SpatialScanEvidence, ...] = ()
 
     def __post_init__(self) -> None:
         identifier("map_id", self.map_id)
@@ -912,36 +1316,7 @@ class SpatialMapSnapshot:
                 "invalid_spatial_map_quality",
                 "Spatial map quality is invalid",
             )
-        if (
-            not isinstance(self.evidence_sources, tuple)
-            or any(
-                source not in (
-                    "simulation_metric",
-                    PHYSICAL_IR_REFLECTION,
-                )
-                for source in self.evidence_sources
-            )
-            or len(set(self.evidence_sources))
-            != len(self.evidence_sources)
-        ):
-            raise NavigationContractError(
-                "invalid_spatial_evidence_sources",
-                "Spatial map evidence sources are invalid",
-            )
-        expected_sources = {
-            MAP_EMPTY: (),
-            MAP_SIMULATION_METRIC: ("simulation_metric",),
-            MAP_PROVISIONAL_IR: (PHYSICAL_IR_REFLECTION,),
-            MAP_METRIC_WITH_PROVISIONAL_IR: (
-                PHYSICAL_IR_REFLECTION,
-                "simulation_metric",
-            ),
-        }[self.map_quality]
-        if tuple(sorted(self.evidence_sources)) != expected_sources:
-            raise NavigationContractError(
-                "inconsistent_spatial_map_quality",
-                "Map quality and evidence sources disagree",
-            )
+        validate_evidence_sources(self.evidence_sources, self.map_quality)
         integer("resolution_mm", self.resolution_mm, 1, 100_000)
         integer("capacity", self.capacity, 1, 1_000_000)
         integer("map_version", self.map_version, 0, _MAX_INT)
@@ -999,6 +1374,120 @@ class SpatialMapSnapshot:
                     "invalid_spatial_robot_pose",
                     "Spatial robot pose is invalid",
                 )
+        integer(
+            "pose_history_evicted",
+            self.pose_history_evicted,
+            0,
+            _MAX_INT,
+        )
+        if (
+            not isinstance(self.pose_history, tuple)
+            or len(self.pose_history) > MAX_POSE_HISTORY
+            or any(
+                not isinstance(item, SpatialRobotPose)
+                for item in self.pose_history
+            )
+        ):
+            raise NavigationContractError(
+                "invalid_pose_history",
+                "Spatial pose history is invalid",
+            )
+        if any(
+            item.frame_id != self.frame_id
+            or item.state_version > self.based_on_state_version
+            or item.world_model_version
+            != self.based_on_world_model_version
+            or item.observed_at_ms > self.updated_at_ms
+            or item.captured_at_host_ms > self.updated_at_ms
+            for item in self.pose_history
+        ):
+            raise NavigationContractError(
+                "inconsistent_pose_history",
+                "Spatial pose history crosses the map boundary",
+            )
+        for previous, current in zip(
+            self.pose_history,
+            self.pose_history[1:],
+        ):
+            if (
+                current.state_version <= previous.state_version
+                or current.observed_at_ms < previous.observed_at_ms
+                or current.captured_at_host_ms
+                < previous.captured_at_host_ms
+                or (
+                    current.x_mm,
+                    current.y_mm,
+                    current.heading_mdeg,
+                )
+                == (
+                    previous.x_mm,
+                    previous.y_mm,
+                    previous.heading_mdeg,
+                )
+            ):
+                raise NavigationContractError(
+                    "inconsistent_pose_history_order",
+                    "Spatial pose history is not a monotonic trajectory",
+                )
+        if (
+            self.pose_history
+            and self.latest_robot_pose is not None
+            and (
+                self.pose_history[-1].x_mm,
+                self.pose_history[-1].y_mm,
+                self.pose_history[-1].heading_mdeg,
+            )
+            != (
+                self.latest_robot_pose.x_mm,
+                self.latest_robot_pose.y_mm,
+                self.latest_robot_pose.heading_mdeg,
+            )
+        ):
+            raise NavigationContractError(
+                "inconsistent_latest_pose_history",
+                "Latest robot pose does not end the retained trajectory",
+            )
+        if (
+            self.collision_geometry is not None
+            and not isinstance(
+                self.collision_geometry,
+                SpatialCollisionGeometry,
+            )
+        ):
+            raise NavigationContractError(
+                "invalid_collision_geometry",
+                "Spatial collision geometry is invalid",
+            )
+        if (
+            not isinstance(self.scan_evidence_history, tuple)
+            or len(self.scan_evidence_history)
+            > MAX_SPATIAL_SCAN_EVIDENCE
+            or any(
+                not isinstance(item, SpatialScanEvidence)
+                for item in self.scan_evidence_history
+            )
+            or len({
+                item.scan_id for item in self.scan_evidence_history
+            }) != len(self.scan_evidence_history)
+        ):
+            raise NavigationContractError(
+                "invalid_spatial_scan_history",
+                "Spatial scan history is invalid",
+            )
+        if self.scan_evidence_history and (
+            self.frame_kind != LOCAL_ODOMETRY
+            or PHYSICAL_IR_REFLECTION not in self.evidence_sources
+            or self.collision_geometry is None
+            or any(
+                item.frame_id != self.frame_id
+                or item.completed_at_unix_ms > self.updated_at_ms
+                for item in self.scan_evidence_history
+            )
+        ):
+            raise NavigationContractError(
+                "inconsistent_spatial_scan_history",
+                "Spatial scan history crosses map trust boundaries",
+            )
         if (
             not isinstance(self.sensor_rays, tuple)
             or any(
@@ -1193,6 +1682,18 @@ class SpatialMapSnapshot:
                 if self.latest_robot_pose is None
                 else self.latest_robot_pose.to_dict()
             ),
+            "pose_history": [
+                item.to_dict() for item in self.pose_history
+            ],
+            "pose_history_evicted": self.pose_history_evicted,
+            "collision_geometry": (
+                None
+                if self.collision_geometry is None
+                else self.collision_geometry.to_dict()
+            ),
+            "scan_evidence_history": [
+                item.to_dict() for item in self.scan_evidence_history
+            ],
             "sensor_rays": [
                 ray.to_dict() for ray in self.sensor_rays
             ],

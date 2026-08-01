@@ -8,6 +8,7 @@ from robot_agent.controller_runtime_profile import (
     ControllerRuntimeProfileError,
 )
 from robot_agent.ev3rstorm_profile import (
+    EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION,
     EV3RSTORM_PROFILE_ID,
     EV3RSTORM_REMOTE_WORKER_PATH,
     EV3RSTORM_REQUEST_TIMEOUT_SECONDS,
@@ -149,6 +150,14 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                     EV3RSTORM_SCAN_TIMEOUT_SECONDS,
                 )
                 self.assertEqual(adapter.scan_timeout_seconds, 80.0)
+                self.assertIs(
+                    adapter.active_scan_calibration,
+                    EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION,
+                )
+                self.assertEqual(
+                    adapter.active_scan_calibration.alignment_tolerance_mdeg,
+                    10_000,
+                )
                 self.assertIsInstance(
                     adapter.spatial_map_provider,
                     PhysicalSpatialMapBridge,

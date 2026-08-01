@@ -76,6 +76,9 @@ class SpatialDashboardViewTests(unittest.TestCase):
         self.assertEqual(value["based_on_world_model_version"], 1)
         self.assertIsNotNone(value["bounds"])
         self.assertEqual(value["robot_pose"]["x_mm"], 100)
+        self.assertEqual(len(value["pose_history"]), 1)
+        self.assertEqual(value["pose_history_evicted"], 0)
+        self.assertEqual(value["pose_history"][0]["x_mm"], 100)
         self.assertEqual(len(value["sensor_rays"]), 3)
         self.assertTrue(value["cells"])
         self.assertTrue(value["object_hypotheses"])
@@ -103,6 +106,9 @@ class SpatialDashboardViewTests(unittest.TestCase):
         self.assertIsNone(value["observed_at_unix_ms"])
         self.assertIsNone(
             value["robot_pose"]["observed_at_unix_ms"]
+        )
+        self.assertIsNone(
+            value["pose_history"][0]["observed_at_unix_ms"]
         )
         self.assertTrue(all(
             item["observed_at_unix_ms"] is None
@@ -136,6 +142,11 @@ class SpatialDashboardViewTests(unittest.TestCase):
         self.assertEqual(
             value["sensor_rays"][0]["observed_at_unix_ms"],
             1_999_750,
+        )
+        self.assertEqual(value["pose_history"][0]["age_ms"], 255)
+        self.assertEqual(
+            value["pose_history"][0]["observed_at_unix_ms"],
+            1_999_745,
         )
 
     def test_physical_ir_is_visible_but_never_drawn_as_metric(self):

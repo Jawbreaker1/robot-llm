@@ -191,6 +191,25 @@ def spatial_dashboard_view(
         })
 
     pose = None
+    pose_history = []
+    for historical_pose in snapshot.pose_history:
+        pose_history.append({
+            "x_mm": historical_pose.x_mm,
+            "y_mm": historical_pose.y_mm,
+            "heading_mdeg": historical_pose.heading_mdeg,
+            "frame_id": historical_pose.frame_id,
+            "state_version": historical_pose.state_version,
+            "source_id": "navigation-pose",
+            "provenance": (
+                "SIMULATION"
+                if snapshot.frame_kind == SIMULATION_WORLD
+                else "LOCAL_ODOMETRY"
+            ),
+            "observed_at_unix_ms": unix_for(
+                historical_pose.observed_at_ms
+            ),
+            "age_ms": age_for(historical_pose.observed_at_ms),
+        })
     if snapshot.latest_robot_pose is not None:
         pose = {
             "x_mm": snapshot.latest_robot_pose.x_mm,
@@ -272,6 +291,8 @@ def spatial_dashboard_view(
             None if snapshot.bounds is None else snapshot.bounds.to_dict()
         ),
         "robot_pose": pose,
+        "pose_history": pose_history,
+        "pose_history_evicted": snapshot.pose_history_evicted,
         "sensor_rays": dashboard_rays,
         "cells": dashboard_cells,
         "qualitative_observations": qualitative_observations,

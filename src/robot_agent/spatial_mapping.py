@@ -24,6 +24,7 @@ from .spatial_map_contract import (
     CELL_UNKNOWN,
     LOCAL_ODOMETRY,
     LOCAL_ODOMETRY_POSE,
+    MAX_POSE_HISTORY,
     MAP_EMPTY,
     MAP_METRIC_WITH_PROVISIONAL_IR,
     MAP_PROVISIONAL_IR,
@@ -229,6 +230,10 @@ class BoundedOccupancyGrid:
         self._active_provisional_object_id: Optional[str] = None
         self._evidence_sources: Set[str] = set()
         self._latest_robot_pose: Optional[SpatialRobotPose] = None
+        self._pose_history: Deque[SpatialRobotPose] = deque(
+            maxlen=MAX_POSE_HISTORY
+        )
+        self._pose_history_evicted = 0
         self._sensor_rays: Tuple[SpatialSensorRay, ...] = ()
         self._map_version = 0
         self._created_at_ms = created_at_ms
@@ -405,6 +410,27 @@ class BoundedOccupancyGrid:
         self._evidence_sources.clear()
         self._sensor_rays = ()
         self._latest_robot_pose = None
+        self._pose_history.clear()
+        self._pose_history_evicted = 0
+
+    def _retain_pose_locked(self, pose: SpatialRobotPose) -> None:
+        """Retain changed pose geometry without stationary duplicates."""
+
+        if self._pose_history:
+            previous = self._pose_history[-1]
+            if (
+                pose.x_mm,
+                pose.y_mm,
+                pose.heading_mdeg,
+            ) == (
+                previous.x_mm,
+                previous.y_mm,
+                previous.heading_mdeg,
+            ):
+                return
+        if len(self._pose_history) == MAX_POSE_HISTORY:
+            self._pose_history_evicted += 1
+        self._pose_history.append(pose)
 
     def _ingest_provisional_object_locked(
         self,
@@ -521,6 +547,11 @@ class BoundedOccupancyGrid:
                 snapshot.captured_at_host_ms < self._updated_at_ms
                 or snapshot.clearance.observed_at_ms
                 < self._last_observed_at_ms
+                or (
+                    self._latest_robot_pose is not None
+                    and snapshot.state_observed_at_ms
+                    < self._latest_robot_pose.observed_at_ms
+                )
             ):
                 return self._ignored_update_locked(
                     snapshot,
@@ -597,6 +628,7 @@ class BoundedOccupancyGrid:
                 state_version=snapshot.state_version,
                 world_model_version=snapshot.world_model_version,
             )
+            self._retain_pose_locked(self._latest_robot_pose)
 
             self._map_version += 1
             self._updated_at_ms = snapshot.captured_at_host_ms
@@ -790,6 +822,8 @@ class BoundedOccupancyGrid:
                 cells_evicted=self._cells_evicted,
                 bounds=self._bounds_locked(),
                 latest_robot_pose=self._latest_robot_pose,
+                pose_history=tuple(self._pose_history),
+                pose_history_evicted=self._pose_history_evicted,
                 sensor_rays=self._sensor_rays,
                 cells=cells,
                 qualitative_evidence=tuple(self._qualitative),

@@ -172,6 +172,9 @@
       if (map.robotPose) {
         addPoint(map.robotPose.xMm, map.robotPose.yMm);
       }
+      map.poseHistory.forEach((pose) => {
+        addPoint(pose.xMm, pose.yMm);
+      });
       map.objectHypotheses.forEach((hypothesis) => {
         if (
           hypothesis.provisional
@@ -191,7 +194,23 @@
           ],
         );
       }
-      return { points, cues };
+      const latestScans = new Map();
+      map.scanEvidenceHistory.forEach((scan) => {
+        if (scan.spatiallyRenderable && scan.scanPose) {
+          addPoint(scan.scanPose.xMm, scan.scanPose.yMm);
+          latestScans.set(scan.targetHypothesisId, scan);
+        }
+      });
+      footprintCorners(
+        map.robotPose,
+        map.collisionGeometry,
+        true,
+      ).forEach((point) => addPoint(point.xMm, point.yMm));
+      return {
+        points,
+        cues,
+        latestScans: Array.from(latestScans.values()),
+      };
     }
 
     function localOdometryProjection(points) {
@@ -231,6 +250,72 @@
       };
     }
 
+    function bodyPointToWorld(pose, forwardMm, leftMm) {
+      const heading = pose.headingMdeg / 1000 * Math.PI / 180;
+      return {
+        xMm: pose.xMm
+          + forwardMm * Math.cos(heading)
+          - leftMm * Math.sin(heading),
+        yMm: pose.yMm
+          + forwardMm * Math.sin(heading)
+          + leftMm * Math.cos(heading),
+      };
+    }
+
+    function footprintCorners(pose, geometry, includeMargin = false) {
+      if (!pose || geometry?.geometry !== "ASYMMETRIC_RECTANGLE") {
+        return [];
+      }
+      const margin = includeMargin ? geometry.clearanceMarginMm : 0;
+      return [
+        bodyPointToWorld(
+          pose,
+          geometry.frontExtentMm + margin,
+          geometry.leftExtentMm + margin,
+        ),
+        bodyPointToWorld(
+          pose,
+          geometry.frontExtentMm + margin,
+          -geometry.rightExtentMm - margin,
+        ),
+        bodyPointToWorld(
+          pose,
+          -geometry.rearExtentMm - margin,
+          -geometry.rightExtentMm - margin,
+        ),
+        bodyPointToWorld(
+          pose,
+          -geometry.rearExtentMm - margin,
+          geometry.leftExtentMm + margin,
+        ),
+      ];
+    }
+
+    function scanBearingLabel(bearingMdeg) {
+      const degrees = Math.abs(bearingMdeg) / 1000;
+      const value = formatNumber(degrees, {
+        maximumFractionDigits: 1,
+      });
+      if (bearingMdeg > 0) {
+        return t("map.scan.bearing_left", { value });
+      }
+      if (bearingMdeg < 0) {
+        return t("map.scan.bearing_right", { value });
+      }
+      return t("map.scan.bearing_center");
+    }
+
+    function retainedScanCounts(map) {
+      const result = new Map();
+      map.scanEvidenceHistory.forEach((scan) => {
+        result.set(
+          scan.targetHypothesisId,
+          (result.get(scan.targetHypothesisId) || 0) + 1,
+        );
+      });
+      return result;
+    }
+
     function renderLocalOdometryMap(map, scene, drawable) {
       const layer = byId("map-local-odometry-layer");
       layer.replaceChildren();
@@ -255,6 +340,8 @@
       });
       layerNote.textContent = t("map.local_odometry.layer_note");
       layer.appendChild(layerNote);
+
+      renderPath(layer, map.poseHistory, projection);
 
       scene.cues.forEach(({ anchorPose, evidence }) => {
         const anchor = projection.point(
@@ -319,6 +406,112 @@
         layer.appendChild(group);
       });
 
+      const scanCounts = retainedScanCounts(map);
+      scene.latestScans.forEach((scan) => {
+        const anchor = projection.point(
+          scan.scanPose.xMm,
+          scan.scanPose.yMm,
+        );
+        const baseHeading = (
+          scan.scanPose.headingMdeg / 1000
+        ) * Math.PI / 180;
+        const attemptCount = scanCounts.get(
+          scan.targetHypothesisId,
+        ) || 1;
+        const group = createSvgElement("g", {
+          class: "map-local-scan",
+          "data-provisional": "true",
+          "data-geometry": "angular-nonmetric",
+          "data-metric-distance": "none",
+          "data-attempt-count": attemptCount,
+          "data-scan-id": scan.scanId,
+          "data-origin-x-mm": scan.scanPose.xMm,
+          "data-origin-y-mm": scan.scanPose.yMm,
+          "data-origin-heading-mdeg": scan.scanPose.headingMdeg,
+          "data-based-on-map-version": scan.basedOnMapVersion,
+        });
+        appendSvgTitle(group, [
+          t("map.scan.title", { count: formatNumber(attemptCount) }),
+          t("map.scan.nonmetric"),
+          t("map.scan.hypothesis", {
+            id: scan.targetHypothesisId,
+          }),
+          Number.isFinite(scan.ageMs)
+            ? t("map.tooltip.age", {
+              age: formatMapAge(scan.ageMs),
+            })
+            : "",
+        ]);
+        scan.rays.forEach((ray) => {
+          const rayHeading = baseHeading
+            + ray.actualBearingMdeg / 1000 * Math.PI / 180;
+          const end = screenPoint(anchor, rayHeading, 86);
+          const state = ray.blocked
+            ? t("map.scan.blocked")
+            : t("map.scan.clear");
+          const rayGroup = createSvgElement("g", {
+            class: `map-local-scan-ray ${
+              ray.blocked ? "is-blocked" : "is-clear"
+            }`,
+            "data-actual-bearing-mdeg": ray.actualBearingMdeg,
+            "data-metric-distance": "none",
+          });
+          appendSvgTitle(rayGroup, [
+            t("map.scan.ray_title", {
+              bearing: scanBearingLabel(ray.actualBearingMdeg),
+              state,
+            }),
+            t("map.scan.nonmetric"),
+          ]);
+          rayGroup.appendChild(createSvgElement("line", {
+            x1: anchor.x,
+            y1: anchor.y,
+            x2: end.x,
+            y2: end.y,
+            class: "map-local-scan-ray-line",
+          }));
+          rayGroup.appendChild(createSvgElement("circle", {
+            cx: end.x,
+            cy: end.y,
+            r: ray.blocked ? 5 : 3,
+            class: "map-local-scan-ray-end",
+          }));
+          const rayLabel = createSvgElement("text", {
+            x: end.x,
+            y: end.y - 9,
+            class: "map-local-scan-ray-label",
+            "text-anchor": "middle",
+          });
+          rayLabel.textContent = scanBearingLabel(
+            ray.actualBearingMdeg,
+          );
+          rayGroup.appendChild(rayLabel);
+          group.appendChild(rayGroup);
+        });
+        group.appendChild(createSvgElement("circle", {
+          cx: anchor.x,
+          cy: anchor.y,
+          r: 8,
+          class: "map-local-scan-anchor",
+        }));
+        const scanLabelPosition = screenPoint(
+          anchor,
+          baseHeading,
+          116,
+        );
+        const scanLabel = createSvgElement("text", {
+          x: scanLabelPosition.x,
+          y: scanLabelPosition.y + 18,
+          class: "map-local-scan-label",
+          "text-anchor": "middle",
+        });
+        scanLabel.textContent = t("map.scan.label", {
+          count: formatNumber(attemptCount),
+        });
+        group.appendChild(scanLabel);
+        layer.appendChild(group);
+      });
+
       if (map.robotPose) {
         const robot = projection.point(
           map.robotPose.xMm,
@@ -331,17 +524,104 @@
         const group = createSvgElement("g", {
           class: "map-local-robot",
           "data-provisional": "true",
+          "data-collision-geometry": (
+            map.collisionGeometry?.geometry || "unavailable"
+          ),
         });
         appendSvgTitle(group, [
           t("map.local_odometry.robot_title"),
+          map.collisionGeometry
+            ? t("map.footprint.no_contact_inference")
+            : "",
           ...mapTooltipParts(map.robotPose),
         ]);
-        group.appendChild(createSvgElement("circle", {
-          cx: robot.x,
-          cy: robot.y,
-          r: 24,
-          class: "map-local-robot-boundary",
-        }));
+        if (
+          map.collisionGeometry?.geometry
+          === "ASYMMETRIC_RECTANGLE"
+        ) {
+          const outerCorners = footprintCorners(
+            map.robotPose,
+            map.collisionGeometry,
+            true,
+          ).map((point) => projection.point(point.xMm, point.yMm));
+          const bodyCorners = footprintCorners(
+            map.robotPose,
+            map.collisionGeometry,
+          ).map((point) => projection.point(point.xMm, point.yMm));
+          group.appendChild(createSvgElement("polygon", {
+            points: outerCorners
+              .map((point) => `${point.x},${point.y}`)
+              .join(" "),
+            class: "map-local-robot-clearance",
+            "data-clearance-margin-mm": (
+              map.collisionGeometry.clearanceMarginMm
+            ),
+          }));
+          const footprint = createSvgElement("polygon", {
+            points: bodyCorners
+              .map((point) => `${point.x},${point.y}`)
+              .join(" "),
+            class: "map-local-robot-footprint",
+            "data-front-extent-mm": (
+              map.collisionGeometry.frontExtentMm
+            ),
+            "data-rear-extent-mm": (
+              map.collisionGeometry.rearExtentMm
+            ),
+            "data-left-extent-mm": (
+              map.collisionGeometry.leftExtentMm
+            ),
+            "data-right-extent-mm": (
+              map.collisionGeometry.rightExtentMm
+            ),
+          });
+          appendSvgTitle(footprint, [
+            t("map.footprint.asymmetric_title", {
+              front: formatNumber(
+                map.collisionGeometry.frontExtentMm,
+              ),
+              rear: formatNumber(
+                map.collisionGeometry.rearExtentMm,
+              ),
+              left: formatNumber(
+                map.collisionGeometry.leftExtentMm,
+              ),
+              right: formatNumber(
+                map.collisionGeometry.rightExtentMm,
+              ),
+            }),
+            t("map.footprint.no_contact_inference"),
+          ]);
+          group.appendChild(footprint);
+        } else if (
+          map.collisionGeometry?.geometry === "SYMMETRIC_CIRCLE"
+        ) {
+          const radiusPoint = bodyPointToWorld(
+            map.robotPose,
+            map.collisionGeometry.radiusMm,
+            0,
+          );
+          const projectedRadius = projection.point(
+            radiusPoint.xMm,
+            radiusPoint.yMm,
+          );
+          group.appendChild(createSvgElement("circle", {
+            cx: robot.x,
+            cy: robot.y,
+            r: Math.hypot(
+              projectedRadius.x - robot.x,
+              projectedRadius.y - robot.y,
+            ),
+            class: "map-local-robot-boundary",
+          }));
+        } else {
+          group.appendChild(createSvgElement("circle", {
+            cx: robot.x,
+            cy: robot.y,
+            r: 24,
+            class: "map-local-robot-boundary",
+          }));
+        }
         group.appendChild(createSvgElement("line", {
           x1: robot.x,
           y1: robot.y,
@@ -355,6 +635,16 @@
           r: 17,
           class: "map-local-robot-body",
         }));
+        if (map.collisionGeometry) {
+          const footprintLabel = createSvgElement("text", {
+            x: robot.x,
+            y: robot.y + 34,
+            class: "map-local-footprint-label",
+            "text-anchor": "middle",
+          });
+          footprintLabel.textContent = t("map.footprint.label");
+          group.appendChild(footprintLabel);
+        }
         layer.appendChild(group);
       }
     }
@@ -370,6 +660,33 @@
         return "map-cell map-cell-uncertain";
       }
       return "map-cell map-cell-unknown";
+    }
+
+    function renderPath(layer, poses, projection) {
+      if (!Array.isArray(poses) || poses.length < 2) {
+        return;
+      }
+      const points = poses.map((pose) => projection.point(
+        pose.xMm,
+        pose.yMm,
+      ));
+      const path = createSvgElement("path", {
+        d: points.map((point, index) => (
+          `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`
+        )).join(" "),
+        class: "map-path",
+      });
+      appendSvgTitle(path, [
+        t("map.path.title"),
+        ...mapTooltipParts(poses[poses.length - 1]),
+      ]);
+      layer.appendChild(path);
+      layer.appendChild(createSvgElement("circle", {
+        cx: points[0].x,
+        cy: points[0].y,
+        r: 6,
+        class: "map-path-start",
+      }));
     }
 
     function statusLabel(status) {
@@ -424,6 +741,32 @@
             : formatNumber(map.basedOnWorldModelVersion),
         ],
         [t("map.details.robot"), safeText(map.robotId)],
+        [
+          t("map.details.collision_geometry"),
+          map.collisionGeometry
+            ? localizedValue(
+              `map.footprint.geometry.${
+                map.collisionGeometry.geometry.toLocaleLowerCase(
+                  "en-US",
+                )
+              }`,
+              map.collisionGeometry.geometry,
+            )
+            : t("common.missing"),
+        ],
+        [
+          t("map.details.scan_attempts"),
+          formatNumber(map.scanEvidenceHistory.length),
+        ],
+        [
+          t("map.details.path_points"),
+          map.poseHistoryEvicted > 0
+            ? t("map.details.path_points_truncated", {
+              count: formatNumber(map.poseHistory.length),
+              evicted: formatNumber(map.poseHistoryEvicted),
+            })
+            : formatNumber(map.poseHistory.length),
+        ],
       ];
       details.replaceChildren(...values.map(([label, value]) => {
         const row = createElement("div");
@@ -435,6 +778,7 @@
 
     function renderMapObjects(map) {
       const list = byId("map-object-list");
+      const scanCounts = retainedScanCounts(map);
       byId("map-object-count").textContent = formatNumber(
         map.objectHypotheses.length,
       );
@@ -448,6 +792,14 @@
       }
       list.replaceChildren(...map.objectHypotheses.map((hypothesis) => {
         const item = createElement("article", "map-object-item");
+        const hypothesisScans = map.scanEvidenceHistory.filter(
+          (scan) => (
+            scan.targetHypothesisId === hypothesis.hypothesisId
+          ),
+        );
+        const latestScan = hypothesisScans.length > 0
+          ? hypothesisScans[hypothesisScans.length - 1]
+          : null;
         item.appendChild(createElement(
           "strong",
           "",
@@ -495,6 +847,16 @@
               ),
             })
             : "",
+          scanCounts.has(hypothesis.hypothesisId)
+            ? t("map.scan.attempt_count", {
+              count: formatNumber(
+                scanCounts.get(hypothesis.hypothesisId),
+              ),
+            })
+            : "",
+          latestScan
+            ? scanPatternLabel(latestScan.observationPattern)
+            : "",
         ].filter(Boolean);
         item.appendChild(createElement(
           "small",
@@ -515,6 +877,13 @@
         key,
         safeText(relation, t("map.qualitative.relation.unknown")),
       );
+    }
+
+    function scanPatternLabel(pattern) {
+      const key = `map.scan.pattern.${String(
+        pattern || "unknown",
+      ).toLocaleLowerCase("en-US")}`;
+      return localizedValue(key, safeText(pattern));
     }
 
     function renderQualitativeObservations(map) {
@@ -629,10 +998,12 @@
 
     function renderMetricMap(map, mapDrawable) {
       const cellLayer = byId("map-cell-layer");
+      const pathLayer = byId("map-path-layer");
       const rayLayer = byId("map-ray-layer");
       const objectLayer = byId("map-object-layer");
       const robotLayer = byId("map-robot-layer");
       cellLayer.replaceChildren();
+      pathLayer.replaceChildren();
       rayLayer.replaceChildren();
       objectLayer.replaceChildren();
       robotLayer.replaceChildren();
@@ -640,6 +1011,7 @@
         return;
       }
       const projection = mapProjection(map.bounds);
+      renderPath(pathLayer, map.poseHistory, projection);
       map.cells.forEach((cell) => {
         const point = projection.point(cell.xMm, cell.yMm);
         const size = Number.isFinite(cell.sizeMm)
@@ -760,6 +1132,7 @@
         && (
           map.status === "pose_only"
           || map.status === "qualitative_only"
+          || map.status === "degraded"
         )
         && map.bounds === null
         && localOdometrySceneValue.points.length > 0

@@ -1,4 +1,5 @@
 import copy
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import uuid
 from robot_agent.active_ir_scan import ActiveIrScanExecutor
 from robot_agent.active_ir_scan_contract import (
     ActiveIrScanCalibration,
+    ActiveIrRay,
     ActiveIrScanResult,
     ModelScanChoice,
     build_scan_request,
@@ -47,12 +49,19 @@ from robot_agent.physical_navigation_contract import (
     OBSERVE,
     REVERSE,
     SCAN_FRONT_ARC,
+    TURN_LEFT_90,
+    TURN_RIGHT_90,
     NavigationDecision,
     PhysicalNavigationContractError,
     expected_scan_turn_profile,
     expected_scan_sample_profile,
 )
 from robot_agent.physical_navigation_mission import DirectionalMission
+from robot_agent.physical_observation_progress import (
+    RestoredScanProgressBarrier,
+    observation_information_result,
+    observation_progress_signature,
+)
 from robot_agent.physical_navigation_runtime import (
     PhysicalNavigationRuntime,
     PhysicalNavigationRuntimeConfig,
@@ -68,6 +77,8 @@ from robot_agent.physical_odometry import (
     verified_motion_from_result,
 )
 from robot_agent.robot_speech_runtime import RobotSpeechRuntime
+from robot_agent.provisional_hazard_map import HazardMapCalibration
+from robot_agent.physical_footprint import RobotFootprint
 
 
 def observation(
@@ -571,6 +582,193 @@ class PhysicalMemoryAndMapTests(unittest.TestCase):
         self.assertEqual(recorded.last_seen_at_ms, 3_000)
         self.assertTrue(recorded.bilateral_scan_complete)
 
+    def test_restored_unilateral_scan_evidence_persists_actual_bearings(self):
+        self.memory.begin_episode(
+            observation(1, blocked=True),
+            1_001,
+        )
+        target = self.memory.hazard_map.hazard_ids[0]
+        basis = self.memory.hazard_map.revision
+        self.memory.ingest_stationary_observation(
+            observation(2, blocked=True),
+            2_100,
+        )
+        rays = tuple(
+            ActiveIrRay(
+                ordinal=index,
+                requested_relative_bearing_mdeg=requested,
+                actual_relative_bearing_mdeg=actual,
+                observed_at_ms=2_000 + index,
+                state_version=2 + index,
+                raw=31 if blocked else 62,
+                filtered=32 if blocked else 61,
+                blocked=blocked,
+            )
+            for index, (requested, actual, blocked) in enumerate(
+                (
+                    (0, 0, True),
+                    (-30_000, -28_500, True),
+                    (-60_000, -57_500, True),
+                    (15_000, 14_250, False),
+                    (30_000, 28_500, False),
+                    (60_000, 57_500, False),
+                ),
+                start=1,
+            )
+        )
+        result = ActiveIrScanResult(
+            scan_id="scan-unilateral-live-shape",
+            target_hypothesis_id=target,
+            frame_id=self.memory.frame_id,
+            map_generation_id=self.memory.generation_id,
+            based_on_map_version=basis,
+            started_at_ms=2_000,
+            completed_at_ms=2_050,
+            status="CANCELLED",
+            reason="bilateral_boundaries_not_observed",
+            stop_confirmed=True,
+            restored_start_heading=True,
+            rays=rays,
+            left_boundary_mdeg=7_500,
+            right_boundary_mdeg=None,
+        )
+
+        recorded = self.memory.hazard_map.record_scan_result(
+            result,
+            scan_pose=self.memory.pose,
+        )
+        self.memory.save()
+        loaded = NavigationMemoryStore.load(
+            path=self.path,
+            robot_id="ev3rstorm-01",
+            controller_instance_id="ev3-main",
+        )
+        evidence = loaded.hazard_map.get(
+            recorded.hypothesis_id
+        ).scan_evidence_history[-1]
+
+        self.assertEqual(evidence.arc_coverage, "BILATERAL_ARC")
+        self.assertEqual(
+            evidence.boundary_coverage,
+            "POSITIVE_BOUNDARY_ONLY",
+        )
+        self.assertEqual(evidence.observation_pattern, "MIXED")
+        self.assertEqual(evidence.scan_pose, self.memory.pose)
+        self.assertEqual(evidence.based_on_map_version, basis)
+        self.assertEqual(evidence.left_boundary_mdeg, 7_500)
+        self.assertIsNone(evidence.right_boundary_mdeg)
+        self.assertEqual(
+            [ray.actual_relative_bearing_mdeg for ray in evidence.rays],
+            [0, -28_500, -57_500, 14_250, 28_500, 57_500],
+        )
+        self.assertFalse(recorded.bilateral_scan_complete)
+
+    def test_all_clear_scan_conflicts_with_old_bilateral_hypothesis(self):
+        self.memory.begin_episode(
+            observation(1, blocked=True),
+            1_001,
+        )
+        target = self.memory.hazard_map.hazard_ids[0]
+        basis = self.memory.hazard_map.revision
+        self.memory.ingest_stationary_observation(
+            observation(2, blocked=True),
+            2_100,
+        )
+        mixed_rays = tuple(
+            ActiveIrRay(
+                ordinal=index,
+                requested_relative_bearing_mdeg=bearing,
+                actual_relative_bearing_mdeg=bearing,
+                observed_at_ms=2_000 + index,
+                state_version=2 + index,
+                raw=31 if blocked else 62,
+                filtered=32 if blocked else 61,
+                blocked=blocked,
+            )
+            for index, (bearing, blocked) in enumerate(
+                ((-60_000, False), (-30_000, True), (0, True),
+                 (30_000, True), (60_000, False)),
+                start=1,
+            )
+        )
+        self.memory.hazard_map.record_scan_result(
+            ActiveIrScanResult(
+                scan_id="scan-bilateral-before-conflict",
+                target_hypothesis_id=target,
+                frame_id=self.memory.frame_id,
+                map_generation_id=self.memory.generation_id,
+                based_on_map_version=basis,
+                started_at_ms=2_000,
+                completed_at_ms=2_050,
+                status="COMPLETED",
+                reason="bilateral_boundaries_observed",
+                stop_confirmed=True,
+                restored_start_heading=True,
+                rays=mixed_rays,
+                left_boundary_mdeg=45_000,
+                right_boundary_mdeg=-45_000,
+            ),
+            scan_pose=self.memory.pose,
+        )
+        self.assertTrue(
+            self.memory.hazard_map.get(target).bilateral_scan_complete
+        )
+
+        second_basis = self.memory.hazard_map.revision
+        self.memory.ingest_stationary_observation(
+            observation(3, blocked=False),
+            3_100,
+        )
+        clear_rays = tuple(
+            ActiveIrRay(
+                ordinal=index,
+                requested_relative_bearing_mdeg=bearing,
+                actual_relative_bearing_mdeg=bearing,
+                observed_at_ms=3_000 + index,
+                state_version=10 + index,
+                raw=62,
+                filtered=61,
+                blocked=False,
+            )
+            for index, bearing in enumerate(
+                (-60_000, -30_000, 0, 30_000, 60_000),
+                start=1,
+            )
+        )
+        recorded = self.memory.hazard_map.record_scan_result(
+            ActiveIrScanResult(
+                scan_id="scan-all-clear-conflict",
+                target_hypothesis_id=target,
+                frame_id=self.memory.frame_id,
+                map_generation_id=self.memory.generation_id,
+                based_on_map_version=second_basis,
+                started_at_ms=3_000,
+                completed_at_ms=3_050,
+                status="CANCELLED",
+                reason="bilateral_boundaries_not_observed",
+                stop_confirmed=True,
+                restored_start_heading=True,
+                rays=clear_rays,
+                left_boundary_mdeg=None,
+                right_boundary_mdeg=None,
+            ),
+            scan_pose=self.memory.pose,
+        )
+
+        self.assertFalse(recorded.bilateral_scan_complete)
+        self.assertIsNone(recorded.scan_completed_at_ms)
+        self.assertEqual(
+            recorded.scan_evidence_history[-1].hypothesis_relation,
+            "CONFLICTS_BLOCKED_HYPOTHESIS",
+        )
+        self.assertFalse(recorded.active_for_collision)
+        context_hazard = self.memory.hazard_map.context()[
+            "navigation_hazard_hypotheses"
+        ][0]
+        self.assertFalse(context_hazard["active_for_collision"])
+        self.assertEqual(context_hazard["collision_support_count"], 0)
+        self.assertFalse(recorded.to_dict()["bilateral_scan_complete"])
+
     def test_scan_boundary_fusion_rejects_foreign_or_stale_basis(self):
         self.memory.begin_episode(
             observation(1, blocked=True),
@@ -889,29 +1087,58 @@ class PlanTailAndCommitmentTests(unittest.TestCase):
                 action=ADVANCE,
                 turn=1,
                 hazard_map=memory.hazard_map,
+                pose=memory.pose,
                 fact_values={},
             )
-        self.assertEqual(caught.exception.code, "bilateral_scan_required")
+        self.assertEqual(caught.exception.code, "route_evidence_required")
 
         scan_basis = memory.hazard_map.revision
         memory.ingest_stationary_observation(
             observation(3, blocked=True),
             2_001,
         )
-        memory.hazard_map.record_scan_boundaries(
-            target,
-            evidence_frame_id=memory.frame_id,
-            evidence_map_generation_id=memory.generation_id,
-            based_on_map_version=scan_basis,
-            completed_at_ms=2_000,
-            left_boundary_mdeg=20_000,
-            right_boundary_mdeg=-20_000,
+        rays = tuple(
+            ActiveIrRay(
+                ordinal=index,
+                requested_relative_bearing_mdeg=bearing,
+                actual_relative_bearing_mdeg=bearing,
+                observed_at_ms=1_900 + index,
+                state_version=3 + index,
+                raw=60 if clear else 20,
+                filtered=60 if clear else 20,
+                blocked=not clear,
+            )
+            for index, (bearing, clear) in enumerate(
+                ((-30_000, True), (-10_000, False),
+                 (10_000, False), (30_000, True)),
+                start=1,
+            )
+        )
+        memory.hazard_map.record_scan_result(
+            ActiveIrScanResult(
+                scan_id="route-ready-scan",
+                target_hypothesis_id=target,
+                frame_id=memory.frame_id,
+                map_generation_id=memory.generation_id,
+                based_on_map_version=scan_basis,
+                started_at_ms=1_900,
+                completed_at_ms=2_000,
+                status="COMPLETED",
+                reason="bilateral_boundaries_observed",
+                stop_confirmed=True,
+                restored_start_heading=True,
+                rays=rays,
+                left_boundary_mdeg=20_000,
+                right_boundary_mdeg=-20_000,
+            ),
+            scan_pose=memory.pose,
         )
         state = commitment.apply(
             proposal,
             action=ADVANCE,
             turn=1,
             hazard_map=memory.hazard_map,
+            pose=memory.pose,
             fact_values={},
         )
         self.assertEqual(
@@ -1816,6 +2043,32 @@ class BlockingPulseTransport(FakeRuntimeTransport):
         raise RuntimeError("simulated SSH cancellation")
 
 
+class DecisionRelevantChangeTransport(FakeRuntimeTransport):
+    """Change blocked truth only on the explicit post-scan OBSERVE."""
+
+    def __init__(self):
+        super().__init__(blocked=True)
+        self.observe_calls = 0
+
+    def request(
+        self,
+        operation,
+        arguments,
+        timeout,
+        cancel_requested=None,
+    ):
+        if operation == "observe":
+            self.observe_calls += 1
+            if self.observe_calls == 2:
+                self.blocked = False
+        return super().request(
+            operation,
+            arguments,
+            timeout,
+            cancel_requested=cancel_requested,
+        )
+
+
 class DegradedFirstPulseTransport(FakeRuntimeTransport):
     def __init__(self):
         super().__init__()
@@ -1944,9 +2197,13 @@ class SpeechRuntimePlanner(FakeRuntimePlanner):
 class InvalidThenValidSpeechPlanner:
     def __init__(self):
         self.calls = 0
+        self.recent_utterances = []
 
     def decide(self, **context):
         self.calls += 1
+        self.recent_utterances.append(
+            tuple(context["recent_committed_utterances"])
+        )
         if self.calls == 1:
             value = decision_mapping(
                 episode_id=context["episode_id"],
@@ -1974,6 +2231,89 @@ class InvalidThenValidSpeechPlanner:
             state_version=context["observation"]["state_version"],
             available_actions=context["available_actions"],
             published_target_ids=(),
+        )
+
+
+class CommittedSpeechHistoryPlanner:
+    def __init__(self):
+        self.calls = 0
+        self.recent_utterances = []
+
+    def decide(self, **context):
+        self.calls += 1
+        self.recent_utterances.append(
+            tuple(context["recent_committed_utterances"])
+        )
+        if self.calls == 1:
+            action = ADVANCE
+            plan = [ADVANCE, ADVANCE]
+            reason_code = "PROGRESS_GOAL"
+            utterance = "Jaha, då rullar jag väl."
+        else:
+            action = FINISH
+            plan = [FINISH]
+            reason_code = "COMPLETE_GOAL"
+            utterance = None
+        value = decision_mapping(
+            episode_id=context["episode_id"],
+            turn=context["turn"],
+            state_version=context["observation"]["state_version"],
+            action=action,
+            plan=plan,
+            reason_code=reason_code,
+            utterance=utterance,
+        )
+        return NavigationDecision.from_mapping(
+            value,
+            episode_id=context["episode_id"],
+            turn=context["turn"],
+            state_version=context["observation"]["state_version"],
+            available_actions=context["available_actions"],
+            published_target_ids=(),
+        )
+
+
+class VetoThenObserveSpeechHistoryPlanner:
+    def __init__(self):
+        self.calls = 0
+        self.recent_utterances = []
+
+    def decide(self, **context):
+        self.calls += 1
+        self.recent_utterances.append(
+            tuple(context["recent_committed_utterances"])
+        )
+        targets = tuple(
+            item["hypothesis_id"]
+            for item in context["navigation"][
+                "navigation_hazard_hypotheses"
+            ]
+        )
+        if self.calls == 1:
+            action = ADVANCE
+            plan = [ADVANCE, ADVANCE]
+            reason_code = "PROGRESS_GOAL"
+            utterance = "Jag tänker köra rakt genom skiten."
+        else:
+            action = OBSERVE
+            plan = [OBSERVE]
+            reason_code = "VERIFY_RESULT"
+            utterance = None
+        return NavigationDecision.from_mapping(
+            decision_mapping(
+                episode_id=context["episode_id"],
+                turn=context["turn"],
+                state_version=context["observation"]["state_version"],
+                action=action,
+                plan=plan,
+                reason_code=reason_code,
+                utterance=utterance,
+            ),
+            episode_id=context["episode_id"],
+            turn=context["turn"],
+            state_version=context["observation"]["state_version"],
+            available_actions=context["available_actions"],
+            published_target_ids=targets,
         )
 
 
@@ -2009,7 +2349,18 @@ class InvalidModelOutputThenValidPlanner:
 
 
 class VetoedSpeechPlanner:
+    def __init__(self, memory):
+        self.memory = memory
+
     def decide(self, **context):
+        # Simulate authoritative perception changing after the planner
+        # snapshot but before dispatch. The pre-planner feasibility table
+        # cannot predict this; the final execution veto still must catch it.
+        self.memory.hazard_map.record_observation(
+            self.memory.pose,
+            observation(99, blocked=True),
+            2_001,
+        )
         targets = tuple(
             item["hypothesis_id"]
             for item in context["navigation"][
@@ -2135,9 +2486,11 @@ class ObserveThenScanPlanner:
 class CaptureAvailablePlanner:
     def __init__(self):
         self.available_actions = None
+        self.navigation = None
 
     def decide(self, **context):
         self.available_actions = tuple(context["available_actions"])
+        self.navigation = copy.deepcopy(context["navigation"])
         return NavigationDecision.from_mapping(
             decision_mapping(
                 episode_id=context["episode_id"],
@@ -2160,12 +2513,35 @@ class CaptureAvailablePlanner:
         )
 
 
+class MapChangesAfterScanPlanningPlanner(SingleScanPlanner):
+    def __init__(self, memory):
+        super().__init__()
+        self.memory = memory
+
+    def decide(self, **context):
+        if SCAN_FRONT_ARC not in context["available_actions"]:
+            raise AssertionError("scan was not feasible before planning")
+        hazard = self.memory.hazard_map.hazards[0]
+        self.memory.hazard_map._hazards = (
+            replace(hazard, centroid_x_mm=100),
+        )
+        return super().decide(**context)
+
+
+class ScanExecutorMustNotRun:
+    def execute(self, _request, cancel_requested):
+        del cancel_requested
+        raise AssertionError("rotation-vetoed scan reached executor")
+
+
 class RuntimeScanExecutor:
     def __init__(self, transport, *, touch_after_turn=False):
         self.transport = transport
         self.touch_after_turn = touch_after_turn
+        self.requests = []
 
     def execute(self, request, cancel_requested):
+        self.requests.append(request)
         rig = FakeScanRig(
             touch_after_turn=self.touch_after_turn,
             evidence_offset_ms=(
@@ -2207,14 +2583,71 @@ class RestoredCancelledRuntimeScanExecutor:
         )
 
 
+class RestoredEvidenceRuntimeScanExecutor:
+    """Return live-shaped unilateral evidence, then optional all-clear."""
+
+    def __init__(self, transport, *, all_clear_after_first=False):
+        self.transport = transport
+        self.all_clear_after_first = all_clear_after_first
+        self.calls = 0
+
+    def execute(self, request, cancel_requested):
+        self.calls += 1
+        all_clear = self.all_clear_after_first and self.calls > 1
+        samples = (
+            (0, 0, not all_clear),
+            (-30_000, -28_500, not all_clear),
+            (-60_000, -57_500, not all_clear),
+            (15_000, 14_250, False),
+            (30_000, 28_500, False),
+            (60_000, 57_500, False),
+        )
+        rays = tuple(
+            ActiveIrRay(
+                ordinal=index,
+                requested_relative_bearing_mdeg=requested,
+                actual_relative_bearing_mdeg=actual,
+                observed_at_ms=request.created_at_ms + index,
+                state_version=request.start_state_version + index,
+                raw=31 if blocked else 62,
+                filtered=32 if blocked else 61,
+                blocked=blocked,
+            )
+            for index, (requested, actual, blocked) in enumerate(
+                samples,
+                start=1,
+            )
+        )
+        self.transport.left += 7
+        self.transport.right -= 6
+        return ActiveIrScanResult(
+            scan_id=request.scan_id,
+            target_hypothesis_id=request.target_hypothesis_id,
+            frame_id=request.frame_id,
+            map_generation_id=request.map_generation_id,
+            based_on_map_version=request.based_on_map_version,
+            started_at_ms=request.created_at_ms,
+            completed_at_ms=request.created_at_ms + len(rays) + 1,
+            status="CANCELLED",
+            reason="bilateral_boundaries_not_observed",
+            stop_confirmed=True,
+            restored_start_heading=True,
+            rays=rays,
+            left_boundary_mdeg=None if all_clear else 7_500,
+            right_boundary_mdeg=None,
+        )
+
+
 class ScanThenObservePlanner(SingleScanPlanner):
     def __init__(self):
         super().__init__()
         self.calls = 0
         self.feedback = None
+        self.available_history = []
 
     def decide(self, **context):
         self.calls += 1
+        self.available_history.append(tuple(context["available_actions"]))
         if self.calls == 1:
             return super().decide(**context)
         self.feedback = copy.deepcopy(context["last_tool_result"])
@@ -2237,6 +2670,45 @@ class ScanThenObservePlanner(SingleScanPlanner):
                     "navigation_hazard_hypotheses"
                 ]
             ),
+        )
+
+
+class ScanObserveChangedThenScanPlanner(SingleScanPlanner):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+        self.available_history = []
+
+    def decide(self, **context):
+        self.calls += 1
+        available = tuple(context["available_actions"])
+        self.available_history.append(available)
+        targets = tuple(
+            item["hypothesis_id"]
+            for item in context["navigation"][
+                "navigation_hazard_hypotheses"
+            ]
+        )
+        action = SCAN_FRONT_ARC if self.calls in (1, 3) else OBSERVE
+        return NavigationDecision.from_mapping(
+            decision_mapping(
+                episode_id=context["episode_id"],
+                turn=context["turn"],
+                state_version=context["observation"]["state_version"],
+                action=action,
+                plan=[action],
+                reason_code=(
+                    "HANDLE_OBSTACLE"
+                    if action == SCAN_FRONT_ARC
+                    else "VERIFY_RESULT"
+                ),
+                target=targets[0] if action == SCAN_FRONT_ARC else None,
+            ),
+            episode_id=context["episode_id"],
+            turn=context["turn"],
+            state_version=context["observation"]["state_version"],
+            available_actions=available,
+            published_target_ids=targets,
         )
 
 
@@ -2306,12 +2778,16 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                     )
 
     def test_adapter_propagates_profile_specific_scan_timeout(self):
+        scan_calibration = ActiveIrScanCalibration(
+            alignment_tolerance_mdeg=10_000,
+        )
         adapter = PhysicalNavigationRuntimeAdapter(
             transport_factory=object,
             planner_factory=lambda _model: object(),
             memory_factory=object,
             request_timeout_seconds=25.0,
             scan_timeout_seconds=30.0,
+            active_scan_calibration=scan_calibration,
         )
         context = SimpleNamespace(
             episode_id="episode-profile-scan-timeout",
@@ -2340,6 +2816,10 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         config = runtime_type.call_args.kwargs["config"]
         self.assertEqual(config.request_timeout_seconds, 25.0)
         self.assertEqual(config.scan_timeout_seconds, 30.0)
+        self.assertIs(
+            runtime_type.call_args.kwargs["active_scan_calibration"],
+            scan_calibration,
+        )
 
     def test_committed_start_and_motion_observations_are_detached_offers(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3307,8 +3787,8 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                     max_turns=1,
                     max_episode_seconds=10,
                 ),
-                transport=FakeRuntimeTransport(blocked=True),
-                planner=VetoedSpeechPlanner(),
+                transport=FakeRuntimeTransport(blocked=False),
+                planner=VetoedSpeechPlanner(memory),
                 memory=memory,
                 monotonic=lambda: 0.0,
                 unix_ms=lambda: 2_000,
@@ -3690,6 +4170,10 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             )
             transport = FakeRuntimeTransport(blocked=True)
             planner = SingleScanPlanner()
+            scan_executor = RuntimeScanExecutor(transport)
+            scan_calibration = ActiveIrScanCalibration(
+                alignment_tolerance_mdeg=10_000,
+            )
             runtime_times = iter((1_500, 2_000, 10_000))
             offers = []
 
@@ -3716,7 +4200,8 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 transport=transport,
                 planner=planner,
                 memory=memory,
-                active_scan_executor=RuntimeScanExecutor(transport),
+                active_scan_executor=scan_executor,
+                active_scan_calibration=scan_calibration,
                 monotonic=lambda: 0.0,
                 unix_ms=lambda: next(runtime_times),
                 observation_sink=offer,
@@ -3726,6 +4211,11 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             result = runtime.run()
 
         self.assertEqual(result.actions, (SCAN_FRONT_ARC,))
+        self.assertEqual(len(scan_executor.requests), 1)
+        self.assertIs(
+            scan_executor.requests[0].calibration,
+            scan_calibration,
+        )
         self.assertTrue(memory.localization_valid)
         self.assertEqual(memory.pose, initial_pose)
         self.assertEqual(
@@ -3804,6 +4294,14 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             {"drive_b": 7, "drive_c": -6},
         )
         self.assertEqual(planner.calls, 2)
+        self.assertNotIn(
+            SCAN_FRONT_ARC,
+            planner.available_history[1],
+        )
+        self.assertTrue({OBSERVE, REVERSE}.issubset(
+            planner.available_history[1]
+        ))
+        self.assertNotIn(ADVANCE, planner.available_history[1])
         self.assertEqual(planner.feedback["status"], "CANCELLED")
         self.assertEqual(
             planner.feedback["reason"],
@@ -3814,6 +4312,137 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(scan_event["scan"]["status"], "CANCELLED")
         self.assertTrue(scan_event["scan"]["restored_start_heading"])
+
+    def test_restored_unilateral_scan_requires_progress_before_rescan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "scan-progress-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=153),
+            )
+            transport = DecisionRelevantChangeTransport()
+            planner = ScanObserveChangedThenScanPlanner()
+            scan_executor = RestoredEvidenceRuntimeScanExecutor(
+                transport,
+                all_clear_after_first=True,
+            )
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-scan-progress-gate",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Inspect and adapt around the obstacle",
+                    locale="en",
+                    max_turns=3,
+                    max_episode_seconds=60,
+                ),
+                transport=transport,
+                planner=planner,
+                memory=memory,
+                active_scan_executor=scan_executor,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(
+            result.actions,
+            (SCAN_FRONT_ARC, OBSERVE, SCAN_FRONT_ARC),
+        )
+        self.assertEqual(scan_executor.calls, 2)
+        self.assertIn(SCAN_FRONT_ARC, planner.available_history[0])
+        self.assertNotIn(SCAN_FRONT_ARC, planner.available_history[1])
+        self.assertIn(SCAN_FRONT_ARC, planner.available_history[2])
+        hazard = memory.hazard_map.hazards[0]
+        self.assertEqual(len(hazard.scan_evidence_history), 2)
+        first, second = hazard.scan_evidence_history
+        self.assertEqual(first.left_boundary_mdeg, 7_500)
+        self.assertIsNone(first.right_boundary_mdeg)
+        self.assertEqual(
+            second.hypothesis_relation,
+            "CONFLICTS_BLOCKED_HYPOTHESIS",
+        )
+
+    def test_scan_progress_barrier_rearms_for_pose_or_target_change(self):
+        baseline = observation(2, blocked=True)
+        baseline["motors"].append({
+            "role": "arm",
+            "position": 0,
+            "state": "",
+        })
+        motor_roles = ("drive_b", "drive_c")
+        barrier = RestoredScanProgressBarrier(
+            scan_id="scan-progress-facts",
+            target_hypothesis_id="hazard-a",
+            map_generation_id="map-a",
+            pose=PhysicalPose(),
+            hazard_ids=("hazard-a",),
+            observation_signature=observation_progress_signature(
+                baseline,
+                motor_roles=motor_roles,
+            ),
+            motor_roles=motor_roles,
+        )
+
+        arm_only = copy.deepcopy(baseline)
+        arm_only["state_version"] = 3
+        arm_only["motors"][-1]["position"] = 360
+        self.assertIsNone(barrier.rearm_reason(
+            map_generation_id="map-a",
+            pose=PhysicalPose(),
+            hazard_ids=("hazard-a",),
+            observation=arm_only,
+        ))
+
+        self.assertIsNone(barrier.rearm_reason(
+            map_generation_id="map-a",
+            pose=PhysicalPose(),
+            hazard_ids=("hazard-a",),
+            observation=observation(99, blocked=True),
+        ))
+        self.assertEqual(
+            barrier.rearm_reason(
+                map_generation_id="map-a",
+                pose=PhysicalPose(x_mm=1),
+                hazard_ids=("hazard-a",),
+                observation=baseline,
+            ),
+            "VERIFIED_POSE_CHANGED",
+        )
+        self.assertEqual(
+            barrier.rearm_reason(
+                map_generation_id="map-a",
+                pose=PhysicalPose(),
+                hazard_ids=("hazard-a", "hazard-b"),
+                observation=baseline,
+            ),
+            "TARGET_HYPOTHESES_CHANGED",
+        )
+
+    def test_arm_position_is_not_navigation_observation_information(self):
+        before = observation(1)
+        after = observation(2)
+        before["motors"].append({
+            "role": "arm",
+            "position": 0,
+            "state": "",
+        })
+        after["motors"].append({
+            "role": "arm",
+            "position": 720,
+            "state": "",
+        })
+
+        result = observation_information_result(
+            before,
+            after,
+            motor_roles=("drive_b", "drive_c"),
+        )
+
+        self.assertEqual(result["information_gain"], "NONE")
+        self.assertEqual(result["changed_facts"], [])
 
     def test_rejected_scan_map_fusion_replans_without_physical_fault(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3847,7 +4476,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
 
             with mock.patch.object(
                 memory.hazard_map,
-                "record_scan_boundaries",
+                "record_scan_result",
                 side_effect=ValueError("simulated stale basis"),
             ):
                 result = runtime.run()
@@ -3964,6 +4593,101 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.actions, (OBSERVE,))
         self.assertNotIn(SCAN_FRONT_ARC, planner.available_actions)
+
+    def test_scan_rotation_feasibility_is_published_and_filters_planner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "scan-footprint-filter.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=154),
+                hazard_calibration=HazardMapCalibration(
+                    robot_footprint=RobotFootprint(
+                        front_extent_mm=100,
+                        rear_extent_mm=60,
+                        left_extent_mm=150,
+                        right_extent_mm=60,
+                    ),
+                ),
+            )
+            planner = CaptureAvailablePlanner()
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-scan-footprint-filter",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Inspect the obstacle",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=60,
+                ),
+                transport=FakeRuntimeTransport(blocked=True),
+                planner=planner,
+                memory=memory,
+                active_scan_executor=ScanExecutorMustNotRun(),
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.actions, (OBSERVE,))
+        self.assertNotIn(SCAN_FRONT_ARC, planner.available_actions)
+        feasibility = planner.navigation["scan_front_arc_feasibility"]
+        self.assertFalse(feasibility["allowed"])
+        self.assertEqual(
+            feasibility["reason"],
+            "provisional_hazard_rotation_sweep_collision",
+        )
+
+    def test_scan_rotation_feasibility_is_rechecked_before_executor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "scan-footprint-toctou.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=155),
+                hazard_calibration=HazardMapCalibration(
+                    provisional_hazard_offset_mm=500,
+                    robot_footprint=RobotFootprint(
+                        front_extent_mm=100,
+                        rear_extent_mm=60,
+                        left_extent_mm=150,
+                        right_extent_mm=60,
+                    ),
+                ),
+            )
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-scan-footprint-toctou",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Inspect the obstacle",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=60,
+                ),
+                transport=FakeRuntimeTransport(blocked=True),
+                planner=MapChangesAfterScanPlanningPlanner(memory),
+                memory=memory,
+                active_scan_executor=ScanExecutorMustNotRun(),
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=events.append,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.actions, (SCAN_FRONT_ARC,))
+        denied = next(
+            event for event in events if event["event"] == "scan_denied"
+        )
+        self.assertEqual(
+            denied["scan"]["reason"],
+            "provisional_hazard_rotation_sweep_collision",
+        )
+        self.assertEqual(memory.hazard_map.hazards[0].scan_evidence_history, ())
 
     def test_dashboard_runner_adapter_uses_injected_model_and_publishes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4397,8 +5121,18 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
         self.assertEqual(active["target_hypothesis_id"]["type"], "string")
 
     def test_commitment_schema_opens_only_after_bilateral_scan_evidence(self):
-        for scanned in (False, True):
-            with self.subTest(scanned=scanned):
+        cases = (
+            (False, None, False),
+            (True, None, True),
+            # A newer all-clear attempt can explicitly invalidate legacy
+            # boundary fields retained only as history.
+            (True, False, False),
+        )
+        for scanned, bilateral_fact, schema_opens in cases:
+            with self.subTest(
+                scanned=scanned,
+                bilateral_fact=bilateral_fact,
+            ):
                 captured = {}
 
                 def transport(_url, body, _headers, _timeout, _maximum):
@@ -4437,6 +5171,15 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
                             "scan_completed_at_ms": 2_000 if scanned else None,
                             "scan_left_boundary_mdeg": 30_000 if scanned else None,
                             "scan_right_boundary_mdeg": -30_000 if scanned else None,
+                            **(
+                                {}
+                                if bilateral_fact is None
+                                else {
+                                    "bilateral_scan_complete": (
+                                        bilateral_fact
+                                    )
+                                }
+                            ),
                         }],
                     },
                     maneuver_state={"active": None},
@@ -4449,7 +5192,7 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
                 schema = decision_schema["oneOf"][0]["properties"][
                     "maneuver_commitment"
                 ]
-                if scanned:
+                if schema_opens:
                     self.assertEqual(set(schema), {"anyOf"})
                 else:
                     self.assertEqual(
@@ -4521,6 +5264,68 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
         self.assertEqual(
             non_scan["properties"]["perception_target_hypothesis_id"],
             {"type": "null"},
+        )
+
+    def test_scan_schema_keeps_other_target_when_one_requires_progress(self):
+        captured = {}
+
+        def transport(_url, body, _headers, _timeout, _maximum):
+            captured["payload"] = json.loads(body.decode("utf-8"))
+            response_decision = decision_mapping(
+                episode_id="episode-target-specific-scan",
+                turn=1,
+                state_version=1,
+                action=OBSERVE,
+                plan=[OBSERVE],
+                reason_code="VERIFY_RESULT",
+            )
+            return json.dumps({
+                "choices": [{
+                    "message": {
+                        "content": json.dumps(response_decision),
+                    },
+                }],
+            }).encode("utf-8")
+
+        planner = LMStudioNavigationPlanner(
+            base_url="http://127.0.0.1:1234",
+            model="test-model",
+            transport=transport,
+            clock=lambda: 1.0,
+        )
+        planner.decide(
+            episode_id="episode-target-specific-scan",
+            turn=1,
+            locale="en",
+            observation=observation(1, blocked=True),
+            mission={"completed": False},
+            navigation={
+                "navigation_hazard_hypotheses": [
+                    {"hypothesis_id": "hazard-a"},
+                    {"hypothesis_id": "hazard-b"},
+                ],
+                "scan_eligible_target_hypothesis_ids": ["hazard-b"],
+                "scan_progress_blocked_target_hypothesis_ids": [
+                    "hazard-a"
+                ],
+            },
+            maneuver_state={"active": None},
+            available_actions=[OBSERVE, SCAN_FRONT_ARC],
+            last_tool_result=None,
+        )
+
+        schema = captured["payload"]["response_format"]["json_schema"][
+            "schema"
+        ]
+        scan = next(
+            variant
+            for variant in schema["oneOf"]
+            if variant["properties"]["action"].get("const")
+            == SCAN_FRONT_ARC
+        )
+        self.assertEqual(
+            scan["properties"]["perception_target_hypothesis_id"],
+            {"type": "string", "enum": ["hazard-b"]},
         )
 
     def test_invalid_decision_is_typed_for_runtime_feedback(self):

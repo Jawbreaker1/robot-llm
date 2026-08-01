@@ -11,18 +11,28 @@ import hashlib
 import math
 from typing import Iterable, Mapping, Optional, Tuple
 
+from .active_ir_scan_contract import ActiveIrScanResult
 from .physical_navigation_contract import MOTION_ACTIONS
+from .physical_footprint import (
+    RobotFootprint,
+    footprint_sweep_intersects,
+)
 from .physical_odometry import (
     OdometryCalibration,
     PhysicalPose,
     nominal_effect,
     normalize_heading_mdeg,
 )
+from .physical_scan_evidence import (
+    MAX_SCAN_ATTEMPTS_PER_HAZARD,
+    MAX_SCAN_ATTEMPTS_PER_MAP,
+    ScanAttemptEvidence,
+    retain_scan_attempt_diversity,
+)
 
 
 PROVISIONAL_QUALITATIVE = "PROVISIONAL_QUALITATIVE"
 GEOMETRY_BASIS = "CONSERVATIVE_COLLISION_ENVELOPE_NOT_OBJECT_SURFACE"
-
 
 @dataclass(frozen=True)
 class HazardMapCalibration:
@@ -31,6 +41,7 @@ class HazardMapCalibration:
     provisional_hazard_radius_mm: int = 70
     hazard_merge_distance_mm: int = 120
     maximum_anchor_heading_drift_mdeg: int = 5_000
+    robot_footprint: Optional[RobotFootprint] = None
 
     def __post_init__(self) -> None:
         if any(
@@ -46,6 +57,20 @@ class HazardMapCalibration:
             )
         ):
             raise ValueError("hazard map calibration is invalid")
+        if self.robot_footprint is not None and not isinstance(
+            self.robot_footprint,
+            RobotFootprint,
+        ):
+            raise ValueError("hazard map calibration is invalid")
+
+    def collision_geometry(self) -> Mapping[str, object]:
+        if self.robot_footprint is not None:
+            return self.robot_footprint.to_dict()
+        return {
+            "geometry": "SYMMETRIC_CIRCLE",
+            "reference_point": "DIFFERENTIAL_DRIVE_ORIGIN",
+            "radius_mm": self.robot_collision_radius_mm,
+        }
 
 
 @dataclass(frozen=True)
@@ -67,6 +92,7 @@ class ProvisionalHazard:
     scan_completed_at_ms: Optional[int] = None
     scan_left_boundary_mdeg: Optional[int] = None
     scan_right_boundary_mdeg: Optional[int] = None
+    scan_evidence_history: Tuple[ScanAttemptEvidence, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -118,15 +144,70 @@ class ProvisionalHazard:
             for value in scan_values
         ):
             raise ValueError("hazard scan evidence is incomplete")
+        if (
+            not isinstance(self.scan_evidence_history, tuple)
+            or len(self.scan_evidence_history)
+            > MAX_SCAN_ATTEMPTS_PER_HAZARD
+            or any(
+                not isinstance(item, ScanAttemptEvidence)
+                for item in self.scan_evidence_history
+            )
+            or tuple(
+                sorted(
+                    self.scan_evidence_history,
+                    key=lambda item: item.completed_at_ms,
+                )
+            )
+            != self.scan_evidence_history
+        ):
+            raise ValueError("hazard scan history is invalid")
 
     @property
     def bilateral_scan_complete(self) -> bool:
+        latest = (
+            self.scan_evidence_history[-1]
+            if self.scan_evidence_history
+            else None
+        )
         return (
             self.scan_completed_at_ms is not None
             and self.scan_left_boundary_mdeg is not None
             and self.scan_right_boundary_mdeg is not None
             and self.scan_left_boundary_mdeg > 0
             and self.scan_right_boundary_mdeg < 0
+            # A later all-clear arc is explicit conflict evidence against the
+            # old blocked hypothesis. Keep history, not stale geometry.
+            and (
+                latest is None
+                or latest.hypothesis_relation
+                != "CONFLICTS_BLOCKED_HYPOTHESIS"
+            )
+        )
+
+    @property
+    def latest_conflicting_scan_at_ms(self) -> Optional[int]:
+        conflicts = [
+            attempt.completed_at_ms
+            for attempt in self.scan_evidence_history
+            if attempt.hypothesis_relation
+            == "CONFLICTS_BLOCKED_HYPOTHESIS"
+        ]
+        return max(conflicts) if conflicts else None
+
+    @property
+    def active_for_collision(self) -> bool:
+        """Keep all-clear evidence without pretending the object vanished.
+
+        A restored bilateral all-clear scan contests the earlier blocked
+        envelope.  It suspends that envelope until a later blocked
+        observation supports the hypothesis again.  The hypothesis and its
+        evidence remain in memory either way.
+        """
+
+        conflict_at_ms = self.latest_conflicting_scan_at_ms
+        return (
+            conflict_at_ms is None
+            or self.last_seen_at_ms > conflict_at_ms
         )
 
     def to_dict(self) -> Mapping[str, object]:
@@ -152,11 +233,15 @@ class ProvisionalHazard:
             "scan_completed_at_ms": self.scan_completed_at_ms,
             "scan_left_boundary_mdeg": self.scan_left_boundary_mdeg,
             "scan_right_boundary_mdeg": self.scan_right_boundary_mdeg,
+            "bilateral_scan_complete": self.bilateral_scan_complete,
+            "scan_evidence_history": [
+                item.to_dict() for item in self.scan_evidence_history
+            ],
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]):
-        expected = {
+        legacy = {
             "hypothesis_id",
             "frame_id",
             "semantic_label",
@@ -179,7 +264,12 @@ class ProvisionalHazard:
             "scan_left_boundary_mdeg",
             "scan_right_boundary_mdeg",
         }
-        if not isinstance(value, dict) or set(value) != expected:
+        history_fields = legacy | {"scan_evidence_history"}
+        expected = history_fields | {"bilateral_scan_complete"}
+        if (
+            not isinstance(value, dict)
+            or set(value) not in (legacy, history_fields, expected)
+        ):
             raise ValueError("hazard fields are invalid")
         if (
             value["semantic_label"] != "UNKNOWN"
@@ -188,19 +278,33 @@ class ProvisionalHazard:
             or value["geometry_basis"] != GEOMETRY_BASIS
         ):
             raise ValueError("hazard trust boundary is invalid")
-        return cls(
-            **{
-                key: value[key]
-                for key in expected
-                if key
-                not in {
-                    "semantic_label",
-                    "quality",
-                    "provisional",
-                    "geometry_basis",
-                }
-            }
+        excluded = {
+            "semantic_label",
+            "quality",
+            "provisional",
+            "geometry_basis",
+            "scan_evidence_history",
+            "bilateral_scan_complete",
+        }
+        arguments = {
+            key: value[key]
+            for key in legacy
+            if key not in excluded
+        }
+        history = value.get("scan_evidence_history", [])
+        if not isinstance(history, list):
+            raise ValueError("hazard scan history is invalid")
+        arguments["scan_evidence_history"] = tuple(
+            ScanAttemptEvidence.from_dict(item) for item in history
         )
+        hazard = cls(**arguments)
+        if (
+            "bilateral_scan_complete" in value
+            and value["bilateral_scan_complete"]
+            is not hazard.bilateral_scan_complete
+        ):
+            raise ValueError("hazard bilateral scan fact is invalid")
+        return hazard
 
 
 def _point_segment_distance(
@@ -247,6 +351,10 @@ class ProvisionalHazardMap:
             raise ValueError("hazard set is invalid")
         if any(item.frame_id != frame_id for item in values):
             raise ValueError("hazard frame does not match map frame")
+        if sum(
+            len(item.scan_evidence_history) for item in values
+        ) > MAX_SCAN_ATTEMPTS_PER_MAP:
+            raise ValueError("hazard scan histories exceed map bound")
         self.frame_id = frame_id
         self.map_generation_id = map_generation_id
         self.revision = revision
@@ -433,6 +541,181 @@ class ProvisionalHazardMap:
         self.revision += 1
         return updated
 
+    def _prune_scan_histories(
+        self,
+        *,
+        protected_scan_id: Optional[str] = None,
+    ) -> None:
+        """Keep planner context and persisted memory bounded map-wide."""
+
+        while sum(
+            len(hazard.scan_evidence_history) for hazard in self._hazards
+        ) > MAX_SCAN_ATTEMPTS_PER_MAP:
+            candidates = []
+            for hazard in self._hazards:
+                signature_counts = {}
+                for attempt in hazard.scan_evidence_history:
+                    signature_counts[attempt.evidence_signature] = (
+                        signature_counts.get(attempt.evidence_signature, 0)
+                        + 1
+                    )
+                for attempt in hazard.scan_evidence_history:
+                    if attempt.scan_id == protected_scan_id:
+                        continue
+                    candidates.append((
+                        0
+                        if signature_counts[attempt.evidence_signature] > 1
+                        else 1,
+                        attempt.completed_at_ms,
+                        hazard.hypothesis_id,
+                        attempt.scan_id,
+                    ))
+            if not candidates:
+                raise ValueError("scan history bound cannot be enforced")
+            _redundancy, _completed_at_ms, hypothesis_id, scan_id = min(
+                candidates
+            )
+            hazard = self.get(hypothesis_id)
+            retained = tuple(
+                attempt
+                for attempt in hazard.scan_evidence_history
+                if attempt.scan_id != scan_id
+            )
+            self._hazards = tuple(
+                replace(item, scan_evidence_history=retained)
+                if item.hypothesis_id == hypothesis_id
+                else item
+                for item in self._hazards
+            )
+
+    def record_scan_result(
+        self,
+        result: ActiveIrScanResult,
+        *,
+        scan_pose: PhysicalPose,
+    ) -> ProvisionalHazard:
+        """Persist every restored scan, including unilateral and all-clear.
+
+        Bilateral boundaries remain the stronger route-commitment fact.  The
+        bounded attempt history gives the planner cumulative evidence after
+        ``latest_tool_result`` has been replaced by later motion feedback.
+        """
+
+        if not isinstance(result, ActiveIrScanResult):
+            raise ValueError("scan result has the wrong type")
+        hazard = self.get(result.target_hypothesis_id)
+        if hazard is None:
+            raise ValueError("scan target no longer exists")
+        if (
+            result.frame_id != self.frame_id
+            or result.map_generation_id != self.map_generation_id
+            or hazard.frame_id != result.frame_id
+        ):
+            raise ValueError("scan evidence belongs to a foreign map")
+        if (
+            isinstance(result.based_on_map_version, bool)
+            or result.based_on_map_version < 0
+            or self.revision != result.based_on_map_version + 1
+        ):
+            raise ValueError("scan evidence map basis is stale")
+        if (
+            result.stop_confirmed is not True
+            or result.restored_start_heading is not True
+            or result.completed_at_ms < hazard.first_seen_at_ms
+        ):
+            raise ValueError("scan evidence is not restored/fresh")
+        if not isinstance(scan_pose, PhysicalPose):
+            raise ValueError("scan evidence pose is invalid")
+        attempt = ScanAttemptEvidence.from_scan_result(
+            result,
+            scan_pose=scan_pose,
+        )
+        history = retain_scan_attempt_diversity(
+            hazard.scan_evidence_history + (attempt,),
+            MAX_SCAN_ATTEMPTS_PER_HAZARD,
+        )
+        updates = {"scan_evidence_history": history}
+        if result.bilateral_complete:
+            updates.update({
+                "scan_completed_at_ms": result.completed_at_ms,
+                "scan_left_boundary_mdeg": result.left_boundary_mdeg,
+                "scan_right_boundary_mdeg": result.right_boundary_mdeg,
+            })
+        elif attempt.hypothesis_relation == "CONFLICTS_BLOCKED_HYPOTHESIS":
+            updates.update({
+                "scan_completed_at_ms": None,
+                "scan_left_boundary_mdeg": None,
+                "scan_right_boundary_mdeg": None,
+            })
+        updated = replace(hazard, **updates)
+        self._hazards = tuple(
+            updated
+            if item.hypothesis_id == result.target_hypothesis_id
+            else item
+            for item in self._hazards
+        )
+        self._prune_scan_histories(protected_scan_id=result.scan_id)
+        self.revision += 1
+        return self.get(result.target_hypothesis_id)
+
+    def _collision_envelopes(
+        self,
+        hazard: ProvisionalHazard,
+    ) -> Tuple[Tuple[int, int], ...]:
+        """Return conservative support points for one object hypothesis.
+
+        IR-PROX has no trustworthy range, so every support uses the same
+        explicitly provisional offset as the original forward envelope.
+        Blocked scan bearings extend the hypothesis angularly; they are not
+        presented as measured object surfaces or distances.
+        """
+
+        if not hazard.active_for_collision:
+            return ()
+        values = [(hazard.centroid_x_mm, hazard.centroid_y_mm)]
+        conflict_cutoff = max(
+            (
+                attempt.completed_at_ms
+                for attempt in hazard.scan_evidence_history
+                if attempt.hypothesis_relation
+                == "CONFLICTS_BLOCKED_HYPOTHESIS"
+            ),
+            default=-1,
+        )
+        for attempt in hazard.scan_evidence_history:
+            if (
+                attempt.completed_at_ms <= conflict_cutoff
+                or attempt.scan_pose is None
+                or attempt.hypothesis_relation
+                != "SUPPORTS_BLOCKED_HYPOTHESIS"
+            ):
+                continue
+            for ray in attempt.rays:
+                if not ray.blocked:
+                    continue
+                heading = math.radians(
+                    (
+                        attempt.scan_pose.heading_mdeg
+                        + ray.actual_relative_bearing_mdeg
+                    )
+                    / 1000.0
+                )
+                values.append((
+                    attempt.scan_pose.x_mm
+                    + int(round(
+                        math.cos(heading)
+                        * self.calibration.provisional_hazard_offset_mm
+                    )),
+                    attempt.scan_pose.y_mm
+                    + int(round(
+                        math.sin(heading)
+                        * self.calibration.provisional_hazard_offset_mm
+                    )),
+                ))
+        # Exact coordinate de-duplication is deterministic and does not infer
+        # object identity beyond the parent hypothesis.
+        return tuple(dict.fromkeys(values))
+
     def validate_swept_path(
         self,
         pose: PhysicalPose,
@@ -455,44 +738,74 @@ class ProvisionalHazardMap:
             odometry_calibration,
         )
         del nominal
+        footprint = self.calibration.robot_footprint
+        heading_delta_mdeg = normalize_heading_mdeg(
+            maximum.heading_mdeg - pose.heading_mdeg
+        )
         colliding = []
         escaping = []
         for hazard in self._hazards:
+            supports = self._collision_envelopes(hazard)
+            if not supports:
+                continue
             clearance_radius = (
                 self.calibration.robot_collision_radius_mm + hazard.radius_mm
             )
-            start_distance = math.hypot(
-                pose.x_mm - hazard.centroid_x_mm,
-                pose.y_mm - hazard.centroid_y_mm,
-            )
-            end_distance = math.hypot(
-                maximum.x_mm - hazard.centroid_x_mm,
-                maximum.y_mm - hazard.centroid_y_mm,
-            )
-            swept_distance = _point_segment_distance(
-                hazard.centroid_x_mm,
-                hazard.centroid_y_mm,
-                pose.x_mm,
-                pose.y_mm,
-                maximum.x_mm,
-                maximum.y_mm,
-            )
-            if start_distance <= clearance_radius:
-                travel_x = maximum.x_mm - pose.x_mm
-                travel_y = maximum.y_mm - pose.y_mm
-                away_x = pose.x_mm - hazard.centroid_x_mm
-                away_y = pose.y_mm - hazard.centroid_y_mm
-                strictly_away = (
-                    travel_x * away_x + travel_y * away_y > 0
-                    and end_distance > start_distance
-                    and abs(swept_distance - start_distance) < 1e-6
+            hazard_collides = False
+            hazard_escapes = False
+            for support_x_mm, support_y_mm in supports:
+                start_distance = math.hypot(
+                    pose.x_mm - support_x_mm,
+                    pose.y_mm - support_y_mm,
                 )
-                if strictly_away:
-                    escaping.append(hazard.hypothesis_id)
+                end_distance = math.hypot(
+                    maximum.x_mm - support_x_mm,
+                    maximum.y_mm - support_y_mm,
+                )
+                swept_distance = _point_segment_distance(
+                    support_x_mm,
+                    support_y_mm,
+                    pose.x_mm,
+                    pose.y_mm,
+                    maximum.x_mm,
+                    maximum.y_mm,
+                )
+                if footprint is None:
+                    start_intersects = start_distance <= clearance_radius
+                    swept_intersects = swept_distance <= clearance_radius
                 else:
-                    colliding.append(hazard.hypothesis_id)
-            elif swept_distance <= clearance_radius:
+                    (
+                        start_intersects,
+                        swept_intersects,
+                    ) = footprint_sweep_intersects(
+                        obstacle_x_mm=support_x_mm,
+                        obstacle_y_mm=support_y_mm,
+                        obstacle_radius_mm=hazard.radius_mm,
+                        start=pose,
+                        end=maximum,
+                        footprint=footprint,
+                    )
+                if start_intersects:
+                    travel_x = maximum.x_mm - pose.x_mm
+                    travel_y = maximum.y_mm - pose.y_mm
+                    away_x = pose.x_mm - support_x_mm
+                    away_y = pose.y_mm - support_y_mm
+                    strictly_away = (
+                        travel_x * away_x + travel_y * away_y > 0
+                        and end_distance > start_distance
+                        and abs(swept_distance - start_distance) < 1e-6
+                        and (footprint is None or heading_delta_mdeg == 0)
+                    )
+                    if strictly_away:
+                        hazard_escapes = True
+                    else:
+                        hazard_collides = True
+                elif swept_intersects:
+                    hazard_collides = True
+            if hazard_collides:
                 colliding.append(hazard.hypothesis_id)
+            elif hazard_escapes:
+                escaping.append(hazard.hypothesis_id)
         return {
             "allowed": not colliding,
             "reason": (
@@ -504,6 +817,104 @@ class ProvisionalHazardMap:
             "monotonic_escape_hazard_ids": sorted(escaping),
             "start_pose": pose.to_dict(),
             "maximum_endpoint": maximum.to_dict(),
+            "collision_geometry": (
+                self.calibration.collision_geometry()
+            ),
+            "host_selected_alternative_action": False,
+        }
+
+    def validate_in_place_rotation(
+        self,
+        pose: PhysicalPose,
+        relative_heading_offsets_mdeg: Iterable[int],
+        alignment_tolerance_mdeg: int = 0,
+    ) -> Mapping[str, object]:
+        """Validate the body sweep used by a scan or other in-place look.
+
+        The caller supplies the scan's relative bearings.  A scan traverses
+        the complete interval between its extrema, so checking that interval
+        catches an arm strike even when the centre-mounted IR ray itself is
+        clear.
+        """
+
+        offsets = tuple(relative_heading_offsets_mdeg)
+        if not offsets or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not -180_000 <= value <= 180_000
+            for value in offsets
+        ):
+            raise ValueError("rotation sweep offsets are invalid")
+        if (
+            isinstance(alignment_tolerance_mdeg, bool)
+            or not isinstance(alignment_tolerance_mdeg, int)
+            or not 0 <= alignment_tolerance_mdeg <= 30_000
+        ):
+            raise ValueError("rotation sweep tolerance is invalid")
+        minimum = max(
+            -180_000,
+            min(0, min(offsets)) - alignment_tolerance_mdeg,
+        )
+        maximum = min(
+            180_000,
+            max(0, max(offsets)) + alignment_tolerance_mdeg,
+        )
+        footprint = self.calibration.robot_footprint
+        colliding = []
+        for hazard in self._hazards:
+            supports = self._collision_envelopes(hazard)
+            if not supports:
+                continue
+            if footprint is None:
+                # A symmetric circle occupies exactly the same volume at
+                # every heading.  Rotation introduces no new collision and
+                # must not make legacy profiles unable to scan a hypothesis
+                # whose conservative envelopes already touch.
+                intersects = False
+            else:
+                intersects = False
+                for support_x_mm, support_y_mm in supports:
+                    segment_start = pose
+                    for relative_heading in (minimum, maximum, 0):
+                        segment_end = replace(
+                            pose,
+                            heading_mdeg=normalize_heading_mdeg(
+                                pose.heading_mdeg + relative_heading
+                            ),
+                        )
+                        _starts_inside, segment_intersects = (
+                            footprint_sweep_intersects(
+                                obstacle_x_mm=support_x_mm,
+                                obstacle_y_mm=support_y_mm,
+                                obstacle_radius_mm=hazard.radius_mm,
+                                start=segment_start,
+                                end=segment_end,
+                                footprint=footprint,
+                            )
+                        )
+                        if segment_intersects:
+                            intersects = True
+                            break
+                        segment_start = segment_end
+                    if intersects:
+                        break
+            if intersects:
+                colliding.append(hazard.hypothesis_id)
+        return {
+            "allowed": not colliding,
+            "reason": (
+                "in_place_rotation_clear"
+                if not colliding
+                else "provisional_hazard_rotation_sweep_collision"
+            ),
+            "hazard_ids": sorted(colliding),
+            "start_pose": pose.to_dict(),
+            "minimum_relative_heading_mdeg": minimum,
+            "maximum_relative_heading_mdeg": maximum,
+            "alignment_tolerance_mdeg": alignment_tolerance_mdeg,
+            "collision_geometry": (
+                self.calibration.collision_geometry()
+            ),
             "host_selected_alternative_action": False,
         }
 
@@ -525,22 +936,74 @@ class ProvisionalHazardMap:
             self._hazards,
             key=lambda item: item.hypothesis_id,
         ):
-            relative_x = hazard.centroid_x_mm - pose.x_mm
-            relative_y = hazard.centroid_y_mm - pose.y_mm
-            longitudinal = relative_x * goal_x + relative_y * goal_y
-            signed_lateral = -relative_x * goal_y + relative_y * goal_x
-            center_clearance = (
-                abs(signed_lateral)
-                if longitudinal >= 0
-                else math.hypot(relative_x, relative_y)
-            )
-            required = (
-                self.calibration.robot_collision_radius_mm
-                + hazard.radius_mm
-            )
-            intersects = center_clearance <= required
+            footprint = self.calibration.robot_footprint
+            if footprint is None:
+                behind_clearance = self.calibration.robot_collision_radius_mm
+            else:
+                behind_clearance = (
+                    int(math.ceil(footprint.maximum_corner_radius_mm))
+                    + footprint.clearance_margin_mm
+                )
+            supports = self._collision_envelopes(hazard)
+            measurements = []
+            for support_x_mm, support_y_mm in supports:
+                relative_x = support_x_mm - pose.x_mm
+                relative_y = support_y_mm - pose.y_mm
+                longitudinal = relative_x * goal_x + relative_y * goal_y
+                signed_lateral = -relative_x * goal_y + relative_y * goal_x
+                center_clearance = (
+                    abs(signed_lateral)
+                    if longitudinal >= 0
+                    else math.hypot(relative_x, relative_y)
+                )
+                if footprint is None:
+                    body_clearance = (
+                        self.calibration.robot_collision_radius_mm
+                    )
+                else:
+                    body_clearance = (
+                        max(
+                            footprint.left_extent_mm,
+                            footprint.right_extent_mm,
+                        )
+                        if signed_lateral == 0
+                        else footprint.left_extent_mm
+                        if signed_lateral > 0
+                        else footprint.right_extent_mm
+                    ) + footprint.clearance_margin_mm
+                required = body_clearance + hazard.radius_mm
+                measurements.append({
+                    "longitudinal": longitudinal,
+                    "signed_lateral": signed_lateral,
+                    "center_clearance": center_clearance,
+                    "required": required,
+                    "intersects": center_clearance <= required,
+                })
+            if measurements:
+                worst = min(
+                    measurements,
+                    key=lambda item: item["center_clearance"]
+                    - item["required"],
+                )
+                intersects = any(
+                    item["intersects"] for item in measurements
+                )
+                longitudinal = worst["longitudinal"]
+                signed_lateral = worst["signed_lateral"]
+                center_clearance = worst["center_clearance"]
+                required = worst["required"]
+            else:
+                relative_x = hazard.centroid_x_mm - pose.x_mm
+                relative_y = hazard.centroid_y_mm - pose.y_mm
+                longitudinal = relative_x * goal_x + relative_y * goal_y
+                signed_lateral = -relative_x * goal_y + relative_y * goal_x
+                center_clearance = math.hypot(relative_x, relative_y)
+                required = 0
+                intersects = False
             row = {
                 "hypothesis_id": hazard.hypothesis_id,
+                "active_for_collision": hazard.active_for_collision,
+                "collision_support_count": len(supports),
                 "longitudinal_offset_mm": int(round(longitudinal)),
                 "signed_lateral_offset_mm": int(round(signed_lateral)),
                 "half_line_center_clearance_mm": int(
@@ -553,7 +1016,14 @@ class ProvisionalHazardMap:
             if intersects:
                 conflicts.append(dict(row))
             target_behind[hazard.hypothesis_id] = (
-                longitudinal + required < 0
+                not supports
+                or all(
+                    item["longitudinal"]
+                    + behind_clearance
+                    + hazard.radius_mm
+                    < 0
+                    for item in measurements
+                )
             )
         heading_error = normalize_heading_mdeg(
             goal_heading_mdeg - pose.heading_mdeg
@@ -570,12 +1040,89 @@ class ProvisionalHazardMap:
             },
         }
 
+    def route_evidence(
+        self,
+        hypothesis_id: str,
+        *,
+        pose: PhysicalPose,
+    ) -> Mapping[str, object]:
+        """Publish whether stored angular evidence applies at this pose.
+
+        Complementary one-sided attempts may accumulate only when they share
+        the exact verified scan pose.  Evidence from another viewpoint stays
+        useful to collision geometry, but body-relative boundaries are not
+        silently compared as if they came from one viewpoint.
+        """
+
+        if not isinstance(pose, PhysicalPose):
+            raise ValueError("route evidence pose is invalid")
+        hazard = self.get(hypothesis_id)
+        if hazard is None:
+            return {
+                "ready": False,
+                "reason": "UNKNOWN_HYPOTHESIS",
+                "applicable_scan_ids": [],
+                "positive_boundary_scan_ids": [],
+                "negative_boundary_scan_ids": [],
+            }
+        applicable = [
+            attempt
+            for attempt in hazard.scan_evidence_history
+            if attempt.scan_pose == pose
+            and attempt.hypothesis_relation
+            != "CONFLICTS_BLOCKED_HYPOTHESIS"
+        ]
+        positive = [
+            attempt.scan_id
+            for attempt in applicable
+            if attempt.left_boundary_mdeg is not None
+        ]
+        negative = [
+            attempt.scan_id
+            for attempt in applicable
+            if attempt.right_boundary_mdeg is not None
+        ]
+        ready = (
+            hazard.active_for_collision
+            and bool(positive)
+            and bool(negative)
+        )
+        if not hazard.active_for_collision:
+            reason = "HYPOTHESIS_CONTESTED_BY_FULL_ALL_CLEAR"
+        elif not applicable:
+            reason = "NO_SCAN_EVIDENCE_AT_CURRENT_VERIFIED_POSE"
+        elif not positive or not negative:
+            reason = "COMPLEMENTARY_BOUNDARY_EVIDENCE_REQUIRED"
+        else:
+            reason = "COMPLEMENTARY_BOUNDARIES_AT_CURRENT_POSE"
+        return {
+            "ready": ready,
+            "reason": reason,
+            "applicable_scan_ids": [
+                attempt.scan_id for attempt in applicable
+            ],
+            "positive_boundary_scan_ids": positive,
+            "negative_boundary_scan_ids": negative,
+        }
+
     def context(self) -> Mapping[str, object]:
+        hypotheses = []
+        for item in self._hazards:
+            value = dict(item.to_dict())
+            value.update({
+                "active_for_collision": item.active_for_collision,
+                "collision_support_count": len(
+                    self._collision_envelopes(item)
+                ),
+                "collision_evidence_basis": (
+                    "PROVISIONAL_IR_ANGULAR_SUPPORTS_NOT_OBJECT_SURFACE"
+                ),
+            })
+            hypotheses.append(value)
         return {
             "map_generation_id": self.map_generation_id,
             "map_version": self.revision,
             "frame_id": self.frame_id,
-            "navigation_hazard_hypotheses": [
-                item.to_dict() for item in self._hazards
-            ],
+            "collision_geometry": self.calibration.collision_geometry(),
+            "navigation_hazard_hypotheses": hypotheses,
         }

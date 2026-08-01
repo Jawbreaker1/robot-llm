@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Mapping, Optional, Tuple
 
 from .physical_navigation_contract import FINISH, SCAN_FRONT_ARC
+from .physical_odometry import PhysicalPose
 from .provisional_hazard_map import ProvisionalHazardMap
 
 
@@ -203,9 +204,12 @@ class ManeuverCommitment:
     def _scan_ready(
         target_id: str,
         hazard_map: ProvisionalHazardMap,
+        pose: PhysicalPose,
     ) -> bool:
-        hazard = hazard_map.get(target_id)
-        return hazard is not None and hazard.bilateral_scan_complete
+        return hazard_map.route_evidence(
+            target_id,
+            pose=pose,
+        )["ready"]
 
     def apply(
         self,
@@ -214,6 +218,7 @@ class ManeuverCommitment:
         action: str,
         turn: int,
         hazard_map: ProvisionalHazardMap,
+        pose: PhysicalPose,
         fact_values: Mapping[str, object],
         perception_target_hypothesis_id: Optional[str] = None,
     ) -> Mapping[str, object]:
@@ -257,10 +262,10 @@ class ManeuverCommitment:
                     "unknown_maneuver_target",
                     "START target is not in the current map",
                 )
-            if not self._scan_ready(target, hazard_map):
+            if not self._scan_ready(target, hazard_map, pose):
                 raise ManeuverCommitmentError(
-                    "bilateral_scan_required",
-                    "Route commitment requires a completed bilateral scan",
+                    "route_evidence_required",
+                    "Route commitment requires applicable complementary scan evidence",
                 )
             self.active = ActiveManeuver(
                 commitment_id=proposal["id"],
@@ -326,10 +331,14 @@ class ManeuverCommitment:
                 target != active.target_hypothesis_id
                 or proposal["detour_side"] != active.detour_side
             )
-            if route_changed and not self._scan_ready(target, hazard_map):
+            if route_changed and not self._scan_ready(
+                target,
+                hazard_map,
+                pose,
+            ):
                 raise ManeuverCommitmentError(
-                    "bilateral_scan_required",
-                    "A changed route requires bilateral scan evidence",
+                    "route_evidence_required",
+                    "A changed route requires applicable complementary scan evidence",
                 )
             self.active = ActiveManeuver(
                 commitment_id=active.commitment_id,

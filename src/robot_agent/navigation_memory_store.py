@@ -492,11 +492,25 @@ class NavigationMemoryStore:
 
     def context(self) -> Mapping[str, object]:
         value = dict(self.hazard_map.context())
+        for hypothesis in value["navigation_hazard_hypotheses"]:
+            route_evidence = self.hazard_map.route_evidence(
+                hypothesis["hypothesis_id"],
+                pose=self.pose,
+            )
+            hypothesis["route_commitment_ready"] = route_evidence[
+                "ready"
+            ]
+            hypothesis["route_evidence"] = route_evidence
         value.update(
             {
                 "robot_id": self.robot_id,
                 "controller_instance_id": self.controller_instance_id,
                 "pose": self.pose.to_dict(),
+                "drive_motor_roles": (
+                    None
+                    if self.drive_roles is None
+                    else self.drive_roles.to_dict()
+                ),
                 "localization_valid": self.localization_valid,
                 "localization_error": self.localization_error,
             }

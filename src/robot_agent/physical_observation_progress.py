@@ -1,11 +1,17 @@
-"""Language-independent information-gain facts for physical observations."""
+"""Language-independent progress facts for physical navigation."""
 
-from typing import Mapping
+from dataclasses import dataclass
+from typing import Mapping, Optional, Tuple
 
 from .physical_navigation_contract import validate_observation
+from .physical_odometry import PhysicalPose
 
 
-def _signature(observation: Mapping[str, object]) -> Mapping[str, object]:
+def observation_progress_signature(
+    observation: Mapping[str, object],
+    *,
+    motor_roles: Optional[Tuple[str, ...]] = None,
+) -> Tuple[Tuple[str, object], ...]:
     """Keep physical facts that can change a navigation decision.
 
     Worker versions, request budgets, and small changes in raw IR reflection
@@ -13,8 +19,18 @@ def _signature(observation: Mapping[str, object]) -> Mapping[str, object]:
     """
 
     checked = validate_observation(observation)
+    if motor_roles is not None and (
+        not isinstance(motor_roles, tuple)
+        or not motor_roles
+        or len(set(motor_roles)) != len(motor_roles)
+        or any(not isinstance(role, str) or not role for role in motor_roles)
+    ):
+        raise ValueError("progress motor roles are invalid")
+    relevant_roles = (
+        None if motor_roles is None else frozenset(motor_roles)
+    )
     infrared = checked["infrared"]
-    return {
+    facts = {
         "infrared_available": (
             infrared["raw"] is not None
             or infrared["filtered"] is not None
@@ -27,16 +43,101 @@ def _signature(observation: Mapping[str, object]) -> Mapping[str, object]:
         "motor_positions": tuple(sorted(
             (motor["role"], motor["position"])
             for motor in checked["motors"]
+            if relevant_roles is None or motor["role"] in relevant_roles
         )),
     }
+    return tuple((key, facts[key]) for key in sorted(facts))
+
+
+@dataclass(frozen=True)
+class RestoredScanProgressBarrier:
+    """Require a typed world or pose change before another active scan.
+
+    Worker state versions and small raw-reflection changes deliberately do
+    not rearm scanning.  Otherwise a fresh-but-identical OBSERVE would turn
+    ``scan -> observe -> scan`` into the same non-agentic loop under a new
+    sequence number.
+    """
+
+    scan_id: str
+    target_hypothesis_id: str
+    map_generation_id: str
+    pose: PhysicalPose
+    hazard_ids: Tuple[str, ...]
+    observation_signature: Tuple[Tuple[str, object], ...]
+    motor_roles: Optional[Tuple[str, ...]] = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.scan_id, str)
+            or not self.scan_id
+            or not isinstance(self.target_hypothesis_id, str)
+            or not self.target_hypothesis_id
+            or not isinstance(self.map_generation_id, str)
+            or not self.map_generation_id
+            or not isinstance(self.pose, PhysicalPose)
+            or tuple(sorted(set(self.hazard_ids))) != self.hazard_ids
+            or any(
+                not isinstance(hypothesis_id, str) or not hypothesis_id
+                for hypothesis_id in self.hazard_ids
+            )
+            or not isinstance(self.observation_signature, tuple)
+            or (
+                self.motor_roles is not None
+                and (
+                    not isinstance(self.motor_roles, tuple)
+                    or not self.motor_roles
+                    or len(set(self.motor_roles)) != len(self.motor_roles)
+                    or any(
+                        not isinstance(role, str) or not role
+                        for role in self.motor_roles
+                    )
+                )
+            )
+        ):
+            raise ValueError("restored scan progress barrier is invalid")
+
+    def rearm_reason(
+        self,
+        *,
+        map_generation_id: str,
+        pose: PhysicalPose,
+        hazard_ids: Tuple[str, ...],
+        observation: Mapping[str, object],
+    ) -> Optional[str]:
+        """Return the first typed progress fact that permits a new scan."""
+
+        if map_generation_id != self.map_generation_id:
+            return "MAP_GENERATION_CHANGED"
+        if pose != self.pose:
+            return "VERIFIED_POSE_CHANGED"
+        if tuple(sorted(hazard_ids)) != self.hazard_ids:
+            return "TARGET_HYPOTHESES_CHANGED"
+        if (
+            observation_progress_signature(
+                observation,
+                motor_roles=self.motor_roles,
+            )
+            != self.observation_signature
+        ):
+            return "DECISION_RELEVANT_OBSERVATION_CHANGED"
+        return None
 
 
 def observation_information_result(
     before: Mapping[str, object],
     after: Mapping[str, object],
+    *,
+    motor_roles: Optional[Tuple[str, ...]] = None,
 ) -> Mapping[str, object]:
-    prior = _signature(before)
-    current = _signature(after)
+    prior = dict(observation_progress_signature(
+        before,
+        motor_roles=motor_roles,
+    ))
+    current = dict(observation_progress_signature(
+        after,
+        motor_roles=motor_roles,
+    ))
     changed = sorted(key for key in current if current[key] != prior[key])
     return {
         "information_gain": (
@@ -55,6 +156,8 @@ def observe_without_information_gain(value: object) -> bool:
 
 
 __all__ = (
+    "RestoredScanProgressBarrier",
     "observation_information_result",
+    "observation_progress_signature",
     "observe_without_information_gain",
 )

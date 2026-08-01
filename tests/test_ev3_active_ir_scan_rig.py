@@ -329,6 +329,19 @@ class FakeScanTransport:
         raise AssertionError("unexpected operation {}".format(operation))
 
 
+class SequencedEncoderScaleScanTransport(FakeScanTransport):
+    """Apply deterministic encoder scales to successive scan turns."""
+
+    def __init__(self, clock, encoder_scales):
+        super().__init__(clock)
+        self.encoder_scales = tuple(encoder_scales)
+
+    def _scan_turn(self, relative_delta_mdeg):
+        if self.turn_count < len(self.encoder_scales):
+            self.encoder_scale = self.encoder_scales[self.turn_count]
+        return super()._scan_turn(relative_delta_mdeg)
+
+
 class StrictValidatingScanTransport(FakeScanTransport):
     """Run fake scan receipts through the real host wire validator."""
 
@@ -494,6 +507,7 @@ def scan_request(
     deadline_ms=30_000,
     heading_mdeg=10_000,
     estimated_turn_ms_per_degree=2,
+    alignment_tolerance_mdeg=2_500,
 ):
     return build_scan_request(
         choice=ModelScanChoice("target-a"),
@@ -506,6 +520,7 @@ def scan_request(
         deadline_ms=deadline_ms,
         calibration=ActiveIrScanCalibration(
             estimated_turn_ms_per_degree=estimated_turn_ms_per_degree,
+            alignment_tolerance_mdeg=alignment_tolerance_mdeg,
         ),
     )
 
@@ -1047,6 +1062,45 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
             )
         )
 
+    def test_ev3_tolerance_accepts_encoder_derived_bilateral_underturn(self):
+        clock = FakeClock()
+        transport = FakeScanTransport(clock, encoder_scale=0.95)
+        request = scan_request(
+            clock,
+            alignment_tolerance_mdeg=10_000,
+        )
+
+        result = build_ev3_active_ir_scan_executor(
+            transport,
+            clock_ms=clock,
+        ).execute(request)
+        checked = validate_scan_result(
+            result,
+            request,
+            current_frame_id=request.frame_id,
+            current_map_generation_id=request.map_generation_id,
+            current_map_version=request.based_on_map_version,
+        )
+
+        self.assertIs(checked, result)
+        self.assertTrue(result.bilateral_complete)
+        self.assertTrue(result.restored_start_heading)
+        requested = {
+            ray.requested_relative_bearing_mdeg for ray in result.rays
+        }
+        self.assertTrue(any(value < 0 for value in requested))
+        self.assertTrue(any(value > 0 for value in requested))
+        self.assertTrue(
+            all(
+                abs(
+                    ray.actual_relative_bearing_mdeg
+                    - ray.requested_relative_bearing_mdeg
+                )
+                <= request.calibration.alignment_tolerance_mdeg
+                for ray in result.rays
+            )
+        )
+
     def test_center_ray_jitter_survives_strict_transport_and_full_scan(self):
         clock = FakeClock()
         transport = StrictValidatingScanTransport(clock)
@@ -1091,7 +1145,7 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
                 )
                 self.assertTrue(receipt["stop_confirmed"])
 
-    def test_encoder_mismatch_fails_closed_and_aborts_transport(self):
+    def test_verified_encoder_undertravel_is_returned_for_pose_validation(self):
         clock = FakeClock()
         transport = FakeScanTransport(clock, encoder_scale=0.5)
         rig = EV3ActiveIrScanRig(
@@ -1100,17 +1154,97 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
         )
         request = scan_request(clock)
         rig.begin_scan(request)
-        with self.assertRaises(ActiveIrScanContractError) as caught:
-            rig.turn_relative_mdeg(
-                30_000,
-                request.calibration,
-                request.deadline_ms,
-            )
-        self.assertEqual(
-            caught.exception.code,
-            "scan_encoder_pose_mismatch",
+        receipt = rig.turn_relative_mdeg(
+            30_000,
+            request.calibration,
+            request.deadline_ms,
         )
-        self.assertTrue(transport.aborted)
+        snapshot = rig.read_snapshot(request.deadline_ms)
+
+        self.assertGreater(
+            abs(receipt["actual_delta_mdeg"] - 30_000),
+            request.calibration.alignment_tolerance_mdeg,
+        )
+        self.assertEqual(
+            snapshot["pose_heading_mdeg"],
+            request.start_pose.heading_mdeg
+            + receipt["actual_delta_mdeg"],
+        )
+        self.assertFalse(transport.aborted)
+
+    def test_symmetric_underturn_cancels_bad_ray_but_restores_heading(self):
+        clock = FakeClock()
+        transport = FakeScanTransport(clock, encoder_scale=0.95)
+        request = scan_request(clock)
+
+        result = build_ev3_active_ir_scan_executor(
+            transport,
+            clock_ms=clock,
+        ).execute(request)
+        checked = validate_scan_result(
+            result,
+            request,
+            current_frame_id=request.frame_id,
+            current_map_generation_id=request.map_generation_id,
+            current_map_version=request.based_on_map_version,
+        )
+
+        self.assertIs(checked, result)
+        self.assertEqual(result.status, "CANCELLED")
+        self.assertEqual(result.reason, "scan_snapshot_pose_misaligned")
+        self.assertTrue(result.stop_confirmed)
+        self.assertTrue(result.restored_start_heading)
+        self.assertEqual(
+            [ray.requested_relative_bearing_mdeg for ray in result.rays],
+            [0, -30_000],
+        )
+        self.assertEqual(
+            [
+                arguments["relative_delta_mdeg"]
+                for operation, arguments in transport.calls
+                if operation == "scan_turn"
+            ],
+            [-30_000, -30_000, 60_000],
+        )
+        self.assertLessEqual(
+            abs(transport.relative_heading_mdeg),
+            request.calibration.alignment_tolerance_mdeg,
+        )
+        self.assertFalse(transport.aborted)
+
+    def test_asymmetric_underturn_keeps_failed_restoration_unverified(self):
+        clock = FakeClock()
+        transport = SequencedEncoderScaleScanTransport(
+            clock,
+            encoder_scales=(0.95, 0.95, 0.85),
+        )
+        request = scan_request(clock)
+
+        result = build_ev3_active_ir_scan_executor(
+            transport,
+            clock_ms=clock,
+        ).execute(request)
+        checked = validate_scan_result(
+            result,
+            request,
+            current_frame_id=request.frame_id,
+            current_map_generation_id=request.map_generation_id,
+            current_map_version=request.based_on_map_version,
+        )
+
+        self.assertIs(checked, result)
+        self.assertEqual(result.status, "CANCELLED")
+        self.assertEqual(
+            result.reason,
+            "scan_heading_restoration_unverified",
+        )
+        self.assertTrue(result.stop_confirmed)
+        self.assertFalse(result.restored_start_heading)
+        self.assertGreater(
+            abs(transport.relative_heading_mdeg),
+            request.calibration.alignment_tolerance_mdeg,
+        )
+        self.assertFalse(transport.aborted)
 
     def test_touch_motion_fault_late_and_cancel_all_fail_closed(self):
         scenarios = (

@@ -475,24 +475,45 @@ def validate_scan_result(
             "invalid_scan_ray_ordinals",
             "Scan ray ordinals are not contiguous",
         )
-    if result.status == "COMPLETED":
-        sorted_rays = sorted(
-            result.rays,
-            key=lambda item: item.requested_relative_bearing_mdeg,
-        )
-        transition_midpoints = {
-            int(
-                round(
-                    (
-                        first.requested_relative_bearing_mdeg
-                        + second.requested_relative_bearing_mdeg
-                    )
-                    / 2.0
+    sorted_rays = sorted(
+        result.rays,
+        key=lambda item: item.requested_relative_bearing_mdeg,
+    )
+    transition_midpoints = {
+        int(
+            round(
+                (
+                    first.requested_relative_bearing_mdeg
+                    + second.requested_relative_bearing_mdeg
                 )
+                / 2.0
             )
-            for first, second in zip(sorted_rays, sorted_rays[1:])
-            if first.blocked != second.blocked
-        }
+        )
+        for first, second in zip(sorted_rays, sorted_rays[1:])
+        if first.blocked != second.blocked
+    }
+    if (
+        result.left_boundary_mdeg is not None
+        and (
+            isinstance(result.left_boundary_mdeg, bool)
+            or not isinstance(result.left_boundary_mdeg, int)
+            or result.left_boundary_mdeg <= 0
+            or result.left_boundary_mdeg not in transition_midpoints
+        )
+    ) or (
+        result.right_boundary_mdeg is not None
+        and (
+            isinstance(result.right_boundary_mdeg, bool)
+            or not isinstance(result.right_boundary_mdeg, int)
+            or result.right_boundary_mdeg >= 0
+            or result.right_boundary_mdeg not in transition_midpoints
+        )
+    ):
+        raise ActiveIrScanContractError(
+            "invalid_scan_boundary_evidence",
+            "Scan boundary evidence was not derived from its rays",
+        )
+    if result.status == "COMPLETED":
         if (
             not result.bilateral_complete
             or result.left_boundary_mdeg not in transition_midpoints

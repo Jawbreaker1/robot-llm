@@ -8,6 +8,7 @@ from robot_agent.spatial_map_contract import (
     LOCAL_ODOMETRY,
     LOCAL_ODOMETRY_POSE,
     MAP_PROVISIONAL_IR,
+    MAX_POSE_HISTORY,
     METRIC_FUSED,
     ObjectHypothesis,
     PHYSICAL_IR_REFLECTION,
@@ -17,6 +18,9 @@ from robot_agent.spatial_map_contract import (
     QualitativeObstacleEvidence,
     OccupancyCell,
     SpatialMapSnapshot,
+    SpatialCollisionGeometry,
+    SpatialScanEvidence,
+    SpatialScanRayEvidence,
     SpatialRobotPose,
     SpatialSensorRay,
 )
@@ -105,6 +109,101 @@ def provisional_hypothesis():
 
 
 class SpatialEvidenceContractTests(unittest.TestCase):
+    def test_asymmetric_collision_geometry_preserves_right_side_extent(self):
+        geometry = SpatialCollisionGeometry.from_mapping({
+            "geometry": "ASYMMETRIC_RECTANGLE",
+            "reference_point": "DIFFERENTIAL_DRIVE_ORIGIN",
+            "front_extent_mm": 110,
+            "rear_extent_mm": 90,
+            "left_extent_mm": 105,
+            "right_extent_mm": 160,
+            "clearance_margin_mm": 10,
+            "calibration_status": "provisional",
+            "calibration_evidence": "assembled right arm observed",
+        })
+
+        self.assertEqual(geometry.right_extent_mm, 160)
+        self.assertGreater(
+            geometry.right_extent_mm,
+            geometry.left_extent_mm,
+        )
+        self.assertEqual(
+            geometry.to_dict()["reference_point"],
+            "DIFFERENTIAL_DRIVE_ORIGIN",
+        )
+        with self.assertRaises(NavigationContractError):
+            SpatialCollisionGeometry.from_mapping({
+                "geometry": "ASYMMETRIC_RECTANGLE",
+                "reference_point": "DIFFERENTIAL_DRIVE_ORIGIN",
+                "front_extent_mm": 110,
+                "rear_extent_mm": 90,
+                "left_extent_mm": 105,
+                "right_extent_mm": 160,
+                "clearance_margin_mm": 10,
+                "calibration_status": "provisional",
+                "calibration_evidence": "assembled right arm observed",
+                "measured_obstacle_distance_mm": 40,
+            })
+
+    def test_scan_evidence_separates_actual_scan_pose_from_hypothesis_anchor(
+        self,
+    ):
+        scan = SpatialScanEvidence(
+            target_hypothesis_id="hazard-1",
+            frame_id="local-odometry",
+            hypothesis_anchor_x_mm=10,
+            hypothesis_anchor_y_mm=20,
+            hypothesis_anchor_heading_mdeg=30_000,
+            scan_x_mm=80,
+            scan_y_mm=-35,
+            scan_heading_mdeg=45_000,
+            based_on_map_version=3,
+            scan_id="scan-1",
+            completed_at_unix_ms=100,
+            status="CANCELLED",
+            reason="bilateral_boundaries_not_observed",
+            observation_pattern="MIXED",
+            arc_coverage="BILATERAL_ARC",
+            boundary_coverage="NO_BOUNDARIES",
+            hypothesis_relation="SUPPORTS_BLOCKED_HYPOTHESIS",
+            left_boundary_mdeg=None,
+            right_boundary_mdeg=None,
+            rays=(
+                SpatialScanRayEvidence(
+                    requested_relative_bearing_mdeg=-30_000,
+                    actual_relative_bearing_mdeg=-28_500,
+                    blocked=True,
+                    raw_ir_proximity=24,
+                    filtered_ir_proximity=25,
+                ),
+                SpatialScanRayEvidence(
+                    requested_relative_bearing_mdeg=30_000,
+                    actual_relative_bearing_mdeg=31_500,
+                    blocked=False,
+                    raw_ir_proximity=56,
+                    filtered_ir_proximity=55,
+                ),
+            ),
+        )
+
+        payload = scan.to_dict()
+        self.assertNotEqual(
+            payload["scan_pose"],
+            payload["hypothesis_anchor_pose"],
+        )
+        self.assertEqual(payload["based_on_map_version"], 3)
+        self.assertNotIn("distance", json.dumps(payload["rays"]))
+        legacy = replace(
+            scan,
+            scan_x_mm=None,
+            scan_y_mm=None,
+            scan_heading_mdeg=None,
+            based_on_map_version=None,
+        )
+        self.assertIsNone(legacy.to_dict()["scan_pose"])
+        with self.assertRaises(NavigationContractError):
+            replace(scan, scan_x_mm=None)
+
     def test_physical_ir_contract_is_low_confidence_and_non_metric(self):
         evidence = physical_evidence()
         ray = SpatialSensorRay(
@@ -218,6 +317,86 @@ class SpatialSnapshotContractTests(unittest.TestCase):
         self.assertEqual(cell.to_dict()["provenance"], [
             "SIMULATION_CONFIGURATION_SPACE:FORWARD"
         ])
+        self.assertEqual(snapshot.pose_history, ())
+        self.assertEqual(snapshot.pose_history_evicted, 0)
+        self.assertEqual(snapshot.to_dict()["pose_history"], [])
+        self.assertIsNone(snapshot.to_dict()["collision_geometry"])
+        self.assertEqual(snapshot.to_dict()["scan_evidence_history"], [])
+
+    def test_snapshot_accepts_a_bounded_monotonic_pose_history(self):
+        snapshot = physical_map_snapshot()
+        first = SpatialRobotPose(
+            frame_id=snapshot.frame_id,
+            x_mm=0,
+            y_mm=0,
+            heading_mdeg=0,
+            observed_at_ms=90,
+            captured_at_host_ms=95,
+            state_version=1,
+            world_model_version=1,
+        )
+        retained = replace(
+            snapshot,
+            pose_history=(first, snapshot.latest_robot_pose),
+            pose_history_evicted=3,
+        )
+
+        self.assertEqual(len(retained.pose_history), 2)
+        self.assertEqual(retained.pose_history_evicted, 3)
+        self.assertEqual(
+            retained.to_dict()["pose_history"][0]["x_mm"],
+            0,
+        )
+
+    def test_snapshot_rejects_invalid_pose_history_boundaries(self):
+        snapshot = physical_map_snapshot()
+        first = SpatialRobotPose(
+            frame_id=snapshot.frame_id,
+            x_mm=0,
+            y_mm=0,
+            heading_mdeg=0,
+            observed_at_ms=90,
+            captured_at_host_ms=95,
+            state_version=1,
+            world_model_version=1,
+        )
+        duplicate_geometry = replace(
+            snapshot.latest_robot_pose,
+            x_mm=first.x_mm,
+            y_mm=first.y_mm,
+            heading_mdeg=first.heading_mdeg,
+        )
+        cases = (
+            ("not-a-tuple", "invalid_pose_history"),
+            (
+                tuple(first for _ in range(MAX_POSE_HISTORY + 1)),
+                "invalid_pose_history",
+            ),
+            (
+                (replace(first, frame_id="foreign-frame"),),
+                "inconsistent_pose_history",
+            ),
+            (
+                (replace(first, world_model_version=2),),
+                "inconsistent_pose_history",
+            ),
+            (
+                (first, duplicate_geometry),
+                "inconsistent_pose_history_order",
+            ),
+        )
+        for history, code in cases:
+            with self.subTest(code=code):
+                with self.assertRaises(NavigationContractError) as caught:
+                    replace(snapshot, pose_history=history)
+                self.assertEqual(caught.exception.code, code)
+
+        with self.assertRaises(NavigationContractError) as caught:
+            replace(snapshot, pose_history=(first,))
+        self.assertEqual(
+            caught.exception.code,
+            "inconsistent_latest_pose_history",
+        )
 
     def test_snapshot_rejects_cross_identity_or_version_children(self):
         snapshot = physical_map_snapshot()

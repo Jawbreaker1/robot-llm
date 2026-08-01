@@ -347,6 +347,8 @@ def _empty_spatial_map() -> Mapping[str, object]:
         "bounds": None,
         "resolution_mm": None,
         "robot_pose": None,
+        "pose_history": [],
+        "pose_history_evicted": 0,
         "cells": [],
         "sensor_rays": [],
         "qualitative_observations": [],

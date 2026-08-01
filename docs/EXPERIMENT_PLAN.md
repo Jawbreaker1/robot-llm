@@ -1242,6 +1242,65 @@ loop closure, kartbaserad path planning, frontier exploration eller semantisk
 objektklassificering. Kartan är ännu observationsdata och återkopplas inte
 till `MotionSupervisor`. Ingen EV3 eller annan fysisk hårdvara kontaktades.
 
+### EXP-F5B-PHYSICAL-NAV-EVIDENCE-001 – kropp, scanminne och erfarenhet
+
+- Datum: `2026-08-01`.
+- Status: implementerad och hårdvarufritt testad; fysisk låd-acceptans
+  återstår.
+
+Hypotes: den fysiska agenten kan undvika oförändrade försök och behålla ett
+allt rikare men bounded beslutsunderlag om hosten publicerar faktisk
+kroppsgeometri, posebunden scan-evidens och strukturerade action/result-fakta
+utan att själv välja modellens rutt.
+
+Implementerad slice:
+
+- EV3RSTORM-profilen har en asymmetrisk, provisorisk rektangel runt
+  differential-drive-origo. Separata extents modellerar att högerarmen sticker
+  ut längre än vänstersidan; måtten är ännu inte fysiskt uppmätta.
+- Varje erbjuden rörelse och aktiv scan kontrolleras mot hela den
+  interpolerade svepta kroppen och aktuella provisoriska hinder. Samma kontroll
+  upprepas före dispatch. Hosten tar bort omöjliga handlingar men rangordnar
+  eller väljer ingen ersättare.
+- Återställda scans sparar faktisk scanpose, kartbasis, requested/actual
+  body-relative bearing, blocked/clear och unilateral/bilateral gränsevidens.
+  Retention prioriterar olika evidenssignaturer framför duplicerade retries
+  inom gränsen fyra poster per hinder och åtta per karta.
+- Blockerade historiska strålar ger konservativa angular supports med
+  provisorisk fast offset; de är inte metriska objektkonturer. En full
+  bilateral all-clear contestar hypotesen utan att radera historiken.
+- En ruttcommitment kräver kompletterande positiv och negativ gräns från exakt
+  robotens aktuella verifierade scanpose. Evidens från en äldre pose får stanna
+  i kollisionsminnet men får inte återanvändas som aktuell vänster/höger-gräns.
+- Ett episodlokalt `NavigationExperienceLedger` behåller strukturerade
+  försök/resultat, högst `8 KiB` publicerad detalj och ett LRU-index över
+  43 200 tidigare `(action, evidence basis)`-par. Gränsen motsvarar tre
+  möjliga handlingar per tillåten runtime-turn under en hel episod. Det
+  skiljer första försök,
+  oförändrad repetition och retry efter en verifierad förändring i beslutsfakta.
+- Evidensbasen ignorerar state-version, tidsstämplar, liten rå IR-jitter,
+  duplicerade scan-ID:n och icke-drivande armmotorer. Den använder verifierad
+  pose, drivencoders, beslutssensorer, hinder och substantiell scan-evidens.
+- Dashboardens read-only fysiska lager visar den konfigurerade kroppskonturen,
+  historiska scanposer och faktiska blocked/clear-vinklar. Ingen stråle får
+  uppfunnen fysisk längd.
+
+Hårdvarufria scenarier täcker bland annat att högerarmen ger annan
+svepgeometri än vänstersidan, att en geometriskt omöjlig modellhandling inte
+erbjuds, att äldre scanperspektiv nekas som route evidence, att duplicerade
+scans inte tränger undan unik gränsevidens och att en action/basis-cykel känns
+igen efter att den detaljerade ledgerhistoriken roterat.
+
+Fysisk evidensgräns: den föregående lådkörningen observerade att högerarmen
+tog i hindret och motiverade den nya profilen, men hela implementationen ovan
+körde inte då. Den äldre scanartefakten
+`data/EXP-EV3-LIVE-SCAN-20260801-001.json` innehåller rådata endast för ett
+stoppat försök med `2,5°` tolerans. Senare toleransprov saknar ännu en
+korrelerad incheckad råartefakt. Nästa grind är därför samma autonoma
+lådscenario med den nya koden, följt av publicerad observation, scan,
+action/result-ledger och terminalt utfall. Fysiskt propelleruttryck ingår
+inte i denna slice.
+
 ## Fas 6 – Parallella snurror
 
 Simulator-slicen bevisar nu en avgränsad del av

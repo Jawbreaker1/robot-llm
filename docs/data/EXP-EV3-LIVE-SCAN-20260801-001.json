@@ -1,0 +1,93 @@
+{
+  "schema": "robot-llm-physical-scan-evidence/v1",
+  "experiment_id": "EXP-EV3-LIVE-SCAN-20260801-001",
+  "recorded_date": "2026-08-01",
+  "episode_id": "episode-eca03253e93d3dad40fca2a6",
+  "scope": {
+    "robot": "physical EV3RSTORM over Wi-Fi",
+    "scene_target": "dark gray box",
+    "model": "google/gemma-4-26b-a4b Q8, shared with another local project",
+    "host_route_or_side_selected": false
+  },
+  "scan": {
+    "scan_id": "scan-85ed1f009d5ce07424d8",
+    "status": "CANCELLED",
+    "reason": "scan_heading_restoration_unverified",
+    "stop_confirmed": true,
+    "restored_start_heading": false,
+    "configured_alignment_tolerance_mdeg": 2500,
+    "rays": [
+      {
+        "requested_relative_bearing_mdeg": 0,
+        "actual_relative_bearing_mdeg": 0,
+        "raw": 33,
+        "filtered": 33,
+        "blocked": true
+      },
+      {
+        "requested_relative_bearing_mdeg": -30000,
+        "actual_relative_bearing_mdeg": -29230,
+        "raw": 31,
+        "filtered": 31,
+        "blocked": true
+      },
+      {
+        "requested_relative_bearing_mdeg": -60000,
+        "actual_relative_bearing_mdeg": -57998,
+        "raw": 48,
+        "filtered": 48,
+        "blocked": false
+      },
+      {
+        "requested_relative_bearing_mdeg": 30000,
+        "actual_relative_bearing_mdeg": 31012,
+        "raw": 58,
+        "filtered": 58,
+        "blocked": false
+      },
+      {
+        "requested_relative_bearing_mdeg": 60000,
+        "actual_relative_bearing_mdeg": 59912,
+        "raw": 57,
+        "filtered": 56,
+        "blocked": false
+      },
+      {
+        "requested_relative_bearing_mdeg": 15000,
+        "actual_relative_bearing_mdeg": 16825,
+        "raw": 50,
+        "filtered": 50,
+        "blocked": false
+      }
+    ],
+    "physical_direction_convention": {
+      "negative_bearing": "robot right",
+      "positive_bearing": "robot left"
+    }
+  },
+  "post_scan_encoder_check": {
+    "start_positions_degrees": {
+      "drive_b": 712,
+      "drive_c": 640
+    },
+    "observed_positions_degrees": {
+      "drive_b": 685,
+      "drive_c": 674
+    },
+    "net_deltas_degrees": {
+      "drive_b": -27,
+      "drive_c": 34
+    },
+    "derived_residual_heading_mdeg": 4025,
+    "motors_idle": true,
+    "battery_voltage_uv": 7680600
+  },
+  "interpretation": {
+    "coarse_sweep": "The encoder-derived rays crossed from center to physical right and then across center to physical left.",
+    "recorded_failure": "The final heading was about 4.0 degrees from the starting heading and was rejected by the then-configured 2.5-degree EV3 tolerance.",
+    "superseded_follow_up": "The 5-degree change proposed during this recorded attempt was not the final profile. A later 5-degree trial failed and a 10-degree trial was operator-reported successful, but neither correlated raw result is contained in this artifact.",
+    "checked_in_state": "The EV3RSTORM profile now uses a provisional 10-degree tolerance and model-free tests cover that configuration.",
+    "evidence_boundary": "This file is evidence only for the recorded stopped 2.5-degree attempt. It must not be cited as machine-verifiable evidence for either later tolerance trial or for a complete autonomous obstacle route.",
+    "validation_status": "Historical physical failure retained; current navigation changes are implemented and hardware-free tested, with a fresh physical acceptance artifact pending."
+  }
+}
