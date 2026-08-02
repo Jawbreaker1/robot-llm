@@ -9,6 +9,7 @@ from robot_agent.navigation_intent_proposal import (
 )
 from robot_agent.physical_agent_state import (
     AgentPhase,
+    ControllerCommandReceipt,
     ControllerKey,
     ExecutionPlan,
     GoalActivated,
@@ -19,13 +20,18 @@ from robot_agent.physical_agent_state import (
     PhysicalAgentState,
     PhysicalAgentStateReducer,
     PlanBinding,
-    PlanFinished,
     PlanRecompiled,
-    PlanStepAdvanced,
+    PlanStepKey,
     PlanningCause,
     PlanningTicket,
     PrimitiveStep,
+    ReceiptOutcome,
     ReplanRequested,
+    StepCommandAuthorization,
+    StepCommandAuthorized,
+    StepCommandDispatched,
+    StepCommandSettled,
+    StepDisposition,
     StopRequested,
     StopVerified,
 )
@@ -147,6 +153,67 @@ def successor(current, *, controller_version, basis_id):
     )
 
 
+def settle_completed_step(reducer, resulting_basis, *, now_ms):
+    state = reducer.snapshot()
+    sequence = state.last_host_dispatch_sequence + 1
+    authorization = StepCommandAuthorization(
+        action_id="replay-action-{}".format(sequence),
+        command_id="replay-command-{}".format(sequence),
+        host_dispatch_sequence=sequence,
+        controller_key=state.controller_key,
+        step_key=PlanStepKey(
+            plan_id=state.plan.plan_id,
+            plan_revision=state.plan.revision,
+            cursor=state.plan.cursor,
+            step_id=state.plan.active_step.step_id,
+        ),
+        based_on_navigation_basis_id=state.basis.navigation_basis_id,
+        based_on_controller_state_version=(
+            state.basis.controller_state_version
+        ),
+        command_fingerprint="sha256:replay-command-{}".format(sequence),
+        issued_at_ms=now_ms,
+        valid_until_ms=now_ms + 1_000,
+    )
+    authorized = reducer.apply(StepCommandAuthorized(authorization))
+    dispatched = reducer.apply(
+        StepCommandDispatched(
+            authorization=authorization,
+            dispatched_at_ms=now_ms + 1,
+            settle_by_host_ms=now_ms + 30_000,
+        )
+    )
+    receipt = ControllerCommandReceipt(
+        outcome=ReceiptOutcome.COMPLETED,
+        controller_key=authorization.controller_key,
+        step_key=authorization.step_key,
+        action_id=authorization.action_id,
+        command_id=authorization.command_id,
+        host_dispatch_sequence=authorization.host_dispatch_sequence,
+        command_fingerprint=authorization.command_fingerprint,
+        based_on_navigation_basis_id=(
+            authorization.based_on_navigation_basis_id
+        ),
+        based_on_controller_state_version=(
+            authorization.based_on_controller_state_version
+        ),
+        resulting_controller_state_version=(
+            resulting_basis.controller_state_version
+        ),
+        received_at_host_ms=now_ms + 2,
+        stop_confirmed=True,
+        code="completed",
+    )
+    settled = reducer.apply(
+        StepCommandSettled(
+            receipt=receipt,
+            resulting_basis=resulting_basis,
+            disposition=StepDisposition.COMPLETE,
+        )
+    )
+    return authorized, dispatched, settled
+
+
 class PhysicalAgentReplayTests(unittest.TestCase):
     def test_finished_plan_continues_without_model_then_replans_once(self):
         key = ControllerKey(
@@ -216,14 +283,13 @@ class PhysicalAgentReplayTests(unittest.TestCase):
             controller_version=2,
             basis_id="basis-step-one",
         )
-        advanced = reducer.apply(
-            PlanStepAdvanced(
-                plan_id=first_plan.plan_id,
-                plan_revision=first_plan.revision,
-                expected_cursor=0,
-                resulting_basis=step_basis,
-            )
+        authorized, dispatched, advanced = settle_completed_step(
+            reducer,
+            step_basis,
+            now_ms=1_010,
         )
+        self.assertEqual(authorized.plan.cursor, 0)
+        self.assertEqual(dispatched.plan.cursor, 0)
         phase_trace.append(advanced.phase)
         self.assertEqual(advanced.plan.cursor, 1)
         self.assertFalse(advanced.compile_pending)
@@ -233,14 +299,13 @@ class PhysicalAgentReplayTests(unittest.TestCase):
             controller_version=3,
             basis_id="basis-plan-finished",
         )
-        finished = reducer.apply(
-            PlanFinished(
-                plan_id=first_plan.plan_id,
-                plan_revision=first_plan.revision,
-                expected_cursor=1,
-                resulting_basis=finished_basis,
-            )
+        authorized, dispatched, finished = settle_completed_step(
+            reducer,
+            finished_basis,
+            now_ms=1_020,
         )
+        self.assertEqual(authorized.plan.cursor, 1)
+        self.assertEqual(dispatched.plan.cursor, 1)
         phase_trace.append(finished.phase)
 
         self.assertEqual(finished.phase, AgentPhase.PLANNING)

@@ -144,6 +144,30 @@ Each authorization carries `action_id`, target `robot_id` and `controller_id`,
 controller boot epoch, intent and plan revisions, referenced state versions,
 an idempotent sequence, and a deadline or TTL.
 
+Plan progress requires a correlated controller receipt. The canonical
+execution state records at most one `ActiveDispatch` per controller bus:
+first the gate's authorization, then the fact that dispatch began. The
+`StepCommandDispatched` event is a write-ahead fact and MUST be durably
+journaled before the first outbound command byte. It carries a finite,
+profile-selected `settle_by_host_ms` bounded by a generous global ceiling.
+
+A receipt must match the controller boot, action ID, command ID, monotonically
+increasing host dispatch sequence, command fingerprint, exact plan step, and
+referenced controller state. While `EXECUTING`, at or after the settlement
+deadline the host MUST first journal `StepCommandSettlementExpired`; that
+event makes no plan or cursor progress. An expired dispatch can never advance
+from a `COMPLETED` receipt. It may only be reconciled by an exact non-completed
+receipt that blocks the step and creates a basis-bound replan ticket. If
+`STOPPING` retains an already-sent dispatch, stop verification instead accepts
+only that dispatch's exact `STOPPED` receipt and resulting basis before
+entering `TERMINAL`; this reconciliation never advances the plan.
+
+A duplicate, late, cross-controller, or fabricated receipt cannot advance the
+plan. Backend-specific tokens such as EV3 request/session sequences remain in
+the adapter; they are validated there rather than pretending every controller
+shares the same wire protocol. Receipt ingress is timestamped in the host
+clock domain, so host deadlines never compare unrelated controller clocks.
+
 The controller-local supervisor is the only process that writes its motor bus.
 It rechecks controller identity, epoch, deadline, command sequence, local motor
 state, heartbeat, and immediate safety inputs. It may always reject or stop.
@@ -239,13 +263,18 @@ Migration MUST be reversible and must not use a big-bang runtime replacement.
    changed gate semantics MUST first run in shadow mode against identical
    snapshots, comparing allowed action, denial reason, selected plan step,
    route progress, and terminal result with the authoritative path.
-4. Make changed gate semantics authoritative behind a feature flag after
+4. Before physical authority, define and replay an explicit controller-loss
+   transition. A permanently disconnected, powered-off, or rebooted controller
+   cannot produce a same-instance command receipt; recovery must invalidate
+   the old instance without plan progress and bind any replacement boot as a
+   new controller instance. Shadow mode MUST NOT pretend that receipt exists.
+5. Make changed gate semantics authoritative behind a feature flag after
    replay parity: simulator first, then a bounded EV3 canary. Keep dual
    decision events long enough for rollback.
-5. Stop creating new physical `NavigationPlanTail` values, migrate dashboard
+6. Stop creating new physical `NavigationPlanTail` values, migrate dashboard
    projections, then remove duplicate state one producer and consumer at a
    time.
-6. Add EV3 and 51515 as controller adapters behind the same semantic
+7. Add EV3 and 51515 as controller adapters behind the same semantic
    observation, authorization, command, and receipt contracts. Transport
    details MUST remain outside the control-state core.
 

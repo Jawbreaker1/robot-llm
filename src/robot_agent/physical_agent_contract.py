@@ -14,6 +14,8 @@ from typing import Optional, Tuple, Union
 
 MAX_INT = 2**63 - 1
 MAX_PLANNING_TICKET_TTL_MS = 5 * 60_000
+MAX_STEP_COMMAND_START_TTL_MS = 60_000
+MAX_STEP_COMMAND_SETTLE_MS = 30 * 60_000
 PRIMITIVE_ACTIONS = frozenset(
     ("ADVANCE", "REVERSE", "TURN_LEFT_90", "TURN_RIGHT_90")
 )
@@ -51,6 +53,18 @@ class PlanningCause(str, Enum):
 class DetourSide(str, Enum):
     LEFT_OF_GOAL = "LEFT_OF_GOAL"
     RIGHT_OF_GOAL = "RIGHT_OF_GOAL"
+
+
+class ReceiptOutcome(str, Enum):
+    COMPLETED = "COMPLETED"
+    REJECTED_NOT_STARTED = "REJECTED_NOT_STARTED"
+    STOPPED = "STOPPED"
+
+
+class StepDisposition(str, Enum):
+    CONTINUE = "CONTINUE"
+    COMPLETE = "COMPLETE"
+    BLOCKED = "BLOCKED"
 
 
 def _identifier(name: str, value: object, maximum: int = 128) -> str:
@@ -523,6 +537,211 @@ class ExecutionPlan:
 
 
 @dataclass(frozen=True)
+class PlanStepKey:
+    plan_id: str
+    plan_revision: int
+    cursor: int
+    step_id: str
+
+    def __post_init__(self) -> None:
+        _identifier("step_key_plan_id", self.plan_id)
+        _integer("step_key_plan_revision", self.plan_revision, 1)
+        _integer("step_key_cursor", self.cursor)
+        _identifier("step_key_step_id", self.step_id)
+
+
+@dataclass(frozen=True)
+class StepCommandAuthorization:
+    """Host-issued permission to start one exact plan-step command."""
+
+    action_id: str
+    command_id: str
+    host_dispatch_sequence: int
+    controller_key: ControllerKey
+    step_key: PlanStepKey
+    based_on_navigation_basis_id: str
+    based_on_controller_state_version: int
+    command_fingerprint: str
+    issued_at_ms: int
+    valid_until_ms: int
+
+    def __post_init__(self) -> None:
+        _identifier("step_action_id", self.action_id)
+        _identifier("step_command_id", self.command_id)
+        _integer(
+            "host_dispatch_sequence",
+            self.host_dispatch_sequence,
+            1,
+        )
+        if not isinstance(self.controller_key, ControllerKey):
+            raise PhysicalAgentStateError(
+                "invalid_command_controller_key",
+                "step authorization controller key is invalid",
+            )
+        if not isinstance(self.step_key, PlanStepKey):
+            raise PhysicalAgentStateError(
+                "invalid_command_step_key",
+                "step authorization plan-step key is invalid",
+            )
+        _identifier(
+            "command_navigation_basis_id",
+            self.based_on_navigation_basis_id,
+        )
+        _integer(
+            "command_controller_state_version",
+            self.based_on_controller_state_version,
+            1,
+        )
+        _identifier("command_fingerprint", self.command_fingerprint, 256)
+        _integer("command_issued_at_ms", self.issued_at_ms)
+        _integer("command_valid_until_ms", self.valid_until_ms)
+        if (
+            self.valid_until_ms <= self.issued_at_ms
+            or self.valid_until_ms - self.issued_at_ms
+            > MAX_STEP_COMMAND_START_TTL_MS
+        ):
+            raise PhysicalAgentStateError(
+                "invalid_step_command_ttl",
+                "command start expiry must be after issue and within 60 seconds",
+            )
+
+
+@dataclass(frozen=True)
+class ActiveDispatch:
+    """Host-side command lifecycle; ``dispatched_at_ms`` uses the host clock."""
+
+    authorization: StepCommandAuthorization
+    dispatched_at_ms: Optional[int] = None
+    settle_by_host_ms: Optional[int] = None
+    settlement_expired_at_host_ms: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.authorization, StepCommandAuthorization):
+            raise PhysicalAgentStateError(
+                "invalid_active_authorization",
+                "active dispatch authorization is invalid",
+            )
+        if (self.dispatched_at_ms is None) != (self.settle_by_host_ms is None):
+            raise PhysicalAgentStateError(
+                "incomplete_active_dispatch",
+                "dispatch time and settlement deadline must be recorded together",
+            )
+        if self.dispatched_at_ms is not None:
+            _integer(
+                "command_dispatched_at_ms",
+                self.dispatched_at_ms,
+                self.authorization.issued_at_ms,
+            )
+            if self.dispatched_at_ms >= self.authorization.valid_until_ms:
+                raise PhysicalAgentStateError(
+                    "step_command_authorization_expired",
+                    "command must be dispatched before authorization expiry",
+                )
+            _integer(
+                "command_settle_by_host_ms",
+                self.settle_by_host_ms,
+                self.dispatched_at_ms + 1,
+            )
+            if (
+                self.settle_by_host_ms - self.dispatched_at_ms
+                > MAX_STEP_COMMAND_SETTLE_MS
+            ):
+                raise PhysicalAgentStateError(
+                    "invalid_step_command_settle_deadline",
+                    "command settlement deadline exceeds the finite ceiling",
+                )
+        if self.settlement_expired_at_host_ms is not None:
+            if self.settle_by_host_ms is None:
+                raise PhysicalAgentStateError(
+                    "invalid_step_command_settlement_expiry",
+                    "only a dispatched command can expire",
+                )
+            _integer(
+                "command_settlement_expired_at_host_ms",
+                self.settlement_expired_at_host_ms,
+                self.settle_by_host_ms,
+            )
+
+    @property
+    def dispatched(self) -> bool:
+        return self.dispatched_at_ms is not None
+
+    @property
+    def settlement_expired(self) -> bool:
+        return self.settlement_expired_at_host_ms is not None
+
+
+@dataclass(frozen=True)
+class ControllerCommandReceipt:
+    """Verified adapter result stamped on ingress with the host clock."""
+
+    outcome: ReceiptOutcome
+    controller_key: ControllerKey
+    step_key: PlanStepKey
+    action_id: str
+    command_id: str
+    host_dispatch_sequence: int
+    command_fingerprint: str
+    based_on_navigation_basis_id: str
+    based_on_controller_state_version: int
+    resulting_controller_state_version: int
+    received_at_host_ms: int
+    stop_confirmed: bool
+    code: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, ReceiptOutcome):
+            raise PhysicalAgentStateError(
+                "invalid_receipt_outcome",
+                "controller receipt outcome is invalid",
+            )
+        if not isinstance(self.controller_key, ControllerKey):
+            raise PhysicalAgentStateError(
+                "invalid_receipt_controller_key",
+                "controller receipt key is invalid",
+            )
+        if not isinstance(self.step_key, PlanStepKey):
+            raise PhysicalAgentStateError(
+                "invalid_receipt_step_key",
+                "controller receipt plan-step key is invalid",
+            )
+        _identifier("receipt_action_id", self.action_id)
+        _identifier("receipt_command_id", self.command_id)
+        _integer(
+            "receipt_host_dispatch_sequence",
+            self.host_dispatch_sequence,
+            1,
+        )
+        _identifier("receipt_command_fingerprint", self.command_fingerprint, 256)
+        _identifier(
+            "receipt_navigation_basis_id",
+            self.based_on_navigation_basis_id,
+        )
+        _integer(
+            "receipt_based_controller_state_version",
+            self.based_on_controller_state_version,
+            1,
+        )
+        _integer(
+            "receipt_resulting_controller_state_version",
+            self.resulting_controller_state_version,
+            self.based_on_controller_state_version,
+        )
+        _integer("receipt_received_at_host_ms", self.received_at_host_ms)
+        if not isinstance(self.stop_confirmed, bool):
+            raise PhysicalAgentStateError(
+                "invalid_receipt_stop_confirmation",
+                "receipt stop confirmation must be a boolean",
+            )
+        if self.outcome == ReceiptOutcome.STOPPED and not self.stop_confirmed:
+            raise PhysicalAgentStateError(
+                "missing_receipt_stop_confirmation",
+                "STOPPED receipt must confirm that motion stopped",
+            )
+        _identifier("receipt_code", self.code, 160)
+
+
+@dataclass(frozen=True)
 class PlanningTicket:
     ticket_id: str
     cause: PlanningCause
@@ -613,12 +832,14 @@ class PhysicalAgentState:
     phase: AgentPhase = AgentPhase.IDLE
     goal_epoch: int = 0
     plan_revision: int = 0
+    last_host_dispatch_sequence: int = 0
     compile_pending: bool = False
     goal: Optional[GoalAssignment] = None
     basis: Optional[NavigationBasis] = None
     intent: Optional[ActiveIntent] = None
     intent_progress: Optional[IntentProgress] = None
     plan: Optional[ExecutionPlan] = None
+    active_dispatch: Optional[ActiveDispatch] = None
     planning_ticket: Optional[PlanningTicket] = None
     terminal: Optional[GoalTerminal] = None
 
@@ -636,6 +857,10 @@ class PhysicalAgentState:
             )
         _integer("state_goal_epoch", self.goal_epoch)
         _integer("state_plan_revision", self.plan_revision)
+        _integer(
+            "state_last_host_dispatch_sequence",
+            self.last_host_dispatch_sequence,
+        )
         if not isinstance(self.compile_pending, bool):
             raise PhysicalAgentStateError(
                 "invalid_compile_pending",
@@ -655,6 +880,14 @@ class PhysicalAgentState:
             )
         if self.plan is not None and not isinstance(self.plan, ExecutionPlan):
             raise PhysicalAgentStateError("invalid_state_plan", "state plan is invalid")
+        if self.active_dispatch is not None and not isinstance(
+            self.active_dispatch,
+            ActiveDispatch,
+        ):
+            raise PhysicalAgentStateError(
+                "invalid_state_active_dispatch",
+                "state active dispatch is invalid",
+            )
         if self.planning_ticket is not None and not isinstance(
             self.planning_ticket, PlanningTicket
         ):
@@ -726,6 +959,7 @@ class PhysicalAgentState:
                     self.intent,
                     self.intent_progress,
                     self.plan,
+                    self.active_dispatch,
                     self.planning_ticket,
                     self.terminal,
                 )
@@ -738,7 +972,11 @@ class PhysicalAgentState:
 
         self._validate_common_active()
         if self.phase == AgentPhase.PLANNING:
-            if self.plan is not None or self.terminal is not None:
+            if (
+                self.plan is not None
+                or self.active_dispatch is not None
+                or self.terminal is not None
+            ):
                 raise PhysicalAgentStateError(
                     "invalid_planning_state",
                     "PLANNING cannot contain a plan or terminal outcome",
@@ -773,6 +1011,25 @@ class PhysicalAgentState:
                 intent=self.intent,
                 basis=self.basis,
             )
+            if self.active_dispatch is not None:
+                authorization = self.active_dispatch.authorization
+                active_step = self.plan.active_step
+                if (
+                    authorization.controller_key != self.controller_key
+                    or authorization.host_dispatch_sequence
+                    != self.last_host_dispatch_sequence
+                    or authorization.step_key.plan_id != self.plan.plan_id
+                    or authorization.step_key.plan_revision
+                    != self.plan.revision
+                    or authorization.step_key.cursor != self.plan.cursor
+                    or authorization.step_key.step_id != active_step.step_id
+                    or authorization.based_on_controller_state_version
+                    > self.basis.controller_state_version
+                ):
+                    raise PhysicalAgentStateError(
+                        "active_dispatch_binding_mismatch",
+                        "active dispatch is not bound to the current plan step",
+                    )
             return
 
         if self.phase == AgentPhase.STOPPING:
@@ -781,6 +1038,16 @@ class PhysicalAgentState:
                 or self.planning_ticket is not None
                 or self.terminal is None
                 or self.compile_pending
+                or (
+                    self.active_dispatch is not None
+                    and (
+                        not self.active_dispatch.dispatched
+                        or self.active_dispatch.authorization.controller_key
+                        != self.controller_key
+                        or self.active_dispatch.authorization.host_dispatch_sequence
+                        != self.last_host_dispatch_sequence
+                    )
+                )
             ):
                 raise PhysicalAgentStateError(
                     "invalid_stopping_state",
@@ -793,6 +1060,7 @@ class PhysicalAgentState:
                 self.intent is not None
                 or self.intent_progress is not None
                 or self.plan is not None
+                or self.active_dispatch is not None
                 or self.planning_ticket is not None
                 or self.terminal is None
                 or self.compile_pending
@@ -862,21 +1130,37 @@ class NavigationBasisUpdated:
 
 
 @dataclass(frozen=True)
-class PlanStepAdvanced:
-    plan_id: str
-    plan_revision: int
-    expected_cursor: int
-    resulting_basis: NavigationBasis
+class StepCommandAuthorized:
+    authorization: StepCommandAuthorization
 
 
 @dataclass(frozen=True)
-class PlanFinished:
-    """A verified receipt for the final step of the active finite plan."""
+class StepCommandDispatched:
+    """Write-ahead fact; MUST be journaled before the first outbound byte."""
 
-    plan_id: str
-    plan_revision: int
-    expected_cursor: int
+    authorization: StepCommandAuthorization
+    dispatched_at_ms: int
+    settle_by_host_ms: int
+
+
+@dataclass(frozen=True)
+class StepCommandRevoked:
+    authorization: StepCommandAuthorization
+    revoked_at_ms: int
+
+
+@dataclass(frozen=True)
+class StepCommandSettlementExpired:
+    authorization: StepCommandAuthorization
+    observed_at_host_ms: int
+
+
+@dataclass(frozen=True)
+class StepCommandSettled:
+    receipt: ControllerCommandReceipt
     resulting_basis: NavigationBasis
+    disposition: StepDisposition
+    replan_ticket: Optional[PlanningTicket] = None
 
 
 @dataclass(frozen=True)
@@ -906,6 +1190,8 @@ class StopRequested:
 @dataclass(frozen=True)
 class StopVerified:
     verified_at_ms: int
+    dispatch_receipt: Optional[ControllerCommandReceipt] = None
+    resulting_basis: Optional[NavigationBasis] = None
 
 
 @dataclass(frozen=True)
@@ -922,8 +1208,11 @@ PhysicalAgentEvent = Union[
     PlanningHeld,
     PlanningRequested,
     NavigationBasisUpdated,
-    PlanStepAdvanced,
-    PlanFinished,
+    StepCommandAuthorized,
+    StepCommandDispatched,
+    StepCommandRevoked,
+    StepCommandSettlementExpired,
+    StepCommandSettled,
     PlanRecompiled,
     ReplanRequested,
     GoalCompletionRequested,
@@ -936,8 +1225,10 @@ PhysicalAgentEvent = Union[
 
 __all__ = (
     "ActiveIntent",
+    "ActiveDispatch",
     "AgentPhase",
     "ControllerKey",
+    "ControllerCommandReceipt",
     "DetourSide",
     "DetourTargetIntent",
     "ExecutionPlan",
@@ -951,16 +1242,17 @@ __all__ = (
     "IntentPolicy",
     "IntentProgress",
     "MAX_PLANNING_TICKET_TTL_MS",
+    "MAX_STEP_COMMAND_SETTLE_MS",
+    "MAX_STEP_COMMAND_START_TTL_MS",
     "NavigationBasis",
     "NavigationBasisUpdated",
     "PhysicalAgentEvent",
     "PhysicalAgentState",
     "PhysicalAgentStateError",
     "PlanBinding",
-    "PlanFinished",
     "PlanRecompiled",
     "PlanStep",
-    "PlanStepAdvanced",
+    "PlanStepKey",
     "PlanningAbortRequested",
     "PlanningCause",
     "PlanningHeld",
@@ -969,11 +1261,19 @@ __all__ = (
     "PlanningTicketConsumed",
     "PlanningTicketExpired",
     "PrimitiveStep",
+    "ReceiptOutcome",
     "ReplanRequested",
     "ScanTargetIntent",
     "SensorStep",
     "StopRequested",
     "StopVerified",
+    "StepCommandAuthorization",
+    "StepCommandAuthorized",
+    "StepCommandDispatched",
+    "StepCommandRevoked",
+    "StepCommandSettlementExpired",
+    "StepCommandSettled",
+    "StepDisposition",
     "TerminalCleared",
     "WaypointStep",
 )

@@ -5,8 +5,10 @@ import threading
 from typing import Optional, Tuple
 
 from .physical_agent_contract import (
+    ActiveDispatch,
     ActiveIntent,
     AgentPhase,
+    ControllerCommandReceipt,
     ControllerKey,
     DetourSide,
     DetourTargetIntent,
@@ -21,16 +23,17 @@ from .physical_agent_contract import (
     IntentPolicy,
     IntentProgress,
     MAX_PLANNING_TICKET_TTL_MS,
+    MAX_STEP_COMMAND_SETTLE_MS,
+    MAX_STEP_COMMAND_START_TTL_MS,
     NavigationBasis,
     NavigationBasisUpdated,
     PhysicalAgentEvent,
     PhysicalAgentState,
     PhysicalAgentStateError,
     PlanBinding,
-    PlanFinished,
     PlanRecompiled,
     PlanStep,
-    PlanStepAdvanced,
+    PlanStepKey,
     PlanningAbortRequested,
     PlanningCause,
     PlanningHeld,
@@ -39,11 +42,19 @@ from .physical_agent_contract import (
     PlanningTicketConsumed,
     PlanningTicketExpired,
     PrimitiveStep,
+    ReceiptOutcome,
     ReplanRequested,
     ScanTargetIntent,
     SensorStep,
     StopRequested,
     StopVerified,
+    StepCommandAuthorization,
+    StepCommandAuthorized,
+    StepCommandDispatched,
+    StepCommandRevoked,
+    StepCommandSettlementExpired,
+    StepCommandSettled,
+    StepDisposition,
     TerminalCleared,
     WaypointStep,
     _identifier,
@@ -121,6 +132,334 @@ def _successor(state: PhysicalAgentState, value: NavigationBasis) -> None:
             "missing_current_basis", "active state has no navigation basis"
         )
     value.assert_successor_of(state.basis)
+
+
+def _require_no_active_dispatch(
+    state: PhysicalAgentState,
+    event: object,
+) -> None:
+    if state.active_dispatch is not None:
+        raise PhysicalAgentStateError(
+            "active_dispatch_conflict",
+            "{} cannot replace a plan while a command is active".format(
+                type(event).__name__
+            ),
+        )
+
+
+def _active_step_key(state: PhysicalAgentState) -> PlanStepKey:
+    active_plan = state.plan
+    return PlanStepKey(
+        plan_id=active_plan.plan_id,
+        plan_revision=active_plan.revision,
+        cursor=active_plan.cursor,
+        step_id=active_plan.active_step.step_id,
+    )
+
+
+def _current_dispatch(
+    state: PhysicalAgentState,
+    authorization: StepCommandAuthorization,
+    *,
+    dispatched: bool,
+    settlement_expired: Optional[bool] = None,
+) -> ActiveDispatch:
+    value = state.active_dispatch
+    if (
+        value is None
+        or value.authorization != authorization
+        or value.dispatched is not dispatched
+        or (
+            settlement_expired is not None
+            and value.settlement_expired is not settlement_expired
+        )
+    ):
+        raise PhysicalAgentStateError(
+            "active_dispatch_mismatch",
+            "command event does not match the active dispatch",
+        )
+    return value
+
+
+def _ticket_after_basis(
+    state: PhysicalAgentState,
+    resulting_basis: NavigationBasis,
+) -> Optional[PlanningTicket]:
+    value = state.planning_ticket
+    if value is not None and not value.basis.decision_equivalent(
+        resulting_basis
+    ):
+        return None
+    return value
+
+
+def _dispatch_for_stopping(state: PhysicalAgentState) -> Optional[ActiveDispatch]:
+    value = state.active_dispatch
+    return value if value is not None and value.dispatched else None
+
+
+def _validate_receipt(
+    active_dispatch: ActiveDispatch,
+    receipt: ControllerCommandReceipt,
+) -> None:
+    if not isinstance(receipt, ControllerCommandReceipt):
+        raise PhysicalAgentStateError(
+            "invalid_command_receipt",
+            "step settlement requires a controller command receipt",
+        )
+    authorization = active_dispatch.authorization
+    if (
+        receipt.controller_key != authorization.controller_key
+        or receipt.step_key != authorization.step_key
+        or receipt.action_id != authorization.action_id
+        or receipt.command_id != authorization.command_id
+        or receipt.host_dispatch_sequence
+        != authorization.host_dispatch_sequence
+        or receipt.command_fingerprint != authorization.command_fingerprint
+        or receipt.based_on_navigation_basis_id
+        != authorization.based_on_navigation_basis_id
+        or receipt.based_on_controller_state_version
+        != authorization.based_on_controller_state_version
+    ):
+        raise PhysicalAgentStateError(
+            "command_receipt_mismatch",
+            "controller receipt does not match the dispatched command",
+        )
+    if receipt.received_at_host_ms < active_dispatch.dispatched_at_ms:
+        raise PhysicalAgentStateError(
+            "receipt_before_dispatch",
+            "controller receipt predates command dispatch",
+        )
+
+
+def _reduce_step_command_event(
+    state: PhysicalAgentState,
+    event: PhysicalAgentEvent,
+) -> PhysicalAgentState:
+    """Reduce the single-flight command lifecycle for the active plan step."""
+
+    if isinstance(event, StepCommandAuthorized):
+        _require_phase(state, event, AgentPhase.EXECUTING)
+        authorization = event.authorization
+        if not isinstance(authorization, StepCommandAuthorization):
+            raise PhysicalAgentStateError(
+                "invalid_step_command_authorization",
+                "step authorization is invalid",
+            )
+        if state.active_dispatch is not None:
+            raise PhysicalAgentStateError(
+                "active_dispatch_already_exists",
+                "only one step command may be active",
+            )
+        if authorization.host_dispatch_sequence != (
+            state.last_host_dispatch_sequence + 1
+        ):
+            raise PhysicalAgentStateError(
+                "invalid_host_dispatch_sequence",
+                "host dispatch sequence must advance exactly once",
+            )
+        if (
+            authorization.controller_key != state.controller_key
+            or authorization.step_key != _active_step_key(state)
+            or authorization.based_on_navigation_basis_id
+            != state.basis.navigation_basis_id
+            or authorization.based_on_controller_state_version
+            != state.basis.controller_state_version
+        ):
+            raise PhysicalAgentStateError(
+                "step_command_authorization_mismatch",
+                "authorization is not bound to the current controller and plan step",
+            )
+        return _next(
+            state,
+            last_host_dispatch_sequence=(
+                authorization.host_dispatch_sequence
+            ),
+            active_dispatch=ActiveDispatch(authorization),
+        )
+
+    if isinstance(event, StepCommandDispatched):
+        _require_phase(state, event, AgentPhase.EXECUTING)
+        active_dispatch = _current_dispatch(
+            state,
+            event.authorization,
+            dispatched=False,
+        )
+        if (
+            state.basis.navigation_basis_id
+            != event.authorization.based_on_navigation_basis_id
+            or state.basis.controller_state_version
+            != event.authorization.based_on_controller_state_version
+        ):
+            raise PhysicalAgentStateError(
+                "stale_step_command_authorization",
+                "current navigation evidence no longer matches authorization",
+            )
+        return _next(
+            state,
+            active_dispatch=ActiveDispatch(
+                authorization=active_dispatch.authorization,
+                dispatched_at_ms=event.dispatched_at_ms,
+                settle_by_host_ms=event.settle_by_host_ms,
+            ),
+        )
+
+    if isinstance(event, StepCommandRevoked):
+        _require_phase(state, event, AgentPhase.EXECUTING)
+        active_dispatch = _current_dispatch(
+            state,
+            event.authorization,
+            dispatched=False,
+        )
+        _integer(
+            "command_revoked_at_ms",
+            event.revoked_at_ms,
+            active_dispatch.authorization.issued_at_ms,
+        )
+        return _next(state, active_dispatch=None)
+
+    if isinstance(event, StepCommandSettlementExpired):
+        _require_phase(state, event, AgentPhase.EXECUTING)
+        active_dispatch = _current_dispatch(
+            state,
+            event.authorization,
+            dispatched=True,
+            settlement_expired=False,
+        )
+        _integer(
+            "command_settlement_expired_at_host_ms",
+            event.observed_at_host_ms,
+            active_dispatch.settle_by_host_ms,
+        )
+        return _next(
+            state,
+            active_dispatch=replace(
+                active_dispatch,
+                settlement_expired_at_host_ms=event.observed_at_host_ms,
+            ),
+        )
+
+    if not isinstance(event, StepCommandSettled):
+        raise PhysicalAgentStateError(
+            "unsupported_step_command_event",
+            "event is not part of the step-command lifecycle",
+        )
+
+    _require_phase(state, event, AgentPhase.EXECUTING)
+    active_dispatch = state.active_dispatch
+    if active_dispatch is None or not active_dispatch.dispatched:
+        raise PhysicalAgentStateError(
+            "active_dispatch_mismatch",
+            "settlement requires one previously dispatched command",
+        )
+    _validate_receipt(active_dispatch, event.receipt)
+    _successor(state, event.resulting_basis)
+    if (
+        event.receipt.resulting_controller_state_version
+        != event.resulting_basis.controller_state_version
+    ):
+        raise PhysicalAgentStateError(
+            "receipt_resulting_version_mismatch",
+            "receipt and resulting basis controller versions differ",
+        )
+    if not isinstance(event.disposition, StepDisposition):
+        raise PhysicalAgentStateError(
+            "invalid_step_disposition",
+            "step settlement disposition is invalid",
+        )
+    if (
+        not active_dispatch.settlement_expired
+        and event.receipt.received_at_host_ms
+        >= active_dispatch.settle_by_host_ms
+    ):
+        raise PhysicalAgentStateError(
+            "step_command_settlement_expiry_not_recorded",
+            "late command receipt requires an explicit settlement-expired event",
+        )
+    if (
+        active_dispatch.settlement_expired
+        and event.receipt.outcome == ReceiptOutcome.COMPLETED
+    ):
+        raise PhysicalAgentStateError(
+            "completed_receipt_after_settlement_expiry",
+            "an expired command may not advance from a completed receipt",
+        )
+    if (
+        event.receipt.outcome != ReceiptOutcome.COMPLETED
+        and event.disposition != StepDisposition.BLOCKED
+    ):
+        raise PhysicalAgentStateError(
+            "invalid_receipt_disposition",
+            "non-completed commands may only block the active plan",
+        )
+
+    if event.disposition == StepDisposition.BLOCKED:
+        if not isinstance(event.replan_ticket, PlanningTicket):
+            raise PhysicalAgentStateError(
+                "missing_blocked_replan_ticket",
+                "blocked command requires a basis-bound replan ticket",
+            )
+        if event.replan_ticket.basis != event.resulting_basis:
+            raise PhysicalAgentStateError(
+                "planning_ticket_basis_mismatch",
+                "blocked replan ticket must bind the resulting basis",
+            )
+        _new_ticket(
+            replace(state, basis=event.resulting_basis),
+            event.replan_ticket,
+            (PlanningCause.UNCERTAINTY, PlanningCause.REPLAN_REQUIRED),
+        )
+        return _next(
+            state,
+            phase=AgentPhase.PLANNING,
+            basis=event.resulting_basis,
+            compile_pending=False,
+            plan=None,
+            active_dispatch=None,
+            planning_ticket=event.replan_ticket,
+        )
+
+    if event.replan_ticket is not None:
+        raise PhysicalAgentStateError(
+            "unexpected_step_replan_ticket",
+            "only a blocked command may carry a replan ticket",
+        )
+    if event.disposition == StepDisposition.CONTINUE:
+        return _next(
+            state,
+            basis=event.resulting_basis,
+            active_dispatch=None,
+            planning_ticket=_ticket_after_basis(
+                state,
+                event.resulting_basis,
+            ),
+        )
+
+    active_plan = state.plan
+    progress = _verified_step_progress(state, event.resulting_basis)
+    next_cursor = active_plan.cursor + 1
+    if next_cursor < len(active_plan.steps):
+        return _next(
+            state,
+            basis=event.resulting_basis,
+            plan=replace(active_plan, cursor=next_cursor),
+            active_dispatch=None,
+            planning_ticket=_ticket_after_basis(
+                state,
+                event.resulting_basis,
+            ),
+            intent_progress=progress,
+        )
+    return _next(
+        state,
+        phase=AgentPhase.PLANNING,
+        basis=event.resulting_basis,
+        compile_pending=True,
+        plan=None,
+        active_dispatch=None,
+        planning_ticket=None,
+        intent_progress=progress,
+    )
 
 
 def _new_plan(
@@ -243,6 +582,7 @@ def reduce_physical_agent_state(
             intent=None,
             intent_progress=None,
             plan=None,
+            active_dispatch=None,
             planning_ticket=event.ticket,
             terminal=None,
         )
@@ -293,6 +633,7 @@ def reduce_physical_agent_state(
             AgentPhase.PLANNING,
             AgentPhase.EXECUTING,
         )
+        _require_no_active_dispatch(state, event)
         _current_ticket(state, event.ticket_id, event.based_on_basis, True)
         value = event.intent
         if (
@@ -326,6 +667,7 @@ def reduce_physical_agent_state(
             intent_progress=progress,
             plan=event.plan,
             plan_revision=event.plan.revision,
+            active_dispatch=None,
             planning_ticket=None,
         )
 
@@ -355,6 +697,7 @@ def reduce_physical_agent_state(
             phase=AgentPhase.STOPPING,
             compile_pending=False,
             plan=None,
+            active_dispatch=_dispatch_for_stopping(state),
             planning_ticket=None,
             terminal=event.terminal,
         )
@@ -414,71 +757,17 @@ def reduce_physical_agent_state(
             planning_ticket=active_ticket,
         )
 
-    if isinstance(event, PlanStepAdvanced):
-        _require_phase(state, event, AgentPhase.EXECUTING)
-        _successor(state, event.resulting_basis)
-        active_plan = state.plan
-        if (
-            event.plan_id != active_plan.plan_id
-            or event.plan_revision != active_plan.revision
-            or event.expected_cursor != active_plan.cursor
-        ):
-            raise PhysicalAgentStateError(
-                "plan_cursor_mismatch",
-                "step receipt does not match the active plan cursor",
-            )
-        next_cursor = active_plan.cursor + 1
-        if next_cursor >= len(active_plan.steps):
-            raise PhysicalAgentStateError(
-                "final_step_requires_transition",
-                "the final step must transition to planning or stopping",
-            )
-        active_ticket = state.planning_ticket
-        if active_ticket is not None and not active_ticket.basis.decision_equivalent(
-            event.resulting_basis
-        ):
-            active_ticket = None
-        return _next(
-            state,
-            basis=event.resulting_basis,
-            plan=replace(active_plan, cursor=next_cursor),
-            planning_ticket=active_ticket,
-            intent_progress=_verified_step_progress(
-                state,
-                event.resulting_basis,
-            ),
-        )
-
-    if isinstance(event, PlanFinished):
-        _require_phase(state, event, AgentPhase.EXECUTING)
-        _successor(state, event.resulting_basis)
-        active_plan = state.plan
-        if (
-            event.plan_id != active_plan.plan_id
-            or event.plan_revision != active_plan.revision
-            or event.expected_cursor != active_plan.cursor
-        ):
-            raise PhysicalAgentStateError(
-                "plan_cursor_mismatch",
-                "final step receipt does not match the active plan cursor",
-            )
-        if active_plan.cursor != len(active_plan.steps) - 1:
-            raise PhysicalAgentStateError(
-                "plan_not_at_final_step",
-                "plan may finish only while its final step is active",
-            )
-        return _next(
-            state,
-            phase=AgentPhase.PLANNING,
-            basis=event.resulting_basis,
-            compile_pending=True,
-            plan=None,
-            planning_ticket=None,
-            intent_progress=_verified_step_progress(
-                state,
-                event.resulting_basis,
-            ),
-        )
+    if isinstance(
+        event,
+        (
+            StepCommandAuthorized,
+            StepCommandDispatched,
+            StepCommandRevoked,
+            StepCommandSettlementExpired,
+            StepCommandSettled,
+        ),
+    ):
+        return _reduce_step_command_event(state, event)
 
     if isinstance(event, PlanRecompiled):
         _require_phase(
@@ -487,6 +776,7 @@ def reduce_physical_agent_state(
             AgentPhase.PLANNING,
             AgentPhase.EXECUTING,
         )
+        _require_no_active_dispatch(state, event)
         if state.phase == AgentPhase.PLANNING and not state.compile_pending:
             raise PhysicalAgentStateError(
                 "deterministic_compile_not_pending",
@@ -507,11 +797,13 @@ def reduce_physical_agent_state(
             plan=event.plan,
             plan_revision=event.plan.revision,
             intent_progress=progress,
+            active_dispatch=None,
             planning_ticket=None,
         )
 
     if isinstance(event, ReplanRequested):
         _require_phase(state, event, AgentPhase.EXECUTING)
+        _require_no_active_dispatch(state, event)
         _identifier("replan_reason", event.reason, 160)
         _successor(state, event.resulting_basis)
         if event.ticket.basis != event.resulting_basis:
@@ -530,6 +822,7 @@ def reduce_physical_agent_state(
             basis=event.resulting_basis,
             compile_pending=False,
             plan=None,
+            active_dispatch=None,
             planning_ticket=event.ticket,
         )
 
@@ -550,6 +843,7 @@ def reduce_physical_agent_state(
             basis=event.resulting_basis,
             compile_pending=False,
             plan=None,
+            active_dispatch=_dispatch_for_stopping(state),
             planning_ticket=None,
             terminal=event.terminal,
         )
@@ -569,6 +863,7 @@ def reduce_physical_agent_state(
             phase=AgentPhase.STOPPING,
             compile_pending=False,
             plan=None,
+            active_dispatch=_dispatch_for_stopping(state),
             planning_ticket=None,
             terminal=event.terminal,
         )
@@ -581,12 +876,62 @@ def reduce_physical_agent_state(
                 "stop_verified_before_terminal",
                 "stop verification predates the terminal request",
             )
+        resulting_basis = state.basis
+        if state.active_dispatch is None:
+            if (
+                event.dispatch_receipt is not None
+                or event.resulting_basis is not None
+            ):
+                raise PhysicalAgentStateError(
+                    "unexpected_stop_dispatch_receipt",
+                    "stop without an active dispatch cannot carry a command receipt",
+                )
+        else:
+            if (
+                not isinstance(event.dispatch_receipt, ControllerCommandReceipt)
+                or not isinstance(event.resulting_basis, NavigationBasis)
+            ):
+                raise PhysicalAgentStateError(
+                    "missing_stop_dispatch_receipt",
+                    "stop with an active dispatch requires its receipt and basis",
+                )
+            _validate_receipt(state.active_dispatch, event.dispatch_receipt)
+            if (
+                event.dispatch_receipt.outcome != ReceiptOutcome.STOPPED
+                or not event.dispatch_receipt.stop_confirmed
+            ):
+                raise PhysicalAgentStateError(
+                    "invalid_stop_dispatch_receipt",
+                    "active dispatch must be reconciled by a confirmed STOPPED receipt",
+                )
+            _successor(state, event.resulting_basis)
+            if (
+                event.dispatch_receipt.resulting_controller_state_version
+                != event.resulting_basis.controller_state_version
+            ):
+                raise PhysicalAgentStateError(
+                    "receipt_resulting_version_mismatch",
+                    "receipt and resulting basis controller versions differ",
+                )
+            if (
+                event.dispatch_receipt.received_at_host_ms
+                < state.terminal.completed_at_ms
+                or event.verified_at_ms
+                < event.dispatch_receipt.received_at_host_ms
+            ):
+                raise PhysicalAgentStateError(
+                    "stop_receipt_time_mismatch",
+                    "stop receipt and verification must follow the stop request",
+                )
+            resulting_basis = event.resulting_basis
         return _next(
             state,
             phase=AgentPhase.TERMINAL,
+            basis=resulting_basis,
             compile_pending=False,
             intent=None,
             intent_progress=None,
+            active_dispatch=None,
         )
 
     if isinstance(event, TerminalCleared):
@@ -607,6 +952,7 @@ def reduce_physical_agent_state(
             intent=None,
             intent_progress=None,
             plan=None,
+            active_dispatch=None,
             planning_ticket=None,
             terminal=None,
         )
@@ -638,8 +984,10 @@ class PhysicalAgentStateReducer:
 
 
 __all__ = (
+    "ActiveDispatch",
     "ActiveIntent",
     "AgentPhase",
+    "ControllerCommandReceipt",
     "ControllerKey",
     "DetourSide",
     "DetourTargetIntent",
@@ -654,6 +1002,8 @@ __all__ = (
     "IntentPolicy",
     "IntentProgress",
     "MAX_PLANNING_TICKET_TTL_MS",
+    "MAX_STEP_COMMAND_SETTLE_MS",
+    "MAX_STEP_COMMAND_START_TTL_MS",
     "NavigationBasis",
     "NavigationBasisUpdated",
     "PhysicalAgentEvent",
@@ -661,10 +1011,9 @@ __all__ = (
     "PhysicalAgentStateError",
     "PhysicalAgentStateReducer",
     "PlanBinding",
-    "PlanFinished",
     "PlanRecompiled",
     "PlanStep",
-    "PlanStepAdvanced",
+    "PlanStepKey",
     "PlanningAbortRequested",
     "PlanningCause",
     "PlanningHeld",
@@ -673,11 +1022,19 @@ __all__ = (
     "PlanningTicketConsumed",
     "PlanningTicketExpired",
     "PrimitiveStep",
+    "ReceiptOutcome",
     "ReplanRequested",
     "ScanTargetIntent",
     "SensorStep",
     "StopRequested",
     "StopVerified",
+    "StepCommandAuthorization",
+    "StepCommandAuthorized",
+    "StepCommandDispatched",
+    "StepCommandRevoked",
+    "StepCommandSettlementExpired",
+    "StepCommandSettled",
+    "StepDisposition",
     "TerminalCleared",
     "WaypointStep",
     "reduce_physical_agent_state",

@@ -2,8 +2,10 @@ from dataclasses import replace
 import unittest
 
 from robot_agent.physical_agent_state import (
+    ActiveDispatch,
     ActiveIntent,
     AgentPhase,
+    ControllerCommandReceipt,
     ControllerKey,
     DetourSide,
     DetourTargetIntent,
@@ -17,15 +19,16 @@ from robot_agent.physical_agent_state import (
     IntentAccepted,
     IntentPolicy,
     MAX_PLANNING_TICKET_TTL_MS,
+    MAX_STEP_COMMAND_SETTLE_MS,
+    MAX_STEP_COMMAND_START_TTL_MS,
     NavigationBasis,
     NavigationBasisUpdated,
     PhysicalAgentState,
     PhysicalAgentStateError,
     PhysicalAgentStateReducer,
     PlanBinding,
-    PlanFinished,
     PlanRecompiled,
-    PlanStepAdvanced,
+    PlanStepKey,
     PlanningAbortRequested,
     PlanningCause,
     PlanningHeld,
@@ -34,11 +37,19 @@ from robot_agent.physical_agent_state import (
     PlanningTicketConsumed,
     PlanningTicketExpired,
     PrimitiveStep,
+    ReceiptOutcome,
     ReplanRequested,
     ScanTargetIntent,
     SensorStep,
     StopRequested,
     StopVerified,
+    StepCommandAuthorization,
+    StepCommandAuthorized,
+    StepCommandDispatched,
+    StepCommandRevoked,
+    StepCommandSettlementExpired,
+    StepCommandSettled,
+    StepDisposition,
     TerminalCleared,
     WaypointStep,
     reduce_physical_agent_state,
@@ -218,6 +229,142 @@ def executing_state(initial=None):
     return state, assigned_goal, nav_basis, intent, active_plan
 
 
+def step_authorization(
+    state,
+    *,
+    issued_at_ms=None,
+    valid_until_ms=None,
+    **changes
+):
+    sequence = state.last_host_dispatch_sequence + 1
+    issued_at_ms = (
+        102 + sequence * 3
+        if issued_at_ms is None
+        else issued_at_ms
+    )
+    value = StepCommandAuthorization(
+        action_id="action-{}".format(sequence),
+        command_id="command-{}".format(sequence),
+        host_dispatch_sequence=sequence,
+        controller_key=state.controller_key,
+        step_key=PlanStepKey(
+            plan_id=state.plan.plan_id,
+            plan_revision=state.plan.revision,
+            cursor=state.plan.cursor,
+            step_id=state.plan.active_step.step_id,
+        ),
+        based_on_navigation_basis_id=state.basis.navigation_basis_id,
+        based_on_controller_state_version=(
+            state.basis.controller_state_version
+        ),
+        command_fingerprint="sha256:command-{}".format(sequence),
+        issued_at_ms=issued_at_ms,
+        valid_until_ms=(
+            issued_at_ms + 1_000
+            if valid_until_ms is None
+            else valid_until_ms
+        ),
+    )
+    return replace(value, **changes) if changes else value
+
+
+def dispatch_active_step(
+    state,
+    *,
+    authorization=None,
+    dispatched_at_ms=None,
+    settle_by_host_ms=None,
+):
+    authorization = authorization or step_authorization(state)
+    dispatched_at_ms = (
+        authorization.issued_at_ms + 1
+        if dispatched_at_ms is None
+        else dispatched_at_ms
+    )
+    settle_by_host_ms = (
+        dispatched_at_ms + 30_000
+        if settle_by_host_ms is None
+        else settle_by_host_ms
+    )
+    authorized = reduce_physical_agent_state(
+        state,
+        StepCommandAuthorized(authorization),
+    )
+    dispatched = reduce_physical_agent_state(
+        authorized,
+        StepCommandDispatched(
+            authorization,
+            dispatched_at_ms,
+            settle_by_host_ms,
+        ),
+    )
+    return dispatched, authorization
+
+
+def command_receipt(
+    authorization,
+    resulting_basis,
+    *,
+    outcome=ReceiptOutcome.COMPLETED,
+    received_at_host_ms=None,
+    stop_confirmed=True,
+    code="command_settled",
+    **changes
+):
+    value = ControllerCommandReceipt(
+        outcome=outcome,
+        controller_key=authorization.controller_key,
+        step_key=authorization.step_key,
+        action_id=authorization.action_id,
+        command_id=authorization.command_id,
+        host_dispatch_sequence=authorization.host_dispatch_sequence,
+        command_fingerprint=authorization.command_fingerprint,
+        based_on_navigation_basis_id=(
+            authorization.based_on_navigation_basis_id
+        ),
+        based_on_controller_state_version=(
+            authorization.based_on_controller_state_version
+        ),
+        resulting_controller_state_version=(
+            resulting_basis.controller_state_version
+        ),
+        received_at_host_ms=(
+            authorization.issued_at_ms + 2
+            if received_at_host_ms is None
+            else received_at_host_ms
+        ),
+        stop_confirmed=stop_confirmed,
+        code=code,
+    )
+    return replace(value, **changes) if changes else value
+
+
+def settle_active_step(
+    state,
+    resulting_basis,
+    *,
+    disposition=StepDisposition.COMPLETE,
+    outcome=ReceiptOutcome.COMPLETED,
+    replan_ticket=None,
+):
+    dispatched, authorization = dispatch_active_step(state)
+    receipt = command_receipt(
+        authorization,
+        resulting_basis,
+        outcome=outcome,
+    )
+    settled = reduce_physical_agent_state(
+        dispatched,
+        StepCommandSettled(
+            receipt=receipt,
+            resulting_basis=resulting_basis,
+            disposition=disposition,
+            replan_ticket=replan_ticket,
+        ),
+    )
+    return settled, authorization, receipt, dispatched
+
+
 def stopping_state():
     state, assigned_goal, nav_basis, intent, active_plan = executing_state()
     terminal = GoalTerminal(GoalOutcome.CANCELLED, "operator_stop", 110)
@@ -293,6 +440,72 @@ class PhysicalAgentValueTests(unittest.TestCase):
         with self.assertRaises(PhysicalAgentStateError) as expired:
             valid.consume(valid.valid_until_ms)
         self.assertEqual(expired.exception.code, "planning_ticket_expired")
+
+    def test_step_command_start_window_is_finite_and_host_timed(self):
+        state, _goal, _basis, _intent, _plan = executing_state()
+        issued_at_ms = 1_000
+        valid = step_authorization(
+            state,
+            issued_at_ms=issued_at_ms,
+            valid_until_ms=(
+                issued_at_ms + MAX_STEP_COMMAND_START_TTL_MS
+            ),
+        )
+
+        self.assertEqual(
+            valid.valid_until_ms - valid.issued_at_ms,
+            MAX_STEP_COMMAND_START_TTL_MS,
+        )
+        for valid_until_ms in (
+            issued_at_ms,
+            issued_at_ms + MAX_STEP_COMMAND_START_TTL_MS + 1,
+        ):
+            with self.subTest(valid_until_ms=valid_until_ms):
+                with self.assertRaises(PhysicalAgentStateError) as caught:
+                    step_authorization(
+                        state,
+                        issued_at_ms=issued_at_ms,
+                        valid_until_ms=valid_until_ms,
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "invalid_step_command_ttl",
+                )
+
+    def test_step_command_settlement_window_has_a_generous_finite_ceiling(self):
+        state, _goal, _basis, _intent, _plan = executing_state()
+        authorization = step_authorization(state)
+        authorized = reduce_physical_agent_state(
+            state,
+            StepCommandAuthorized(authorization),
+        )
+        dispatched_at_ms = authorization.issued_at_ms + 1
+        valid = reduce_physical_agent_state(
+            authorized,
+            StepCommandDispatched(
+                authorization,
+                dispatched_at_ms,
+                dispatched_at_ms + MAX_STEP_COMMAND_SETTLE_MS,
+            ),
+        )
+
+        self.assertEqual(
+            valid.active_dispatch.settle_by_host_ms - dispatched_at_ms,
+            MAX_STEP_COMMAND_SETTLE_MS,
+        )
+        with self.assertRaises(PhysicalAgentStateError) as unbounded:
+            reduce_physical_agent_state(
+                authorized,
+                StepCommandDispatched(
+                    authorization,
+                    dispatched_at_ms,
+                    dispatched_at_ms + MAX_STEP_COMMAND_SETTLE_MS + 1,
+                ),
+            )
+        self.assertEqual(
+            unbounded.exception.code,
+            "invalid_step_command_settle_deadline",
+        )
 
     def test_plan_binding_requires_sorted_unique_target_signatures(self):
         state, assigned_goal, nav_basis, _planning_ticket = activated_state()
@@ -413,12 +626,24 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
             controller_state_version=2,
             navigation_basis_id="nav-step-1",
         )
+        first_authorization = step_authorization(reducer.snapshot())
+        authorized = reducer.apply(
+            StepCommandAuthorized(first_authorization)
+        )
+        versions.append(authorized.agent_state_version)
+        dispatched = reducer.apply(
+            StepCommandDispatched(
+                first_authorization,
+                first_authorization.issued_at_ms + 1,
+                first_authorization.issued_at_ms + 30_000,
+            )
+        )
+        versions.append(dispatched.agent_state_version)
         advanced = reducer.apply(
-            PlanStepAdvanced(
-                active_plan.plan_id,
-                active_plan.revision,
-                0,
+            StepCommandSettled(
+                command_receipt(first_authorization, step_basis),
                 step_basis,
+                StepDisposition.COMPLETE,
             )
         )
         versions.append(advanced.agent_state_version)
@@ -427,12 +652,24 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
             controller_state_version=3,
             navigation_basis_id="nav-plan-finished",
         )
+        final_authorization = step_authorization(reducer.snapshot())
+        authorized = reducer.apply(
+            StepCommandAuthorized(final_authorization)
+        )
+        versions.append(authorized.agent_state_version)
+        dispatched = reducer.apply(
+            StepCommandDispatched(
+                final_authorization,
+                final_authorization.issued_at_ms + 1,
+                final_authorization.issued_at_ms + 30_000,
+            )
+        )
+        versions.append(dispatched.agent_state_version)
         finished = reducer.apply(
-            PlanFinished(
-                active_plan.plan_id,
-                active_plan.revision,
-                1,
+            StepCommandSettled(
+                command_receipt(final_authorization, final_basis),
                 final_basis,
+                StepDisposition.COMPLETE,
             )
         )
         versions.append(finished.agent_state_version)
@@ -806,14 +1043,8 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
             controller_state_version=2,
             navigation_basis_id="basis-after-motion",
         )
-        superseded = reduce_physical_agent_state(
-            state,
-            PlanStepAdvanced(
-                active_plan.plan_id,
-                active_plan.revision,
-                0,
-                changed_basis,
-            ),
+        superseded, _authorization, _receipt, _dispatched = (
+            settle_active_step(state, changed_basis)
         )
 
         self.assertEqual(superseded.phase, AgentPhase.EXECUTING)
@@ -903,6 +1134,8 @@ class PhysicalAgentTransitionMatrixTests(unittest.TestCase):
         intent_plan = execution_plan(
             controller(), assigned_goal, intent, nav_basis
         )
+        authorization = step_authorization(executing)
+        receipt = command_receipt(authorization, successor)
         events = (
             (
                 GoalActivated(assigned_goal, nav_basis, planning_ticket),
@@ -947,20 +1180,36 @@ class PhysicalAgentTransitionMatrixTests(unittest.TestCase):
                 {AgentPhase.PLANNING, AgentPhase.EXECUTING},
             ),
             (
-                PlanStepAdvanced(
-                    active_plan.plan_id,
-                    active_plan.revision,
-                    active_plan.cursor,
-                    successor,
+                StepCommandAuthorized(authorization),
+                {AgentPhase.EXECUTING},
+            ),
+            (
+                StepCommandDispatched(
+                    authorization,
+                    authorization.issued_at_ms + 1,
+                    authorization.issued_at_ms + 30_000,
                 ),
                 {AgentPhase.EXECUTING},
             ),
             (
-                PlanFinished(
-                    active_plan.plan_id,
-                    active_plan.revision,
-                    active_plan.cursor,
+                StepCommandRevoked(
+                    authorization,
+                    authorization.issued_at_ms + 1,
+                ),
+                {AgentPhase.EXECUTING},
+            ),
+            (
+                StepCommandSettlementExpired(
+                    authorization,
+                    authorization.issued_at_ms + 30_000,
+                ),
+                {AgentPhase.EXECUTING},
+            ),
+            (
+                StepCommandSettled(
+                    receipt,
                     successor,
+                    StepDisposition.COMPLETE,
                 ),
                 {AgentPhase.EXECUTING},
             ),
@@ -1154,8 +1403,8 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
             "planning_ticket_already_active",
         )
 
-    def test_step_keeps_only_a_decision_equivalent_parallel_ticket(self):
-        state, _goal, nav_basis, _intent, active_plan = executing_state()
+    def test_settlement_preserves_only_decision_equivalent_parallel_ticket(self):
+        state, _goal, nav_basis, _intent, _active_plan = executing_state()
         parallel_ticket = ticket(
             nav_basis,
             ticket_id="ticket-during-step",
@@ -1171,30 +1420,17 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
             controller_state_version=2,
             world_model_version=2,
         )
-        equivalent = reduce_physical_agent_state(
-            pending,
-            PlanStepAdvanced(
-                active_plan.plan_id,
-                active_plan.revision,
-                0,
-                equivalent_basis,
-            ),
+        equivalent, _authorization, _receipt, _dispatched = (
+            settle_active_step(pending, equivalent_basis)
         )
-
         changed_basis = replace(
             nav_basis,
             controller_state_version=2,
             world_model_version=2,
             navigation_basis_id="basis-decision-changed",
         )
-        changed = reduce_physical_agent_state(
-            pending,
-            PlanStepAdvanced(
-                active_plan.plan_id,
-                active_plan.revision,
-                0,
-                changed_basis,
-            ),
+        changed, _authorization, _receipt, _dispatched = (
+            settle_active_step(pending, changed_basis)
         )
 
         self.assertEqual(equivalent.phase, AgentPhase.EXECUTING)
@@ -1204,194 +1440,62 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
         self.assertEqual(changed.plan.cursor, 1)
         self.assertIsNone(changed.planning_ticket)
 
-    def test_plan_finished_clears_even_a_still_fresh_parallel_ticket(self):
-        state, _goal, nav_basis, _intent, active_plan = executing_state()
-        parallel_ticket = ticket(
-            nav_basis,
-            ticket_id="ticket-until-plan-finished",
-            cause=PlanningCause.UNCERTAINTY,
-            created_at_ms=120,
-        )
-        pending = reduce_physical_agent_state(
-            state,
-            PlanningRequested(parallel_ticket),
-        )
-        step_basis = replace(nav_basis, controller_state_version=2)
-        pending = reduce_physical_agent_state(
-            pending,
-            PlanStepAdvanced(
-                active_plan.plan_id,
-                active_plan.revision,
-                0,
-                step_basis,
-            ),
-        )
-        final_basis = replace(step_basis, controller_state_version=3)
-        finished = reduce_physical_agent_state(
-            pending,
-            PlanFinished(
-                active_plan.plan_id,
-                active_plan.revision,
-                1,
-                final_basis,
-            ),
-        )
-
-        self.assertEqual(pending.planning_ticket, parallel_ticket)
-        self.assertEqual(finished.phase, AgentPhase.PLANNING)
-        self.assertTrue(finished.compile_pending)
-        self.assertIsNone(finished.plan)
-        self.assertIsNone(finished.planning_ticket)
-
-    def test_cursor_advances_once_and_final_step_needs_transition(self):
-        state, _goal, nav_basis, _intent, active_plan = executing_state()
+    def test_completed_receipts_advance_then_finish_the_plan_exactly_once(self):
+        state, _goal, nav_basis, _intent, _active_plan = executing_state()
         next_basis = replace(nav_basis, controller_state_version=2)
-        event = PlanStepAdvanced(
-            active_plan.plan_id,
-            active_plan.revision,
-            0,
+        advanced, _authorization, receipt, _dispatched = settle_active_step(
+            state,
             next_basis,
         )
-        advanced = reduce_physical_agent_state(state, event)
 
         self.assertEqual(advanced.plan.cursor, 1)
         self.assertEqual(advanced.plan.active_step.step_id, "waypoint-2")
-        with self.assertRaises(PhysicalAgentStateError) as stale:
-            reduce_physical_agent_state(advanced, event)
-        self.assertEqual(stale.exception.code, "plan_cursor_mismatch")
-
-        final_basis = replace(next_basis, controller_state_version=3)
-        with self.assertRaises(PhysicalAgentStateError) as final:
+        self.assertEqual(advanced.intent_progress.completed_steps, 1)
+        self.assertIsNone(advanced.active_dispatch)
+        with self.assertRaises(PhysicalAgentStateError) as duplicate:
             reduce_physical_agent_state(
                 advanced,
-                PlanStepAdvanced(
-                    active_plan.plan_id,
-                    active_plan.revision,
-                    1,
-                    final_basis,
+                StepCommandSettled(
+                    receipt,
+                    next_basis,
+                    StepDisposition.COMPLETE,
                 ),
             )
-        self.assertEqual(
-            final.exception.code,
-            "final_step_requires_transition",
+        self.assertEqual(duplicate.exception.code, "active_dispatch_mismatch")
+
+        final_basis = replace(next_basis, controller_state_version=3)
+        finished, _authorization, _receipt, _dispatched = settle_active_step(
+            advanced,
+            final_basis,
         )
 
-        finished = reduce_physical_agent_state(
-            advanced,
-            PlanFinished(
-                active_plan.plan_id,
-                active_plan.revision,
-                1,
-                final_basis,
-            ),
-        )
         self.assertEqual(finished.phase, AgentPhase.PLANNING)
         self.assertTrue(finished.compile_pending)
         self.assertIsNone(finished.plan)
+        self.assertIsNone(finished.active_dispatch)
         self.assertIsNone(finished.planning_ticket)
         self.assertEqual(finished.intent, state.intent)
         self.assertEqual(finished.intent_progress.completed_steps, 2)
 
-    def test_plan_finished_validates_final_cursor_binding_and_basis(self):
-        state, _goal, nav_basis, _intent, active_plan = executing_state()
-        next_basis = replace(
-            nav_basis,
-            controller_state_version=2,
-            navigation_basis_id="nav-basis-final-cursor",
-        )
-        with self.assertRaises(PhysicalAgentStateError) as not_final:
-            reduce_physical_agent_state(
-                state,
-                PlanFinished(
-                    active_plan.plan_id,
-                    active_plan.revision,
-                    0,
-                    next_basis,
-                ),
-            )
-        self.assertEqual(not_final.exception.code, "plan_not_at_final_step")
-
-        advanced = reduce_physical_agent_state(
-            state,
-            PlanStepAdvanced(
-                active_plan.plan_id,
-                active_plan.revision,
-                0,
-                next_basis,
-            ),
-        )
-        final_basis = replace(
-            next_basis,
-            controller_state_version=3,
-            navigation_basis_id="nav-basis-finished",
-        )
-        mismatches = (
-            ("wrong-plan", active_plan.revision, 1),
-            (active_plan.plan_id, active_plan.revision + 1, 1),
-            (active_plan.plan_id, active_plan.revision, 0),
-        )
-        for plan_id, revision, cursor in mismatches:
-            with self.subTest(
-                plan_id=plan_id,
-                revision=revision,
-                cursor=cursor,
-            ):
-                with self.assertRaises(PhysicalAgentStateError) as mismatch:
-                    reduce_physical_agent_state(
-                        advanced,
-                        PlanFinished(
-                            plan_id,
-                            revision,
-                            cursor,
-                            final_basis,
-                        ),
-                    )
-                self.assertEqual(
-                    mismatch.exception.code,
-                    "plan_cursor_mismatch",
-                )
-
-        with self.assertRaises(PhysicalAgentStateError) as stale:
-            reduce_physical_agent_state(
-                advanced,
-                PlanFinished(
-                    active_plan.plan_id,
-                    active_plan.revision,
-                    1,
-                    nav_basis,
-                ),
-            )
-        self.assertEqual(stale.exception.code, "stale_navigation_basis")
-
     def test_finished_plan_recompiles_same_intent_without_model_ticket(self):
-        state, assigned_goal, nav_basis, intent, active_plan = executing_state()
+        state, assigned_goal, nav_basis, intent, _active_plan = executing_state()
         step_basis = replace(
             nav_basis,
             controller_state_version=2,
             navigation_basis_id="nav-basis-step",
         )
-        state = reduce_physical_agent_state(
+        state, _authorization, _receipt, _dispatched = settle_active_step(
             state,
-            PlanStepAdvanced(
-                active_plan.plan_id,
-                active_plan.revision,
-                0,
-                step_basis,
-            ),
+            step_basis,
         )
         finished_basis = replace(
             step_basis,
             controller_state_version=3,
             navigation_basis_id="nav-basis-plan-finished",
         )
-        planning = reduce_physical_agent_state(
+        planning, _authorization, _receipt, _dispatched = settle_active_step(
             state,
-            PlanFinished(
-                active_plan.plan_id,
-                active_plan.revision,
-                1,
-                finished_basis,
-            ),
+            finished_basis,
         )
         self.assertEqual(planning.phase, AgentPhase.PLANNING)
         self.assertTrue(planning.compile_pending)
@@ -1548,14 +1652,9 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
             controller_state_version=2,
             navigation_basis_id="nav-basis-progress",
         )
-        state = reduce_physical_agent_state(
+        state, _authorization, _receipt, _dispatched = settle_active_step(
             state,
-            PlanStepAdvanced(
-                active_plan.plan_id,
-                active_plan.revision,
-                0,
-                next_basis,
-            ),
+            next_basis,
         )
         replacement_basis = replace(
             next_basis,
@@ -1580,6 +1679,640 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
         self.assertEqual(
             state.intent_progress.consecutive_no_progress_plans,
             0,
+        )
+
+
+class PhysicalAgentDispatchTests(unittest.TestCase):
+    def test_authorization_is_exact_sequenced_and_single_flight(self):
+        state, _goal, _basis, _intent, _plan = executing_state()
+        authorization = step_authorization(state)
+        authorized = reduce_physical_agent_state(
+            state,
+            StepCommandAuthorized(authorization),
+        )
+
+        self.assertEqual(authorized.last_host_dispatch_sequence, 1)
+        self.assertEqual(
+            authorized.active_dispatch,
+            ActiveDispatch(authorization),
+        )
+        self.assertFalse(authorized.active_dispatch.dispatched)
+        with self.assertRaises(PhysicalAgentStateError) as concurrent:
+            reduce_physical_agent_state(
+                authorized,
+                StepCommandAuthorized(step_authorization(authorized)),
+            )
+        self.assertEqual(
+            concurrent.exception.code,
+            "active_dispatch_already_exists",
+        )
+
+        mismatches = (
+            replace(
+                authorization,
+                controller_key=controller("different-boot"),
+            ),
+            replace(
+                authorization,
+                step_key=replace(
+                    authorization.step_key,
+                    cursor=authorization.step_key.cursor + 1,
+                ),
+            ),
+            replace(
+                authorization,
+                based_on_navigation_basis_id="different-basis",
+            ),
+            replace(
+                authorization,
+                based_on_controller_state_version=(
+                    authorization.based_on_controller_state_version + 1
+                ),
+            ),
+        )
+        for mismatch in mismatches:
+            with self.subTest(mismatch=mismatch):
+                with self.assertRaises(PhysicalAgentStateError) as caught:
+                    reduce_physical_agent_state(
+                        state,
+                        StepCommandAuthorized(mismatch),
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "step_command_authorization_mismatch",
+                )
+
+        with self.assertRaises(PhysicalAgentStateError) as skipped:
+            reduce_physical_agent_state(
+                state,
+                StepCommandAuthorized(
+                    replace(authorization, host_dispatch_sequence=2)
+                ),
+            )
+        self.assertEqual(
+            skipped.exception.code,
+            "invalid_host_dispatch_sequence",
+        )
+
+    def test_dispatch_is_exact_current_and_revocation_is_before_send_only(self):
+        state, _goal, nav_basis, _intent, _plan = executing_state()
+        authorization = step_authorization(state)
+        authorized = reduce_physical_agent_state(
+            state,
+            StepCommandAuthorized(authorization),
+        )
+
+        with self.assertRaises(PhysicalAgentStateError) as wrong_command:
+            reduce_physical_agent_state(
+                authorized,
+                StepCommandDispatched(
+                    replace(authorization, command_id="different-command"),
+                    authorization.issued_at_ms + 1,
+                    authorization.issued_at_ms + 30_000,
+                ),
+            )
+        self.assertEqual(
+            wrong_command.exception.code,
+            "active_dispatch_mismatch",
+        )
+        with self.assertRaises(PhysicalAgentStateError) as expired:
+            reduce_physical_agent_state(
+                authorized,
+                StepCommandDispatched(
+                    authorization,
+                    authorization.valid_until_ms,
+                    authorization.valid_until_ms + 30_000,
+                ),
+            )
+        self.assertEqual(
+            expired.exception.code,
+            "step_command_authorization_expired",
+        )
+
+        version_advanced = reduce_physical_agent_state(
+            authorized,
+            NavigationBasisUpdated(
+                replace(nav_basis, controller_state_version=2)
+            ),
+        )
+        with self.assertRaises(PhysicalAgentStateError) as stale:
+            reduce_physical_agent_state(
+                version_advanced,
+                StepCommandDispatched(
+                    authorization,
+                    authorization.issued_at_ms + 1,
+                    authorization.issued_at_ms + 30_000,
+                ),
+            )
+        self.assertEqual(
+            stale.exception.code,
+            "stale_step_command_authorization",
+        )
+        revoked = reduce_physical_agent_state(
+            version_advanced,
+            StepCommandRevoked(
+                authorization,
+                authorization.issued_at_ms + 2,
+            ),
+        )
+        self.assertIsNone(revoked.active_dispatch)
+        replacement = step_authorization(revoked)
+        self.assertEqual(replacement.host_dispatch_sequence, 2)
+
+        dispatched, authorization = dispatch_active_step(state)
+        self.assertTrue(dispatched.active_dispatch.dispatched)
+        with self.assertRaises(PhysicalAgentStateError) as after_send:
+            reduce_physical_agent_state(
+                dispatched,
+                StepCommandRevoked(
+                    authorization,
+                    authorization.issued_at_ms + 2,
+                ),
+            )
+        self.assertEqual(
+            after_send.exception.code,
+            "active_dispatch_mismatch",
+        )
+
+    def test_receipt_requires_exact_dispatch_binding_and_host_time(self):
+        state, _goal, nav_basis, _intent, _plan = executing_state()
+        dispatched, authorization = dispatch_active_step(state)
+        resulting_basis = replace(
+            nav_basis,
+            controller_state_version=2,
+        )
+        receipt = command_receipt(authorization, resulting_basis)
+        mismatches = (
+            replace(receipt, controller_key=controller("different-boot")),
+            replace(
+                receipt,
+                step_key=replace(
+                    receipt.step_key,
+                    plan_id="different-plan",
+                ),
+            ),
+            replace(
+                receipt,
+                step_key=replace(
+                    receipt.step_key,
+                    plan_revision=receipt.step_key.plan_revision + 1,
+                ),
+            ),
+            replace(
+                receipt,
+                step_key=replace(
+                    receipt.step_key,
+                    cursor=receipt.step_key.cursor + 1,
+                ),
+            ),
+            replace(
+                receipt,
+                step_key=replace(
+                    receipt.step_key,
+                    step_id="different-step",
+                ),
+            ),
+            replace(receipt, action_id="different-action"),
+            replace(receipt, command_id="different-command"),
+            replace(
+                receipt,
+                host_dispatch_sequence=receipt.host_dispatch_sequence + 1,
+            ),
+            replace(receipt, command_fingerprint="sha256:different"),
+            replace(
+                receipt,
+                based_on_navigation_basis_id="different-basis",
+            ),
+            replace(
+                receipt,
+                based_on_controller_state_version=2,
+            ),
+        )
+        for mismatch in mismatches:
+            with self.subTest(mismatch=mismatch):
+                with self.assertRaises(PhysicalAgentStateError) as caught:
+                    reduce_physical_agent_state(
+                        dispatched,
+                        StepCommandSettled(
+                            mismatch,
+                            resulting_basis,
+                            StepDisposition.COMPLETE,
+                        ),
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "command_receipt_mismatch",
+                )
+
+        with self.assertRaises(PhysicalAgentStateError) as wrong_result:
+            reduce_physical_agent_state(
+                dispatched,
+                StepCommandSettled(
+                    replace(
+                        receipt,
+                        resulting_controller_state_version=3,
+                    ),
+                    resulting_basis,
+                    StepDisposition.COMPLETE,
+                ),
+            )
+        self.assertEqual(
+            wrong_result.exception.code,
+            "receipt_resulting_version_mismatch",
+        )
+        with self.assertRaises(PhysicalAgentStateError) as too_early:
+            reduce_physical_agent_state(
+                dispatched,
+                StepCommandSettled(
+                    replace(
+                        receipt,
+                        received_at_host_ms=(
+                            dispatched.active_dispatch.dispatched_at_ms - 1
+                        ),
+                    ),
+                    resulting_basis,
+                    StepDisposition.COMPLETE,
+                ),
+            )
+        self.assertEqual(too_early.exception.code, "receipt_before_dispatch")
+
+    def test_expired_settlement_never_advances_and_reconciles_as_blocked(self):
+        state, _goal, nav_basis, _intent, active_plan = executing_state()
+        authorization = step_authorization(state)
+        settle_by_host_ms = authorization.issued_at_ms + 100
+        dispatched, authorization = dispatch_active_step(
+            state,
+            authorization=authorization,
+            settle_by_host_ms=settle_by_host_ms,
+        )
+        resulting_basis = replace(
+            nav_basis,
+            controller_state_version=2,
+            navigation_basis_id="basis-after-expired-command",
+        )
+        late_completed = command_receipt(
+            authorization,
+            resulting_basis,
+            received_at_host_ms=settle_by_host_ms,
+        )
+
+        with self.assertRaises(PhysicalAgentStateError) as implicit_expiry:
+            reduce_physical_agent_state(
+                dispatched,
+                StepCommandSettled(
+                    late_completed,
+                    resulting_basis,
+                    StepDisposition.COMPLETE,
+                ),
+            )
+        self.assertEqual(
+            implicit_expiry.exception.code,
+            "step_command_settlement_expiry_not_recorded",
+        )
+
+        with self.assertRaises(PhysicalAgentStateError) as too_early:
+            reduce_physical_agent_state(
+                dispatched,
+                StepCommandSettlementExpired(
+                    authorization,
+                    settle_by_host_ms - 1,
+                ),
+            )
+        self.assertEqual(
+            too_early.exception.code,
+            "invalid_command_settlement_expired_at_host_ms",
+        )
+
+        expired = reduce_physical_agent_state(
+            dispatched,
+            StepCommandSettlementExpired(
+                authorization,
+                settle_by_host_ms,
+            ),
+        )
+        self.assertTrue(expired.active_dispatch.settlement_expired)
+        self.assertEqual(expired.plan, active_plan)
+        self.assertEqual(expired.plan.cursor, 0)
+        self.assertEqual(expired.basis, nav_basis)
+        self.assertEqual(expired.intent_progress.completed_steps, 0)
+
+        with self.assertRaises(PhysicalAgentStateError) as completed_after_expiry:
+            reduce_physical_agent_state(
+                expired,
+                StepCommandSettled(
+                    late_completed,
+                    resulting_basis,
+                    StepDisposition.COMPLETE,
+                ),
+            )
+        self.assertEqual(
+            completed_after_expiry.exception.code,
+            "completed_receipt_after_settlement_expiry",
+        )
+
+        rejected = replace(
+            late_completed,
+            outcome=ReceiptOutcome.REJECTED_NOT_STARTED,
+            code="expired_not_started",
+        )
+        replan_ticket = ticket(
+            resulting_basis,
+            ticket_id="ticket-expired-command",
+            cause=PlanningCause.REPLAN_REQUIRED,
+            created_at_ms=settle_by_host_ms,
+        )
+        reconciled = reduce_physical_agent_state(
+            expired,
+            StepCommandSettled(
+                rejected,
+                resulting_basis,
+                StepDisposition.BLOCKED,
+                replan_ticket,
+            ),
+        )
+
+        self.assertEqual(reconciled.phase, AgentPhase.PLANNING)
+        self.assertIsNone(reconciled.active_dispatch)
+        self.assertIsNone(reconciled.plan)
+        self.assertEqual(reconciled.planning_ticket, replan_ticket)
+        self.assertEqual(reconciled.intent_progress.completed_steps, 0)
+
+    def test_dispositions_are_finite_and_blocked_requires_replanning(self):
+        state, _goal, nav_basis, _intent, _plan = executing_state()
+        continue_basis = replace(
+            nav_basis,
+            controller_state_version=2,
+        )
+        continued, _authorization, _receipt, _dispatched = settle_active_step(
+            state,
+            continue_basis,
+            disposition=StepDisposition.CONTINUE,
+        )
+        self.assertEqual(continued.phase, AgentPhase.EXECUTING)
+        self.assertEqual(continued.plan.cursor, 0)
+        self.assertEqual(continued.intent_progress.completed_steps, 0)
+        self.assertIsNone(continued.active_dispatch)
+
+        blocked_basis = replace(
+            continue_basis,
+            controller_state_version=3,
+            navigation_basis_id="basis-blocked",
+        )
+        dispatched, authorization = dispatch_active_step(continued)
+        rejected = command_receipt(
+            authorization,
+            blocked_basis,
+            outcome=ReceiptOutcome.REJECTED_NOT_STARTED,
+            code="controller_rejected",
+        )
+        with self.assertRaises(PhysicalAgentStateError) as wrong_disposition:
+            reduce_physical_agent_state(
+                dispatched,
+                StepCommandSettled(
+                    rejected,
+                    blocked_basis,
+                    StepDisposition.COMPLETE,
+                ),
+            )
+        self.assertEqual(
+            wrong_disposition.exception.code,
+            "invalid_receipt_disposition",
+        )
+        with self.assertRaises(PhysicalAgentStateError) as missing_ticket:
+            reduce_physical_agent_state(
+                dispatched,
+                StepCommandSettled(
+                    rejected,
+                    blocked_basis,
+                    StepDisposition.BLOCKED,
+                ),
+            )
+        self.assertEqual(
+            missing_ticket.exception.code,
+            "missing_blocked_replan_ticket",
+        )
+        replan_ticket = ticket(
+            blocked_basis,
+            ticket_id="ticket-command-blocked",
+            cause=PlanningCause.REPLAN_REQUIRED,
+            created_at_ms=130,
+        )
+        blocked = reduce_physical_agent_state(
+            dispatched,
+            StepCommandSettled(
+                rejected,
+                blocked_basis,
+                StepDisposition.BLOCKED,
+                replan_ticket,
+            ),
+        )
+
+        self.assertEqual(blocked.phase, AgentPhase.PLANNING)
+        self.assertIsNone(blocked.plan)
+        self.assertIsNone(blocked.active_dispatch)
+        self.assertEqual(blocked.planning_ticket, replan_ticket)
+        with self.assertRaises(PhysicalAgentStateError) as unconfirmed_stop:
+            command_receipt(
+                authorization,
+                blocked_basis,
+                outcome=ReceiptOutcome.STOPPED,
+                stop_confirmed=False,
+            )
+        self.assertEqual(
+            unconfirmed_stop.exception.code,
+            "missing_receipt_stop_confirmation",
+        )
+
+    def test_plan_replacement_and_recompile_reject_an_active_dispatch(self):
+        state, assigned_goal, nav_basis, intent, _plan = executing_state()
+        planning_ticket = ticket(
+            nav_basis,
+            ticket_id="ticket-replacement",
+            cause=PlanningCause.UNCERTAINTY,
+            created_at_ms=120,
+        )
+        pending = reduce_physical_agent_state(
+            state,
+            PlanningRequested(planning_ticket),
+        )
+        pending = reduce_physical_agent_state(
+            pending,
+            PlanningTicketConsumed(
+                planning_ticket.ticket_id,
+                nav_basis,
+                121,
+            ),
+        )
+        authorization = step_authorization(pending)
+        active = reduce_physical_agent_state(
+            pending,
+            StepCommandAuthorized(authorization),
+        )
+        replacement_intent = active_intent(
+            nav_basis,
+            assigned_goal,
+            intent_id=intent.intent_id,
+            revision=2,
+            accepted_at_ms=122,
+        )
+        replacement_plan = execution_plan(
+            state.controller_key,
+            assigned_goal,
+            replacement_intent,
+            nav_basis,
+            plan_id="plan-2",
+            revision=2,
+        )
+        events = (
+            IntentAccepted(
+                planning_ticket.ticket_id,
+                nav_basis,
+                replacement_intent,
+                replacement_plan,
+            ),
+            PlanRecompiled(replacement_plan, nav_basis),
+            ReplanRequested(
+                ticket(
+                    nav_basis,
+                    ticket_id="ticket-blocking-replan",
+                    cause=PlanningCause.REPLAN_REQUIRED,
+                    created_at_ms=123,
+                ),
+                nav_basis,
+                "plan_changed",
+            ),
+        )
+        for event in events:
+            with self.subTest(event=type(event).__name__):
+                with self.assertRaises(PhysicalAgentStateError) as caught:
+                    reduce_physical_agent_state(active, event)
+                self.assertEqual(
+                    caught.exception.code,
+                    "active_dispatch_conflict",
+                )
+
+    def test_stop_drops_unsent_authorization_but_retains_sent_dispatch(self):
+        state, _goal, nav_basis, _intent, _plan = executing_state()
+        terminal = GoalTerminal(
+            GoalOutcome.CANCELLED,
+            "operator_stop",
+            130,
+        )
+        authorization = step_authorization(state)
+        authorized = reduce_physical_agent_state(
+            state,
+            StepCommandAuthorized(authorization),
+        )
+        unsent_stop = reduce_physical_agent_state(
+            authorized,
+            StopRequested(terminal),
+        )
+        self.assertEqual(unsent_stop.phase, AgentPhase.STOPPING)
+        self.assertIsNone(unsent_stop.active_dispatch)
+
+        dispatched, authorization = dispatch_active_step(state)
+        sent_stop = reduce_physical_agent_state(
+            dispatched,
+            StopRequested(terminal),
+        )
+        self.assertEqual(sent_stop.phase, AgentPhase.STOPPING)
+        self.assertEqual(sent_stop.active_dispatch, dispatched.active_dispatch)
+        self.assertTrue(sent_stop.active_dispatch.dispatched)
+        with self.assertRaises(PhysicalAgentStateError):
+            replace(
+                sent_stop,
+                active_dispatch=ActiveDispatch(authorization),
+            )
+
+        with self.assertRaises(PhysicalAgentStateError) as missing_receipt:
+            reduce_physical_agent_state(sent_stop, StopVerified(131))
+        self.assertEqual(
+            missing_receipt.exception.code,
+            "missing_stop_dispatch_receipt",
+        )
+
+        stopped_basis = replace(
+            nav_basis,
+            controller_state_version=2,
+            navigation_basis_id="basis-stop-confirmed",
+        )
+        stopped_receipt = command_receipt(
+            authorization,
+            stopped_basis,
+            outcome=ReceiptOutcome.STOPPED,
+            received_at_host_ms=131,
+            code="stop_confirmed",
+        )
+        with self.assertRaises(PhysicalAgentStateError) as mismatch:
+            reduce_physical_agent_state(
+                sent_stop,
+                StopVerified(
+                    132,
+                    replace(stopped_receipt, command_id="wrong-command"),
+                    stopped_basis,
+                ),
+            )
+        self.assertEqual(mismatch.exception.code, "command_receipt_mismatch")
+
+        with self.assertRaises(PhysicalAgentStateError) as completed_receipt:
+            reduce_physical_agent_state(
+                sent_stop,
+                StopVerified(
+                    132,
+                    replace(stopped_receipt, outcome=ReceiptOutcome.COMPLETED),
+                    stopped_basis,
+                ),
+            )
+        self.assertEqual(
+            completed_receipt.exception.code,
+            "invalid_stop_dispatch_receipt",
+        )
+        with self.assertRaises(PhysicalAgentStateError) as before_stop_request:
+            reduce_physical_agent_state(
+                sent_stop,
+                StopVerified(
+                    132,
+                    replace(stopped_receipt, received_at_host_ms=129),
+                    stopped_basis,
+                ),
+            )
+        self.assertEqual(
+            before_stop_request.exception.code,
+            "stop_receipt_time_mismatch",
+        )
+
+        stopped = reduce_physical_agent_state(
+            sent_stop,
+            StopVerified(132, stopped_receipt, stopped_basis),
+        )
+        self.assertEqual(stopped.phase, AgentPhase.TERMINAL)
+        self.assertEqual(stopped.basis, stopped_basis)
+        self.assertIsNone(stopped.active_dispatch)
+
+    def test_stop_without_active_dispatch_rejects_command_evidence(self):
+        executing, _goal, nav_basis, _intent, _plan = executing_state()
+        authorization = step_authorization(executing)
+        resulting_basis = replace(
+            nav_basis,
+            controller_state_version=2,
+            navigation_basis_id="basis-unexpected-stop-receipt",
+        )
+        receipt = command_receipt(
+            authorization,
+            resulting_basis,
+            outcome=ReceiptOutcome.STOPPED,
+            received_at_host_ms=131,
+        )
+        stopping, _goal, _basis, _terminal = stopping_state()
+
+        with self.assertRaises(PhysicalAgentStateError) as unexpected:
+            reduce_physical_agent_state(
+                stopping,
+                StopVerified(132, receipt, resulting_basis),
+            )
+        self.assertEqual(
+            unexpected.exception.code,
+            "unexpected_stop_dispatch_receipt",
         )
 
 
