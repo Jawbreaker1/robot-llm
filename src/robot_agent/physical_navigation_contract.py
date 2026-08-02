@@ -270,6 +270,23 @@ def _text(name: str, value: object, maximum: int) -> str:
     return value
 
 
+def validate_controller_instance_id(value: object) -> str:
+    """Validate the shared ASCII identity for one controller incarnation."""
+
+    checked = _text("controller_instance_id", value, 128)
+    allowed = (
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789._:-"
+    )
+    if any(character not in allowed for character in checked):
+        raise PhysicalNavigationContractError(
+            "invalid_controller_instance_id",
+            "controller_instance_id is invalid",
+        )
+    return checked
+
+
 def strict_json_loads(raw: bytes, maximum_bytes: int) -> object:
     """Decode bounded UTF-8 JSON while rejecting duplicates and NaN."""
 

@@ -421,6 +421,9 @@ class EV3NavigationWorkerProtocolTests(unittest.TestCase):
         self.assertLessEqual(len(first), 128)
         self.assertNotEqual(first, second)
 
+        with self.assertRaises(WorkerError):
+            new_controller_instance_id(lambda: "å")
+
     def test_input_channel_readability_or_eof_requests_cancellation(self):
         read_descriptor, write_descriptor = os.pipe()
         raw_reader = os.fdopen(read_descriptor, "rb", buffering=0)

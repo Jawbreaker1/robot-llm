@@ -22,6 +22,7 @@ from .physical_navigation_contract import (
     expected_scan_turn_profile,
     json_bytes,
     strict_json_loads,
+    validate_controller_instance_id,
     validate_observation,
 )
 
@@ -127,15 +128,12 @@ def _remote_path(value: str) -> str:
 
 
 def _controller_instance_identity(value: object) -> str:
-    checked = _identifier("controller_instance_id", value, 128)
-    if any(
-        not (character.isalnum() or character in "._:-")
-        for character in checked
-    ):
+    try:
+        return validate_controller_instance_id(value)
+    except ValueError:
         raise EV3NavigationTransportError(
             "controller_instance_id is invalid"
-        )
-    return checked
+        ) from None
 
 
 class EV3NavigationSSHTransport:
@@ -1151,6 +1149,7 @@ class EV3NavigationSSHTransport:
             raise
 
     def close(self) -> None:
+        self._worker_description = None
         if self._process is None:
             return
         if self._process.stdin is not None:
@@ -1179,6 +1178,7 @@ class EV3NavigationSSHTransport:
         """Break the SSH channel so the worker's EOF cleanup stops motors."""
 
         with self._abort_lock:
+            self._worker_description = None
             if self._aborted:
                 return
             self._aborted = True

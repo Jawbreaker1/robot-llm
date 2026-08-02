@@ -90,6 +90,7 @@ from .physical_navigation_contract import (
     expected_scan_turn_profile,
     expected_scan_sample_profile,
     motion_budget_allows,
+    validate_controller_instance_id,
     validate_observation,
 )
 from .physical_navigation_mission import DirectionalMission
@@ -228,12 +229,6 @@ class PhysicalNavigationRuntime(
             episode_id=episode_id,
         )
 
-    @property
-    def controller_instance_id(self) -> Optional[str]:
-        """Identity of the currently connected EV3 worker incarnation."""
-
-        return self._controller_instance_id
-
     def request_stop(self) -> None:
         self._stop_requested.set()
 
@@ -242,6 +237,7 @@ class PhysicalNavigationRuntime(
         abort = getattr(self.transport, "abort", None)
         if callable(abort):
             abort()
+        self._controller_instance_id = None
 
     def _cancelled(self) -> bool:
         return (
@@ -424,6 +420,8 @@ class PhysicalNavigationRuntime(
                 ),
             )
         except Exception:
+            if getattr(self.transport, "aborted", False) is True:
+                self._controller_instance_id = None
             # The SSH transport closes its channel when the callback turns
             # true. Convert that expected transport failure into the episode's
             # cancellation result, while preserving unrelated failures.  A
@@ -456,8 +454,7 @@ class PhysicalNavigationRuntime(
         Mapping[str, object],
         Mapping[str, Mapping[str, object]],
         DriveMotorRoles,
-        int,
-        str,
+        int, str,
     ]:
         result = response.get("result")
         if not isinstance(result, dict):
@@ -490,23 +487,15 @@ class PhysicalNavigationRuntime(
         pulse = result["pulse"]
         safety = result["safety"]
         process = result["process"]
-        controller_instance_id = result["controller_instance_id"]
-        if (
-            not isinstance(controller_instance_id, str)
-            or not controller_instance_id
-            or len(controller_instance_id) > 128
-            or any(
-                not (
-                    character.isalnum()
-                    or character in "._:-"
-                )
-                for character in controller_instance_id
+        try:
+            controller_instance_id = validate_controller_instance_id(
+                result["controller_instance_id"]
             )
-        ):
+        except PhysicalNavigationContractError:
             raise PhysicalNavigationRuntimeError(
                 "invalid_worker_instance_id",
                 "Worker controller instance identity is invalid",
-            )
+            ) from None
         if (
             not isinstance(process, dict)
             or set(process) != {"absolute_max_ms", "max_requests"}
@@ -1096,7 +1085,9 @@ class PhysicalNavigationRuntime(
         *,
         expected_action_specs=None,
         expected_drive_roles=None,
+        previous_controller_instance_id=None,
     ):
+        self._controller_instance_id = None
         self._raise_if_cancelled("immediately_before_worker_start")
         self.transport.start()
         self._transport_started = True
@@ -1113,6 +1104,14 @@ class PhysicalNavigationRuntime(
             absolute_max_ms,
             controller_instance_id,
         ) = self._description(description)
+        if (
+            previous_controller_instance_id is not None
+            and controller_instance_id == previous_controller_instance_id
+        ):
+            raise PhysicalNavigationRuntimeError(
+                "worker_instance_reused_between_sessions",
+                "Renewed worker reused the prior controller instance ID",
+            )
         self._remember_observation(observation)
         if (
             expected_action_specs is not None
@@ -1158,6 +1157,7 @@ class PhysicalNavigationRuntime(
 
     def _shutdown_current_transport(self) -> bool:
         if not self._transport_started:
+            self._controller_instance_id = None
             return True
         clean = False
         try:
@@ -1191,6 +1191,7 @@ class PhysicalNavigationRuntime(
                 error_type=type(error).__name__,
             )
         self._transport_started = False
+        self._controller_instance_id = None
         return clean
 
     def _session_renewal_headroom_ms(
@@ -1305,6 +1306,7 @@ class PhysicalNavigationRuntime(
                 "worker_session_renewal_unavailable",
                 "Logical episode outlived one worker and no renewal factory exists",
             )
+        previous_controller_instance_id = self._controller_instance_id
         prior_clean = self._shutdown_current_transport()
         self._all_sessions_clean = self._all_sessions_clean and prior_clean
         if not prior_clean:
@@ -1328,6 +1330,7 @@ class PhysicalNavigationRuntime(
             self._start_worker_session(
                 expected_action_specs=action_specs,
                 expected_drive_roles=drive_roles,
+                previous_controller_instance_id=previous_controller_instance_id,
             )
         )
         self._emit("worker_session_renewed")

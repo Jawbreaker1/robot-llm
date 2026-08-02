@@ -1537,13 +1537,14 @@ class EV3NavigationTransportTests(unittest.TestCase):
                 "/home/robot/robot-llm/ev3/navigation_worker.py"
             ),
         )
-        response = FakeRuntimeTransport().request("describe", {}, 1.0)
+        fake = FakeRuntimeTransport()
+        response = fake.request("describe", {}, 1.0)
 
         self.assertIsNone(transport.controller_instance_id)
         transport._validate_success_result("describe", {}, response)
         self.assertEqual(
             transport.controller_instance_id,
-            "ev3-worker-fake-session",
+            fake.controller_instance_id,
         )
 
         changed = copy.deepcopy(response)
@@ -1556,6 +1557,9 @@ class EV3NavigationTransportTests(unittest.TestCase):
         ):
             transport._validate_success_result("describe", {}, changed)
 
+        transport.abort()
+        self.assertIsNone(transport.controller_instance_id)
+
     def test_describe_rejects_invalid_worker_instance(self):
         transport = EV3NavigationSSHTransport(
             target="robot@ev3.local",
@@ -1565,13 +1569,17 @@ class EV3NavigationTransportTests(unittest.TestCase):
             ),
         )
         response = FakeRuntimeTransport().request("describe", {}, 1.0)
-        response["result"]["controller_instance_id"] = "not valid"
-
-        with self.assertRaisesRegex(
-            EV3NavigationTransportError,
-            "instance identity is invalid",
-        ):
-            transport._validate_success_result("describe", {}, response)
+        for value in ("not valid", "ev3-worker-å"):
+            with self.subTest(value=value):
+                changed = copy.deepcopy(response)
+                changed["result"]["controller_instance_id"] = value
+                with self.assertRaisesRegex(
+                    EV3NavigationTransportError,
+                    "instance identity is invalid",
+                ):
+                    transport._validate_success_result(
+                        "describe", {}, changed
+                    )
 
     def test_scan_sample_uses_declared_filter_tail_not_whole_batch(self):
         transport = EV3NavigationSSHTransport(
@@ -2100,6 +2108,8 @@ class EV3NavigationTransportTests(unittest.TestCase):
 
 
 class FakeRuntimeTransport:
+    _instance_sequence = 0
+
     def __init__(
         self,
         *,
@@ -2107,7 +2117,15 @@ class FakeRuntimeTransport:
         pulse_count_remaining=40,
         pulse_duration_ms_remaining=32_000,
         blocked=False,
+        controller_instance_id=None,
     ):
+        type(self)._instance_sequence += 1
+        self.controller_instance_id = (
+            controller_instance_id
+            or "ev3-worker-fake-{}".format(
+                type(self)._instance_sequence
+            )
+        )
         self.shutdown_complete = False
         self.version = 1
         self.left = 0
@@ -2153,7 +2171,7 @@ class FakeRuntimeTransport:
                     "demo_only": True,
                     "policy_owner": "host",
                     "controller_id": "ev3-main",
-                    "controller_instance_id": "ev3-worker-fake-session",
+                    "controller_instance_id": self.controller_instance_id,
                     "request_schema": "ev3-agent-worker-request/v1",
                     "response_schema": "ev3-agent-worker-response/v2",
                     "operations": [
@@ -3435,7 +3453,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
 
     def test_runtime_requires_a_valid_worker_instance_identity(self):
         response = FakeRuntimeTransport().request("describe", {}, 1.0)
-        for value in (None, "", "not valid", "x" * 129):
+        for value in (None, "", "not valid", "ev3-worker-å", "x" * 129):
             with self.subTest(value=value):
                 changed = copy.deepcopy(response)
                 changed["result"]["controller_instance_id"] = value
@@ -3472,10 +3490,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             result = runtime.run()
 
         self.assertTrue(result.completed)
-        self.assertEqual(
-            runtime.controller_instance_id,
-            "ev3-worker-fake-session",
-        )
+        self.assertIsNone(runtime._controller_instance_id)
         self.assertEqual(
             result.actions,
             (ADVANCE, ADVANCE, FINISH),
@@ -5602,6 +5617,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             replacements = [second]
             scan_bindings = []
             offers = []
+            events = []
 
             def transport_factory():
                 return replacements.pop(0)
@@ -5626,6 +5642,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 active_scan_executor_factory=scan_executor_factory,
                 monotonic=lambda: 0.0,
                 unix_ms=lambda: 2_000,
+                event_sink=events.append,
                 observation_sink=lambda **value: offers.append({
                     "state_version": value["observation"]["state_version"],
                     "map_version": value["memory"].hazard_map.revision,
@@ -5637,6 +5654,17 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         self.assertTrue(result.shutdown_clean)
         self.assertEqual(replacements, [])
         self.assertEqual(scan_bindings, [second])
+        session_ids = [
+            event["controller_instance_id"]
+            for event in events
+            if event["event"] == "worker_session_started"
+        ]
+        self.assertEqual(
+            session_ids,
+            [first.controller_instance_id, second.controller_instance_id],
+        )
+        self.assertNotEqual(session_ids[0], session_ids[1])
+        self.assertIsNone(runtime._controller_instance_id)
         self.assertEqual(
             [operation for operation, _arguments in first.calls],
             ["start", "describe", "shutdown", "close"],
@@ -5655,6 +5683,52 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             {"state_version": 2, "map_version": 3},
             {"state_version": 3, "map_version": 4},
         ])
+
+    def test_worker_renewal_rejects_a_reused_instance_identity(self):
+        shared_instance = "ev3-worker-reused-instance"
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "reused-instance-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+            )
+            first = FakeRuntimeTransport(
+                controller_instance_id=shared_instance
+            )
+            second = FakeRuntimeTransport(
+                controller_instance_id=shared_instance
+            )
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-reused-worker-instance",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Reject a stale worker epoch",
+                    locale="en",
+                    max_episode_seconds=60,
+                ),
+                transport=first,
+                planner=FakeRuntimePlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+            )
+
+            runtime._start_worker_session()
+            previous = runtime._controller_instance_id
+            self.assertEqual(previous, shared_instance)
+            self.assertTrue(runtime._shutdown_current_transport())
+            self.assertIsNone(runtime._controller_instance_id)
+            runtime.transport = second
+            with self.assertRaises(PhysicalNavigationRuntimeError) as caught:
+                runtime._start_worker_session(
+                    previous_controller_instance_id=previous
+                )
+            runtime._shutdown_current_transport()
+
+        self.assertEqual(
+            caught.exception.code,
+            "worker_instance_reused_between_sessions",
+        )
+        self.assertIsNone(runtime._controller_instance_id)
 
     def test_latched_motion_fault_requires_worker_session_renewal(self):
         with tempfile.TemporaryDirectory() as directory:
