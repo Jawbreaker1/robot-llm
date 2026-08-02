@@ -333,6 +333,7 @@ class EV3NavigationSSHTransport:
                 expected_status == "completed"
                 and value["reason"] not in (
                     "duration_elapsed",
+                    "encoder_recovered",
                     "motor_fault_encoder_verified",
                 )
             )

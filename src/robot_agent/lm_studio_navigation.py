@@ -438,10 +438,30 @@ positive is the robot's physical left and negative is its physical right.
 Before choosing the first detour side around a target, request SCAN_FRONT_ARC
 for that published target while keeping maneuver_commitment at the exact NONE
 sentinel. The deterministic scan samples both sides but does not choose a
-route. START a route only after the context reports completed bilateral
-or complementary boundary evidence at the current verified pose through
-route_commitment_ready for that same target. Historical rays from other
-poses still inform collision geometry but do not authorize a new route.
+route. START a route only when route_commitment_ready is true for that target
+at the current verified pose. route_commitment_evidence_strength distinguishes
+bilateral boundaries from explicitly best-effort unilateral or blocked-arc
+evidence; use weaker evidence cautiously, but keep making physical progress
+instead of abandoning the maneuver state. Historical rays from other poses
+still inform collision geometry but do not authorize a new route.
+
+Authorize a ready target and detour_side with START on singleton OBSERVE. Do
+not START with a turn or other motion. The host then builds the geometric route
+for that model-chosen side and follows each uniquely determined waypoint pulse
+without another model call. Changing target or side with REVISE, or ABANDONing
+the route, likewise uses singleton OBSERVE so the strategic change takes effect
+before any later physical motion.
+
+When navigation.local_detour_route is ACTIVE, it is the persistent geometric
+route for your chosen target and detour_side. Follow its active waypoint in
+order; navigation.local_detour_guidance explains the current heading error,
+distance, and why motion choices were filtered. The route first establishes
+lateral clearance, passes the complete remembered object envelope, merges
+back onto the frozen goal axis, and resumes the original goal heading. It is
+rebuilt from verified pose when map geometry changes. Do not restart the
+maneuver merely because a waypoint advanced. The route and its active waypoint
+are the authoritative local execution state; maneuver focus remains strategic
+context rather than a second waypoint implementation.
 
 perception_target_hypothesis_id names what SCAN_FRONT_ARC will scan. It must
 name one published target for SCAN_FRONT_ARC and must be null for every other

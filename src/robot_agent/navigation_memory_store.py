@@ -537,9 +537,13 @@ class NavigationMemoryStore:
                 hypothesis["hypothesis_id"],
                 pose=self.pose,
             )
-            hypothesis["route_commitment_ready"] = route_evidence[
-                "ready"
-            ]
+            hypothesis["route_commitment_ready"] = (
+                route_evidence["ready"]
+                or route_evidence["best_effort_ready"]
+            )
+            hypothesis["route_commitment_evidence_strength"] = (
+                route_evidence["strength"]
+            )
             hypothesis["route_evidence"] = route_evidence
         value.update(
             {

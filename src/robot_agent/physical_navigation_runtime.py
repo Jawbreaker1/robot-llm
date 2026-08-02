@@ -29,12 +29,16 @@ from .navigation_memory_store import (
     NavigationMemoryError,
     NavigationMemoryStore,
 )
-from .navigation_plan_tail import NavigationPlanTail
-from .physical_action_feasibility import navigation_action_feasibility
+from .navigation_plan_tail import (
+    PLAN_TAIL_MAX_AGE_SECONDS,
+    NavigationPlanTail,
+)
+from . import physical_action_feasibility
+from .local_detour_controller import filter_local_detour_actions
+from .local_detour_route import ROUTE_ACTIVE
 from .physical_navigation_experience import (
     NavigationExperienceLedger,
     PLANNER_ACTION_SOURCE,
-    PLAN_TAIL_ACTION_SOURCE,
     navigation_evidence_basis,
 )
 from .physical_observation_progress import (
@@ -49,15 +53,21 @@ from .physical_navigation_scan_runtime import (
     DEFAULT_SCAN_BUDGET,
     PhysicalNavigationScanRuntimeMixin,
 )
+from .physical_navigation_route_runtime import (
+    HANDOFF_EPISODE_DEADLINE_ELAPSED,
+    PhysicalNavigationRouteRuntimeMixin,
+)
+from .physical_navigation_plan_tail_runtime import (
+    PhysicalNavigationPlanTailRuntimeMixin,
+)
 from .physical_navigation_contract import (
-    ACTIONS,
     ADVANCE,
     EXPECTED_WORKER_SAFETY,
     EXPECTED_WORKER_OPERATIONS,
     EXPECTED_ACTION_SPECS,
     FINISH,
-    MOTION_ACTIONS,
     OBSERVE,
+    REVERSE,
     SCAN_FRONT_ARC,
     NavigationDecision,
     PhysicalNavigationContractError,
@@ -97,11 +107,13 @@ class PhysicalNavigationRuntimeConfig:
     goal: str
     locale: str
     minimum_forward_progress_mm: int = 420
+    goal_heading_tolerance_mdeg: int = 5_000
     max_turns: Optional[int] = None
     max_episode_seconds: float = DEFAULT_MAX_EPISODE_SECONDS
     startup_timeout_seconds: float = 30.0
     request_timeout_seconds: float = 8.0
     scan_timeout_seconds: float = float(DEFAULT_SCAN_TIMEOUT_SECONDS)
+    plan_tail_max_age_seconds: float = PLAN_TAIL_MAX_AGE_SECONDS
     max_validation_attempts: int = 2
 
     def __post_init__(self) -> None:
@@ -137,6 +149,9 @@ class PhysicalNavigationRuntimeConfig:
             or isinstance(self.minimum_forward_progress_mm, bool)
             or not isinstance(self.minimum_forward_progress_mm, int)
             or not 1 <= self.minimum_forward_progress_mm <= 2_000
+            or isinstance(self.goal_heading_tolerance_mdeg, bool)
+            or not isinstance(self.goal_heading_tolerance_mdeg, int)
+            or not 1_000 <= self.goal_heading_tolerance_mdeg <= 45_000
             or isinstance(self.max_turns, bool)
             or not isinstance(self.max_turns, int)
             or not 1 <= self.max_turns <= HARD_MAX_TURNS
@@ -152,6 +167,12 @@ class PhysicalNavigationRuntimeConfig:
             or not DEFAULT_SCAN_TIMEOUT_SECONDS
             <= float(self.scan_timeout_seconds)
             <= MAX_SCAN_TIMEOUT_SECONDS
+            or isinstance(self.plan_tail_max_age_seconds, bool)
+            or not isinstance(
+                self.plan_tail_max_age_seconds,
+                (int, float),
+            )
+            or not 1.0 <= float(self.plan_tail_max_age_seconds) <= 120.0
             or isinstance(self.max_validation_attempts, bool)
             or not isinstance(self.max_validation_attempts, int)
             or not 1 <= self.max_validation_attempts <= 3
@@ -189,7 +210,11 @@ class PhysicalNavigationResult:
         }
 
 
-class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
+class PhysicalNavigationRuntime(
+    PhysicalNavigationRouteRuntimeMixin,
+    PhysicalNavigationPlanTailRuntimeMixin,
+    PhysicalNavigationScanRuntimeMixin,
+):
     """Serializes physical execution while model reasoning stays replaceable."""
 
     def __init__(
@@ -658,6 +683,7 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
         geometry = self.memory.hazard_map.goal_geometry(
             pose=self.memory.pose,
             goal_heading_mdeg=mission.reference_heading_mdeg,
+            heading_tolerance_mdeg=mission.heading_tolerance_mdeg,
         )
         facts = geometry["facts"]
         target_values = facts[FACT_TARGET_BEHIND]
@@ -684,7 +710,7 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
         navigation = dict(self.memory.context())
         navigation["goal_geometry"] = geometry
         navigation["fact_values"] = deepcopy(fact_values)
-        feasibility = navigation_action_feasibility(
+        feasibility = physical_action_feasibility.navigation_action_feasibility(
             hazard_map=self.memory.hazard_map,
             pose=self.memory.pose,
             action_specs=action_specs,
@@ -761,16 +787,10 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
                 "nonterminal_complete_reason",
                 "COMPLETE_GOAL is valid only with FINISH",
             )
-        delta = mission[
-            "candidate_action_longitudinal_deltas_mm"
-        ].get(action)
-        heading_recovery = (
-            delta == 0
-            and mission[
-                "projected_goal_heading_aligned_after_action"
-            ].get(action)
-            is True
-        )
+        delta = mission["candidate_action_longitudinal_deltas_mm"].get(action)
+        heading_recovery = delta == 0 and mission[
+            "projected_goal_heading_aligned_after_action"
+        ].get(action) is True
         if decision.reason_code == "PROGRESS_GOAL" and (
             delta is None or delta < 0 or (delta == 0 and not heading_recovery)
         ):
@@ -787,6 +807,14 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
                 "regression_without_hazard",
                 "Negative progress requires a published hazard",
             )
+        detour_error = physical_action_feasibility.detour_decision_error(
+            action,
+            decision.perception_target_hypothesis_id,
+            decision.maneuver_commitment,
+            navigation,
+        )
+        if detour_error is not None:
+            raise PhysicalNavigationRuntimeError(*detour_error)
 
     def _remaining_seconds(self, deadline: float) -> float:
         return max(0.0, deadline - self.monotonic())
@@ -1299,7 +1327,8 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
                 DEFAULT_SCAN_BUDGET["turn_duration_ms"],
             )
         return (
-            effective_process_ms
+            budgets["motion_fault_latched"] is True
+            or effective_process_ms
             < self._session_renewal_headroom_ms(
                 action_specs,
                 include_scan=include_scan,
@@ -1376,6 +1405,7 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
         action_specs = None
         mission = None
         maneuver = ManeuverCommitment()
+        local_route = None
         last_tool_result = None
         shutdown_clean = False
         cleanup_error = None
@@ -1389,6 +1419,9 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
                     self.config.minimum_forward_progress_mm
                 ),
                 pose=self.memory.pose,
+                heading_tolerance_mdeg=(
+                    self.config.goal_heading_tolerance_mdeg
+                ),
             )
             self._emit(
                 "episode_started",
@@ -1419,8 +1452,63 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
                     action_specs,
                 )
                 final_mission = mission_value
-                action_feasibility = navigation["action_feasibility"]
-                scan_rotation_sweep = action_feasibility["active_scan"]
+                route_refresh = self._refresh_authorized_local_detour_route(
+                    route=local_route,
+                    active_maneuver=maneuver.state(turn)["active"],
+                    mission=mission,
+                    navigation=navigation,
+                    action_specs=action_specs,
+                )
+                local_route = route_refresh.route
+                if (
+                    local_route is not None
+                    and local_route.status == ROUTE_ACTIVE
+                    and route_refresh.guidance.gate_active
+                ):
+                    route_result = (
+                        self._execute_authorized_local_detour_route(
+                            turn=turn,
+                            deadline=deadline,
+                            observation=observation,
+                            action_specs=action_specs,
+                            mission=mission,
+                            route=local_route,
+                            active_maneuver=(
+                                maneuver.state(turn)["active"]
+                            ),
+                            last_tool_result=last_tool_result,
+                        )
+                    )
+                    observation = route_result.observation
+                    local_route = route_result.route
+                    last_tool_result = route_result.last_tool_result
+                    actions.extend(route_result.actions)
+                    if (
+                        route_result.handoff_reason
+                        == HANDOFF_EPISODE_DEADLINE_ELAPSED
+                    ):
+                        terminal_reason = "episode_deadline_elapsed"
+                        break
+                    # Route execution may have consumed several physical
+                    # pulses before fresh geometry, a veto, or another
+                    # handoff condition requires planner attention.  Never
+                    # resume an active/rebuilt route merely because at least
+                    # one pulse completed: rebuild the planner snapshot from
+                    # the post-motion observation and let the model validate
+                    # the handoff in this turn.
+                    (
+                        mission_value,
+                        navigation,
+                        route_refresh,
+                    ) = self._post_route_planner_snapshot(
+                        route=local_route,
+                        active_maneuver=maneuver.state(turn)["active"],
+                        mission=mission,
+                        observation=observation,
+                        action_specs=action_specs,
+                    )
+                    local_route = route_refresh.route
+                    final_mission = mission_value
                 repeated_uninformative_observe = (
                     observe_without_information_gain(last_tool_result)
                 )
@@ -1435,45 +1523,35 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
                     if hypothesis["hypothesis_id"]
                     not in scan_blocked_targets
                 )
-                navigation["scan_eligible_target_hypothesis_ids"] = (
-                    scan_eligible_targets
+                available = (
+                    physical_action_feasibility.prepare_navigation_availability(
+                        navigation,
+                        active_maneuver=maneuver.state(turn)["active"],
+                        scan_eligible_target_ids=scan_eligible_targets,
+                        scan_blocked_target_ids=scan_blocked_targets,
+                        scan_budget_available=self._scan_budget_allows(
+                            observation,
+                            action_specs,
+                            deadline,
+                        ),
+                        reverse_budget_available=motion_budget_allows(
+                            REVERSE,
+                            observation,
+                            action_specs,
+                        ),
+                        action_specs=action_specs,
+                        observation=observation,
+                        repeated_uninformative_observe=(
+                            repeated_uninformative_observe
+                        ),
+                    )
                 )
-                navigation["scan_progress_blocked_target_hypothesis_ids"] = (
-                    sorted(scan_blocked_targets)
+                available = filter_local_detour_actions(
+                    available,
+                    route_refresh.guidance,
                 )
-                available = [
-                    action
-                    for action in sorted(ACTIONS)
-                    if (
-                        action != OBSERVE
-                        or not repeated_uninformative_observe
-                    )
-                    and (
-                        action not in MOTION_ACTIONS
-                        or (
-                            action_feasibility["motion_actions"][action][
-                                "allowed"
-                            ]
-                            and motion_budget_allows(
-                                action,
-                                observation,
-                                action_specs,
-                            )
-                        )
-                    )
-                    and (
-                        action != SCAN_FRONT_ARC
-                        or (
-                            bool(scan_eligible_targets)
-                            and scan_rotation_sweep["allowed"]
-                            and self._scan_budget_allows(
-                                observation,
-                                action_specs,
-                                deadline,
-                            )
-                        )
-                    )
-                ]
+                if mission_value["completed"] is not True:
+                    available = tuple(a for a in available if a != FINISH)
                 decision = self._validated_decision(
                     turn=turn,
                     deadline=deadline,
@@ -1606,15 +1684,18 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
                         observation_after=observation,
                     )
                     continue
-                tail = NavigationPlanTail.from_decision(
-                    decision,
-                    now_monotonic=self.monotonic(),
-                    episode_deadline=deadline,
-                    map_context=navigation,
-                    observation=observation,
-                    maneuver_state=maneuver.state(turn),
-                    fact_values=navigation["fact_values"],
-                )
+                tail = None
+                if not route_refresh.guidance.gate_active:
+                    tail = NavigationPlanTail.from_decision(
+                        decision,
+                        now_monotonic=self.monotonic(),
+                        episode_deadline=deadline,
+                        map_context=navigation,
+                        observation=observation,
+                        maneuver_state=maneuver.state(turn),
+                        fact_values=navigation["fact_values"],
+                        max_age_seconds=self.config.plan_tail_max_age_seconds,
+                    )
                 self._commit_decision(decision, turn=turn)
                 observation, last_tool_result = self._execute_motion(
                     decision.action,
@@ -1635,91 +1716,22 @@ class PhysicalNavigationRuntime(PhysicalNavigationScanRuntimeMixin):
                         counters["tails_cancelled"] += 1
                     continue
 
-                while tail is not None and not tail.complete:
-                    self._raise_if_cancelled(
-                        "before_plan_tail_action_validation"
-                    )
-                    mission_value, navigation = self._goal_state(
-                        mission,
-                        observation,
-                        action_specs,
-                    )
-                    next_action = tail.next_action(
-                        now_monotonic=self.monotonic(),
-                        map_context=navigation,
-                        observation=observation,
-                        maneuver_state=maneuver.state(turn),
-                        fact_values=navigation["fact_values"],
-                        localization_valid=self.memory.localization_valid,
-                    )
-                    if next_action is None:
-                        counters["tails_cancelled"] += 1
-                        self._emit(
-                            "plan_tail_cancelled",
-                            reason=tail.cancelled_reason,
-                            source_plan=list(tail.source_plan),
-                        )
-                        break
-                    basis_before = self._experience_basis(observation)
-                    veto = self._execution_veto(
-                        action=next_action,
-                        observation=observation,
-                        action_specs=action_specs,
-                        deadline=deadline,
-                    )
-                    if veto is not None:
-                        tail.cancel(veto["code"])
-                        counters["tails_cancelled"] += 1
-                        last_tool_result = {
-                            "operation": "pulse",
-                            "status": "tail_vetoed",
-                            "validation": veto,
-                        }
-                        self._emit(
-                            "plan_tail_cancelled",
-                            reason=tail.cancelled_reason,
-                            source_plan=list(tail.source_plan),
-                        )
-                        self._record_experience(
-                            turn=turn,
-                            action=next_action,
-                            source=PLAN_TAIL_ACTION_SOURCE,
-                            result=last_tool_result,
-                            basis_before=basis_before,
-                            observation_after=observation,
-                        )
-                        break
-                    self._raise_if_cancelled(
-                        "immediately_before_plan_tail_motion"
-                    )
-                    observation, last_tool_result = self._execute_motion(
-                        next_action,
-                        action_specs=action_specs,
-                    )
-                    actions.append(next_action)
-                    self._record_experience(
+                if tail is not None:
+                    tail_result = self._execute_navigation_plan_tail(
+                        tail=tail,
                         turn=turn,
-                        action=next_action,
-                        source=PLAN_TAIL_ACTION_SOURCE,
-                        result=last_tool_result,
-                        basis_before=basis_before,
-                        observation_after=observation,
-                    )
-                    if last_tool_result["status"] != "completed":
-                        tail.cancel("tail_motion_not_completed")
-                        counters["tails_cancelled"] += 1
-                        break
-                    tail.mark_executed(
-                        next_action,
-                        map_context=self.memory.context(),
+                        deadline=deadline,
                         observation=observation,
+                        last_tool_result=last_tool_result,
+                        action_specs=action_specs,
+                        mission=mission,
+                        maneuver=maneuver,
                     )
-                    if tail.complete:
-                        counters["tails_completed"] += 1
-                        self._emit(
-                            "plan_tail_completed",
-                            source_plan=list(tail.source_plan),
-                        )
+                    observation = tail_result.observation
+                    last_tool_result = tail_result.last_tool_result
+                    actions.extend(tail_result.actions)
+                    counters["tails_completed"] += tail_result.completed
+                    counters["tails_cancelled"] += tail_result.cancelled
 
             if mission is not None and observation is not None:
                 final_mission, _navigation = self._goal_state(

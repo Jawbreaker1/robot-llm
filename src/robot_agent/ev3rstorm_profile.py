@@ -27,6 +27,7 @@ from .host_piper_speech import (
 from .navigation_memory_store import NavigationMemoryStore
 from .physical_footprint import RobotFootprint
 from .physical_navigation_adapter import PhysicalNavigationRuntimeAdapter
+from .physical_odometry import OdometryCalibration
 from .physical_spatial_map import PhysicalSpatialMapBridge
 from .provisional_hazard_map import HazardMapCalibration
 from .robot_speech_runtime import RobotSpeechRuntime
@@ -38,6 +39,12 @@ EV3RSTORM_REMOTE_WORKER_PATH = (
 )
 EV3RSTORM_STARTUP_TIMEOUT_SECONDS = 30.0
 EV3RSTORM_REQUEST_TIMEOUT_SECONDS = 30.0
+EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS = 45.0
+# The EV3's coarse 90-degree action and asymmetric drive motors accumulated
+# about 16 degrees of heading error in the first live detour.  This profile
+# accepts that measured dead-reckoning precision while faster controllers can
+# keep the generic five-degree default.
+EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG = 20_000
 # Live Wi-Fi evidence shows that EV3 worker operations vary from roughly
 # 1.5 seconds for a stationary sample to more than 8 seconds for a sliced
 # 90-degree turn. Spread measured controller/SSH headroom across the fixed
@@ -187,6 +194,39 @@ def _physical_footprint(value: object) -> Optional[RobotFootprint]:
         ) from error
 
 
+def _odometry_calibration(value: object) -> OdometryCalibration:
+    expected = {
+        "status",
+        "linear_mm_per_encoder_degree",
+        "turn_mdeg_per_opposed_encoder_degree",
+        "evidence",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or value["status"] != "provisional-live-encoder-derived"
+        or not isinstance(value["evidence"], str)
+        or not value["evidence"]
+        or len(value["evidence"]) > 512
+    ):
+        raise ControllerRuntimeProfileError(
+            "EV3RSTORM odometry calibration is incomplete"
+        )
+    try:
+        return OdometryCalibration(
+            linear_mm_per_encoder_degree=(
+                value["linear_mm_per_encoder_degree"]
+            ),
+            turn_mdeg_per_opposed_encoder_degree=(
+                value["turn_mdeg_per_opposed_encoder_degree"]
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise ControllerRuntimeProfileError(
+            "EV3RSTORM odometry calibration is invalid"
+        ) from error
+
+
 def _load_profile_config(path: Path):
     resolved = Path(path).expanduser().resolve()
     try:
@@ -242,7 +282,8 @@ def _load_profile_config(path: Path):
     footprint = _physical_footprint(
         calibration.get("physical_footprint")
     )
-    return resolved, robot_id, controller_id, footprint
+    odometry = _odometry_calibration(calibration.get("odometry"))
+    return resolved, robot_id, controller_id, footprint, odometry
 
 
 @dataclass(frozen=True)
@@ -304,12 +345,14 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             robot_id,
             controller_id,
             footprint,
+            odometry,
         ) = _load_profile_config(config_path)
         self.config_path = resolved
         self.speech_profile = speech_profile
         self.hazard_calibration = HazardMapCalibration(
             robot_footprint=footprint,
         )
+        self.odometry_calibration = odometry
         self._descriptor = ControllerRuntimeDescriptor(
             profile_id=EV3RSTORM_PROFILE_ID,
             robot_id=robot_id,
@@ -373,6 +416,7 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
                     robot_id=self.descriptor.robot_id,
                     controller_instance_id=self.descriptor.controller_id,
                     reset=reset_pending,
+                    odometry_calibration=self.odometry_calibration,
                     hazard_calibration=self.hazard_calibration,
                 )
                 if reset_pending:
@@ -419,8 +463,14 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             scan_executor_factory=scan_executor_factory,
             speech_runtime_factory=speech_runtime_factory,
             spatial_map_bridge=spatial_map_bridge,
+            goal_heading_tolerance_mdeg=(
+                EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG
+            ),
             startup_timeout_seconds=EV3RSTORM_STARTUP_TIMEOUT_SECONDS,
             request_timeout_seconds=EV3RSTORM_REQUEST_TIMEOUT_SECONDS,
+            plan_tail_max_age_seconds=(
+                EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS
+            ),
             scan_timeout_seconds=EV3RSTORM_SCAN_TIMEOUT_SECONDS,
             active_scan_calibration=(
                 EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION
@@ -433,6 +483,8 @@ __all__ = (
     "DEFAULT_EV3RSTORM_MEMORY_PATH",
     "EV3RSTORM_PROFILE_ID",
     "EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION",
+    "EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG",
+    "EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS",
     "EV3RSTORM_REMOTE_WORKER_PATH",
     "EV3RSTORM_REQUEST_TIMEOUT_SECONDS",
     "EV3RSTORM_SCAN_TIMEOUT_SECONDS",

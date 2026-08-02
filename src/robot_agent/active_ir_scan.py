@@ -527,7 +527,7 @@ class ActiveIrScanExecutor:
                 )
             except ActiveIrScanContractError as error:
                 status = "CANCELLED"
-                reason = error.code
+                reason = getattr(error, "result_reason", error.code)
         if not safety_cancelled and current_offset == 0:
             try:
                 require_active()

@@ -435,6 +435,10 @@
                 <span id="map-mission-plan-label" data-i18n="mission.plan.label">Aktuell plan</span>
                 <strong id="map-mission-plan-summary">—</strong>
               </div>
+              <div class="map-mission-summary-item is-route">
+                <span id="map-mission-route-label" data-i18n="mission.route.label">Aktiv rutt</span>
+                <strong id="map-mission-route-summary">—</strong>
+              </div>
               <div class="map-mission-summary-item">
                 <span data-i18n="mission.speech.label">Tal</span>
                 <strong id="map-mission-speech">—</strong>
@@ -448,8 +452,8 @@
             <details class="map-mission-details" id="map-mission-details">
               <summary>
                 <span>
-                  <strong data-i18n="mission.details.title">Plan och händelsehistorik</strong>
-                  <small data-i18n="mission.details.description">Följ beslut, handlingar, perception och tal i samma ordning som de inträffar.</small>
+                  <strong data-i18n="mission.details.title">Plan, rutt och händelsehistorik</strong>
+                  <small data-i18n="mission.details.description">Följ beslut, ruttsteg, handlingar, perception och tal i samma ordning som de inträffar.</small>
                 </span>
                 <span class="map-mission-details-meta">
                   <span class="state-chip state-idle" id="map-mission-history-status" data-i18n="mission.history.waiting">väntar</span>
@@ -462,6 +466,12 @@
                   <h4 id="map-mission-plan-heading" data-i18n="mission.plan.title">Planen just nu</h4>
                   <ol class="map-mission-plan" id="map-mission-plan">
                     <li class="map-mission-plan-empty" data-i18n="mission.plan.empty">Ingen plan har publicerats.</li>
+                  </ol>
+                </section>
+                <section class="map-mission-route-panel" aria-labelledby="map-mission-route-heading">
+                  <h4 id="map-mission-route-heading" data-i18n="mission.route.title">Aktiv omvägsrutt</h4>
+                  <ol class="map-mission-route" id="map-mission-route">
+                    <li class="map-mission-route-empty" data-i18n="mission.route.empty">Ingen aktiv omvägsrutt har publicerats.</li>
                   </ol>
                 </section>
                 <section class="map-mission-history-panel" aria-labelledby="map-mission-history-heading">

@@ -628,6 +628,23 @@ class ProvisionalHazardMap:
             None,
         )
 
+    def active_collision_support_points(
+        self,
+        hypothesis_id: str,
+    ) -> Tuple[Tuple[int, int], ...]:
+        """Expose the exact support geometry used by swept-path checks.
+
+        Route construction and collision validation must reason about the
+        same remembered object envelope.  Returning no points means the
+        hypothesis is missing or currently contested for collision use; it
+        does not silently substitute the centroid.
+        """
+
+        hazard = self.get(hypothesis_id)
+        if hazard is None:
+            return ()
+        return self._collision_envelopes(hazard)
+
     def _stable_id(
         self,
         pose: PhysicalPose,
@@ -965,6 +982,17 @@ class ProvisionalHazardMap:
             result,
             scan_pose=scan_pose,
         )
+        if (
+            attempt.observation_pattern == "ALL_CLEAR"
+            and attempt.arc_coverage == "BILATERAL_ARC"
+            and attempt.reason == "bilateral_boundaries_not_observed"
+        ):
+            attempt = replace(
+                attempt,
+                all_clear_arc_covers_target_hypothesis=(
+                    self._all_clear_arc_covers_hazard(hazard, attempt)
+                ),
+            )
         history_candidates = hazard.scan_evidence_history + (attempt,)
         history = retain_scan_attempt_diversity(
             history_candidates,
@@ -1039,6 +1067,100 @@ class ProvisionalHazardMap:
         )
         self.revision += 1
         return self.get(result.target_hypothesis_id)
+
+    def _all_clear_arc_covers_hazard(
+        self,
+        hazard: ProvisionalHazard,
+        attempt: ScanAttemptEvidence,
+    ) -> bool:
+        """Check an all-clear scan against remembered world geometry."""
+
+        if attempt.scan_pose is None or not attempt.rays:
+            return False
+        ray_bearings = [
+            ray.actual_relative_bearing_mdeg for ray in attempt.rays
+        ]
+        minimum_bearing = min(ray_bearings)
+        maximum_bearing = max(ray_bearings)
+        alignment_tolerance_mdeg = 1_000
+        pose = attempt.scan_pose
+
+        def covered(
+            support_x_mm,
+            support_y_mm,
+            radius_mm,
+            evidence_pose_x_mm,
+            evidence_pose_y_mm,
+        ):
+            relative_x = support_x_mm - pose.x_mm
+            relative_y = support_y_mm - pose.y_mm
+            distance = math.hypot(relative_x, relative_y)
+            if distance <= radius_mm:
+                return False
+            # IR-PROX gives no trustworthy metric range.  A clear ray can
+            # therefore contradict a remembered blocked support only while
+            # that support's envelope still reaches the same provisional
+            # near-field zone in which blocked observations are anchored.
+            # Merely backing away until the reading crosses the collision
+            # threshold must not erase the object from the map.
+            evidence_distance = math.hypot(
+                support_x_mm - evidence_pose_x_mm,
+                support_y_mm - evidence_pose_y_mm,
+            )
+            if distance > evidence_distance:
+                return False
+            center_bearing = normalize_heading_mdeg(
+                int(round(math.degrees(math.atan2(relative_y, relative_x))
+                          * 1_000))
+                - pose.heading_mdeg
+            )
+            half_width = int(math.ceil(
+                math.degrees(math.asin(min(1.0, radius_mm / distance)))
+                * 1_000 - 1e-9
+            ))
+            return not (
+                center_bearing - half_width
+                < minimum_bearing - alignment_tolerance_mdeg
+                or center_bearing + half_width
+                > maximum_bearing + alignment_tolerance_mdeg
+            )
+
+        if not covered(
+            hazard.centroid_x_mm,
+            hazard.centroid_y_mm,
+            hazard.radius_mm,
+            hazard.anchor_x_mm,
+            hazard.anchor_y_mm,
+        ):
+            return False
+        conflict_cutoff = hazard.collision_contested_at_ms or -1
+        for support in hazard.collision_supports:
+            if support.completed_at_ms <= conflict_cutoff:
+                continue
+            heading = math.radians(
+                (
+                    support.pose_heading_mdeg
+                    + support.actual_relative_bearing_mdeg
+                )
+                / 1_000.0
+            )
+            support_x_mm = support.pose_x_mm + int(round(
+                math.cos(heading)
+                * self.calibration.provisional_hazard_offset_mm
+            ))
+            support_y_mm = support.pose_y_mm + int(round(
+                math.sin(heading)
+                * self.calibration.provisional_hazard_offset_mm
+            ))
+            if not covered(
+                support_x_mm,
+                support_y_mm,
+                hazard.radius_mm,
+                support.pose_x_mm,
+                support.pose_y_mm,
+            ):
+                return False
+        return True
 
     def _collision_envelopes(
         self,
@@ -1289,8 +1411,16 @@ class ProvisionalHazardMap:
         *,
         pose: PhysicalPose,
         goal_heading_mdeg: int,
+        heading_tolerance_mdeg: int = 5_000,
     ) -> Mapping[str, object]:
         """Publish exact boolean maneuver facts from conservative envelopes."""
+
+        if (
+            isinstance(heading_tolerance_mdeg, bool)
+            or not isinstance(heading_tolerance_mdeg, int)
+            or not 1_000 <= heading_tolerance_mdeg <= 45_000
+        ):
+            raise ValueError("goal heading tolerance is invalid")
 
         angle = math.radians(goal_heading_mdeg / 1000.0)
         goal_x = math.cos(angle)
@@ -1397,11 +1527,14 @@ class ProvisionalHazardMap:
         return {
             "goal_heading_mdeg": goal_heading_mdeg,
             "heading_error_mdeg": heading_error,
+            "heading_tolerance_mdeg": heading_tolerance_mdeg,
             "hazards": rows,
             "conflicts": conflicts,
             "facts": {
                 "GOAL_CORRIDOR_CLEAR": not conflicts,
-                "GOAL_HEADING_ALIGNED": abs(heading_error) <= 5_000,
+                "GOAL_HEADING_ALIGNED": (
+                    abs(heading_error) <= heading_tolerance_mdeg
+                ),
                 "TARGET_ENVELOPE_BEHIND_GOAL_ORIGIN": target_behind,
             },
         }
@@ -1426,6 +1559,8 @@ class ProvisionalHazardMap:
         if hazard is None:
             return {
                 "ready": False,
+                "best_effort_ready": False,
+                "strength": "NONE",
                 "reason": "UNKNOWN_HYPOTHESIS",
                 "applicable_scan_ids": [],
                 "positive_boundary_scan_ids": [],
@@ -1448,21 +1583,41 @@ class ProvisionalHazardMap:
             for attempt in applicable
             if attempt.right_boundary_mdeg is not None
         ]
+        blocked_arc = any(
+            any(ray.blocked for ray in attempt.rays)
+            for attempt in applicable
+        )
         ready = (
             hazard.active_for_collision
             and bool(positive)
             and bool(negative)
         )
+        best_effort_ready = (
+            hazard.active_for_collision
+            and bool(positive or negative or blocked_arc)
+        )
         if not hazard.active_for_collision:
             reason = "HYPOTHESIS_CONTESTED_BY_FULL_ALL_CLEAR"
         elif not applicable:
             reason = "NO_SCAN_EVIDENCE_AT_CURRENT_VERIFIED_POSE"
+        elif blocked_arc and not (positive or negative):
+            reason = "BLOCKED_ARC_WITHOUT_BOUNDARY"
         elif not positive or not negative:
             reason = "COMPLEMENTARY_BOUNDARY_EVIDENCE_REQUIRED"
         else:
             reason = "COMPLEMENTARY_BOUNDARIES_AT_CURRENT_POSE"
         return {
             "ready": ready,
+            "best_effort_ready": best_effort_ready,
+            "strength": (
+                "BILATERAL_BOUNDARIES"
+                if ready
+                else "UNILATERAL_BOUNDARY"
+                if positive or negative
+                else "BLOCKED_ARC"
+                if best_effort_ready
+                else "NONE"
+            ),
             "reason": reason,
             "applicable_scan_ids": [
                 attempt.scan_id for attempt in applicable

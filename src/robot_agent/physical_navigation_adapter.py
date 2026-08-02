@@ -12,6 +12,7 @@ from .physical_navigation_runtime import (
     PhysicalNavigationRuntimeConfig,
     PhysicalNavigationRuntimeError,
 )
+from .navigation_plan_tail import PLAN_TAIL_MAX_AGE_SECONDS
 from .robot_control_service import RobotEpisodeOutcome
 
 
@@ -34,9 +35,11 @@ class PhysicalNavigationRuntimeAdapter:
         speech_runtime_factory: Optional[Callable[..., object]] = None,
         spatial_map_bridge=None,
         minimum_forward_progress_mm: int = 420,
+        goal_heading_tolerance_mdeg: int = 5_000,
         startup_timeout_seconds: float = 30.0,
         request_timeout_seconds: float = 8.0,
         scan_timeout_seconds: float = float(DEFAULT_SCAN_TIMEOUT_SECONDS),
+        plan_tail_max_age_seconds: float = PLAN_TAIL_MAX_AGE_SECONDS,
         active_scan_calibration: ActiveIrScanCalibration = (
             ActiveIrScanCalibration()
         ),
@@ -71,6 +74,12 @@ class PhysicalNavigationRuntimeAdapter:
         ):
             raise ValueError("spatial map bridge is invalid")
         if (
+            isinstance(goal_heading_tolerance_mdeg, bool)
+            or not isinstance(goal_heading_tolerance_mdeg, int)
+            or not 1_000 <= goal_heading_tolerance_mdeg <= 45_000
+        ):
+            raise ValueError("runtime heading tolerance is invalid")
+        if (
             isinstance(startup_timeout_seconds, bool)
             or not isinstance(startup_timeout_seconds, (int, float))
             or not 0.1 <= float(startup_timeout_seconds) <= 60.0
@@ -90,6 +99,12 @@ class PhysicalNavigationRuntimeAdapter:
             <= MAX_SCAN_TIMEOUT_SECONDS
         ):
             raise ValueError("runtime scan timeout is invalid")
+        if (
+            isinstance(plan_tail_max_age_seconds, bool)
+            or not isinstance(plan_tail_max_age_seconds, (int, float))
+            or not 1.0 <= float(plan_tail_max_age_seconds) <= 120.0
+        ):
+            raise ValueError("runtime plan tail age is invalid")
         if not isinstance(
             active_scan_calibration,
             ActiveIrScanCalibration,
@@ -106,9 +121,11 @@ class PhysicalNavigationRuntimeAdapter:
         self.spatial_map_provider = spatial_map_bridge
         self._spatial_map_offer = spatial_map_offer
         self.minimum_forward_progress_mm = minimum_forward_progress_mm
+        self.goal_heading_tolerance_mdeg = goal_heading_tolerance_mdeg
         self.startup_timeout_seconds = float(startup_timeout_seconds)
         self.request_timeout_seconds = float(request_timeout_seconds)
         self.scan_timeout_seconds = float(scan_timeout_seconds)
+        self.plan_tail_max_age_seconds = float(plan_tail_max_age_seconds)
         self.active_scan_calibration = active_scan_calibration
         self.event_mapper = event_mapper or self._dashboard_update
         self._lock = threading.Lock()
@@ -139,6 +156,29 @@ class PhysicalNavigationRuntimeAdapter:
             if event.get("utterance"):
                 value["message"] = event["utterance"]
             return value
+        if name == "decision_vetoed":
+            feedback = event.get("validation_feedback")
+            feedback = feedback if isinstance(feedback, Mapping) else {}
+            code = feedback.get("code", "decision_validation_failed")
+            message = feedback.get("message", "Model proposal was rejected")
+            return {
+                "current_action": None,
+                "plan": [],
+                "message": "Decision vetoed: {} — {}".format(
+                    code,
+                    message,
+                )[:1_000],
+            }
+        if name in ("planner_attempt_failed", "planner_termination"):
+            code = event.get(
+                "planner_error_code",
+                event.get("terminal_reason", "planner_unavailable"),
+            )
+            return {
+                "current_action": None,
+                "plan": [],
+                "message": "Planner unavailable: {}".format(code)[:1_000],
+            }
         if name == "speech_offer_failed":
             return {"speech_status": "failed"}
         if (
@@ -156,11 +196,14 @@ class PhysicalNavigationRuntimeAdapter:
                 "current_action": event["action"],
                 "obstacle": hazards[-1] if hazards else None,
             }
+        if name == "local_detour_route_updated":
+            return {"active_route": event.get("route")}
         if name == "scan_result":
             return {"scan": event["scan"]}
         if name == "episode_stopped":
             return {
                 "current_action": None,
+                "active_route": None,
                 "plan": [],
                 "message": event["terminal_reason"],
             }
@@ -277,12 +320,18 @@ class PhysicalNavigationRuntimeAdapter:
                     minimum_forward_progress_mm=(
                         self.minimum_forward_progress_mm
                     ),
+                    goal_heading_tolerance_mdeg=(
+                        self.goal_heading_tolerance_mdeg
+                    ),
                     max_episode_seconds=(
                         context.settings.max_episode_ms / 1000.0
                     ),
                     startup_timeout_seconds=self.startup_timeout_seconds,
                     request_timeout_seconds=self.request_timeout_seconds,
                     scan_timeout_seconds=self.scan_timeout_seconds,
+                    plan_tail_max_age_seconds=(
+                        self.plan_tail_max_age_seconds
+                    ),
                 ),
                 transport=transport,
                 transport_factory=self.transport_factory,
@@ -324,6 +373,7 @@ class PhysicalNavigationRuntimeAdapter:
                 completed=result.completed,
                 runtime_update={
                     "current_action": None,
+                    "active_route": None,
                     "plan": [],
                     "model_latency_ms": result.model_latency_ms,
                     "message": result.terminal_reason,

@@ -9,8 +9,11 @@
 speak, and adapt as it goes.**
 
 Robot LLM Lab connects a local AI agent to a physical LEGO EV3RSTORM. Give it
-a goal and the agent plans a few steps, performs one controlled action, reads
-the sensors and motor feedback, verifies what happened, and adapts its plan.
+a goal and the agent plans, acts, reads the sensors and motor feedback, and
+adapts when reality disagrees. For obstacle avoidance it can authorize a side
+around a remembered target; the host then builds a typed waypoint route and
+follows its short, revalidated motion pulses without waiting for the model
+after every pulse.
 
 The language model chooses semantic intent and expression. The host application
 validates and dispatches typed actions, while an EV3 worker remains the sole
@@ -54,13 +57,14 @@ or language-specific command menus. The model never receives raw motor access.
 | Status | Capabilities |
 |---|---|
 | Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
-| Working in the application | English/Swedish web dashboard, Robot and Workbench conversation targets, local push-to-talk STT, technical events, current plan and action, simulator mapping, and persistent physical navigation memory |
-| Experimental | Physical obstacle investigation, active IR scanning, qualitative hazard mapping, body-aware path checks, and recovery from imperfect motor movement |
+| Working in the application | English/Swedish web dashboard, Robot and Workbench conversation targets, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, and persistent physical navigation memory |
+| Experimental | Physical obstacle investigation, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
 | Planned | Repeatable autonomous obstacle navigation, continuous hands-free voice interaction, color-sensor fusion, cameras, vision, sound localization, Robot Inventor 51515, BOOST, and multi-robot coordination |
 
-The physical EV3 has moved, sensed an obstacle, spoken, scanned, turned, and
-replanned under agent control. A clean and repeatable autonomous route around
-an obstacle is still pending validation.
+The physical EV3 has moved, sensed an obstacle, spoken, backed away to make
+room, completed a restored IR scan, turned, and replanned under agent control.
+A clean and repeatable autonomous route around an obstacle is still pending
+validation.
 
 The current EV3 map is intentionally qualitative. IR reflection can support
 obstacle hypotheses, but it is not vision, object recognition, or precise
@@ -91,6 +95,10 @@ flowchart TD
 The host owns goals, state, navigation memory, model calls, and validation.
 The EV3 worker exposes a small set of fixed robot operations and processes one
 request at a time. It contains no planner, personality, or independent goal.
+Once the model has authorized a target and detour side, a deterministic route
+executive may serialize several freshly checked pulses before asking the model
+again. New geometry, ambiguous progress, a veto, or a failed movement returns
+control to the agent immediately.
 
 Speech, map publication, and UI delivery already run alongside the physical
 loop. Future vision, audio, validation, and planning workers will publish
@@ -112,8 +120,9 @@ The local web application has two conversation targets:
 
 The dashboard shows the current live state rather than offering old physical
 runs to resume. It exposes the current goal, plan, action, speech state,
-technical events, and a read-only map. Navigation memory is separate from the
-UI history and may persist between runs.
+active detour route and waypoint progress, technical events, and a read-only
+map. Navigation memory is separate from the UI history and may persist between
+runs.
 
 The same Map view can display a completed simulator run or qualitative physical
 odometry and obstacle hypotheses:

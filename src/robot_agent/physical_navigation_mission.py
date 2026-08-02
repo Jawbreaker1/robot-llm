@@ -35,6 +35,7 @@ class DirectionalMission:
         episode_id: str,
         minimum_forward_progress_mm: int,
         pose: PhysicalPose,
+        heading_tolerance_mdeg: int = 5_000,
     ):
         if (
             not isinstance(episode_id, str)
@@ -42,6 +43,9 @@ class DirectionalMission:
             or isinstance(minimum_forward_progress_mm, bool)
             or not isinstance(minimum_forward_progress_mm, int)
             or not 1 <= minimum_forward_progress_mm <= 2_000
+            or isinstance(heading_tolerance_mdeg, bool)
+            or not isinstance(heading_tolerance_mdeg, int)
+            or not 1_000 <= heading_tolerance_mdeg <= 45_000
         ):
             raise ValueError("directional mission configuration is invalid")
         return cls(
@@ -50,6 +54,7 @@ class DirectionalMission:
             origin_x_mm=pose.x_mm,
             origin_y_mm=pose.y_mm,
             reference_heading_mdeg=pose.heading_mdeg,
+            heading_tolerance_mdeg=heading_tolerance_mdeg,
         )
 
     def longitudinal_progress_mm(self, pose: PhysicalPose) -> int:

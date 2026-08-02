@@ -9,6 +9,12 @@ from .physical_navigation_contract import (
 
 
 ACTIVE_MOTOR_STATES = frozenset(("running", "ramping"))
+# EV3 tacho positions are separate sysfs reads.  A motor that has already
+# passed the verified brake/stop loop can publish one last encoder tick
+# between the receipt snapshot and the immediately following observation.
+# Keep that non-atomic settling window small and explicit; larger movement,
+# active state, or a net direction reversal remains a contract failure.
+MAX_FINAL_ENCODER_SETTLING_DEGREES = 5
 
 
 class EV3PulseContractError(ValueError):
@@ -750,16 +756,32 @@ def validate_pulse_result(
         observed_motors = {
             motor["role"]: motor for motor in observation["motors"]
         }
-        if any(
-            motor["role"] not in observed_motors
-            or observed_motors[motor["role"]]["position"]
-            != motor["position_after"]
-            or frozenset(
-                observed_motors[motor["role"]]["state"].split()
+        final_observation_correlated = True
+        for motor in evidence["motors"]:
+            observed = observed_motors.get(motor["role"])
+            if observed is None:
+                final_observation_correlated = False
+                break
+            settling_delta = (
+                observed["position"] - motor["position_after"]
             )
-            & ACTIVE_MOTOR_STATES
-            for motor in evidence["motors"]
-        ):
+            observed_net_delta = (
+                observed["position"] - motor["position_before"]
+            )
+            receipt_delta = motor["position_delta"]
+            if (
+                abs(settling_delta)
+                > MAX_FINAL_ENCODER_SETTLING_DEGREES
+                or frozenset(observed["state"].split())
+                & ACTIVE_MOTOR_STATES
+                or (
+                    receipt_delta != 0
+                    and observed_net_delta * receipt_delta < 0
+                )
+            ):
+                final_observation_correlated = False
+                break
+        if not final_observation_correlated:
             raise EV3PulseContractError(
                 "pulse final encoder observation is uncorrelated"
             )

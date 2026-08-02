@@ -184,6 +184,15 @@ def footprint_sweep_intersects(
     base_clearance_mm = (
         obstacle_radius_mm + footprint.clearance_margin_mm
     )
+    samples, coverage_margin_mm = _interpolated_sweep(
+        start,
+        end,
+        footprint,
+    )
+    # Use the same interpolation margin at the starting endpoint.  Otherwise
+    # a body only one millimetre outside the exact envelope can be classified
+    # as clear at the start but colliding over an immediately retreating
+    # sweep, preventing the monotonic-escape rule from ever applying.
     start_intersects = (
         _point_distance(
             obstacle_x_mm,
@@ -191,12 +200,7 @@ def footprint_sweep_intersects(
             start,
             footprint,
         )
-        <= base_clearance_mm
-    )
-    samples, coverage_margin_mm = _interpolated_sweep(
-        start,
-        end,
-        footprint,
+        <= base_clearance_mm + coverage_margin_mm
     )
     swept_intersects = any(
         _point_distance(

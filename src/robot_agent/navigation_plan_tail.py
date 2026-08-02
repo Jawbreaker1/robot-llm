@@ -6,6 +6,7 @@ from typing import Mapping, Optional, Tuple
 
 from .physical_navigation_contract import (
     MOTION_ACTIONS,
+    REVERSE,
     NavigationDecision,
     observation_safety_signature,
 )
@@ -50,6 +51,7 @@ class NavigationPlanTail:
     safety_signature: Tuple[bool, bool, bool]
     active_commitment: Optional[Mapping[str, object]]
     focus_truth: Tuple[Optional[str], object]
+    scan_staging_target_ids: Tuple[str, ...]
     cancelled_reason: Optional[str] = None
 
     @classmethod
@@ -63,12 +65,19 @@ class NavigationPlanTail:
         observation: Mapping[str, object],
         maneuver_state: Mapping[str, object],
         fact_values: Mapping[str, object],
+        max_age_seconds: float = PLAN_TAIL_MAX_AGE_SECONDS,
     ) -> Optional["NavigationPlanTail"]:
         remaining = decision.plan[1:]
         if not remaining:
             return None
         if any(action not in MOTION_ACTIONS for action in decision.plan):
             raise ValueError("plan tail may contain only motion actions")
+        if (
+            isinstance(max_age_seconds, bool)
+            or not isinstance(max_age_seconds, (int, float))
+            or not 1.0 <= float(max_age_seconds) <= 120.0
+        ):
+            raise ValueError("plan tail age is invalid")
         hazards = tuple(
             sorted(
                 item["hypothesis_id"]
@@ -84,7 +93,7 @@ class NavigationPlanTail:
             created_monotonic=now_monotonic,
             expires_monotonic=min(
                 episode_deadline,
-                now_monotonic + PLAN_TAIL_MAX_AGE_SECONDS,
+                now_monotonic + float(max_age_seconds),
             ),
             map_generation_id=map_context["map_generation_id"],
             last_map_version=map_context["map_version"],
@@ -93,6 +102,14 @@ class NavigationPlanTail:
             safety_signature=observation_safety_signature(observation),
             active_commitment=_active_commitment(maneuver_state),
             focus_truth=_focus_truth(maneuver_state, fact_values),
+            scan_staging_target_ids=(
+                tuple(sorted(map_context.get(
+                    "detour_scan_required_target_hypothesis_ids",
+                    (),
+                )))
+                if decision.action == REVERSE
+                else ()
+            ),
         )
 
     @property
@@ -148,6 +165,15 @@ class NavigationPlanTail:
             failures.append("plan_tail_commitment_changed")
         if _focus_truth(maneuver_state, fact_values) != self.focus_truth:
             failures.append("plan_tail_focus_truth_changed")
+        scan_feasibility = map_context.get("action_feasibility", {}).get(
+            "active_scan",
+            {},
+        )
+        if (
+            self.scan_staging_target_ids
+            and scan_feasibility.get("allowed") is True
+        ):
+            failures.append("plan_tail_scan_staging_complete")
         return tuple(failures)
 
     def next_action(

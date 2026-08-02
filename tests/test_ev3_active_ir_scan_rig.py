@@ -1463,6 +1463,28 @@ class EV3NavigationCancellationTests(unittest.TestCase):
                 tampered,
             )
 
+    def test_transport_accepts_recovered_scan_encoder_receipt(self):
+        clock = FakeClock()
+        worker = FakeScanTransport(clock)
+        response = worker._scan_turn(30_000)
+        response["result"]["outcome"]["slices"][0][
+            "reason"
+        ] = "encoder_recovered"
+        response["result"]["observation"]["last_outcome"] = copy.deepcopy(
+            response["result"]["outcome"]
+        )
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path="/home/robot/navigation_worker.py",
+        )
+
+        transport._validate_success_result(
+            "scan_turn",
+            {"relative_delta_mdeg": 30_000},
+            response,
+        )
+
     def test_cancellation_closes_input_and_terminates_ssh_process(self):
         transport = EV3NavigationSSHTransport(
             target="robot@ev3.local",

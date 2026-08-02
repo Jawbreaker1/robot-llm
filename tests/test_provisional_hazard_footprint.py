@@ -124,6 +124,25 @@ class ProvisionalHazardFootprintTests(unittest.TestCase):
         self.assertFalse(left_turn["allowed"])
         self.assertTrue(right_turn["allowed"])
 
+    def test_ev3_near_envelope_can_continue_monotonic_reverse_escape(self):
+        profile = EV3RSTORMProfile()
+        obstacle = hazard_map(
+            footprint=profile.hazard_calibration.robot_footprint,
+            x_mm=140,
+            y_mm=0,
+            radius_mm=70,
+        )
+
+        reverse = obstacle.validate_swept_path(
+            PhysicalPose(x_mm=-51, heading_mdeg=66),
+            REVERSE,
+            EXPECTED_ACTION_SPECS,
+            profile.odometry_calibration,
+        )
+
+        self.assertTrue(reverse["allowed"])
+        self.assertEqual(reverse["monotonic_escape_hazard_ids"], ["box"])
+
     def test_blocked_scan_bearing_extends_collision_hypothesis(self):
         scan = ScanAttemptEvidence(
             scan_id="scan-wide-box-right-edge",

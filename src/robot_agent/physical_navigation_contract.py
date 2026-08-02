@@ -608,7 +608,8 @@ def motion_budget_allows(
     checked = validate_observation(observation)
     spec = action_specs[action]
     return (
-        spec["slice_count"]
+        checked["budgets"]["motion_fault_latched"] is False
+        and spec["slice_count"]
         <= checked["budgets"]["pulse_count_remaining"]
         and spec["total_duration_ms"]
         <= checked["budgets"]["pulse_duration_ms_remaining"]

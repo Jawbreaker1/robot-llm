@@ -1,0 +1,109 @@
+{
+  "schema": "robot-llm-physical-navigation-evidence/v1",
+  "experiment_id": "EXP-EV3-LIVE-BACKOFF-SCAN-20260802-001",
+  "recorded_date": "2026-08-02",
+  "episode_id": "episode-2971adc84f14049a5d3e3560",
+  "scope": {
+    "robot": "physical EV3RSTORM over Wi-Fi",
+    "model_endpoint_id": "google/gemma-4-26b-a4b",
+    "goal": "Create maneuvering room, scan the known obstacle, choose a side, follow a waypoint route, and resume the original heading",
+    "host_route_or_side_selected": false
+  },
+  "preflight_battery": {
+    "voltage_uv": 5721800,
+    "current_ua": 436000,
+    "measurement_relation": "motion-free inventory before the overnight navigation episodes"
+  },
+  "verified_navigation": {
+    "initial_pose": {
+      "x_mm": -51,
+      "y_mm": 0,
+      "heading_mdeg": 66,
+      "verified_motion_count": 1,
+      "total_forward_mm": 51,
+      "total_turn_mdeg": 594
+    },
+    "final_persisted_pose": {
+      "x_mm": -196,
+      "y_mm": 0,
+      "heading_mdeg": 330,
+      "verified_motion_count": 4,
+      "total_forward_mm": 196,
+      "total_turn_mdeg": 1518
+    },
+    "verified_episode_motion": {
+      "semantic_action": "REVERSE",
+      "pulse_count": 3,
+      "odometry_displacement_mm": 145
+    }
+  },
+  "scan": {
+    "scan_id": "scan-2fd92cc3e5a1c68742f6",
+    "target_hypothesis_id": "provisional-object-5ef7068fd3902e6d522a",
+    "scan_pose": {
+      "x_mm": -148,
+      "y_mm": 0,
+      "heading_mdeg": -132,
+      "verified_motion_count": 3,
+      "total_forward_mm": 148,
+      "total_turn_mdeg": 924
+    },
+    "status": "CANCELLED",
+    "reason": "bilateral_boundaries_not_observed",
+    "stop_confirmed": true,
+    "restored_start_heading": true,
+    "observation_pattern": "ALL_CLEAR",
+    "hypothesis_relation": "NO_EVIDENCE",
+    "all_clear_arc_covers_target_hypothesis": false,
+    "rays": [
+      {
+        "requested_relative_bearing_mdeg": 0,
+        "actual_relative_bearing_mdeg": 0,
+        "raw": 48,
+        "filtered": 48,
+        "blocked": false
+      },
+      {
+        "requested_relative_bearing_mdeg": -30000,
+        "actual_relative_bearing_mdeg": -27383,
+        "raw": 62,
+        "filtered": 62,
+        "blocked": false
+      },
+      {
+        "requested_relative_bearing_mdeg": -60000,
+        "actual_relative_bearing_mdeg": -54898,
+        "raw": 76,
+        "filtered": 76,
+        "blocked": false
+      },
+      {
+        "requested_relative_bearing_mdeg": 30000,
+        "actual_relative_bearing_mdeg": 32001,
+        "raw": 56,
+        "filtered": 55,
+        "blocked": false
+      },
+      {
+        "requested_relative_bearing_mdeg": 60000,
+        "actual_relative_bearing_mdeg": 59714,
+        "raw": 66,
+        "filtered": 66,
+        "blocked": false
+      }
+    ]
+  },
+  "terminal_outcome": {
+    "control_state": "FAULTED",
+    "primary_error_code": "robot_runtime_failed",
+    "primary_error_message": "worker output ended after an SSH banner timeout",
+    "last_error_code": "physical_shutdown_unverified",
+    "follow_up_motion_free_ssh_check": "Connection timed out during banner exchange"
+  },
+  "interpretation": {
+    "proved": "The agent repeatedly selected and completed verified reverse progress, then completed and restored a five-ray physical scan before another verified reverse pulse.",
+    "not_proved": "The scan produced no applicable obstacle boundaries, no detour side was authorized, and no physical waypoint route completed.",
+    "termination_boundary": "The brick stopped responding over SSH after the final persisted motion; shutdown could not be verified remotely.",
+    "map_boundary": "The qualitative remembered hazard remains active because the all-clear arc did not cover the target hypothesis from the current verified scan pose."
+  }
+}

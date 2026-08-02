@@ -57,6 +57,7 @@ SPEECH_STATES = (
 RUNTIME_UPDATE_FIELDS = frozenset(
     (
         "current_action",
+        "active_route",
         "obstacle",
         "plan",
         "scan",
@@ -255,6 +256,7 @@ class RobotRuntimeUpdate:
     """One validated, display-only update published by a runtime adapter."""
 
     current_action: Optional[str] = None
+    active_route: object = None
     obstacle: object = None
     plan: Tuple[str, ...] = ()
     scan: object = None
@@ -269,6 +271,11 @@ class RobotRuntimeUpdate:
     def __post_init__(self) -> None:
         if self.current_action is not None:
             _text("current_action", self.current_action, 256)
+        object.__setattr__(
+            self,
+            "active_route",
+            _optional_json("active_route", self.active_route),
+        )
         object.__setattr__(
             self,
             "obstacle",
@@ -337,6 +344,7 @@ class RobotRuntimeUpdate:
                 "current_action",
                 prior.current_action,
             ),
+            active_route=value.get("active_route", prior.active_route),
             obstacle=value.get("obstacle", prior.obstacle),
             plan=plan,
             scan=value.get("scan", prior.scan),
@@ -370,6 +378,7 @@ class RobotRuntimeUpdate:
     def to_dict(self):
         return {
             "current_action": self.current_action,
+            "active_route": thaw_json(self.active_route),
             "obstacle": thaw_json(self.obstacle),
             "plan": list(self.plan),
             "scan": thaw_json(self.scan),

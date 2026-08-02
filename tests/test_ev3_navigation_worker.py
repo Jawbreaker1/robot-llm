@@ -783,6 +783,10 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
 
     def test_scan_turn_undertravel_is_a_canonical_stopped_failure(self):
         self.owner.blocked_roles.add("drive_c")
+        single_wheel_starts = []
+        self.owner.after_single_start = lambda: single_wheel_starts.append(
+            True
+        )
 
         result = self.worker._scan_turn(-30_000)
 
@@ -798,6 +802,43 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
                 "passed"
             ]
         )
+        self.assertTrue(result["stop"]["stop_confirmed"])
+        self.assertEqual(single_wheel_starts, [])
+        self.assertEqual(self.worker.pulse_count, 1)
+        self.assertTrue(self.worker.motion_fault_latched)
+        self.assertEqual(self.owner.state, "")
+
+    def test_scan_turn_clean_completion_is_paired_and_symmetric(self):
+        single_wheel_starts = []
+        self.owner.after_single_start = lambda: single_wheel_starts.append(
+            True
+        )
+        result = self.worker._scan_turn(-30_000)
+
+        self.assertEqual(result["outcome"]["status"], "completed")
+        receipt = result["outcome"]["slices"][0]
+        self.assertEqual(receipt["reason"], "duration_elapsed")
+        self.assertNotIn("segments", receipt)
+        self.assertTrue(receipt["encoder_verification"]["passed"])
+        deltas = [
+            motor["position_delta"] for motor in receipt["motors"]
+        ]
+        self.assertEqual(deltas[0], -deltas[1])
+        self.assertEqual(single_wheel_starts, [])
+        self.assertFalse(self.worker.motion_fault_latched)
+        self.assertEqual(self.owner.state, "")
+
+    def test_scan_turn_wrong_direction_never_enters_recovery(self):
+        self.owner.wrong_direction_roles.add("drive_c")
+
+        result = self.worker._scan_turn(-30_000)
+
+        self.assertEqual(result["outcome"]["status"], "verification_failed")
+        self.assertEqual(
+            result["outcome"]["reason"],
+            "encoder_verification_failed",
+        )
+        self.assertEqual(result["outcome"]["completed_slice_count"], 0)
         self.assertTrue(result["stop"]["stop_confirmed"])
         self.assertTrue(self.worker.motion_fault_latched)
         self.assertEqual(self.owner.state, "")

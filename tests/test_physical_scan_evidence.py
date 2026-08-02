@@ -345,6 +345,7 @@ class PhysicalScanEvidenceTests(unittest.TestCase):
             right_boundary_mdeg=None,
             scan_pose=PhysicalPose(),
             based_on_map_version=1,
+            all_clear_arc_covers_target_hypothesis=True,
         )
         with_detail = hazard(0, (conflict,))
         pruned = ProvisionalHazard(
@@ -371,6 +372,7 @@ class PhysicalScanEvidenceTests(unittest.TestCase):
             right_boundary_mdeg=None,
             scan_pose=PhysicalPose(),
             based_on_map_version=1,
+            all_clear_arc_covers_target_hypothesis=True,
         )
         blocked = self._one_sided_attempt(
             "scan-later-blocked",

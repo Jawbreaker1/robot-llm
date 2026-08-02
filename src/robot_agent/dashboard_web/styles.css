@@ -1578,6 +1578,7 @@ textarea:focus-visible,
 
 .map-mission-header h3,
 .map-mission-plan-panel h4,
+.map-mission-route-panel h4,
 .map-mission-history-panel h4 {
   margin: 0;
 }
@@ -1616,7 +1617,7 @@ textarea:focus-visible,
 
 .map-mission-summary {
   display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.8fr) minmax(0, 1.35fr) minmax(100px, 0.5fr);
+  grid-template-columns: minmax(0, 1.3fr) minmax(0, 0.7fr) minmax(0, 1.05fr) minmax(0, 1.05fr) minmax(90px, 0.45fr);
   border-bottom: 1px solid var(--line-soft);
 }
 
@@ -1627,7 +1628,7 @@ textarea:focus-visible,
   border-right: 1px solid var(--line-soft);
 }
 
-.map-mission-summary-item:nth-child(4) {
+.map-mission-summary-item:nth-child(5) {
   border-right: 0;
 }
 
@@ -1667,6 +1668,12 @@ textarea:focus-visible,
 
 .map-mission-summary-item.is-plan strong {
   color: var(--model);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.map-mission-summary-item.is-route strong {
+  color: var(--ready);
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 12px;
 }
@@ -1731,40 +1738,53 @@ textarea:focus-visible,
 
 .map-mission-details-grid {
   display: grid;
-  grid-template-columns: minmax(220px, 0.72fr) minmax(0, 1.28fr);
+  grid-template-columns: minmax(190px, 0.58fr) minmax(250px, 0.82fr) minmax(0, 1.25fr);
   min-height: 240px;
 }
 
 .map-mission-plan-panel,
+.map-mission-route-panel,
 .map-mission-history-panel {
   min-width: 0;
   padding: 16px 17px 18px;
 }
 
-.map-mission-plan-panel {
+.map-mission-plan-panel,
+.map-mission-route-panel {
   border-right: 1px solid var(--line-soft);
+}
+
+.map-mission-plan-panel {
   background: rgb(185 163 255 / 2%);
 }
 
+.map-mission-route-panel {
+  background: rgb(110 214 196 / 2%);
+}
+
 .map-mission-plan-panel h4,
+.map-mission-route-panel h4,
 .map-mission-history-panel h4 {
   color: var(--text-soft);
   font-size: 11px;
 }
 
 .map-mission-plan,
+.map-mission-route,
 .map-mission-timeline {
   padding: 0;
   margin: 13px 0 0;
   list-style: none;
 }
 
-.map-mission-plan {
+.map-mission-plan,
+.map-mission-route {
   display: grid;
   gap: 8px;
 }
 
-.map-mission-plan-step {
+.map-mission-plan-step,
+.map-mission-route-step {
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr);
   align-items: start;
@@ -1775,7 +1795,8 @@ textarea:focus-visible,
   overflow-wrap: anywhere;
 }
 
-.map-mission-plan-index {
+.map-mission-plan-index,
+.map-mission-route-index {
   display: grid;
   width: 22px;
   height: 22px;
@@ -1787,7 +1808,28 @@ textarea:focus-visible,
   font-size: 8px;
 }
 
+.map-mission-route-index {
+  color: var(--ready);
+  border-color: rgb(110 214 196 / 30%);
+}
+
+.map-mission-route-step.is-active {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.map-mission-route-step.is-active .map-mission-route-index {
+  color: var(--canvas);
+  border-color: var(--ready);
+  background: var(--ready);
+}
+
+.map-mission-route-step.is-complete {
+  color: var(--muted);
+}
+
 .map-mission-plan-empty,
+.map-mission-route-empty,
 .map-mission-timeline-empty {
   color: var(--muted);
   font-size: 12px;
@@ -3510,20 +3552,28 @@ textarea:focus-visible,
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .map-mission-summary-item:nth-child(2) {
+  .map-mission-summary-item:nth-child(2),
+  .map-mission-summary-item:nth-child(4) {
     border-right: 0;
   }
 
   .map-mission-summary-item:nth-child(3),
-  .map-mission-summary-item:nth-child(4) {
+  .map-mission-summary-item:nth-child(4),
+  .map-mission-summary-item:nth-child(5) {
     border-top: 1px solid var(--line-soft);
+  }
+
+  .map-mission-summary-item:nth-child(5) {
+    grid-column: 1 / -1;
+    border-right: 0;
   }
 
   .map-mission-details-grid {
     grid-template-columns: 1fr;
   }
 
-  .map-mission-plan-panel {
+  .map-mission-plan-panel,
+  .map-mission-route-panel {
     border-right: 0;
     border-bottom: 1px solid var(--line-soft);
   }

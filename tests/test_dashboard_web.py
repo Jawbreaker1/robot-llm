@@ -604,6 +604,10 @@ process.stdout.write(JSON.stringify({
             "map-mission-action",
             "map-mission-plan-summary",
             "map-mission-plan",
+            "map-mission-route-label",
+            "map-mission-route-summary",
+            "map-mission-route-heading",
+            "map-mission-route",
             "map-mission-history-status",
             "map-mission-history-count",
             "map-mission-history-gap",
@@ -733,6 +737,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(len(mission_details), 1)
         self.assertIn("map-mission-panel", self.html)
         self.assertIn("map-mission-timeline", self.html)
+        self.assertIn("map-mission-route", self.html)
         self.assertIn("RobotMissionPanelUI.create", self.robot_control)
         self.assertIn("robot-spatial-map/v1", self.dashboard_logic)
         self.assertIn("normalizeSpatialMap", self.dashboard_logic)
@@ -782,6 +787,7 @@ process.stdout.write(JSON.stringify({
         self.assertIn(".map-path", self.css)
         self.assertIn(".map-mission-panel", self.css)
         self.assertIn(".map-mission-timeline", self.css)
+        self.assertIn(".map-mission-route-step.is-active", self.css)
         self.assertLess(len(self.javascript.splitlines()), 1900)
         self.assertNotIn("function mapProjection", self.javascript)
         self.assertIn("map.reason.observation_gap", self.i18n)
@@ -2223,12 +2229,39 @@ function snapshot(sequence, episodeId, updatedAt, runtime, state = "RUNNING") {
   };
 }
 
+function activeRoute(version, activeIndex) {
+  return {
+    route_id: "local-detour-1",
+    version,
+    status: "ACTIVE",
+    active_index: activeIndex,
+    detour_side: "LEFT_OF_GOAL",
+    waypoints: [
+      {
+        ordinal: 0,
+        kind: "LATERAL_CLEARANCE",
+        x_mm: 150,
+        y_mm: -220,
+        heading_mdeg: -90000,
+      },
+      {
+        ordinal: 1,
+        kind: "REACQUIRE_GOAL_HEADING",
+        x_mm: 300,
+        y_mm: -220,
+        heading_mdeg: 0,
+      },
+    ],
+  };
+}
+
 const snapshots = [
   snapshot(1, "episode-1", 1000, {}, "STARTING"),
   snapshot(2, "episode-1", 1100, {
     current_action: "advance",
     obstacle: { relation: "CLEAR" },
     plan: ["advance", "scan"],
+    active_route: activeRoute(1, 0),
     model_latency_ms: 42,
     speech_status: "generating",
     message: "Moving now",
@@ -2237,6 +2270,7 @@ const snapshots = [
     current_action: "advance",
     obstacle: { relation: "CLEAR" },
     plan: ["advance", "scan"],
+    active_route: activeRoute(1, 0),
     model_latency_ms: 99,
     speech_status: "generating",
     message: "Moving now",
@@ -2245,6 +2279,7 @@ const snapshots = [
     current_action: "scan",
     obstacle: { relation: "CLEAR" },
     plan: ["scan", "turn"],
+    active_route: activeRoute(2, 1),
     scan: { state: "pending" },
     model_latency_ms: 99,
     speech_status: "playing",
@@ -2323,6 +2358,7 @@ store.ingestSnapshots(snapshotPage);
 store.ingestEvents(eventPage);
 store.ingestSnapshots(snapshotPage);
 const current = api.normalizeSnapshot(snapshots[3]);
+const normalizedAgain = api.normalizeRoute(current.activeRoute);
 const timeline = api.buildTimeline(store.values(), current);
 const limited = api.buildTimeline(store.values(), current, 2);
 const liveFirst = api.createHistoryStore(10);
@@ -2378,6 +2414,23 @@ process.stdout.write(JSON.stringify({
     events: store.values().events.length,
     snapshots: store.values().snapshots.length,
   },
+  route: {
+    routeId: current.activeRoute.routeId,
+    version: current.activeRoute.version,
+    activeIndex: current.activeRoute.activeIndex,
+    detourSide: current.activeRoute.detourSide,
+    waypoint: current.activeRoute.waypoints[0],
+    frozen: Object.isFrozen(current.activeRoute),
+    waypointsFrozen: Object.isFrozen(current.activeRoute.waypoints),
+    waypointFrozen: Object.isFrozen(current.activeRoute.waypoints[0]),
+    normalizedAgain: {
+      routeId: normalizedAgain.routeId,
+      activeIndex: normalizedAgain.activeIndex,
+      xMm: normalizedAgain.waypoints[0].xMm,
+      yMm: normalizedAgain.waypoints[0].yMm,
+      headingMdeg: normalizedAgain.waypoints[0].headingMdeg,
+    },
+  },
   timeline: {
     episodeId: timeline.episodeId,
     count: timeline.entries.length,
@@ -2425,6 +2478,32 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(result["cursors"], {"event": 4, "snapshot": 5})
         self.assertEqual(result["gaps"], {"event": True, "snapshot": False})
         self.assertEqual(result["counts"], {"events": 3, "snapshots": 5})
+        self.assertEqual(
+            result["route"],
+            {
+                "routeId": "local-detour-1",
+                "version": 2,
+                "activeIndex": 1,
+                "detourSide": "LEFT_OF_GOAL",
+                "waypoint": {
+                    "ordinal": 0,
+                    "kind": "LATERAL_CLEARANCE",
+                    "xMm": 150,
+                    "yMm": -220,
+                    "headingMdeg": -90_000,
+                },
+                "frozen": True,
+                "waypointsFrozen": True,
+                "waypointFrozen": True,
+                "normalizedAgain": {
+                    "routeId": "local-detour-1",
+                    "activeIndex": 1,
+                    "xMm": 150,
+                    "yMm": -220,
+                    "headingMdeg": -90_000,
+                },
+            },
+        )
         self.assertEqual(result["timeline"]["episodeId"], "episode-1")
         self.assertEqual(result["timeline"]["count"], 4)
         self.assertEqual(
@@ -2442,8 +2521,15 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(
             result["timeline"]["snapshotChanges"],
             [
-                ["action", "plan", "scan", "speech"],
-                ["action", "plan", "obstacle", "speech", "message"],
+                ["action", "plan", "route", "scan", "speech"],
+                [
+                    "action",
+                    "plan",
+                    "route",
+                    "obstacle",
+                    "speech",
+                    "message",
+                ],
             ],
         )
         self.assertEqual(result["limitedCount"], 2)
@@ -2477,6 +2563,260 @@ process.stdout.write(JSON.stringify({
             self.robot_mission_panel,
         )
         self.assertNotIn("innerHTML", self.robot_mission_panel)
+
+    def test_robot_mission_panel_renders_typed_active_route(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const context = {};
+vm.runInNewContext(source, context, { filename: process.argv[1] });
+const api = context.RobotMissionPanelUI;
+
+class FakeNode {
+  constructor(tagName = "div") {
+    this.tagName = tagName;
+    this.textContent = "";
+    this.className = "";
+    this.children = [];
+    this.hidden = false;
+    this.dateTime = "";
+    this.attributes = {};
+    this.classList = {
+      add: (...names) => {
+        const classes = new Set(this.className.split(/\s+/).filter(Boolean));
+        names.forEach((name) => classes.add(name));
+        this.className = Array.from(classes).join(" ");
+      },
+    };
+  }
+
+  appendChild(node) {
+    this.children.push(node);
+    return node;
+  }
+
+  replaceChildren(...nodes) {
+    this.children = nodes;
+  }
+
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+  }
+}
+
+const requiredIds = [
+  "map-mission-state",
+  "map-mission-mode",
+  "map-mission-action-label",
+  "map-mission-plan-label",
+  "map-mission-plan-heading",
+  "map-mission-route-label",
+  "map-mission-route-heading",
+  "map-mission-goal",
+  "map-mission-action",
+  "map-mission-message",
+  "map-mission-speech",
+  "map-mission-updated",
+  "map-mission-live-announcement",
+  "map-mission-plan",
+  "map-mission-plan-summary",
+  "map-mission-route",
+  "map-mission-route-summary",
+  "map-mission-timeline",
+  "map-mission-history-count",
+  "map-mission-history-gap",
+  "map-mission-history-status",
+];
+const nodes = Object.fromEntries(
+  requiredIds.map((id) => [id, new FakeNode()]),
+);
+const documentApi = {
+  getElementById(id) {
+    if (!Object.hasOwn(nodes, id)) {
+      throw new Error(`Unexpected DOM id: ${id}`);
+    }
+    return nodes[id];
+  },
+  createElement(tagName) {
+    return new FakeNode(tagName);
+  },
+};
+const translations = {
+  "common.missing": "missing",
+  "common.none": "none",
+  "mission.action.label": "Doing now",
+  "mission.action.latest_label": "Latest action",
+  "mission.goal.empty": "No goal",
+  "mission.history.live": "live",
+  "mission.history.waiting": "waiting",
+  "mission.message.idle": "Mission stopped",
+  "mission.message.waiting": "Waiting",
+  "mission.mode.active": "Active mission",
+  "mission.mode.latest": "Latest mission",
+  "mission.mode.none": "No mission",
+  "mission.plan.empty": "No plan",
+  "mission.plan.label": "Current plan",
+  "mission.plan.latest_label": "Latest plan",
+  "mission.plan.latest_title": "Latest published plan",
+  "mission.plan.title": "Plan right now",
+  "mission.route.empty": "No route",
+  "mission.route.label": "Active route",
+  "mission.route.latest_label": "Latest route",
+  "mission.route.latest_title": "Latest published detour route",
+  "mission.route.side.LEFT_OF_GOAL": "left of the goal heading",
+  "mission.route.status.ACTIVE": "active",
+  "mission.route.title": "Active detour route",
+  "mission.route.waypoint.LATERAL_CLEARANCE": "Create lateral clearance",
+  "mission.route.waypoint.MERGE_GOAL_AXIS": "Merge onto the goal axis",
+  "mission.route.waypoint.PASS_BEYOND_TARGET": "Pass beyond the obstacle",
+  "mission.route.waypoint.REACQUIRE_GOAL_HEADING": "Reacquire the goal heading",
+  "mission.route.waypoint.RESUME_GOAL_HEADING": "Resume the goal heading",
+  "mission.timeline.empty": "No history",
+  "mission.timeline.route": "Route updated",
+  "robot.speech.idle": "idle",
+  "robot.state.IDLE": "Idle",
+  "robot.state.RUNNING": "Running",
+};
+function translate(key, args) {
+  if (key === "mission.live_announcement") {
+    return `${args.state}: ${args.action}. ${args.message}`;
+  }
+  return Object.hasOwn(translations, key) ? translations[key] : key;
+}
+
+function descendantTexts(node) {
+  return [
+    node.textContent,
+    ...node.children.flatMap((child) => descendantTexts(child)),
+  ];
+}
+
+const activeRoute = {
+  route_id: "local-detour-7",
+  version: 3,
+  status: "ACTIVE",
+  active_index: 1,
+  detour_side: "LEFT_OF_GOAL",
+  waypoints: [
+    [0, "LATERAL_CLEARANCE", 0, -220, -90000],
+    [1, "REACQUIRE_GOAL_HEADING", 180, -220, 0],
+    [2, "PASS_BEYOND_TARGET", 520, -220, 0],
+    [3, "MERGE_GOAL_AXIS", 520, 0, 90000],
+    [4, "RESUME_GOAL_HEADING", 700, 0, 0],
+  ].map(([ordinal, kind, xMm, yMm, headingMdeg]) => ({
+    ordinal,
+    kind,
+    x_mm: xMm,
+    y_mm: yMm,
+    heading_mdeg: headingMdeg,
+  })),
+};
+function snapshot(sequence, state, runtime) {
+  return {
+    schema: "robot-control/v1",
+    sequence,
+    state,
+    enabled: true,
+    accepting: state === "RUNNING",
+    episode: {
+      episode_id: "episode-route",
+      goal: "Pass the obstacle",
+      started_at_unix_ms: 1000,
+      terminal_reason: null,
+    },
+    updated_at_unix_ms: 2000 + sequence,
+    runtime,
+  };
+}
+
+const panel = api.create({
+  document: documentApi,
+  request: async () => {
+    throw new Error("Network access was not expected");
+  },
+  translate,
+  getLocale: () => "en",
+});
+panel.setControl(snapshot(1, "RUNNING", {
+  current_action: "ADVANCE",
+  plan: ["ADVANCE", "OBSERVE"],
+  active_route: activeRoute,
+  speech_status: "idle",
+  message: "Following detour",
+}));
+const activeRender = {
+  label: nodes["map-mission-route-label"].textContent,
+  heading: nodes["map-mission-route-heading"].textContent,
+  summary: nodes["map-mission-route-summary"].textContent,
+  count: nodes["map-mission-route"].children.length,
+  firstClass: nodes["map-mission-route"].children[0].className,
+  firstMarker: nodes["map-mission-route"].children[0].children[0].textContent,
+  activeClass: nodes["map-mission-route"].children[1].className,
+  activeText: nodes["map-mission-route"].children[1].children[1].textContent,
+  timelineShowsRoute: descendantTexts(nodes["map-mission-timeline"])
+    .includes("Route updated"),
+  timelineShowsSummary: descendantTexts(nodes["map-mission-timeline"])
+    .includes("active · left of the goal heading · 2/5"),
+};
+panel.setControl(snapshot(2, "IDLE", {
+  speech_status: "idle",
+  message: "Detour complete",
+}));
+
+process.stdout.write(JSON.stringify({
+  activeRender,
+  historicalRender: {
+    label: nodes["map-mission-route-label"].textContent,
+    heading: nodes["map-mission-route-heading"].textContent,
+    summary: nodes["map-mission-route-summary"].textContent,
+    count: nodes["map-mission-route"].children.length,
+  },
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(WEB_ROOT / "robot_mission_panel.js"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(
+            result["activeRender"],
+            {
+                "label": "Active route",
+                "heading": "Active detour route",
+                "summary": "active · left of the goal heading · 2/5",
+                "count": 5,
+                "firstClass": "map-mission-route-step is-complete",
+                "firstMarker": "✓",
+                "activeClass": "map-mission-route-step is-active",
+                "activeText": (
+                    "Reacquire the goal heading · (180, -220) mm · 0°"
+                ),
+                "timelineShowsRoute": True,
+                "timelineShowsSummary": True,
+            },
+        )
+        self.assertEqual(
+            result["historicalRender"],
+            {
+                "label": "Latest route",
+                "heading": "Latest published detour route",
+                "summary": "active · left of the goal heading · 2/5",
+                "count": 5,
+            },
+        )
 
     def test_robot_mission_history_retention_is_generous_and_explicit(self):
         script = r"""

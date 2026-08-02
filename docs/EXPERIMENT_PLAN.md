@@ -1319,10 +1319,14 @@ tog i hindret och motiverade den nya profilen, men hela implementationen ovan
 körde inte då. Den äldre scanartefakten
 `data/EXP-EV3-LIVE-SCAN-20260801-001.json` innehåller rådata endast för ett
 stoppat försök med `2,5°` tolerans. Senare toleransprov saknar ännu en
-korrelerad incheckad råartefakt. Nästa grind är därför samma autonoma
-lådscenario med den nya koden, följt av publicerad observation, scan,
-action/result-ledger och terminalt utfall. Fysiskt propelleruttryck ingår
-inte i denna slice.
+korrelerad incheckad råartefakt. Den nyare artefakten
+`data/EXP-EV3-LIVE-BACKOFF-SCAN-20260802-001.json` visar tre verifierade
+backningspulser, en återställd femstrålig scan och ännu en verifierad
+backningspuls med den nya profilen. Scannen var helt klar från den nya posen,
+gav inga tillämpliga objektsgränser och auktoriserade därför ingen rutt; brickan
+slutade därefter svara över SSH. Nästa grind är fortfarande ett komplett och
+repeterbart autonomt lådscenario med publicerad rutt, action/result-ledger och
+terminalt utfall. Fysiskt propelleruttryck ingår inte i denna slice.
 
 ## Fas 6 – Parallella snurror
 

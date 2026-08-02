@@ -37,6 +37,12 @@
     "move_motor_roles": ["arm"]
   },
   "calibration": {
+    "odometry": {
+      "status": "provisional-live-encoder-derived",
+      "linear_mm_per_encoder_degree": 0.35,
+      "turn_mdeg_per_opposed_encoder_degree": 132,
+      "evidence": "Linear scale is the current EV3RSTORM dead-reckoning estimate; turn scale is the rounded 90000 mdeg / 682 encoder-degree live calibration"
+    },
     "physical_footprint": {
       "status": "provisional-unmeasured-operator-observed",
       "reference_point": "differential-drive-origin",

@@ -222,6 +222,7 @@ class ScanAttemptEvidence:
     right_boundary_mdeg: Optional[int]
     scan_pose: Optional[PhysicalPose] = None
     based_on_map_version: Optional[int] = None
+    all_clear_arc_covers_target_hypothesis: Optional[bool] = None
 
     def __post_init__(self) -> None:
         if (
@@ -255,6 +256,12 @@ class ScanAttemptEvidence:
                     or not isinstance(self.based_on_map_version, int)
                     or self.based_on_map_version < 0
                 )
+            )
+            or (
+                self.all_clear_arc_covers_target_hypothesis is not None
+                and type(
+                    self.all_clear_arc_covers_target_hypothesis
+                ) is not bool
             )
         ):
             raise ValueError("scan attempt evidence is invalid")
@@ -351,7 +358,12 @@ class ScanAttemptEvidence:
             and self.arc_coverage == "BILATERAL_ARC"
             and self.reason == "bilateral_boundaries_not_observed"
         ):
-            return "CONFLICTS_BLOCKED_HYPOTHESIS"
+            # Absence evidence is destructive to a remembered collision
+            # hypothesis, so legacy/unknown applicability must stay
+            # fail-closed.  Only an explicit geometry check may contest it.
+            if self.all_clear_arc_covers_target_hypothesis is True:
+                return "CONFLICTS_BLOCKED_HYPOTHESIS"
+            return "NO_EVIDENCE"
         if any(ray.blocked for ray in self.rays):
             return "SUPPORTS_BLOCKED_HYPOTHESIS"
         return "NO_EVIDENCE"
@@ -434,6 +446,9 @@ class ScanAttemptEvidence:
                 None if self.scan_pose is None else self.scan_pose.to_dict()
             ),
             "based_on_map_version": self.based_on_map_version,
+            "all_clear_arc_covers_target_hypothesis": (
+                self.all_clear_arc_covers_target_hypothesis
+            ),
             "rays": [ray.to_dict() for ray in self.rays],
         }
 
@@ -457,9 +472,12 @@ class ScanAttemptEvidence:
             "scan_pose",
             "based_on_map_version",
         }
+        coverage_fields = fields | {
+            "all_clear_arc_covers_target_hypothesis",
+        }
         if (
             not isinstance(value, dict)
-            or set(value) not in (legacy_fields, fields)
+            or set(value) not in (legacy_fields, fields, coverage_fields)
             or not isinstance(value["rays"], list)
             or value["bearing_convention"]
             != BODY_RELATIVE_BEARING_CONVENTION
@@ -481,6 +499,9 @@ class ScanAttemptEvidence:
                 else PhysicalPose.from_mapping(value["scan_pose"])
             ),
             based_on_map_version=value.get("based_on_map_version"),
+            all_clear_arc_covers_target_hypothesis=value.get(
+                "all_clear_arc_covers_target_hypothesis"
+            ),
         )
         if (
             value["observation_pattern"] != attempt.observation_pattern

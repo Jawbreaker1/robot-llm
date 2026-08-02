@@ -12,6 +12,7 @@ import uuid
 from robot_agent.active_ir_scan import ActiveIrScanExecutor
 from robot_agent.active_ir_scan_contract import (
     ActiveIrScanCalibration,
+    ActiveIrScanContractError,
     ActiveIrRay,
     ActiveIrScanResult,
     ModelScanChoice,
@@ -55,6 +56,7 @@ from robot_agent.physical_navigation_contract import (
     PhysicalNavigationContractError,
     expected_scan_turn_profile,
     expected_scan_sample_profile,
+    motion_budget_allows,
 )
 from robot_agent.physical_navigation_mission import DirectionalMission
 from robot_agent.physical_observation_progress import (
@@ -94,6 +96,7 @@ def observation(
     process_ms_remaining=40_000,
     pulse_count_remaining=40,
     pulse_duration_ms_remaining=32_000,
+    motion_fault_latched=False,
 ):
     return {
         "state_version": version,
@@ -132,7 +135,7 @@ def observation(
             "pulse_duration_ms": 0,
             "pulse_duration_ms_remaining": pulse_duration_ms_remaining,
             "process_ms_remaining": process_ms_remaining,
-            "motion_fault_latched": False,
+            "motion_fault_latched": motion_fault_latched,
         },
     }
 
@@ -463,6 +466,20 @@ def recovered_motion_result():
 
 
 class PhysicalNavigationContractTests(unittest.TestCase):
+    def test_latched_motion_fault_blocks_only_motion_budget(self):
+        latched = observation(1, motion_fault_latched=True)
+
+        self.assertFalse(motion_budget_allows(
+            ADVANCE,
+            latched,
+            EXPECTED_ACTION_SPECS,
+        ))
+        self.assertTrue(motion_budget_allows(
+            OBSERVE,
+            latched,
+            EXPECTED_ACTION_SPECS,
+        ))
+
     def test_motion_requires_exact_model_authored_tail(self):
         with self.assertRaises(PhysicalNavigationContractError) as caught:
             NavigationDecision.from_mapping(
@@ -865,6 +882,21 @@ class PhysicalMemoryAndMapTests(unittest.TestCase):
         self.assertEqual(second["current_longitudinal_progress_mm"], 110)
         self.assertTrue(second["completed"])
 
+    def test_directional_mission_uses_controller_heading_tolerance(self):
+        mission = DirectionalMission.begin(
+            episode_id="episode-heading-tolerance",
+            minimum_forward_progress_mm=100,
+            pose=PhysicalPose(),
+            heading_tolerance_mdeg=20_000,
+        )
+
+        self.assertTrue(
+            mission.heading_aligned(PhysicalPose(heading_mdeg=16_500))
+        )
+        self.assertFalse(
+            mission.heading_aligned(PhysicalPose(heading_mdeg=20_001))
+        )
+
     def test_real_drive_roles_anchor_and_detect_unobserved_motion(self):
         with tempfile.TemporaryDirectory() as directory:
             memory = NavigationMemoryStore.load(
@@ -1058,6 +1090,58 @@ class PlanTailAndCommitmentTests(unittest.TestCase):
             tail.cancelled_reason,
         )
 
+    def test_reverse_tail_stops_as_soon_as_scan_rotation_is_clear(self):
+        memory = self._memory()
+        decision = NavigationDecision.from_mapping(
+            decision_mapping(
+                episode_id="episode-scan-room",
+                turn=1,
+                state_version=1,
+                action=REVERSE,
+                plan=[REVERSE, REVERSE, REVERSE],
+                reason_code="HANDLE_OBSTACLE",
+            ),
+            episode_id="episode-scan-room",
+            turn=1,
+            state_version=1,
+        )
+        maneuver = ManeuverCommitment()
+        facts = {
+            FACT_GOAL_CORRIDOR_CLEAR: False,
+            FACT_GOAL_HEADING_ALIGNED: True,
+            FACT_TARGET_BEHIND: {},
+        }
+        initial = dict(memory.context())
+        initial["detour_scan_required_target_hypothesis_ids"] = ["box-a"]
+        initial["action_feasibility"] = {
+            "active_scan": {"allowed": False},
+        }
+        tail = NavigationPlanTail.from_decision(
+            decision,
+            now_monotonic=0.0,
+            episode_deadline=20.0,
+            map_context=initial,
+            observation=observation(1),
+            maneuver_state=maneuver.state(1),
+            fact_values=facts,
+        )
+        fresh = copy.deepcopy(initial)
+        fresh["map_version"] += 1
+        fresh["action_feasibility"]["active_scan"]["allowed"] = True
+
+        self.assertIsNone(tail.next_action(
+            now_monotonic=0.1,
+            map_context=fresh,
+            observation=observation(2),
+            maneuver_state=maneuver.state(1),
+            fact_values=facts,
+            localization_valid=True,
+        ))
+        self.assertIn(
+            "plan_tail_scan_staging_complete",
+            tail.cancelled_reason,
+        )
+
     def test_route_start_requires_completed_bilateral_scan(self):
         memory = self._memory()
         memory.ingest_stationary_observation(
@@ -1133,9 +1217,22 @@ class PlanTailAndCommitmentTests(unittest.TestCase):
             ),
             scan_pose=memory.pose,
         )
+        with self.assertRaises(ManeuverCommitmentError) as caught:
+            commitment.apply(
+                proposal,
+                action=ADVANCE,
+                turn=1,
+                hazard_map=memory.hazard_map,
+                pose=memory.pose,
+                fact_values={},
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "route_authorization_requires_observe",
+        )
         state = commitment.apply(
             proposal,
-            action=ADVANCE,
+            action=OBSERVE,
             turn=1,
             hazard_map=memory.hazard_map,
             pose=memory.pose,
@@ -1144,6 +1241,45 @@ class PlanTailAndCommitmentTests(unittest.TestCase):
         self.assertEqual(
             state["active"]["target_hypothesis_id"],
             target,
+        )
+        revised = {
+            **proposal,
+            "revision": 2,
+            "transition": "REVISE",
+            "detour_side": "RIGHT_OF_GOAL",
+            "revision_reason": "The other side is now preferable",
+        }
+        with self.assertRaises(ManeuverCommitmentError) as caught:
+            commitment.apply(
+                revised,
+                action=TURN_RIGHT_90,
+                turn=2,
+                hazard_map=memory.hazard_map,
+                pose=memory.pose,
+                fact_values={},
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "route_revision_requires_observe",
+        )
+        abandoned = {
+            **proposal,
+            "transition": "ABANDON",
+            "current_focus_fact_key": None,
+            "revision_reason": "The hypothesis no longer blocks the goal",
+        }
+        with self.assertRaises(ManeuverCommitmentError) as caught:
+            commitment.apply(
+                abandoned,
+                action=TURN_LEFT_90,
+                turn=2,
+                hazard_map=memory.hazard_map,
+                pose=memory.pose,
+                fact_values={},
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "route_abandon_requires_observe",
         )
 
 
@@ -1336,6 +1472,57 @@ class ActiveIrScanTests(unittest.TestCase):
             clock_ms=lambda: rig.now,
         ).execute(request)
         self.assertEqual(result.status, "CANCELLED")
+        self.assertFalse(result.restored_start_heading)
+
+    def test_restoration_preserves_the_worker_failure_reason(self):
+        class RestorationFailureRig(FakeScanRig):
+            def turn_relative_mdeg(
+                self,
+                delta,
+                calibration,
+                deadline,
+            ):
+                if self.heading != 0 and self.heading + delta == 0:
+                    error = ActiveIrScanContractError(
+                        "scan_worker_error",
+                        "worker rejected restoration",
+                    )
+                    error.result_reason = (
+                        "scan_worker_error:encoder_recovery_exhausted"
+                    )
+                    raise error
+                return super().turn_relative_mdeg(
+                    delta,
+                    calibration,
+                    deadline,
+                )
+
+        rig = RestorationFailureRig()
+        request = build_scan_request(
+            choice=ModelScanChoice("target-a"),
+            frame_id="frame-a",
+            map_generation_id="generation-a",
+            map_version=3,
+            start_pose=PhysicalPose(),
+            start_state_version=1,
+            created_at_ms=1_000,
+            deadline_ms=30_000,
+            calibration=ActiveIrScanCalibration(
+                estimated_turn_ms_per_degree=2
+            ),
+        )
+
+        result = ActiveIrScanExecutor(
+            rig=rig,
+            clock_ms=lambda: rig.now,
+        ).execute(request)
+
+        self.assertEqual(result.status, "CANCELLED")
+        self.assertEqual(
+            result.reason,
+            "scan_worker_error:encoder_recovery_exhausted",
+        )
+        self.assertTrue(result.stop_confirmed)
         self.assertFalse(result.restored_start_heading)
 
 
@@ -1725,6 +1912,50 @@ class EV3NavigationTransportTests(unittest.TestCase):
             {"action": ADVANCE},
             response,
         )
+
+        settled = copy.deepcopy(response)
+        settled_motors = settled["result"]["observation"]["motors"]
+        settled_motors[0]["position"] += 5
+        settled_motors[1]["position"] -= 5
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            settled,
+        )
+
+        excessive = copy.deepcopy(response)
+        excessive["result"]["observation"]["motors"][0][
+            "position"
+        ] += 6
+        with self.assertRaises(EV3NavigationTransportError):
+            transport._validate_success_result(
+                "pulse",
+                {"action": ADVANCE},
+                excessive,
+            )
+
+        active = copy.deepcopy(response)
+        active["result"]["observation"]["motors"][0]["state"] = (
+            "running"
+        )
+        with self.assertRaises(EV3NavigationTransportError):
+            transport._validate_success_result(
+                "pulse",
+                {"action": ADVANCE},
+                active,
+            )
+
+        reversed_net = degraded_motion_result(
+            left_delta=1,
+            right_delta=0,
+        )
+        reversed_net["observation"]["motors"][0]["position"] = -1
+        with self.assertRaises(EV3NavigationTransportError):
+            transport._validate_success_result(
+                "pulse",
+                {"action": ADVANCE},
+                {"state_version": 2, "result": reversed_net},
+            )
 
         backlash = copy.deepcopy(response)
         backlash_result = backlash["result"]
@@ -2229,7 +2460,11 @@ class InvalidThenValidSpeechPlanner:
             episode_id=context["episode_id"],
             turn=context["turn"],
             state_version=context["observation"]["state_version"],
-            available_actions=context["available_actions"],
+            available_actions=(
+                tuple(context["available_actions"]) + (FINISH,)
+                if self.calls == 1
+                else context["available_actions"]
+            ),
             published_target_ids=(),
         )
 
@@ -2713,6 +2948,55 @@ class ScanObserveChangedThenScanPlanner(SingleScanPlanner):
 
 
 class PhysicalNavigationRuntimeTests(unittest.TestCase):
+    def test_incomplete_mission_does_not_publish_finish_as_available(self):
+        class AvailabilityPlanner:
+            def __init__(self):
+                self.available = None
+
+            def decide(self, **context):
+                self.available = context["available_actions"]
+                return NavigationDecision.from_mapping(
+                    decision_mapping(
+                        episode_id=context["episode_id"],
+                        turn=context["turn"],
+                        state_version=context["observation"]["state_version"],
+                        action=OBSERVE,
+                        plan=[OBSERVE],
+                        reason_code="VERIFY_RESULT",
+                    ),
+                    episode_id=context["episode_id"],
+                    turn=context["turn"],
+                    state_version=context["observation"]["state_version"],
+                    available_actions=context["available_actions"],
+                    published_target_ids=(),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "incomplete-finish-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+            )
+            planner = AvailabilityPlanner()
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-incomplete-finish",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Make forward progress",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=FakeRuntimeTransport(),
+                planner=planner,
+                memory=memory,
+                monotonic=lambda: 0.0,
+            )
+
+            runtime.run()
+
+        self.assertNotIn(FINISH, planner.available)
+
     def test_adapter_carries_planner_context_and_token_telemetry(self):
         update = PhysicalNavigationRuntimeAdapter._dashboard_update({
             "event": "model_decision",
@@ -2729,6 +3013,24 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             "prompt_tokens": 21_000,
             "completion_tokens": 120,
             "total_tokens": 21_120,
+        })
+
+    def test_adapter_exposes_model_veto_reason(self):
+        update = PhysicalNavigationRuntimeAdapter._dashboard_update({
+            "event": "decision_vetoed",
+            "validation_feedback": {
+                "code": "detour_start_requires_observe",
+                "message": "Authorize the route before motion",
+            },
+        })
+
+        self.assertEqual(update, {
+            "current_action": None,
+            "plan": [],
+            "message": (
+                "Decision vetoed: detour_start_requires_observe — "
+                "Authorize the route before motion"
+            ),
         })
 
     def test_adapter_exposes_bridge_and_passes_only_its_offer_to_runtime(self):
@@ -4268,6 +4570,97 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             },
         ])
 
+    def test_unscanned_forward_hazard_blocks_detour_turns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "scan-before-detour-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=315),
+            )
+            planner = CaptureAvailablePlanner()
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-scan-before-detour",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Inspect before choosing a detour",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=60,
+                ),
+                transport=FakeRuntimeTransport(blocked=True),
+                planner=planner,
+                memory=memory,
+                active_scan_executor=object(),
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.actions, (OBSERVE,))
+        self.assertIn(SCAN_FRONT_ARC, planner.available_actions)
+        self.assertIn(REVERSE, planner.available_actions)
+        self.assertNotIn(TURN_LEFT_90, planner.available_actions)
+        self.assertNotIn(TURN_RIGHT_90, planner.available_actions)
+        self.assertEqual(
+            planner.navigation[
+                "detour_scan_required_target_hypothesis_ids"
+            ],
+            [
+                planner.navigation["navigation_hazard_hypotheses"][0][
+                    "hypothesis_id"
+                ]
+            ],
+        )
+
+    def test_first_scanned_detour_turn_requires_route_commitment(self):
+        decision = NavigationDecision.from_mapping(
+            decision_mapping(
+                episode_id="episode-detour-commitment",
+                turn=1,
+                state_version=1,
+                action=TURN_RIGHT_90,
+                plan=[TURN_RIGHT_90, ADVANCE],
+                reason_code="HANDLE_OBSTACLE",
+            ),
+            episode_id="episode-detour-commitment",
+            turn=1,
+            state_version=1,
+            available_actions=(TURN_RIGHT_90, ADVANCE),
+            published_target_ids=("box-a",),
+        )
+        mission = {
+            "completed": False,
+            "candidate_action_longitudinal_deltas_mm": {
+                TURN_RIGHT_90: 0,
+            },
+            "projected_goal_heading_aligned_after_action": {
+                TURN_RIGHT_90: False,
+            },
+        }
+        navigation = {
+            "goal_geometry": {
+                "conflicts": [{
+                    "hypothesis_id": "box-a",
+                    "active_for_collision": True,
+                }],
+            },
+            "navigation_hazard_hypotheses": [{
+                "hypothesis_id": "box-a",
+                "active_for_collision": True,
+                "route_commitment_ready": True,
+            }],
+        }
+
+        with self.assertRaises(PhysicalNavigationRuntimeError) as caught:
+            PhysicalNavigationRuntime._validate_mission_decision(
+                decision, mission, navigation
+            )
+
+        self.assertEqual(caught.exception.code, "detour_commitment_required")
+
     def test_restored_soft_scan_timeout_reanchors_and_replans(self):
         with tempfile.TemporaryDirectory() as directory:
             memory = NavigationMemoryStore.load(
@@ -4380,7 +4773,10 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         self.assertIsNone(first.right_boundary_mdeg)
         self.assertEqual(
             second.hypothesis_relation,
-            "CONFLICTS_BLOCKED_HYPOTHESIS",
+            "NO_EVIDENCE",
+        )
+        self.assertFalse(
+            second.all_clear_arc_covers_target_hypothesis
         )
 
     def test_scan_progress_barrier_rearms_for_pose_or_target_change(self):
@@ -4656,6 +5052,67 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         self.assertEqual(
             feasibility["reason"],
             "provisional_hazard_rotation_sweep_collision",
+        )
+
+    def test_rotation_blocked_scan_prefers_clearance_reverse_over_detour(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "scan-clearance-reverse.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=316),
+                hazard_calibration=HazardMapCalibration(
+                    robot_footprint=RobotFootprint(
+                        front_extent_mm=100,
+                        rear_extent_mm=60,
+                        left_extent_mm=150,
+                        right_extent_mm=60,
+                    ),
+                ),
+            )
+            memory.hazard_map.record_observation(
+                PhysicalPose(), observation(1, blocked=True), 1_000
+            )
+            memory.pose = PhysicalPose(x_mm=-60)
+            planner = CaptureAvailablePlanner()
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-scan-clearance-reverse",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Make room to inspect the obstacle",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=60,
+                ),
+                transport=FakeRuntimeTransport(blocked=False),
+                planner=planner,
+                memory=memory,
+                active_scan_executor=ScanExecutorMustNotRun(),
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.actions, (OBSERVE,))
+        feasibility = planner.navigation["action_feasibility"]
+        self.assertFalse(feasibility["active_scan"]["allowed"])
+        self.assertTrue(
+            feasibility["motion_actions"][TURN_LEFT_90]["allowed"]
+        )
+        self.assertIn(REVERSE, planner.available_actions)
+        self.assertNotIn(TURN_LEFT_90, planner.available_actions)
+        self.assertNotIn(TURN_RIGHT_90, planner.available_actions)
+        self.assertEqual(
+            planner.navigation[
+                "detour_scan_required_target_hypothesis_ids"
+            ],
+            [
+                planner.navigation["navigation_hazard_hypotheses"][0][
+                    "hypothesis_id"
+                ]
+            ],
         )
 
     def test_scan_rotation_feasibility_is_rechecked_before_executor(self):
@@ -5094,6 +5551,32 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             {"state_version": 3, "map_version": 4},
         ])
 
+    def test_latched_motion_fault_requires_worker_session_renewal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "latched-renewal-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+            )
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-latched-renewal",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Continue after a recoverable motor fault",
+                    locale="en",
+                    max_episode_seconds=60,
+                ),
+                transport=FakeRuntimeTransport(),
+                planner=FakeRuntimePlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+            )
+
+            self.assertTrue(runtime._worker_session_needs_renewal(
+                observation(1, motion_fault_latched=True),
+                EXPECTED_ACTION_SPECS,
+            ))
+
     def test_runtime_accepts_full_dashboard_episode_duration_range(self):
         configured = PhysicalNavigationRuntimeConfig(
             goal="Explore",
@@ -5104,6 +5587,16 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         self.assertEqual(configured.max_episode_seconds, 3_600)
         self.assertEqual(configured.max_turns, 14_400)
         self.assertEqual(configured.scan_timeout_seconds, 120.0)
+        self.assertEqual(configured.goal_heading_tolerance_mdeg, 5_000)
+        ev3_tolerance = PhysicalNavigationRuntimeConfig(
+            goal="Explore",
+            locale="en",
+            goal_heading_tolerance_mdeg=20_000,
+        )
+        self.assertEqual(
+            ev3_tolerance.goal_heading_tolerance_mdeg,
+            20_000,
+        )
         with self.assertRaises(ValueError):
             PhysicalNavigationRuntimeConfig(
                 goal="Explore",
@@ -5115,6 +5608,12 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 goal="Explore",
                 locale="en",
                 scan_timeout_seconds=120.001,
+            )
+        with self.assertRaises(ValueError):
+            PhysicalNavigationRuntimeConfig(
+                goal="Explore",
+                locale="en",
+                goal_heading_tolerance_mdeg=45_001,
             )
 
 

@@ -308,15 +308,17 @@ navigation memory eller stoppa nästa motorbeslut.
 
 Kartvyn visar även robotkontrollens aktuella uppdrag utan att blanda ihop
 visning och exekvering. Den alltid synliga sammanfattningen innehåller mål,
-kontrolltillstånd, aktuell semantisk handling, den ordnade modellplanen,
-talstatus och runtime:ns senaste lägeskommentar. När episoden är avslutad märks
-panelen uttryckligen som det senaste avslutade uppdraget så att en gammal plan
-inte ser aktiv ut.
+kontrolltillstånd, aktuell semantisk handling, den ordnade modellplanen, den
+typade lokala omvägsruttens status och aktiva waypoint, talstatus och
+runtime:ns senaste lägeskommentar. Ruttpanelen visar modellens valda sida samt
+avslutade, aktiva och återstående waypoints; den väljer aldrig en sida och har
+ingen motorauktoritet. När episoden är avslutad märks panelen uttryckligen som
+det senaste avslutade uppdraget så att en gammal plan inte ser aktiv ut.
 
 Den utfällbara delen cursor-pollar två separata, autentiserade read-only-flöden:
 
 - `GET /api/v1/robot/snapshots` för strukturerade ändringar av plan, handling,
-  hinderbedömning, scan, tal, kommentar och fel,
+  aktiv rutt/waypoint, hinderbedömning, scan, tal, kommentar och fel,
 - `GET /api/v1/robot/events` för typade livscykel-, stopp- och felhändelser.
 
 Event- och snapshotsekvenserna är oberoende. Browsern behåller därför en egen
@@ -336,6 +338,10 @@ släppt äldre poster, eller när den längre lokala tidslinjen har kapats;
 frekventa duplicerade runtime-event tar inte plats från dessa poster. All
 denna historik är processlokal observabilitet, inte robotens beständiga
 navigationsminne eller rå plannerkontext.
+
+Ett modellförslag som nekas av det deterministiska kontraktet publicerar sin
+typade vetoorsak i lägeskommentaren. Det gör exempelvis ett för tidigt
+`FINISH` synligt utan att rå modelltext eller prompt behöver loggas.
 
 Kartan ritar dessutom `pose_history`, högst 2 048 lokala odometriposer i ordning.
 Oförändrad position och riktning dedupliceras exakt, medan rotation på plats

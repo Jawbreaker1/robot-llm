@@ -39,6 +39,39 @@
     return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
   }
 
+  function normalizeRoute(value) {
+    const route = record(value);
+    const waypoints = array(route.waypoints).map((item) => {
+      const waypoint = record(item);
+      return Object.freeze({
+        ordinal: integer(waypoint.ordinal, 0),
+        kind: text(waypoint.kind),
+        xMm: Number.isSafeInteger(waypoint.x_mm)
+          ? waypoint.x_mm
+          : Number.isSafeInteger(waypoint.xMm) ? waypoint.xMm : 0,
+        yMm: Number.isSafeInteger(waypoint.y_mm)
+          ? waypoint.y_mm
+          : Number.isSafeInteger(waypoint.yMm) ? waypoint.yMm : 0,
+        headingMdeg: Number.isSafeInteger(waypoint.heading_mdeg)
+          ? waypoint.heading_mdeg
+          : Number.isSafeInteger(waypoint.headingMdeg)
+            ? waypoint.headingMdeg
+            : 0,
+      });
+    }).filter((item) => item.kind);
+    return Object.freeze({
+      routeId: text(route.route_id, text(route.routeId)),
+      status: text(route.status),
+      version: integer(route.version, 0),
+      activeIndex: integer(
+        route.active_index,
+        integer(route.activeIndex, 0),
+      ),
+      detourSide: text(route.detour_side, text(route.detourSide)),
+      waypoints: Object.freeze(waypoints),
+    });
+  }
+
   function normalizeSnapshot(value) {
     const source = record(value);
     const episode = Object.keys(record(source.episode)).length > 0
@@ -76,6 +109,9 @@
         array(runtime.plan).filter((step) => (
           typeof step === "string" && step.length > 0
         )),
+      ),
+      activeRoute: normalizeRoute(
+        runtime.active_route || runtime.activeRoute,
       ),
       obstacle: record(runtime.obstacle),
       scan: record(runtime.scan),
@@ -349,6 +385,7 @@
     const comparable = [
       ["action", previous && previous.currentAction, current.currentAction],
       ["plan", previous && previous.plan, current.plan],
+      ["route", previous && previous.activeRoute, current.activeRoute],
       ["obstacle", previous && previous.obstacle, current.obstacle],
       ["scan", previous && previous.scan, current.scan],
       [
@@ -367,7 +404,8 @@
     ];
     comparable.forEach(([kind, before, after]) => {
       const meaningful = (
-        typeof after === "string" ? after.length > 0
+        kind === "route" ? Boolean(record(after).routeId)
+          : typeof after === "string" ? after.length > 0
           : Array.isArray(after) ? after.length > 0
             : Object.keys(record(after)).length > 0
       ) && !(
@@ -559,6 +597,7 @@
       const snapshots = history.values().snapshots;
       let action = "";
       let plan = Object.freeze([]);
+      let route = normalizeRoute({});
       for (let index = snapshots.length - 1; index >= 0; index -= 1) {
         const snapshot = snapshots[index];
         if (snapshot.episodeId !== control.episodeId) {
@@ -570,11 +609,14 @@
         if (plan.length === 0 && snapshot.plan.length > 0) {
           plan = snapshot.plan;
         }
-        if (action && plan.length > 0) {
+        if (!route.routeId && snapshot.activeRoute.routeId) {
+          route = snapshot.activeRoute;
+        }
+        if (action && plan.length > 0 && route.routeId) {
           break;
         }
       }
-      return { action, plan };
+      return { action, plan, route };
     }
 
     function renderPlan(plan) {
@@ -602,6 +644,61 @@
       }));
     }
 
+    function routeSummary(route) {
+      if (!route || !route.routeId) {
+        return translate("common.none");
+      }
+      const count = route.waypoints.length;
+      const status = localize(
+        `mission.route.status.${route.status}`,
+        route.status,
+      );
+      const side = localize(
+        `mission.route.side.${route.detourSide}`,
+        route.detourSide,
+      );
+      const progress = count > 0
+        ? `${Math.min(route.activeIndex + 1, count)}/${count}`
+        : "0/0";
+      return [status, side, progress].filter(Boolean).join(" · ");
+    }
+
+    function renderRoute(route) {
+      const value = route && route.routeId ? route : normalizeRoute({});
+      const list = byId("map-mission-route");
+      const count = value.waypoints.length;
+      byId("map-mission-route-summary").textContent = routeSummary(value);
+      if (!value.routeId || count === 0) {
+        list.replaceChildren(createElement(
+          "li",
+          "map-mission-route-empty",
+          translate("mission.route.empty"),
+        ));
+        return;
+      }
+      list.replaceChildren(...value.waypoints.map((waypoint, index) => {
+        const item = createElement(
+          "li",
+          `map-mission-route-step${index === value.activeIndex ? " is-active" : ""}${index < value.activeIndex ? " is-complete" : ""}`,
+        );
+        item.appendChild(createElement(
+          "span",
+          "map-mission-route-index",
+          index < value.activeIndex ? "✓" : waypoint.ordinal + 1,
+        ));
+        const label = localize(
+          `mission.route.waypoint.${waypoint.kind}`,
+          waypoint.kind,
+        );
+        item.appendChild(createElement(
+          "span",
+          "",
+          `${label} · (${waypoint.xMm}, ${waypoint.yMm}) mm · ${Math.round(waypoint.headingMdeg / 1000)}°`,
+        ));
+        return item;
+      }));
+    }
+
     function changeLabel(change) {
       return localize(
         `mission.timeline.${change.kind}`,
@@ -614,6 +711,12 @@
         return array(change.value).length > 0
           ? change.value.join(" → ")
           : translate("mission.timeline.cleared");
+      }
+      if (change.kind === "route") {
+        const route = normalizeRoute(change.value);
+        return route.routeId ? routeSummary(route) : translate(
+          "mission.timeline.cleared",
+        );
       }
       if (change.kind === "obstacle" || change.kind === "scan") {
         return compactFact(change.value);
@@ -799,7 +902,11 @@
       const historical = !active && Boolean(control.episodeId);
       const presentedRuntime = historical
         ? latestPublishedRuntime()
-        : { action: control.currentAction, plan: control.plan };
+        : {
+          action: control.currentAction,
+          plan: control.plan,
+          route: control.activeRoute,
+        };
       byId("map-mission-mode").textContent = active
         ? translate("mission.mode.active")
         : control.episodeId
@@ -814,6 +921,12 @@
       byId("map-mission-plan-heading").textContent = historical
         ? translate("mission.plan.latest_title")
         : translate("mission.plan.title");
+      byId("map-mission-route-label").textContent = historical
+        ? translate("mission.route.latest_label")
+        : translate("mission.route.label");
+      byId("map-mission-route-heading").textContent = historical
+        ? translate("mission.route.latest_title")
+        : translate("mission.route.title");
       byId("map-mission-goal").textContent = text(
         control.goal,
         translate("mission.goal.empty"),
@@ -854,6 +967,7 @@
         );
       }
       renderPlan(presentedRuntime.plan);
+      renderRoute(presentedRuntime.route);
       renderTimeline();
       renderConnection();
     }
@@ -1013,6 +1127,7 @@
     create,
     createHistoryStore,
     normalizeEvent,
+    normalizeRoute,
     normalizeSnapshot,
   });
 })(typeof window === "undefined" ? globalThis : window);

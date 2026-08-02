@@ -9,6 +9,8 @@ from robot_agent.controller_runtime_profile import (
 )
 from robot_agent.ev3rstorm_profile import (
     EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION,
+    EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG,
+    EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS,
     EV3RSTORM_PROFILE_ID,
     EV3RSTORM_REMOTE_WORKER_PATH,
     EV3RSTORM_REQUEST_TIMEOUT_SECONDS,
@@ -21,6 +23,7 @@ from robot_agent.ev3rstorm_profile import (
 )
 from robot_agent.host_piper_speech import PiperSpeechProfile
 from robot_agent.physical_spatial_map import PhysicalSpatialMapBridge
+from robot_agent.physical_odometry import OdometryCalibration
 
 
 class EV3RSTORMProfileTests(unittest.TestCase):
@@ -38,6 +41,13 @@ class EV3RSTORMProfileTests(unittest.TestCase):
         )
         self.assertIn("sensor.infrared", descriptor.capabilities)
         self.assertTrue(self.profile.config_path.is_file())
+        self.assertEqual(
+            self.profile.odometry_calibration,
+            OdometryCalibration(
+                linear_mm_per_encoder_degree=0.35,
+                turn_mdeg_per_opposed_encoder_degree=132,
+            ),
+        )
 
     def test_worker_lifetime_can_cover_default_plan_scan_and_reanchor(self):
         # Dashboard planner (30 s) + EV3 scan (80 s) + post-scan request
@@ -150,6 +160,14 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                     EV3RSTORM_SCAN_TIMEOUT_SECONDS,
                 )
                 self.assertEqual(adapter.scan_timeout_seconds, 80.0)
+                self.assertEqual(
+                    adapter.goal_heading_tolerance_mdeg,
+                    EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG,
+                )
+                self.assertEqual(
+                    adapter.plan_tail_max_age_seconds,
+                    EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS,
+                )
                 self.assertIs(
                     adapter.active_scan_calibration,
                     EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION,
@@ -191,6 +209,10 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                     self.assertEqual(
                         call.kwargs["controller_instance_id"],
                         "ev3rstorm-01.ev3-main",
+                    )
+                    self.assertEqual(
+                        call.kwargs["odometry_calibration"],
+                        self.profile.odometry_calibration,
                     )
                 self.assertIs(
                     adapter.scan_executor_factory(transport_value),

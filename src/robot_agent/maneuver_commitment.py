@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Mapping, Optional, Tuple
 
-from .physical_navigation_contract import FINISH, SCAN_FRONT_ARC
+from .physical_navigation_contract import FINISH, OBSERVE, SCAN_FRONT_ARC
 from .physical_odometry import PhysicalPose
 from .provisional_hazard_map import ProvisionalHazardMap
 
@@ -206,10 +206,11 @@ class ManeuverCommitment:
         hazard_map: ProvisionalHazardMap,
         pose: PhysicalPose,
     ) -> bool:
-        return hazard_map.route_evidence(
+        evidence = hazard_map.route_evidence(
             target_id,
             pose=pose,
-        )["ready"]
+        )
+        return evidence["ready"] or evidence["best_effort_ready"]
 
     def apply(
         self,
@@ -266,6 +267,11 @@ class ManeuverCommitment:
                 raise ManeuverCommitmentError(
                     "route_evidence_required",
                     "Route commitment requires applicable complementary scan evidence",
+                )
+            if action != OBSERVE:
+                raise ManeuverCommitmentError(
+                    "route_authorization_requires_observe",
+                    "START must authorize the route before physical motion",
                 )
             self.active = ActiveManeuver(
                 commitment_id=proposal["id"],
@@ -331,6 +337,11 @@ class ManeuverCommitment:
                 target != active.target_hypothesis_id
                 or proposal["detour_side"] != active.detour_side
             )
+            if route_changed and action != OBSERVE:
+                raise ManeuverCommitmentError(
+                    "route_revision_requires_observe",
+                    "A changed route must be authorized before physical motion",
+                )
             if route_changed and not self._scan_ready(
                 target,
                 hazard_map,
@@ -393,6 +404,11 @@ class ManeuverCommitment:
                 raise ManeuverCommitmentError(
                     "abandon_changed_revision",
                     "ABANDON must preserve the active revision",
+                )
+            if action != OBSERVE:
+                raise ManeuverCommitmentError(
+                    "route_abandon_requires_observe",
+                    "ABANDON must take effect before any later physical motion",
                 )
             self.last_terminal = {
                 "transition": "ABANDON",
