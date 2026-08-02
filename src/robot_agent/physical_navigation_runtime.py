@@ -33,7 +33,11 @@ from .navigation_plan_tail import (
     PLAN_TAIL_MAX_AGE_SECONDS,
     NavigationPlanTail,
 )
-from . import physical_action_feasibility
+from .physical_action_gate import (
+    HOST_PER_SLICE_HEADROOM_SECONDS,
+    HOST_RESPONSE_HEADROOM_SECONDS,
+    PhysicalNavigationActionGate,
+)
 from .local_detour_controller import filter_local_detour_actions
 from .local_detour_route import ROUTE_ACTIVE
 from .physical_navigation_experience import (
@@ -89,8 +93,6 @@ DEFAULT_MAX_EPISODE_SECONDS = 35.0
 MIN_EPISODE_SECONDS = 1.0
 MAX_EPISODE_SECONDS = 60.0 * 60.0
 SUPPORTED_EPISODE_LOCALES = frozenset(("sv", "en"))
-HOST_PER_SLICE_HEADROOM_SECONDS = 0.25
-HOST_RESPONSE_HEADROOM_SECONDS = 0.75
 DEFAULT_SCAN_TIMEOUT_SECONDS = (
     (DEFAULT_SCAN_BUDGET["minimum_deadline_ms"] + 999) // 1000
 )
@@ -238,6 +240,7 @@ class PhysicalNavigationRuntime(
         event_sink: Optional[Callable[[Mapping[str, object]], None]] = None,
         observation_sink: Optional[Callable[..., object]] = None,
         validated_utterance_sink: Optional[Callable[[str], object]] = None,
+        action_gate=None,
         cancel_event=None,
         emergency_event=None,
     ):
@@ -277,6 +280,18 @@ class PhysicalNavigationRuntime(
             and not callable(validated_utterance_sink)
         ):
             raise ValueError("validated utterance sink is invalid")
+        if action_gate is None:
+            action_gate = PhysicalNavigationActionGate()
+        if any(
+            not callable(getattr(action_gate, name, None))
+            for name in (
+                "describe_navigation_feasibility",
+                "prepare",
+                "evaluate_planner_decision",
+                "evaluate_motion",
+            )
+        ):
+            raise ValueError("physical action gate is invalid")
         self.episode_id = episode_id
         self.config = config
         self.transport = transport
@@ -291,6 +306,7 @@ class PhysicalNavigationRuntime(
         self.event_sink = event_sink
         self.observation_sink = observation_sink
         self.validated_utterance_sink = validated_utterance_sink
+        self.action_gate = action_gate
         self.cancel_event = cancel_event or threading.Event()
         self.emergency_event = emergency_event or threading.Event()
         self._stop_requested = threading.Event()
@@ -710,7 +726,7 @@ class PhysicalNavigationRuntime(
         navigation = dict(self.memory.context())
         navigation["goal_geometry"] = geometry
         navigation["fact_values"] = deepcopy(fact_values)
-        feasibility = physical_action_feasibility.navigation_action_feasibility(
+        feasibility = self.action_gate.describe_navigation_feasibility(
             hazard_map=self.memory.hazard_map,
             pose=self.memory.pose,
             action_specs=action_specs,
@@ -765,56 +781,22 @@ class PhysicalNavigationRuntime(
             host_ranked_or_selected_action=False,
         )
 
-    @staticmethod
-    def _validate_mission_decision(
+    def _validate_planner_decision(
+        self,
         decision: NavigationDecision,
         mission: Mapping[str, object],
         navigation: Mapping[str, object],
     ) -> None:
-        action = decision.action
-        if action == FINISH:
-            if (
-                decision.plan != (FINISH,)
-                or decision.reason_code != "COMPLETE_GOAL"
-                or mission["completed"] is not True
-            ):
-                raise PhysicalNavigationRuntimeError(
-                    "premature_mission_finish",
-                    "FINISH requires every directional mission fact",
-                )
-        elif decision.reason_code == "COMPLETE_GOAL":
-            raise PhysicalNavigationRuntimeError(
-                "nonterminal_complete_reason",
-                "COMPLETE_GOAL is valid only with FINISH",
-            )
-        delta = mission["candidate_action_longitudinal_deltas_mm"].get(action)
-        heading_recovery = delta == 0 and mission[
-            "projected_goal_heading_aligned_after_action"
-        ].get(action) is True
-        if decision.reason_code == "PROGRESS_GOAL" and (
-            delta is None or delta < 0 or (delta == 0 and not heading_recovery)
-        ):
-            raise PhysicalNavigationRuntimeError(
-                "nonprogress_action_reason",
-                "PROGRESS_GOAL contradicts published mission arithmetic",
-            )
-        if (
-            delta is not None
-            and delta < 0
-            and not navigation["navigation_hazard_hypotheses"]
-        ):
-            raise PhysicalNavigationRuntimeError(
-                "regression_without_hazard",
-                "Negative progress requires a published hazard",
-            )
-        detour_error = physical_action_feasibility.detour_decision_error(
-            action,
-            decision.perception_target_hypothesis_id,
-            decision.maneuver_commitment,
-            navigation,
+        gate_decision = self.action_gate.evaluate_planner_decision(
+            decision,
+            mission=mission,
+            navigation=navigation,
         )
-        if detour_error is not None:
-            raise PhysicalNavigationRuntimeError(*detour_error)
+        if not gate_decision.allowed:
+            raise PhysicalNavigationRuntimeError(
+                gate_decision.reason_code,
+                gate_decision.details["message"],
+            )
 
     def _remaining_seconds(self, deadline: float) -> float:
         return max(0.0, deadline - self.monotonic())
@@ -839,39 +821,16 @@ class PhysicalNavigationRuntime(
         action_specs: Mapping[str, Mapping[str, object]],
         deadline: float,
     ) -> Optional[Mapping[str, object]]:
-        if not motion_budget_allows(action, observation, action_specs):
-            return {
-                "code": "worker_budget_insufficient",
-                "action": action,
-                "host_selected_alternative_action": False,
-            }
-        swept = self.memory.hazard_map.validate_swept_path(
-            self.memory.pose,
+        decision = self.action_gate.evaluate_motion(
             action,
-            action_specs,
-            self.memory.odometry_calibration,
+            observation=observation,
+            action_specs=action_specs,
+            hazard_map=self.memory.hazard_map,
+            pose=self.memory.pose,
+            odometry_calibration=self.memory.odometry_calibration,
+            remaining_seconds=self._remaining_seconds(deadline),
         )
-        if not swept["allowed"]:
-            return {
-                "code": swept["reason"],
-                "action": action,
-                "swept_path": swept,
-                "host_selected_alternative_action": False,
-            }
-        spec = action_specs[action]
-        required = (
-            spec["total_duration_ms"] / 1000.0
-            + spec["slice_count"] * HOST_PER_SLICE_HEADROOM_SECONDS
-            + HOST_RESPONSE_HEADROOM_SECONDS
-        )
-        if self._remaining_seconds(deadline) < required:
-            return {
-                "code": "host_deadline_headroom_insufficient",
-                "action": action,
-                "required_seconds": required,
-                "host_selected_alternative_action": False,
-            }
-        return None
+        return decision.veto_mapping()
 
     def _validated_decision(
         self,
@@ -1030,7 +989,7 @@ class PhysicalNavigationRuntime(
                         "scan_target_requires_progress",
                         "Selected scan target requires intervening progress",
                     )
-                self._validate_mission_decision(
+                self._validate_planner_decision(
                     decision,
                     mission,
                     navigation,
@@ -1523,29 +1482,29 @@ class PhysicalNavigationRuntime(
                     if hypothesis["hypothesis_id"]
                     not in scan_blocked_targets
                 )
-                available = (
-                    physical_action_feasibility.prepare_navigation_availability(
-                        navigation,
-                        active_maneuver=maneuver.state(turn)["active"],
-                        scan_eligible_target_ids=scan_eligible_targets,
-                        scan_blocked_target_ids=scan_blocked_targets,
-                        scan_budget_available=self._scan_budget_allows(
-                            observation,
-                            action_specs,
-                            deadline,
-                        ),
-                        reverse_budget_available=motion_budget_allows(
-                            REVERSE,
-                            observation,
-                            action_specs,
-                        ),
-                        action_specs=action_specs,
-                        observation=observation,
-                        repeated_uninformative_observe=(
-                            repeated_uninformative_observe
-                        ),
-                    )
+                gate_availability = self.action_gate.prepare(
+                    navigation,
+                    active_maneuver=maneuver.state(turn)["active"],
+                    scan_eligible_target_ids=scan_eligible_targets,
+                    scan_blocked_target_ids=scan_blocked_targets,
+                    scan_budget_available=self._scan_budget_allows(
+                        observation,
+                        action_specs,
+                        deadline,
+                    ),
+                    reverse_budget_available=motion_budget_allows(
+                        REVERSE,
+                        observation,
+                        action_specs,
+                    ),
+                    action_specs=action_specs,
+                    observation=observation,
+                    repeated_uninformative_observe=(
+                        repeated_uninformative_observe
+                    ),
                 )
+                navigation = dict(gate_availability.navigation)
+                available = gate_availability.actions
                 available = filter_local_detour_actions(
                     available,
                     route_refresh.guidance,

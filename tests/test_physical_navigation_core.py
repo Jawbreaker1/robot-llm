@@ -58,6 +58,7 @@ from robot_agent.physical_navigation_contract import (
     expected_scan_sample_profile,
     motion_budget_allows,
 )
+from robot_agent.physical_action_gate import PhysicalNavigationActionGate
 from robot_agent.physical_navigation_mission import DirectionalMission
 from robot_agent.physical_observation_progress import (
     RestoredScanProgressBarrier,
@@ -4654,10 +4655,10 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             }],
         }
 
+        runtime = object.__new__(PhysicalNavigationRuntime)
+        runtime.action_gate = PhysicalNavigationActionGate()
         with self.assertRaises(PhysicalNavigationRuntimeError) as caught:
-            PhysicalNavigationRuntime._validate_mission_decision(
-                decision, mission, navigation
-            )
+            runtime._validate_planner_decision(decision, mission, navigation)
 
         self.assertEqual(caught.exception.code, "detour_commitment_required")
 
