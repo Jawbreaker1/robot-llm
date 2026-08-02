@@ -1068,12 +1068,15 @@ class ProvisionalHazardMap:
         self.revision += 1
         return self.get(result.target_hypothesis_id)
 
-    def _all_clear_arc_covers_hazard(
-        self,
-        hazard: ProvisionalHazard,
+    @staticmethod
+    def _scan_arc_covers_circle(
         attempt: ScanAttemptEvidence,
+        *,
+        center_x_mm: int,
+        center_y_mm: int,
+        radius_mm: int,
     ) -> bool:
-        """Check an all-clear scan against remembered world geometry."""
+        """Check angular coverage without making a range claim."""
 
         if attempt.scan_pose is None or not attempt.rays:
             return False
@@ -1083,6 +1086,37 @@ class ProvisionalHazardMap:
         minimum_bearing = min(ray_bearings)
         maximum_bearing = max(ray_bearings)
         alignment_tolerance_mdeg = 1_000
+        pose = attempt.scan_pose
+        relative_x = center_x_mm - pose.x_mm
+        relative_y = center_y_mm - pose.y_mm
+        distance = math.hypot(relative_x, relative_y)
+        if distance <= radius_mm:
+            return False
+        center_bearing = normalize_heading_mdeg(
+            int(round(math.degrees(math.atan2(relative_y, relative_x))
+                      * 1_000))
+            - pose.heading_mdeg
+        )
+        half_width = int(math.ceil(
+            math.degrees(math.asin(min(1.0, radius_mm / distance)))
+            * 1_000 - 1e-9
+        ))
+        return not (
+            center_bearing - half_width
+            < minimum_bearing - alignment_tolerance_mdeg
+            or center_bearing + half_width
+            > maximum_bearing + alignment_tolerance_mdeg
+        )
+
+    def _all_clear_arc_covers_hazard(
+        self,
+        hazard: ProvisionalHazard,
+        attempt: ScanAttemptEvidence,
+    ) -> bool:
+        """Check an all-clear scan against remembered world geometry."""
+
+        if attempt.scan_pose is None or not attempt.rays:
+            return False
         pose = attempt.scan_pose
 
         def covered(
@@ -1109,20 +1143,11 @@ class ProvisionalHazardMap:
             )
             if distance > evidence_distance:
                 return False
-            center_bearing = normalize_heading_mdeg(
-                int(round(math.degrees(math.atan2(relative_y, relative_x))
-                          * 1_000))
-                - pose.heading_mdeg
-            )
-            half_width = int(math.ceil(
-                math.degrees(math.asin(min(1.0, radius_mm / distance)))
-                * 1_000 - 1e-9
-            ))
-            return not (
-                center_bearing - half_width
-                < minimum_bearing - alignment_tolerance_mdeg
-                or center_bearing + half_width
-                > maximum_bearing + alignment_tolerance_mdeg
+            return self._scan_arc_covers_circle(
+                attempt,
+                center_x_mm=support_x_mm,
+                center_y_mm=support_y_mm,
+                radius_mm=radius_mm,
             )
 
         if not covered(
@@ -1161,6 +1186,24 @@ class ProvisionalHazardMap:
             ):
                 return False
         return True
+
+    def _scan_arc_contains_hazard_geometry(
+        self,
+        hazard: ProvisionalHazard,
+        attempt: ScanAttemptEvidence,
+    ) -> bool:
+        """Check the complete active envelope without contesting the hazard."""
+
+        envelopes = self._collision_envelopes(hazard)
+        return bool(envelopes) and all(
+            self._scan_arc_covers_circle(
+                attempt,
+                center_x_mm=center_x_mm,
+                center_y_mm=center_y_mm,
+                radius_mm=hazard.radius_mm,
+            )
+            for center_x_mm, center_y_mm in envelopes
+        )
 
     def _collision_envelopes(
         self,
@@ -1573,6 +1616,26 @@ class ProvisionalHazardMap:
             and attempt.hypothesis_relation
             != "CONFLICTS_BLOCKED_HYPOTHESIS"
         ]
+        conflict_cutoff = hazard.collision_contested_at_ms or -1
+        latest_collision_evidence_ms = max(
+            (hazard.last_seen_at_ms,) + tuple(
+                support.completed_at_ms
+                for support in hazard.collision_supports
+                if support.completed_at_ms > conflict_cutoff
+            )
+        )
+        cross_hypothesis_all_clear = [
+            attempt
+            for source in self._hazards
+            if source.hypothesis_id != hazard.hypothesis_id
+            for attempt in source.scan_evidence_history
+            if attempt.scan_pose == pose
+            and attempt.observation_pattern == "ALL_CLEAR"
+            and attempt.arc_coverage == "BILATERAL_ARC"
+            and attempt.reason == "bilateral_boundaries_not_observed"
+            and latest_collision_evidence_ms <= attempt.completed_at_ms
+            and self._scan_arc_contains_hazard_geometry(hazard, attempt)
+        ]
         positive = [
             attempt.scan_id
             for attempt in applicable
@@ -1592,7 +1655,7 @@ class ProvisionalHazardMap:
             and attempt.arc_coverage == "BILATERAL_ARC"
             and attempt.reason == "bilateral_boundaries_not_observed"
             for attempt in applicable
-        )
+        ) or bool(cross_hypothesis_all_clear)
         ready = (
             hazard.active_for_collision
             and bool(positive)
@@ -1604,7 +1667,7 @@ class ProvisionalHazardMap:
         )
         if not hazard.active_for_collision:
             reason = "HYPOTHESIS_CONTESTED_BY_FULL_ALL_CLEAR"
-        elif not applicable:
+        elif not applicable and not cross_hypothesis_all_clear:
             reason = "NO_SCAN_EVIDENCE_AT_CURRENT_VERIFIED_POSE"
         elif blocked_arc and not (positive or negative):
             reason = "BLOCKED_ARC_WITHOUT_BOUNDARY"

@@ -218,6 +218,106 @@ class AllClearScanApplicabilityTests(unittest.TestCase):
         self.assertFalse(evidence["best_effort_ready"])
         self.assertEqual(evidence["strength"], "NONE")
 
+    def test_current_clear_arc_is_route_evidence_for_another_hypothesis(self):
+        mapped = hazard_map()
+        pose = PhysicalPose(x_mm=-236)
+        attempt = ScanAttemptEvidence.from_scan_result(
+            all_clear_result(),
+            scan_pose=pose,
+        )
+        source = replace(
+            mapped.hazards[0],
+            scan_evidence_history=(attempt,),
+        )
+        covered = replace(
+            source,
+            hypothesis_id="hazard-b",
+            anchor_x_mm=-236,
+            centroid_x_mm=-96,
+            first_seen_at_ms=1_500,
+            last_seen_at_ms=1_500,
+            last_state_version=2,
+            scan_evidence_history=(),
+        )
+        outside_arc = replace(
+            covered,
+            hypothesis_id="hazard-c",
+            anchor_heading_mdeg=90_000,
+            centroid_x_mm=-236,
+            centroid_y_mm=140,
+        )
+        mapped._hazards = (source, covered, outside_arc)
+
+        evidence = mapped.route_evidence("hazard-b", pose=pose)
+        self.assertTrue(covered.active_for_collision)
+        self.assertTrue(evidence["best_effort_ready"])
+        self.assertEqual(evidence["strength"], "ALL_CLEAR_ARC")
+        self.assertEqual(evidence["applicable_scan_ids"], [])
+        self.assertEqual(
+            mapped.route_evidence("hazard-c", pose=pose)["strength"],
+            "NONE",
+        )
+        later_epoch = replace(pose, verified_motion_count=1)
+        self.assertEqual(
+            mapped.route_evidence("hazard-b", pose=later_epoch)["strength"],
+            "NONE",
+        )
+        newer_blocked_observation = replace(
+            covered,
+            last_seen_at_ms=2_101,
+        )
+        mapped._hazards = (source, newer_blocked_observation)
+        self.assertEqual(
+            mapped.route_evidence("hazard-b", pose=pose)["strength"],
+            "NONE",
+        )
+        newer_blocked_support = replace(
+            covered,
+            collision_supports=(AngularCollisionSupport(
+                source_scan_id="scan-newer-blocked",
+                completed_at_ms=2_101,
+                pose_x_mm=-236,
+                pose_y_mm=0,
+                pose_heading_mdeg=0,
+                actual_relative_bearing_mdeg=0,
+                based_on_map_version=2,
+            ),),
+        )
+        mapped._hazards = (source, newer_blocked_support)
+        self.assertEqual(
+            mapped.route_evidence("hazard-b", pose=pose)["strength"],
+            "NONE",
+        )
+        support_outside_arc = replace(
+            covered,
+            collision_supports=(AngularCollisionSupport(
+                source_scan_id="scan-blocked-edge",
+                completed_at_ms=1_700,
+                pose_x_mm=-236,
+                pose_y_mm=0,
+                pose_heading_mdeg=0,
+                actual_relative_bearing_mdeg=55_000,
+                based_on_map_version=0,
+            ),),
+        )
+        mapped._hazards = (source, support_outside_arc)
+        self.assertEqual(
+            mapped.route_evidence("hazard-b", pose=pose)["strength"],
+            "NONE",
+        )
+        partial_source = replace(
+            source,
+            scan_evidence_history=(replace(
+                attempt,
+                reason="scan_deadline_exceeded",
+            ),),
+        )
+        mapped._hazards = (partial_source, covered)
+        self.assertEqual(
+            mapped.route_evidence("hazard-b", pose=pose)["strength"],
+            "NONE",
+        )
+
     def test_clear_arc_must_cover_collision_support_radius_too(self):
         mapped = hazard_map()
         original = mapped.hazards[0]
