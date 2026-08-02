@@ -33,6 +33,7 @@ class PhysicalNavigationRuntimeAdapter:
         memory_factory: Callable[[], NavigationMemoryStore],
         scan_executor_factory: Optional[Callable[[object], object]] = None,
         speech_runtime_factory: Optional[Callable[..., object]] = None,
+        canonical_shadow_factory: Optional[Callable[..., object]] = None,
         spatial_map_bridge=None,
         minimum_forward_progress_mm: int = 420,
         goal_heading_tolerance_mdeg: int = 5_000,
@@ -62,6 +63,10 @@ class PhysicalNavigationRuntimeAdapter:
             speech_runtime_factory
         ):
             raise ValueError("speech runtime factory is invalid")
+        if canonical_shadow_factory is not None and not callable(
+            canonical_shadow_factory
+        ):
+            raise ValueError("canonical shadow factory is invalid")
         spatial_map_offer = getattr(spatial_map_bridge, "offer", None)
         spatial_map_snapshot = getattr(
             spatial_map_bridge,
@@ -115,6 +120,7 @@ class PhysicalNavigationRuntimeAdapter:
         self.memory_factory = memory_factory
         self.scan_executor_factory = scan_executor_factory
         self.speech_runtime_factory = speech_runtime_factory
+        self.canonical_shadow_factory = canonical_shadow_factory
         self.spatial_map_bridge = spatial_map_bridge
         # Dashboard composition receives only the bridge's read capability;
         # physical runtime wiring below retains its non-blocking write seam.
@@ -233,6 +239,21 @@ class PhysicalNavigationRuntimeAdapter:
             # A broken audio backend cannot fault navigation cleanup.
             return False
 
+    @staticmethod
+    def _request_close_canonical_shadow(canonical_shadow) -> None:
+        try:
+            request_close = getattr(
+                canonical_shadow,
+                "request_close",
+                None,
+            )
+            if callable(request_close):
+                request_close()
+        except Exception:
+            # Lookup and shutdown are both observational. Neither may replace
+            # the physical runtime's terminal outcome or hold its active slot.
+            return
+
     def run(self, context) -> RobotEpisodeOutcome:
         reservation = object()
         with self._lock:
@@ -268,11 +289,21 @@ class PhysicalNavigationRuntimeAdapter:
                 context.publish(update)
 
         speech_runtime = None
+        canonical_shadow = None
         runtime = None
         try:
             transport = self.transport_factory()
             planner = self.planner_factory(context.settings.model)
             memory = self.memory_factory()
+            if self.canonical_shadow_factory is not None:
+                try:
+                    canonical_shadow = self.canonical_shadow_factory(
+                        episode_id=context.episode_id,
+                    )
+                except Exception:
+                    # A shadow construction failure is deliberately invisible
+                    # to planner and motor authority.
+                    canonical_shadow = None
             scan_executor = (
                 None
                 if self.scan_executor_factory is None
@@ -347,6 +378,7 @@ class PhysicalNavigationRuntimeAdapter:
                     if speech_runtime is not None
                     else None
                 ),
+                canonical_shadow=canonical_shadow,
                 cancel_event=context.stop_requested,
                 emergency_event=context.emergency_stop_requested,
             )
@@ -380,30 +412,35 @@ class PhysicalNavigationRuntimeAdapter:
                 },
             )
         finally:
-            speech_closed = self._close_speech(
-                speech_runtime,
-                context.episode_id,
-            )
-            with self._lock:
-                if (
-                    self._active is not None
-                    and (
-                        self._active[0] is reservation
-                        or self._active[0] is runtime
-                    )
-                ):
-                    if speech_closed:
-                        self._active = None
-                    else:
-                        # Do not allow another physical episode to overlap an
-                        # unreaped speech worker. Motor cleanup has already
-                        # completed; restarting the host remains the explicit
-                        # recovery for a broken audio backend.
-                        self._active = (
-                            runtime if runtime is not None else reservation,
-                            speech_runtime,
-                            context.episode_id,
+            try:
+                speech_closed = self._close_speech(
+                    speech_runtime,
+                    context.episode_id,
+                )
+                with self._lock:
+                    if (
+                        self._active is not None
+                        and (
+                            self._active[0] is reservation
+                            or self._active[0] is runtime
                         )
+                    ):
+                        if speech_closed:
+                            self._active = None
+                        else:
+                            # Do not allow another physical episode to overlap
+                            # an unreaped speech worker. Motor cleanup has
+                            # already completed; restarting the host remains
+                            # the explicit recovery for a broken audio backend.
+                            self._active = (
+                                runtime
+                                if runtime is not None
+                                else reservation,
+                                speech_runtime,
+                                context.episode_id,
+                            )
+            finally:
+                self._request_close_canonical_shadow(canonical_shadow)
 
     def request_stop(self) -> None:
         with self._lock:

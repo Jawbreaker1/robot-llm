@@ -10,6 +10,7 @@ from robot_agent.controller_runtime_profile import (
 from robot_agent.ev3rstorm_profile import (
     EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION,
     EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG,
+    EV3RSTORM_LEGACY_SHADOW_DIRECTORY_NAME,
     EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS,
     EV3RSTORM_PROFILE_ID,
     EV3RSTORM_REMOTE_WORKER_PATH,
@@ -24,6 +25,9 @@ from robot_agent.ev3rstorm_profile import (
 from robot_agent.host_piper_speech import PiperSpeechProfile
 from robot_agent.physical_spatial_map import PhysicalSpatialMapBridge
 from robot_agent.physical_odometry import OdometryCalibration
+from robot_agent.persistent_legacy_shadow_journal import (
+    PersistentLegacyShadowSession,
+)
 
 
 class EV3RSTORMProfileTests(unittest.TestCase):
@@ -258,6 +262,47 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                 voices=(("sv", "nst-deep"),),
             ),
         )
+
+    def test_adapter_persists_one_passive_shadow_journal_per_episode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binding = EV3SSHBinding(
+                profile_id=EV3RSTORM_PROFILE_ID,
+                target="robot@ev3dev.local",
+                memory_path=Path(directory) / "memory.json",
+            )
+            adapter = self.profile.build_adapter(
+                binding,
+                planner_factory=mock.Mock(),
+            )
+
+            self.assertFalse(
+                (
+                    binding.memory_path.parent
+                    / EV3RSTORM_LEGACY_SHADOW_DIRECTORY_NAME
+                ).exists()
+            )
+            shadow = adapter.canonical_shadow_factory(
+                episode_id="episode-profile-test",
+            )
+            self.assertIsInstance(shadow, PersistentLegacyShadowSession)
+            self.assertEqual(
+                shadow.path.parent,
+                binding.memory_path.parent
+                / EV3RSTORM_LEGACY_SHADOW_DIRECTORY_NAME,
+            )
+            self.assertEqual(shadow.path.suffix, ".ndjson")
+            self.assertNotIn("episode-profile-test", shadow.path.name)
+            shadow.observe("episode_start", physical_authority="legacy")
+            self.assertTrue(shadow.close())
+            self.assertEqual(
+                shadow.path.read_text(encoding="utf-8").count("\n"),
+                1,
+            )
+            second = adapter.canonical_shadow_factory(
+                episode_id="episode-profile-test-2",
+            )
+            self.assertNotEqual(second.path, shadow.path)
+            self.assertTrue(second.close())
 
     def test_profile_rejects_another_binding_identity(self):
         with tempfile.TemporaryDirectory() as directory:

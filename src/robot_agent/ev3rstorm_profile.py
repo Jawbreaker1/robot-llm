@@ -25,6 +25,10 @@ from .host_piper_speech import (
     PiperSpeechProfile,
 )
 from .navigation_memory_store import NavigationMemoryStore
+from .legacy_shadow_runtime_context import stable_shadow_id
+from .persistent_legacy_shadow_journal import (
+    PersistentLegacyShadowSession,
+)
 from .physical_footprint import RobotFootprint
 from .physical_navigation_adapter import PhysicalNavigationRuntimeAdapter
 from .physical_odometry import OdometryCalibration
@@ -84,6 +88,7 @@ DEFAULT_EV3RSTORM_MEMORY_PATH = (
     / "navigation"
     / "ev3rstorm-01-memory.json"
 )
+EV3RSTORM_LEGACY_SHADOW_DIRECTORY_NAME = "legacy-control-shadow"
 MAX_PROFILE_CONFIG_BYTES = 128 * 1024
 
 
@@ -451,6 +456,38 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
                 ),
             )
 
+        shadow_lock = threading.Lock()
+        previous_shadow = None
+
+        def canonical_shadow_factory(*, episode_id):
+            nonlocal previous_shadow
+            with shadow_lock:
+                if previous_shadow is not None:
+                    prior_status = previous_shadow.status
+                    if prior_status.journal.worker_alive:
+                        # At most one writer may survive for this adapter. If a
+                        # filesystem write is stuck, later robot episodes run
+                        # without shadowing instead of leaking more workers.
+                        raise RuntimeError(
+                            "previous legacy shadow writer is still active"
+                        )
+                directory = (
+                    binding.memory_path.parent
+                    / EV3RSTORM_LEGACY_SHADOW_DIRECTORY_NAME
+                )
+                directory.mkdir(parents=True, exist_ok=True)
+                journal_id = stable_shadow_id(
+                    "legacy-shadow-journal",
+                    self.descriptor.controller_id,
+                    episode_id,
+                )
+                session = PersistentLegacyShadowSession(
+                    episode_id=episode_id,
+                    path=directory / "{}.ndjson".format(journal_id),
+                )
+                previous_shadow = session
+                return session
+
         spatial_map_bridge = PhysicalSpatialMapBridge(
             robot_id=self.descriptor.robot_id,
             controller_instance_id=self.descriptor.controller_id,
@@ -462,6 +499,7 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             memory_factory=memory_factory,
             scan_executor_factory=scan_executor_factory,
             speech_runtime_factory=speech_runtime_factory,
+            canonical_shadow_factory=canonical_shadow_factory,
             spatial_map_bridge=spatial_map_bridge,
             goal_heading_tolerance_mdeg=(
                 EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG
@@ -484,6 +522,7 @@ __all__ = (
     "EV3RSTORM_PROFILE_ID",
     "EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION",
     "EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG",
+    "EV3RSTORM_LEGACY_SHADOW_DIRECTORY_NAME",
     "EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS",
     "EV3RSTORM_REMOTE_WORKER_PATH",
     "EV3RSTORM_REQUEST_TIMEOUT_SECONDS",

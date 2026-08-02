@@ -191,7 +191,15 @@ class RouteRuntimeHost(PhysicalNavigationRouteRuntimeMixin):
         del action, observation, action_specs, deadline
         return self.vetoes.popleft() if self.vetoes else None
 
-    def _execute_motion(self, action, *, action_specs):
+    def _execute_motion(
+        self,
+        action,
+        *,
+        action_specs,
+        turn=None,
+        source=None,
+    ):
+        del turn, source
         if len(self.executed_actions) >= 100:
             raise AssertionError("route runtime did not converge")
         self.executed_actions.append(action)

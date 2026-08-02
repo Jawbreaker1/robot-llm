@@ -2,8 +2,6 @@
 
 from collections import deque
 from copy import deepcopy
-from dataclasses import dataclass
-import math
 import sys
 import threading
 import time
@@ -18,6 +16,7 @@ from .lm_studio_navigation import (
     LMStudioNavigationError,
     NavigationPlannerResult,
 )
+from .legacy_shadow_runtime import LegacyShadowRuntimeMixin
 from .maneuver_commitment import (
     FACT_GOAL_CORRIDOR_CLEAR,
     FACT_GOAL_HEADING_ALIGNED,
@@ -53,6 +52,19 @@ from .physical_navigation_runtime_errors import (
     EpisodeCancelled as _EpisodeCancelled,
     PhysicalNavigationRuntimeError,
 )
+from .physical_navigation_runtime_contract import (
+    DEFAULT_MAX_EPISODE_SECONDS,
+    DEFAULT_MAX_TURNS,
+    DEFAULT_SCAN_TIMEOUT_SECONDS,
+    HARD_MAX_TURNS,
+    MAX_EPISODE_SECONDS,
+    MAX_SCAN_TIMEOUT_SECONDS,
+    MAX_TURNS_PER_EPISODE_SECOND,
+    MIN_EPISODE_SECONDS,
+    PhysicalNavigationResult,
+    PhysicalNavigationRuntimeConfig,
+    SUPPORTED_EPISODE_LOCALES,
+)
 from .physical_navigation_scan_runtime import (
     DEFAULT_SCAN_BUDGET,
     PhysicalNavigationScanRuntimeMixin,
@@ -86,133 +98,13 @@ from .physical_odometry import (
     verified_motion_from_result,
 )
 
-DEFAULT_MAX_TURNS = 14
-MAX_TURNS_PER_EPISODE_SECOND = 4
-HARD_MAX_TURNS = 14_400
-DEFAULT_MAX_EPISODE_SECONDS = 35.0
-MIN_EPISODE_SECONDS = 1.0
-MAX_EPISODE_SECONDS = 60.0 * 60.0
-SUPPORTED_EPISODE_LOCALES = frozenset(("sv", "en"))
-DEFAULT_SCAN_TIMEOUT_SECONDS = (
-    (DEFAULT_SCAN_BUDGET["minimum_deadline_ms"] + 999) // 1000
-)
-MAX_SCAN_TIMEOUT_SECONDS = 120.0
-
 class _LogicalEpisodeTermination(Exception):
     def __init__(self, reason: str):
         self.reason = reason
         super().__init__(reason)
 
-
-@dataclass(frozen=True)
-class PhysicalNavigationRuntimeConfig:
-    goal: str
-    locale: str
-    minimum_forward_progress_mm: int = 420
-    goal_heading_tolerance_mdeg: int = 5_000
-    max_turns: Optional[int] = None
-    max_episode_seconds: float = DEFAULT_MAX_EPISODE_SECONDS
-    startup_timeout_seconds: float = 30.0
-    request_timeout_seconds: float = 8.0
-    scan_timeout_seconds: float = float(DEFAULT_SCAN_TIMEOUT_SECONDS)
-    plan_tail_max_age_seconds: float = PLAN_TAIL_MAX_AGE_SECONDS
-    max_validation_attempts: int = 2
-
-    def __post_init__(self) -> None:
-        duration_is_valid = (
-            not isinstance(self.max_episode_seconds, bool)
-            and isinstance(self.max_episode_seconds, (int, float))
-            and MIN_EPISODE_SECONDS
-            <= float(self.max_episode_seconds)
-            <= MAX_EPISODE_SECONDS
-        )
-        if self.max_turns is None and duration_is_valid:
-            object.__setattr__(
-                self,
-                "max_turns",
-                min(
-                    HARD_MAX_TURNS,
-                    max(
-                        DEFAULT_MAX_TURNS,
-                        int(
-                            math.ceil(
-                                float(self.max_episode_seconds)
-                                * MAX_TURNS_PER_EPISODE_SECOND
-                            )
-                        ),
-                    ),
-                ),
-            )
-        if (
-            not isinstance(self.goal, str)
-            or not self.goal.strip()
-            or len(self.goal) > 2_000
-            or self.locale not in SUPPORTED_EPISODE_LOCALES
-            or isinstance(self.minimum_forward_progress_mm, bool)
-            or not isinstance(self.minimum_forward_progress_mm, int)
-            or not 1 <= self.minimum_forward_progress_mm <= 2_000
-            or isinstance(self.goal_heading_tolerance_mdeg, bool)
-            or not isinstance(self.goal_heading_tolerance_mdeg, int)
-            or not 1_000 <= self.goal_heading_tolerance_mdeg <= 45_000
-            or isinstance(self.max_turns, bool)
-            or not isinstance(self.max_turns, int)
-            or not 1 <= self.max_turns <= HARD_MAX_TURNS
-            or not duration_is_valid
-            or isinstance(self.startup_timeout_seconds, bool)
-            or not isinstance(self.startup_timeout_seconds, (int, float))
-            or not 0.1 <= float(self.startup_timeout_seconds) <= 60.0
-            or isinstance(self.request_timeout_seconds, bool)
-            or not isinstance(self.request_timeout_seconds, (int, float))
-            or not 0.1 <= float(self.request_timeout_seconds) <= 60.0
-            or isinstance(self.scan_timeout_seconds, bool)
-            or not isinstance(self.scan_timeout_seconds, (int, float))
-            or not DEFAULT_SCAN_TIMEOUT_SECONDS
-            <= float(self.scan_timeout_seconds)
-            <= MAX_SCAN_TIMEOUT_SECONDS
-            or isinstance(self.plan_tail_max_age_seconds, bool)
-            or not isinstance(
-                self.plan_tail_max_age_seconds,
-                (int, float),
-            )
-            or not 1.0 <= float(self.plan_tail_max_age_seconds) <= 120.0
-            or isinstance(self.max_validation_attempts, bool)
-            or not isinstance(self.max_validation_attempts, int)
-            or not 1 <= self.max_validation_attempts <= 3
-        ):
-            raise ValueError("physical navigation runtime config is invalid")
-
-
-@dataclass(frozen=True)
-class PhysicalNavigationResult:
-    terminal_reason: str
-    completed: bool
-    turns: int
-    actions: Tuple[str, ...]
-    model_calls: int
-    model_latency_ms: int
-    plan_tails_completed: int
-    plan_tails_cancelled: int
-    final_mission: Mapping[str, object]
-    final_navigation: Mapping[str, object]
-    shutdown_clean: bool
-
-    def to_dict(self) -> Mapping[str, object]:
-        return {
-            "terminal_reason": self.terminal_reason,
-            "completed": self.completed,
-            "turns": self.turns,
-            "actions": list(self.actions),
-            "model_calls": self.model_calls,
-            "model_latency_ms": self.model_latency_ms,
-            "plan_tails_completed": self.plan_tails_completed,
-            "plan_tails_cancelled": self.plan_tails_cancelled,
-            "final_mission": deepcopy(self.final_mission),
-            "final_navigation": deepcopy(self.final_navigation),
-            "shutdown_clean": self.shutdown_clean,
-        }
-
-
 class PhysicalNavigationRuntime(
+    LegacyShadowRuntimeMixin,
     PhysicalNavigationRouteRuntimeMixin,
     PhysicalNavigationPlanTailRuntimeMixin,
     PhysicalNavigationScanRuntimeMixin,
@@ -240,6 +132,7 @@ class PhysicalNavigationRuntime(
         event_sink: Optional[Callable[[Mapping[str, object]], None]] = None,
         observation_sink: Optional[Callable[..., object]] = None,
         validated_utterance_sink: Optional[Callable[[str], object]] = None,
+        canonical_shadow=None,
         action_gate=None,
         cancel_event=None,
         emergency_event=None,
@@ -306,6 +199,15 @@ class PhysicalNavigationRuntime(
         self.event_sink = event_sink
         self.observation_sink = observation_sink
         self.validated_utterance_sink = validated_utterance_sink
+        try:
+            shadow_observe = getattr(canonical_shadow, "observe", None)
+        except Exception:
+            shadow_observe = None
+        self._canonical_shadow = (
+            canonical_shadow if callable(shadow_observe) else None
+        )
+        self._canonical_shadow_goal = None
+        self._canonical_shadow_calibration_fingerprint = None
         self.action_gate = action_gate
         self.cancel_event = cancel_event or threading.Event()
         self.emergency_event = emergency_event or threading.Event()
@@ -456,6 +358,10 @@ class PhysicalNavigationRuntime(
         """Publish and offer speech only for the action being dispatched."""
 
         self._raise_if_cancelled("immediately_before_decision_commit")
+        self._shadow_record_committed_decision(
+            turn=turn,
+            decision=decision,
+        )
         self._emit(
             "model_decision_committed",
             turn=turn,
@@ -848,6 +754,18 @@ class PhysicalNavigationRuntime(
         feedback = None
         for attempt in range(1, self.config.max_validation_attempts + 1):
             counters["model_calls"] += 1
+            planner_maneuver_state = maneuver.state(turn)
+            self._shadow_record_planner_input(
+                turn=turn,
+                attempt=attempt,
+                observation=observation,
+                mission=mission,
+                navigation=navigation,
+                maneuver_state=planner_maneuver_state,
+                available_actions=available_actions,
+                last_tool_result=last_tool_result,
+                validation_feedback=feedback,
+            )
             try:
                 planner_result = self.planner.decide(
                     episode_id=self.episode_id,
@@ -856,7 +774,7 @@ class PhysicalNavigationRuntime(
                     observation=observation,
                     mission=mission,
                     navigation=navigation,
-                    maneuver_state=maneuver.state(turn),
+                    maneuver_state=planner_maneuver_state,
                     available_actions=available_actions,
                     last_tool_result=last_tool_result,
                     validation_feedback=feedback,
@@ -994,6 +912,7 @@ class PhysicalNavigationRuntime(
                     mission,
                     navigation,
                 )
+                maneuver_before = maneuver.state(turn)
                 maneuver.apply(
                     decision.maneuver_commitment,
                     action=decision.action,
@@ -1004,6 +923,20 @@ class PhysicalNavigationRuntime(
                     perception_target_hypothesis_id=(
                         decision.perception_target_hypothesis_id
                     ),
+                )
+                maneuver_after = maneuver.state(turn)
+                self._shadow_record_validated_decision(
+                    turn=turn,
+                    attempt=attempt,
+                    decision=decision,
+                    observation=observation,
+                    mission=mission,
+                    navigation=navigation,
+                    maneuver_before=maneuver_before,
+                    maneuver_after=maneuver_after,
+                    model_latency_ms=latency_ms,
+                    served_model=served_model,
+                    planner_telemetry=planner_telemetry,
                 )
                 return decision
             except (
@@ -1036,6 +969,8 @@ class PhysicalNavigationRuntime(
         action: str,
         *,
         action_specs: Mapping[str, Mapping[str, object]],
+        turn: Optional[int] = None,
+        source: str = PLANNER_ACTION_SOURCE,
     ) -> Tuple[Mapping[str, object], Mapping[str, object]]:
         self._raise_if_cancelled("immediately_before_motion")
         response = self._active_request(
@@ -1083,6 +1018,14 @@ class PhysicalNavigationRuntime(
             "encoder_observation": motion.to_dict(),
             "resulting_pose": self.memory.pose.to_dict(),
         }
+        self._shadow_record_motion(
+            turn=turn,
+            source=source,
+            action=action,
+            worker_result=result,
+            observation=observation,
+            feedback=feedback,
+        )
         self._emit(
             "motion_result",
             action=action,
@@ -1382,6 +1325,11 @@ class PhysicalNavigationRuntime(
                     self.config.goal_heading_tolerance_mdeg
                 ),
             )
+            self._shadow_record_episode_start(
+                mission=mission,
+                observation=observation,
+                action_specs=action_specs,
+            )
             self._emit(
                 "episode_started",
                 observation=deepcopy(observation),
@@ -1442,6 +1390,10 @@ class PhysicalNavigationRuntime(
                     local_route = route_result.route
                     last_tool_result = route_result.last_tool_result
                     actions.extend(route_result.actions)
+                    self._shadow_record_route_handoff(
+                        turn=turn,
+                        route_result=route_result,
+                    )
                     if (
                         route_result.handoff_reason
                         == HANDOFF_EPISODE_DEADLINE_ELAPSED
@@ -1595,6 +1547,13 @@ class PhysicalNavigationRuntime(
                         basis_before=basis_before,
                         observation_after=observation,
                     )
+                    self._shadow_record_observe(
+                        turn=turn,
+                        source=PLANNER_ACTION_SOURCE,
+                        worker_state_version=response["state_version"],
+                        observation=observation,
+                        feedback=last_tool_result,
+                    )
                     continue
                 if decision.action == SCAN_FRONT_ARC:
                     self._raise_if_cancelled("immediately_before_scan_dispatch")
@@ -1613,6 +1572,12 @@ class PhysicalNavigationRuntime(
                         result=last_tool_result,
                         basis_before=basis_before,
                         observation_after=observation,
+                    )
+                    self._shadow_record_scan(
+                        turn=turn,
+                        source=PLANNER_ACTION_SOURCE,
+                        observation=observation,
+                        feedback=last_tool_result,
                     )
                     continue
 
@@ -1633,6 +1598,12 @@ class PhysicalNavigationRuntime(
                         "execution_vetoed",
                         action=decision.action,
                         validation=veto,
+                    )
+                    self._shadow_record_execution_veto(
+                        turn=turn,
+                        action=decision.action,
+                        validation=veto,
+                        observation=observation,
                     )
                     self._record_experience(
                         turn=turn,
@@ -1659,6 +1630,8 @@ class PhysicalNavigationRuntime(
                 observation, last_tool_result = self._execute_motion(
                     decision.action,
                     action_specs=action_specs,
+                    turn=turn,
+                    source=PLANNER_ACTION_SOURCE,
                 )
                 actions.append(decision.action)
                 self._record_experience(
@@ -1691,6 +1664,11 @@ class PhysicalNavigationRuntime(
                     actions.extend(tail_result.actions)
                     counters["tails_completed"] += tail_result.completed
                     counters["tails_cancelled"] += tail_result.cancelled
+                    self._shadow_record_plan_tail_handoff(
+                        turn=turn,
+                        tail=tail,
+                        tail_result=tail_result,
+                    )
 
             if mission is not None and observation is not None:
                 final_mission, _navigation = self._goal_state(
@@ -1723,6 +1701,14 @@ class PhysicalNavigationRuntime(
                 shutdown_clean = False
             if not shutdown_clean:
                 terminal_reason = "physical_shutdown_unverified"
+            self._shadow_record_terminal(
+                terminal_reason=terminal_reason,
+                completed=completed,
+                turns=turns,
+                actions=actions,
+                shutdown_clean=shutdown_clean,
+                counters=counters,
+            )
             self._emit(
                 "episode_stopped",
                 terminal_reason=terminal_reason,

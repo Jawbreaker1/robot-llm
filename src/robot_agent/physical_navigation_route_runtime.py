@@ -559,6 +559,8 @@ class PhysicalNavigationRouteRuntimeMixin:
             next_observation, current_tool_result = self._execute_motion(
                 action,
                 action_specs=action_specs,
+                turn=turn,
+                source=ROUTE_EXECUTOR_ACTION_SOURCE,
             )
             executed_actions.append(action)
             current_observation = next_observation

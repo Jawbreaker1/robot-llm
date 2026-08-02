@@ -91,6 +91,8 @@ class PhysicalNavigationPlanTailRuntimeMixin:
             observation, last_tool_result = self._execute_motion(
                 next_action,
                 action_specs=action_specs,
+                turn=turn,
+                source=PLAN_TAIL_ACTION_SOURCE,
             )
             actions.append(next_action)
             self._record_experience(
