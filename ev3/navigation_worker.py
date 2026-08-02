@@ -11,6 +11,7 @@ from __future__ import print_function
 import copy
 import os
 import time
+import uuid
 
 if __package__:
     from .infrared_safety import (
@@ -115,6 +116,22 @@ DEFAULT_CONFIG_PATH = os.path.join(
 FAULT_STATES = frozenset(FAULT_MOTOR_STATES)
 
 
+def new_controller_instance_id(uuid_factory=uuid.uuid4):
+    """Return one bounded identity for this worker-process incarnation."""
+
+    if not callable(uuid_factory):
+        raise ValueError("uuid_factory must be callable")
+    value = uuid_factory()
+    hexadecimal = getattr(value, "hex", None)
+    if not isinstance(hexadecimal, str):
+        hexadecimal = str(value).replace("-", "")
+    return validate_identifier(
+        "controller_instance_id",
+        "ev3-worker-{0}".format(hexadecimal),
+        128,
+    )
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -135,6 +152,7 @@ class NavigationWorker(object):
         self,
         config_path=DEFAULT_CONFIG_PATH,
         cancel_requested=None,
+        controller_instance_id_factory=uuid.uuid4,
     ):
         if cancel_requested is None:
             cancel_requested = lambda: False
@@ -154,6 +172,9 @@ class NavigationWorker(object):
             "controller_id",
             self.robot.config["controller_id"],
             128,
+        )
+        self.controller_instance_id = new_controller_instance_id(
+            controller_instance_id_factory
         )
         self.gate = InfraredObstacleGate(
             InfraredGatePolicy.from_config(self.robot.config)
@@ -1174,6 +1195,7 @@ class NavigationWorker(object):
             "demo_only": True,
             "policy_owner": "host",
             "controller_id": self.controller_id,
+            "controller_instance_id": self.controller_instance_id,
             "request_schema": REQUEST_SCHEMA,
             "response_schema": RESPONSE_SCHEMA,
             "operations": list(ALLOWED_OPERATIONS),

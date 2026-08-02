@@ -24,7 +24,10 @@ from ev3.navigation_profile import (
     scan_sample_profile,
     validate_action_specs,
 )
-from ev3.navigation_worker import NavigationWorker
+from ev3.navigation_worker import (
+    NavigationWorker,
+    new_controller_instance_id,
+)
 from ev3.navigation_worker_cli import (
     _binary_input_stream,
     _input_cancel_requested,
@@ -38,6 +41,7 @@ from ev3.navigation_worker_protocol import (
 
 
 CONTROLLER_ID = "ev3rstorm-01.ev3-main"
+CONTROLLER_INSTANCE_ID = "ev3-worker-test-instance-1"
 
 
 class Clock(object):
@@ -409,6 +413,14 @@ def request_frame(
 
 
 class EV3NavigationWorkerProtocolTests(unittest.TestCase):
+    def test_worker_instance_ids_are_bounded_and_fresh(self):
+        first = new_controller_instance_id()
+        second = new_controller_instance_id()
+
+        self.assertTrue(first.startswith("ev3-worker-"))
+        self.assertLessEqual(len(first), 128)
+        self.assertNotEqual(first, second)
+
     def test_input_channel_readability_or_eof_requests_cancellation(self):
         read_descriptor, write_descriptor = os.pipe()
         raw_reader = os.fdopen(read_descriptor, "rb", buffering=0)
@@ -653,6 +665,7 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
             }
         }
         worker.controller_id = CONTROLLER_ID
+        worker.controller_instance_id = CONTROLLER_INSTANCE_ID
         worker.gate = InfraredObstacleGate(
             InfraredGatePolicy(16, 35, 40, 3, 2, 3)
         )
@@ -1287,8 +1300,17 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
 
     def test_describe_declares_host_policy_and_lifetime_lock(self):
         description = self.worker.describe()
+        repeated = self.worker.describe()
         self.assertEqual(description["worker_id"], WORKER_ID)
         self.assertEqual(description["policy_owner"], "host")
+        self.assertEqual(
+            description["controller_instance_id"],
+            CONTROLLER_INSTANCE_ID,
+        )
+        self.assertEqual(
+            repeated["controller_instance_id"],
+            CONTROLLER_INSTANCE_ID,
+        )
         self.assertTrue(
             description["safety"]["lifetime_motor_lock"]
         )

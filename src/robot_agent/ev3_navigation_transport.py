@@ -126,6 +126,18 @@ def _remote_path(value: str) -> str:
     return checked
 
 
+def _controller_instance_identity(value: object) -> str:
+    checked = _identifier("controller_instance_id", value, 128)
+    if any(
+        not (character.isalnum() or character in "._:-")
+        for character in checked
+    ):
+        raise EV3NavigationTransportError(
+            "controller_instance_id is invalid"
+        )
+    return checked
+
+
 class EV3NavigationSSHTransport:
     """One outstanding request at a time to one foreground worker process."""
 
@@ -181,6 +193,14 @@ class EV3NavigationSSHTransport:
         if self._worker_description is None:
             return None
         return dict(self._worker_description)
+
+    @property
+    def controller_instance_id(self) -> Optional[str]:
+        """Identity of the currently described worker-process incarnation."""
+
+        if self._worker_description is None:
+            return None
+        return self._worker_description["controller_instance_id"]
 
     @property
     def aborted(self) -> bool:
@@ -645,6 +665,16 @@ class EV3NavigationSSHTransport:
     ) -> None:
         result = response["result"]
         if operation == "describe":
+            try:
+                controller_instance_id = _controller_instance_identity(
+                    result.get("controller_instance_id")
+                    if isinstance(result, dict)
+                    else None,
+                )
+            except EV3NavigationTransportError:
+                raise EV3NavigationTransportError(
+                    "worker controller instance identity is invalid"
+                ) from None
             if (
                 not isinstance(result, dict)
                 or result.get("scan_turn")
@@ -657,6 +687,14 @@ class EV3NavigationSSHTransport:
             ):
                 raise EV3NavigationTransportError(
                     "worker scan-turn capability is invalid"
+                )
+            if (
+                self._worker_description is not None
+                and self._worker_description.get("controller_instance_id")
+                != controller_instance_id
+            ):
+                raise EV3NavigationTransportError(
+                    "worker controller instance identity changed"
                 )
             self._worker_description = dict(result)
             return

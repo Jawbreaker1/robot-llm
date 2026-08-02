@@ -1529,6 +1529,50 @@ class ActiveIrScanTests(unittest.TestCase):
 
 
 class EV3NavigationTransportTests(unittest.TestCase):
+    def test_describe_binds_one_stable_worker_instance(self):
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+        response = FakeRuntimeTransport().request("describe", {}, 1.0)
+
+        self.assertIsNone(transport.controller_instance_id)
+        transport._validate_success_result("describe", {}, response)
+        self.assertEqual(
+            transport.controller_instance_id,
+            "ev3-worker-fake-session",
+        )
+
+        changed = copy.deepcopy(response)
+        changed["result"]["controller_instance_id"] = (
+            "ev3-worker-replacement-session"
+        )
+        with self.assertRaisesRegex(
+            EV3NavigationTransportError,
+            "identity changed",
+        ):
+            transport._validate_success_result("describe", {}, changed)
+
+    def test_describe_rejects_invalid_worker_instance(self):
+        transport = EV3NavigationSSHTransport(
+            target="robot@ev3.local",
+            controller_id="ev3-main",
+            remote_worker_path=(
+                "/home/robot/robot-llm/ev3/navigation_worker.py"
+            ),
+        )
+        response = FakeRuntimeTransport().request("describe", {}, 1.0)
+        response["result"]["controller_instance_id"] = "not valid"
+
+        with self.assertRaisesRegex(
+            EV3NavigationTransportError,
+            "instance identity is invalid",
+        ):
+            transport._validate_success_result("describe", {}, response)
+
     def test_scan_sample_uses_declared_filter_tail_not_whole_batch(self):
         transport = EV3NavigationSSHTransport(
             target="robot@ev3.local",
@@ -2109,6 +2153,7 @@ class FakeRuntimeTransport:
                     "demo_only": True,
                     "policy_owner": "host",
                     "controller_id": "ev3-main",
+                    "controller_instance_id": "ev3-worker-fake-session",
                     "request_schema": "ev3-agent-worker-request/v1",
                     "response_schema": "ev3-agent-worker-response/v2",
                     "operations": [
@@ -3388,6 +3433,15 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                     with self.assertRaises(PhysicalNavigationRuntimeError):
                         PhysicalNavigationRuntime._description(changed)
 
+    def test_runtime_requires_a_valid_worker_instance_identity(self):
+        response = FakeRuntimeTransport().request("describe", {}, 1.0)
+        for value in (None, "", "not valid", "x" * 129):
+            with self.subTest(value=value):
+                changed = copy.deepcopy(response)
+                changed["result"]["controller_instance_id"] = value
+                with self.assertRaises(PhysicalNavigationRuntimeError):
+                    PhysicalNavigationRuntime._description(changed)
+
     def test_runtime_executes_exact_tail_and_replans_to_finish(self):
         with tempfile.TemporaryDirectory() as directory:
             memory = NavigationMemoryStore.load(
@@ -3418,6 +3472,10 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             result = runtime.run()
 
         self.assertTrue(result.completed)
+        self.assertEqual(
+            runtime.controller_instance_id,
+            "ev3-worker-fake-session",
+        )
         self.assertEqual(
             result.actions,
             (ADVANCE, ADVANCE, FINISH),

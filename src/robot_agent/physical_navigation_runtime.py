@@ -218,6 +218,7 @@ class PhysicalNavigationRuntime(
         self._observation_received_monotonic = None
         self._latest_validated_observation = None
         self._worker_absolute_max_ms = None
+        self._controller_instance_id = None
         self._all_sessions_clean = True
         self._recent_committed_utterances = deque(
             maxlen=MAX_RECENT_COMMITTED_UTTERANCES
@@ -226,6 +227,12 @@ class PhysicalNavigationRuntime(
         self._experience_ledger = NavigationExperienceLedger(
             episode_id=episode_id,
         )
+
+    @property
+    def controller_instance_id(self) -> Optional[str]:
+        """Identity of the currently connected EV3 worker incarnation."""
+
+        return self._controller_instance_id
 
     def request_stop(self) -> None:
         self._stop_requested.set()
@@ -450,6 +457,7 @@ class PhysicalNavigationRuntime(
         Mapping[str, Mapping[str, object]],
         DriveMotorRoles,
         int,
+        str,
     ]:
         result = response.get("result")
         if not isinstance(result, dict):
@@ -462,6 +470,7 @@ class PhysicalNavigationRuntime(
             "demo_only",
             "policy_owner",
             "controller_id",
+            "controller_instance_id",
             "request_schema",
             "response_schema",
             "operations",
@@ -481,6 +490,23 @@ class PhysicalNavigationRuntime(
         pulse = result["pulse"]
         safety = result["safety"]
         process = result["process"]
+        controller_instance_id = result["controller_instance_id"]
+        if (
+            not isinstance(controller_instance_id, str)
+            or not controller_instance_id
+            or len(controller_instance_id) > 128
+            or any(
+                not (
+                    character.isalnum()
+                    or character in "._:-"
+                )
+                for character in controller_instance_id
+            )
+        ):
+            raise PhysicalNavigationRuntimeError(
+                "invalid_worker_instance_id",
+                "Worker controller instance identity is invalid",
+            )
         if (
             not isinstance(process, dict)
             or set(process) != {"absolute_max_ms", "max_requests"}
@@ -543,6 +569,7 @@ class PhysicalNavigationRuntime(
             deepcopy(pulse["actions"]),
             drive_roles,
             process["absolute_max_ms"],
+            controller_instance_id,
         )
 
     def _observation_from_response(
@@ -1084,6 +1111,7 @@ class PhysicalNavigationRuntime(
             action_specs,
             drive_roles,
             absolute_max_ms,
+            controller_instance_id,
         ) = self._description(description)
         self._remember_observation(observation)
         if (
@@ -1120,9 +1148,11 @@ class PhysicalNavigationRuntime(
         )
         self._observation_received_monotonic = self.monotonic()
         self._worker_absolute_max_ms = absolute_max_ms
+        self._controller_instance_id = controller_instance_id
         self._emit(
             "worker_session_started",
             worker_absolute_max_ms=absolute_max_ms,
+            controller_instance_id=controller_instance_id,
         )
         return observation, action_specs, drive_roles
 
