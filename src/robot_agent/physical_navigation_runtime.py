@@ -788,16 +788,6 @@ class PhysicalNavigationRuntime(
                 "COMPLETE_GOAL is valid only with FINISH",
             )
         delta = mission["candidate_action_longitudinal_deltas_mm"].get(action)
-        heading_recovery = delta == 0 and mission[
-            "projected_goal_heading_aligned_after_action"
-        ].get(action) is True
-        if decision.reason_code == "PROGRESS_GOAL" and (
-            delta is None or delta < 0 or (delta == 0 and not heading_recovery)
-        ):
-            raise PhysicalNavigationRuntimeError(
-                "nonprogress_action_reason",
-                "PROGRESS_GOAL contradicts published mission arithmetic",
-            )
         if (
             delta is not None
             and delta < 0

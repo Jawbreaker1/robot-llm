@@ -2997,6 +2997,55 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
 
         self.assertNotIn(FINISH, planner.available)
 
+    def test_diagnostic_progress_reason_does_not_veto_safe_observe(self):
+        class ProgressLabelledObservePlanner:
+            def decide(self, **context):
+                return NavigationDecision.from_mapping(
+                    decision_mapping(
+                        episode_id=context["episode_id"],
+                        turn=context["turn"],
+                        state_version=context["observation"]["state_version"],
+                        action=OBSERVE,
+                        plan=[OBSERVE],
+                        reason_code="PROGRESS_GOAL",
+                    ),
+                    episode_id=context["episode_id"],
+                    turn=context["turn"],
+                    state_version=context["observation"]["state_version"],
+                    available_actions=context["available_actions"],
+                    published_target_ids=(),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "diagnostic-reason-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+            )
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-diagnostic-reason",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Observe",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=FakeRuntimeTransport(),
+                planner=ProgressLabelledObservePlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+                event_sink=events.append,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(result.actions, (OBSERVE,))
+        self.assertFalse(
+            any(event["event"] == "decision_vetoed" for event in events)
+        )
+
     def test_adapter_carries_planner_context_and_token_telemetry(self):
         update = PhysicalNavigationRuntimeAdapter._dashboard_update({
             "event": "model_decision",
