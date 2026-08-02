@@ -208,6 +208,7 @@ recognize the dog, turn toward it, and answer, “woof right back at you.”
 | Document | Contents |
 |---|---|
 | [Architecture](docs/ARCHITECTURE.md) | Agent runtime, authority, parallelism, memory, and multi-controller design |
+| [Control state model](docs/CONTROL_STATE_MODEL.md) | Canonical goal, intent, plan, action-gate, and controller-state boundaries |
 | [Dashboard](docs/DASHBOARD.md) | Live UI, STT, map, settings, and persistence |
 | [EV3 Wi-Fi](docs/EV3_WIFI.md) | Network onboarding and recovery |
 | [EV3 runtime deployment](docs/EV3_RUNTIME_DEPLOYMENT.md) | Worker deployment, preflight, transport, speech, and physical checks |
