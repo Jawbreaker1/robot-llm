@@ -48,6 +48,41 @@ class EV3NavigationTransportError(RuntimeError):
     pass
 
 
+class EV3NavigationPreWriteError(EV3NavigationTransportError):
+    """A request was rejected before any byte reached the worker."""
+
+    def __init__(self, request_id: str, message: str):
+        self.request_id = request_id
+        super().__init__(message)
+
+
+class EV3NavigationCommittedNotDispatchedError(
+    EV3NavigationTransportError
+):
+    """The write-ahead record committed, but no worker byte was sent."""
+
+    CANCELLED = "CANCELLED_AFTER_COMMIT"
+    CANCELLATION_PROBE_FAILED = "CANCEL_PROBE_FAILED_AFTER_COMMIT"
+    _MESSAGES = {
+        CANCELLED: "worker request cancelled after commit but before dispatch",
+        CANCELLATION_PROBE_FAILED: (
+            "request cancellation probe failed after commit"
+        ),
+    }
+
+    def __init__(self, request_id: str, reason: str):
+        if reason not in self._MESSAGES:
+            raise ValueError("invalid committed-not-dispatched reason")
+        self.request_id = request_id
+        self.reason = reason
+        self.record_committed = True
+        self.write_attempted = False
+        self.bytes_sent = 0
+        self.physical_outcome_known = True
+        self.transport_reusable = True
+        super().__init__(self._MESSAGES[reason])
+
+
 class EV3NavigationRemoteError(EV3NavigationTransportError):
     def __init__(
         self,
@@ -1021,6 +1056,7 @@ class EV3NavigationSSHTransport:
         arguments: Optional[Mapping[str, object]] = None,
         timeout_seconds: float = 8.0,
         cancel_requested: Optional[Callable[[], bool]] = None,
+        before_write: Optional[Callable[[str], None]] = None,
     ) -> Mapping[str, object]:
         if self.aborted:
             raise EV3NavigationTransportError(
@@ -1059,6 +1095,10 @@ class EV3NavigationSSHTransport:
             raise EV3NavigationTransportError(
                 "request cancellation probe is invalid"
             )
+        if before_write is not None and not callable(before_write):
+            raise EV3NavigationTransportError(
+                "request before-write hook is invalid"
+            )
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
@@ -1085,6 +1125,48 @@ class EV3NavigationSSHTransport:
             )
         request_written = False
         try:
+            if before_write is not None:
+                # The trusted hook must return only after its write-ahead
+                # record is durable; raising must mean no record committed.
+                # Recheck cancellation after commit, then write immediately.
+                if cancel_requested is not None:
+                    try:
+                        cancelled_before_dispatch = (
+                            cancel_requested() is True
+                        )
+                    except BaseException:
+                        raise EV3NavigationPreWriteError(
+                            request_id,
+                            "request cancellation probe failed before dispatch",
+                        ) from None
+                    if cancelled_before_dispatch:
+                        raise EV3NavigationPreWriteError(
+                            request_id,
+                            "worker request cancelled before dispatch",
+                        )
+                try:
+                    before_write(request_id)
+                except BaseException as error:
+                    raise EV3NavigationPreWriteError(
+                        request_id,
+                        "request before-write hook failed",
+                    ) from error
+                if cancel_requested is not None:
+                    try:
+                        cancelled_after_commit = (
+                            cancel_requested() is True
+                        )
+                    except BaseException:
+                        raise EV3NavigationCommittedNotDispatchedError(
+                            request_id,
+                            EV3NavigationCommittedNotDispatchedError.
+                            CANCELLATION_PROBE_FAILED,
+                        ) from None
+                    if cancelled_after_commit:
+                        raise EV3NavigationCommittedNotDispatchedError(
+                            request_id,
+                            EV3NavigationCommittedNotDispatchedError.CANCELLED,
+                        )
             try:
                 self._process.stdin.write(frame)
                 request_written = True
