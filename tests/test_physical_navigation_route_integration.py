@@ -6,6 +6,9 @@ import uuid
 
 from robot_agent.active_ir_scan_contract import ActiveIrRay, ActiveIrScanResult
 from robot_agent.ev3rstorm_profile import EV3RSTORMProfile
+from robot_agent.lm_studio_navigation import (
+    LMStudioNavigationDecisionError,
+)
 from robot_agent.maneuver_commitment import (
     FACT_GOAL_CORRIDOR_CLEAR,
     FACT_GOAL_HEADING_ALIGNED,
@@ -460,6 +463,46 @@ class PhysicalNavigationRouteIntegrationTests(unittest.TestCase):
         ]
         self.assertLess(planner_indices[0], route_motion_index)
         self.assertLess(route_motion_index, planner_indices[1])
+
+    def test_deferred_planner_retry_cannot_resume_active_route(self):
+        class InvalidAfterAuthorizationPlanner(RouteAuthorizationPlanner):
+            def decide(self, **context):
+                if self.calls >= 1:
+                    self.calls += 1
+                    self.contexts.append(copy.deepcopy(context))
+                    raise LMStudioNavigationDecisionError(
+                        "invalid_action_reason",
+                        "Action and reason disagree",
+                        latency_ms=1,
+                    )
+                return super().decide(**context)
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = ReplanAfterOneRoutePulseRuntime(
+                episode_id="episode-route-deferred-planner",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Pass the obstacle and resume the original heading",
+                    locale="en",
+                    minimum_forward_progress_mm=120,
+                    max_turns=3,
+                    max_episode_seconds=300,
+                    max_validation_attempts=1,
+                ),
+                transport=RouteAwareRuntimeTransport(blocked=False),
+                planner=InvalidAfterAuthorizationPlanner(),
+                memory=route_ready_memory(
+                    Path(directory) / "memory.json"
+                ),
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 3_000,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(runtime.route_attempts, 1)
+        self.assertEqual(result.actions, (OBSERVE, ADVANCE))
+        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(result.terminal_reason, "reasoning_unavailable")
 
 
 if __name__ == "__main__":

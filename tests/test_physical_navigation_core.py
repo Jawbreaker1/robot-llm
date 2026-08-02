@@ -3762,7 +3762,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             any(event["event"] == "planner_termination" for event in events)
         )
 
-    def test_exhausted_invalid_decisions_end_as_reasoning_unavailable(self):
+    def test_exhausted_invalid_decisions_defer_once_before_termination(self):
         class AlwaysInvalidPlanner:
             def __init__(self):
                 self.calls = 0
@@ -3792,7 +3792,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 config=PhysicalNavigationRuntimeConfig(
                     goal="Observe",
                     locale="en",
-                    max_turns=1,
+                    max_turns=2,
                     max_episode_seconds=10,
                     max_validation_attempts=2,
                 ),
@@ -3809,9 +3809,9 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         self.assertEqual(result.terminal_reason, "reasoning_unavailable")
         self.assertFalse(result.completed)
         self.assertTrue(result.shutdown_clean)
-        self.assertEqual(result.model_calls, 2)
-        self.assertEqual(result.model_latency_ms, 14)
-        self.assertEqual(planner.calls, 2)
+        self.assertEqual(result.model_calls, 4)
+        self.assertEqual(result.model_latency_ms, 28)
+        self.assertEqual(planner.calls, 4)
         self.assertEqual(result.actions, ())
         self.assertEqual(
             [operation for operation, _arguments in transport.calls],
@@ -3823,7 +3823,15 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 for event in events
                 if event["event"] == "decision_vetoed"
             ],
-            [1, 2],
+            [1, 2, 1, 2],
+        )
+        self.assertEqual(
+            [
+                event["turn"]
+                for event in events
+                if event["event"] == "planner_turn_deferred"
+            ],
+            [1],
         )
         termination = next(
             event
@@ -3833,6 +3841,98 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         self.assertEqual(
             termination["terminal_reason"],
             "reasoning_unavailable",
+        )
+
+    def test_deferred_invalid_decision_recovers_on_next_turn(self):
+        class InvalidTwiceThenObservePlanner:
+            def __init__(self):
+                self.calls = []
+
+            def decide(self, **context):
+                self.calls.append({
+                    "turn": context["turn"],
+                    "feedback": copy.deepcopy(
+                        context["validation_feedback"]
+                    ),
+                })
+                if len(self.calls) <= 2:
+                    raise LMStudioNavigationDecisionError(
+                        "invalid_action_reason",
+                        "Action and reason disagree",
+                        latency_ms=7,
+                    )
+                return NavigationDecision.from_mapping(
+                    decision_mapping(
+                        episode_id=context["episode_id"],
+                        turn=context["turn"],
+                        state_version=context["observation"][
+                            "state_version"
+                        ],
+                        action=OBSERVE,
+                        plan=[OBSERVE],
+                        reason_code="VERIFY_RESULT",
+                    ),
+                    episode_id=context["episode_id"],
+                    turn=context["turn"],
+                    state_version=context["observation"]["state_version"],
+                    available_actions=context["available_actions"],
+                    published_target_ids=(),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "invalid-deferred-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=262),
+            )
+            planner = InvalidTwiceThenObservePlanner()
+            transport = FakeRuntimeTransport()
+            events = []
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-invalid-deferred",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Observe",
+                    locale="en",
+                    max_turns=2,
+                    max_episode_seconds=10,
+                    max_validation_attempts=2,
+                ),
+                transport=transport,
+                planner=planner,
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+                event_sink=events.append,
+            )
+
+            result = runtime.run()
+
+        self.assertEqual(
+            [call["turn"] for call in planner.calls],
+            [1, 1, 2],
+        )
+        self.assertIsNone(planner.calls[0]["feedback"])
+        self.assertEqual(
+            planner.calls[2]["feedback"]["code"],
+            "invalid_action_reason",
+        )
+        self.assertEqual(result.actions, (OBSERVE,))
+        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(result.model_latency_ms, 14)
+        self.assertTrue(result.shutdown_clean)
+        self.assertEqual(
+            [
+                event["turn"]
+                for event in events
+                if event["event"] == "planner_turn_deferred"
+            ],
+            [1],
+        )
+        self.assertFalse(
+            any(event["event"] == "planner_termination" for event in events)
         )
 
     def test_late_planner_output_cannot_dispatch_a_physical_operation(self):

@@ -869,8 +869,9 @@ class PhysicalNavigationRuntime(
         available_actions,
         last_tool_result,
         counters,
-    ) -> NavigationDecision:
-        feedback = None
+        validation_feedback=None,
+    ) -> Tuple[Optional[NavigationDecision], Optional[Mapping[str, object]]]:
+        feedback = validation_feedback
         for attempt in range(1, self.config.max_validation_attempts + 1):
             counters["model_calls"] += 1
             try:
@@ -1030,7 +1031,7 @@ class PhysicalNavigationRuntime(
                         decision.perception_target_hypothesis_id
                     ),
                 )
-                return decision
+                return decision, None
             except (
                 ManeuverCommitmentError,
                 PhysicalNavigationRuntimeError,
@@ -1046,15 +1047,7 @@ class PhysicalNavigationRuntime(
                     turn=turn,
                     validation_feedback=feedback,
                 )
-        self._emit(
-            "planner_termination",
-            turn=turn,
-            attempt=self.config.max_validation_attempts,
-            terminal_reason="reasoning_unavailable",
-            validation_feedback=feedback,
-            host_selected_alternative_action=False,
-        )
-        raise _LogicalEpisodeTermination("reasoning_unavailable")
+        return None, feedback
 
     def _execute_motion(
         self,
@@ -1391,6 +1384,7 @@ class PhysicalNavigationRuntime(
         maneuver = ManeuverCommitment()
         local_route = None
         last_tool_result = None
+        pending_validation_feedback, reasoning_deferred = None, False
         shutdown_clean = False
         cleanup_error = None
         try:
@@ -1445,7 +1439,8 @@ class PhysicalNavigationRuntime(
                 )
                 local_route = route_refresh.route
                 if (
-                    local_route is not None
+                    pending_validation_feedback is None
+                    and local_route is not None
                     and local_route.status == ROUTE_ACTIVE
                     and route_refresh.guidance.gate_active
                 ):
@@ -1536,7 +1531,7 @@ class PhysicalNavigationRuntime(
                 )
                 if mission_value["completed"] is not True:
                     available = tuple(a for a in available if a != FINISH)
-                decision = self._validated_decision(
+                decision, pending_validation_feedback = self._validated_decision(
                     turn=turn,
                     deadline=deadline,
                     observation=observation,
@@ -1546,7 +1541,29 @@ class PhysicalNavigationRuntime(
                     available_actions=available,
                     last_tool_result=last_tool_result,
                     counters=counters,
+                    validation_feedback=pending_validation_feedback,
                 )
+                if decision is None:
+                    if reasoning_deferred:
+                        self._emit(
+                            "planner_termination",
+                            turn=turn,
+                            attempt=self.config.max_validation_attempts,
+                            terminal_reason="reasoning_unavailable",
+                            validation_feedback=pending_validation_feedback,
+                            host_selected_alternative_action=False,
+                        )
+                        raise _LogicalEpisodeTermination("reasoning_unavailable")
+                    reasoning_deferred = True
+                    self._emit(
+                        "planner_turn_deferred",
+                        turn=turn,
+                        attempt=self.config.max_validation_attempts,
+                        validation_feedback=pending_validation_feedback,
+                        host_selected_alternative_action=False,
+                    )
+                    continue
+                reasoning_deferred = False
                 self._post_planner_gate(
                     deadline,
                     "before_planner_decision_dispatch",
