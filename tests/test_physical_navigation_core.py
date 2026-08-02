@@ -2997,8 +2997,11 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
 
         self.assertNotIn(FINISH, planner.available)
 
-    def test_diagnostic_progress_reason_does_not_veto_safe_observe(self):
-        class ProgressLabelledObservePlanner:
+    def test_diagnostic_reason_does_not_veto_safe_observe(self):
+        class DiagnosticObservePlanner:
+            def __init__(self, reason_code):
+                self.reason_code = reason_code
+
             def decide(self, **context):
                 return NavigationDecision.from_mapping(
                     decision_mapping(
@@ -3007,8 +3010,60 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                         state_version=context["observation"]["state_version"],
                         action=OBSERVE,
                         plan=[OBSERVE],
-                        reason_code="PROGRESS_GOAL",
+                        reason_code=self.reason_code,
                     ),
+                    episode_id=context["episode_id"],
+                    turn=context["turn"],
+                    state_version=context["observation"]["state_version"],
+                    available_actions=context["available_actions"],
+                    published_target_ids=(),
+                )
+
+        for reason_code in ("PROGRESS_GOAL", "COMPLETE_GOAL"):
+            with self.subTest(reason_code=reason_code):
+                with tempfile.TemporaryDirectory() as directory:
+                    memory = NavigationMemoryStore.load(
+                        path=Path(directory) / "diagnostic-reason-memory.json",
+                        robot_id="ev3rstorm-01",
+                        controller_instance_id="ev3-main",
+                        reset=True,
+                    )
+                    events = []
+                    runtime = PhysicalNavigationRuntime(
+                        episode_id="episode-diagnostic-reason",
+                        config=PhysicalNavigationRuntimeConfig(
+                            goal="Observe",
+                            locale="en",
+                            max_turns=1,
+                            max_episode_seconds=10,
+                        ),
+                        transport=FakeRuntimeTransport(),
+                        planner=DiagnosticObservePlanner(reason_code),
+                        memory=memory,
+                        monotonic=lambda: 0.0,
+                        event_sink=events.append,
+                    )
+
+                    result = runtime.run()
+
+                self.assertEqual(result.actions, (OBSERVE,))
+                self.assertFalse(
+                    any(
+                        event["event"] == "decision_vetoed"
+                        for event in events
+                    )
+                )
+
+    def test_completed_finish_does_not_require_reason_label(self):
+        class DiagnosticFinishPlanner(FakeRuntimePlanner):
+            def decide(self, **context):
+                decision = super().decide(**context)
+                if decision.action != FINISH:
+                    return decision
+                value = decision.to_dict()
+                value["reason_code"] = "VERIFY_RESULT"
+                return NavigationDecision.from_mapping(
+                    value,
                     episode_id=context["episode_id"],
                     turn=context["turn"],
                     state_version=context["observation"]["state_version"],
@@ -3018,22 +3073,23 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             memory = NavigationMemoryStore.load(
-                path=Path(directory) / "diagnostic-reason-memory.json",
+                path=Path(directory) / "diagnostic-finish-memory.json",
                 robot_id="ev3rstorm-01",
                 controller_instance_id="ev3-main",
                 reset=True,
             )
             events = []
             runtime = PhysicalNavigationRuntime(
-                episode_id="episode-diagnostic-reason",
+                episode_id="episode-diagnostic-finish",
                 config=PhysicalNavigationRuntimeConfig(
-                    goal="Observe",
+                    goal="Move forward at least 100 mm",
                     locale="en",
-                    max_turns=1,
+                    minimum_forward_progress_mm=100,
+                    max_turns=3,
                     max_episode_seconds=10,
                 ),
                 transport=FakeRuntimeTransport(),
-                planner=ProgressLabelledObservePlanner(),
+                planner=DiagnosticFinishPlanner(),
                 memory=memory,
                 monotonic=lambda: 0.0,
                 event_sink=events.append,
@@ -3041,7 +3097,8 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
 
             result = runtime.run()
 
-        self.assertEqual(result.actions, (OBSERVE,))
+        self.assertTrue(result.completed)
+        self.assertEqual(result.actions, (ADVANCE, ADVANCE, FINISH))
         self.assertFalse(
             any(event["event"] == "decision_vetoed" for event in events)
         )

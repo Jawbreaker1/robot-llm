@@ -775,18 +775,12 @@ class PhysicalNavigationRuntime(
         if action == FINISH:
             if (
                 decision.plan != (FINISH,)
-                or decision.reason_code != "COMPLETE_GOAL"
                 or mission["completed"] is not True
             ):
                 raise PhysicalNavigationRuntimeError(
                     "premature_mission_finish",
                     "FINISH requires every directional mission fact",
                 )
-        elif decision.reason_code == "COMPLETE_GOAL":
-            raise PhysicalNavigationRuntimeError(
-                "nonterminal_complete_reason",
-                "COMPLETE_GOAL is valid only with FINISH",
-            )
         delta = mission["candidate_action_longitudinal_deltas_mm"].get(action)
         if (
             delta is not None
