@@ -7,7 +7,12 @@ from robot_agent.maneuver_commitment import (
     ManeuverCommitmentError,
     empty_commitment,
 )
-from robot_agent.physical_navigation_contract import ADVANCE, SCAN_FRONT_ARC
+from robot_agent.physical_navigation_contract import (
+    ADVANCE,
+    FINISH,
+    OBSERVE,
+    SCAN_FRONT_ARC,
+)
 from robot_agent.physical_odometry import PhysicalPose
 
 
@@ -32,6 +37,21 @@ def _active_maneuver():
     )
 
 
+def _complete_proposal():
+    active = _active_maneuver()
+    return {
+        "id": active.commitment_id,
+        "revision": active.revision,
+        "transition": "COMPLETE",
+        "objective": active.objective,
+        "target_hypothesis_id": active.target_hypothesis_id,
+        "detour_side": active.detour_side,
+        "success_fact_keys": list(active.success_fact_keys),
+        "current_focus_fact_key": None,
+        "revision_reason": None,
+    }
+
+
 class ManeuverCommitmentPersistenceTests(unittest.TestCase):
     def _apply_none(
         self,
@@ -49,6 +69,16 @@ class ManeuverCommitmentPersistenceTests(unittest.TestCase):
             pose=PhysicalPose(),
             fact_values={},
             perception_target_hypothesis_id=target_id,
+        )
+
+    def _apply_complete(self, commitment, *, action, fact_value=True):
+        return commitment.apply(
+            _complete_proposal(),
+            action=action,
+            turn=2,
+            hazard_map=_HazardMap(),
+            pose=PhysicalPose(),
+            fact_values={FACT_GOAL_CORRIDOR_CLEAR: fact_value},
         )
 
     def test_none_preserves_an_active_intent(self):
@@ -102,6 +132,45 @@ class ManeuverCommitmentPersistenceTests(unittest.TestCase):
 
         self.assertIsNotNone(first.state(2)["active"])
         self.assertIsNone(second.state(2)["active"])
+
+    def test_observe_can_complete_an_intent_without_finishing_the_mission(self):
+        commitment = ManeuverCommitment(_active_maneuver())
+
+        state = self._apply_complete(commitment, action=OBSERVE)
+
+        self.assertIsNone(state["active"])
+        self.assertEqual(state["last_terminal"]["transition"], "COMPLETE")
+
+    def test_finish_remains_valid_when_completing_an_intent(self):
+        commitment = ManeuverCommitment(_active_maneuver())
+
+        state = self._apply_complete(commitment, action=FINISH)
+
+        self.assertIsNone(state["active"])
+        self.assertEqual(state["last_terminal"]["transition"], "COMPLETE")
+
+    def test_motion_cannot_complete_an_intent(self):
+        commitment = ManeuverCommitment(_active_maneuver())
+
+        with self.assertRaises(ManeuverCommitmentError) as caught:
+            self._apply_complete(commitment, action=ADVANCE)
+
+        self.assertEqual(
+            caught.exception.code,
+            "complete_requires_observe_or_finish",
+        )
+
+    def test_complete_still_requires_every_intent_fact(self):
+        commitment = ManeuverCommitment(_active_maneuver())
+
+        with self.assertRaises(ManeuverCommitmentError) as caught:
+            self._apply_complete(
+                commitment,
+                action=OBSERVE,
+                fact_value=False,
+            )
+
+        self.assertEqual(caught.exception.code, "maneuver_facts_not_complete")
 
 
 if __name__ == "__main__":

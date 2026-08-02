@@ -457,6 +457,10 @@ do not change, return the exact NONE sentinel instead of repeating the active
 commitment as CONTINUE. NONE also preserves the active commitment while
 scanning its current target. CONTINUE remains available for an intentional
 focus change that preserves the same commitment revision, target, and side.
+When every maneuver success fact is true but the directional mission continues,
+use COMPLETE with singleton OBSERVE to retire only the maneuver. COMPLETE may
+accompany FINISH when the complete mission is ready to finish. Never combine
+COMPLETE with physical motion.
 
 When navigation.local_detour_route is ACTIVE, it is the persistent geometric
 route for your chosen target and detour_side. Follow its active waypoint in

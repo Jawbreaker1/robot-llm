@@ -361,10 +361,10 @@ class ManeuverCommitment:
                     "complete_changed_revision",
                     "COMPLETE must preserve the active revision",
                 )
-            if action != FINISH:
+            if action not in (OBSERVE, FINISH):
                 raise ManeuverCommitmentError(
-                    "complete_requires_finish",
-                    "COMPLETE is only valid with FINISH",
+                    "complete_requires_observe_or_finish",
+                    "COMPLETE requires OBSERVE or FINISH",
                 )
             missing = [
                 key
