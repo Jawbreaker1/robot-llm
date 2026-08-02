@@ -19,6 +19,7 @@ from ._physical_agent_core import (
     _integer,
 )
 from ._physical_agent_dispatch_contract import ActiveDispatch
+from ._physical_agent_prepared_contract import PreparedIntentPlan
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class PhysicalAgentState:
     active_dispatch: Optional[ActiveDispatch] = None
     planning_ticket: Optional[PlanningTicket] = None
     terminal: Optional[GoalTerminal] = None
+    prepared_intent_plan: Optional[PreparedIntentPlan] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.controller_key, ControllerKey):
@@ -76,6 +78,14 @@ class PhysicalAgentState:
             )
         if self.plan is not None and not isinstance(self.plan, ExecutionPlan):
             raise PhysicalAgentStateError("invalid_state_plan", "state plan is invalid")
+        if self.prepared_intent_plan is not None and not isinstance(
+            self.prepared_intent_plan,
+            PreparedIntentPlan,
+        ):
+            raise PhysicalAgentStateError(
+                "invalid_state_prepared_intent_plan",
+                "state prepared intent plan is invalid",
+            )
         if self.active_dispatch is not None and not isinstance(
             self.active_dispatch,
             ActiveDispatch,
@@ -144,6 +154,46 @@ class PhysicalAgentState:
                 "planning_ticket_basis_mismatch",
                 "planning ticket does not match current planning evidence",
             )
+        prepared = self.prepared_intent_plan
+        if prepared is not None:
+            ticket = self.planning_ticket
+            if (
+                ticket is None
+                or not ticket.consumed
+                or prepared.ticket != ticket
+                or not prepared.compilation_basis.decision_equivalent(
+                    self.basis
+                )
+                or prepared.prepared_at_ms < ticket.consumed_at_ms
+                or prepared.valid_until_ms > ticket.valid_until_ms
+                or prepared.intent.goal_id != self.goal.goal_id
+                or prepared.intent.goal_epoch != self.goal_epoch
+                or prepared.plan.revision != self.plan_revision + 1
+            ):
+                raise PhysicalAgentStateError(
+                    "prepared_intent_state_mismatch",
+                    "prepared intent plan is not bound to current planning state",
+                )
+            self.basis.assert_successor_of(prepared.compilation_basis)
+            if self.intent is None:
+                valid_revision = prepared.intent.revision == 1
+            elif prepared.intent.intent_id == self.intent.intent_id:
+                valid_revision = (
+                    prepared.intent.revision == self.intent.revision + 1
+                )
+            else:
+                valid_revision = prepared.intent.revision == 1
+            if not valid_revision:
+                raise PhysicalAgentStateError(
+                    "invalid_intent_revision",
+                    "prepared intent revision is invalid",
+                )
+            prepared.plan.binding.assert_matches(
+                controller_key=self.controller_key,
+                goal=self.goal,
+                intent=prepared.intent,
+                basis=prepared.compilation_basis,
+            )
 
     def _validate_phase_shape(self) -> None:
         if self.phase == AgentPhase.IDLE:
@@ -155,6 +205,7 @@ class PhysicalAgentState:
                     self.intent,
                     self.intent_progress,
                     self.plan,
+                    self.prepared_intent_plan,
                     self.active_dispatch,
                     self.planning_ticket,
                     self.terminal,
@@ -231,6 +282,7 @@ class PhysicalAgentState:
         if self.phase == AgentPhase.STOPPING:
             if (
                 self.plan is not None
+                or self.prepared_intent_plan is not None
                 or self.planning_ticket is not None
                 or self.terminal is None
                 or self.compile_pending
@@ -256,6 +308,7 @@ class PhysicalAgentState:
                 self.intent is not None
                 or self.intent_progress is not None
                 or self.plan is not None
+                or self.prepared_intent_plan is not None
                 or self.active_dispatch is not None
                 or self.planning_ticket is not None
                 or self.terminal is None

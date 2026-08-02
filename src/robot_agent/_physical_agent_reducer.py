@@ -3,7 +3,7 @@
 from .physical_agent_contract import (
     GoalActivated,
     GoalCompletionRequested,
-    IntentAccepted,
+    IntentPrepared,
     NavigationBasisUpdated,
     PhysicalAgentEvent,
     PhysicalAgentState,
@@ -14,6 +14,8 @@ from .physical_agent_contract import (
     PlanningRequested,
     PlanningTicketConsumed,
     PlanningTicketExpired,
+    PreparedIntentAccepted,
+    PreparedIntentExpired,
     ReplanRequested,
     StopRequested,
     StopVerified,
@@ -29,6 +31,7 @@ from ._physical_agent_plan_lifecycle_reducer import (
     _reduce_plan_lifecycle_event,
 )
 from ._physical_agent_planning_reducer import _reduce_planning_event
+from ._physical_agent_prepared_reducer import _reduce_prepared_intent_event
 from ._physical_agent_stop_reducer import _reduce_stop_event
 
 
@@ -36,7 +39,6 @@ _PLANNING_EVENTS = (
     GoalActivated,
     PlanningTicketConsumed,
     PlanningTicketExpired,
-    IntentAccepted,
     PlanningAbortRequested,
     PlanningHeld,
     PlanningRequested,
@@ -48,6 +50,11 @@ _COMMAND_EVENTS = (
     StepCommandRevoked,
     StepCommandSettlementExpired,
     StepCommandSettled,
+)
+_PREPARED_INTENT_EVENTS = (
+    IntentPrepared,
+    PreparedIntentAccepted,
+    PreparedIntentExpired,
 )
 _PLAN_LIFECYCLE_EVENTS = (PlanRecompiled, ReplanRequested)
 _STOP_EVENTS = (
@@ -71,6 +78,8 @@ def reduce_physical_agent_state(
         return _reduce_planning_event(state, event)
     if isinstance(event, _COMMAND_EVENTS):
         return _reduce_step_command_event(state, event)
+    if isinstance(event, _PREPARED_INTENT_EVENTS):
+        return _reduce_prepared_intent_event(state, event)
     if isinstance(event, _PLAN_LIFECYCLE_EVENTS):
         return _reduce_plan_lifecycle_event(state, event)
     if isinstance(event, _STOP_EVENTS):

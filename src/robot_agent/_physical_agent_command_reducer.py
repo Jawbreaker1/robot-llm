@@ -31,6 +31,7 @@ from ._physical_agent_reducer_support import (
     _active_step_key,
     _new_ticket,
     _next,
+    _prepared_after_basis,
     _require_phase,
     _successor,
     _ticket_after_basis,
@@ -115,6 +116,11 @@ def _reduce_step_command_event(
             raise PhysicalAgentStateError(
                 "active_dispatch_already_exists",
                 "only one step command may be active",
+            )
+        if state.prepared_intent_plan is not None:
+            raise PhysicalAgentStateError(
+                "prepared_intent_pending",
+                "a prepared intent must activate or expire before a new command",
             )
         if authorization.host_dispatch_sequence != (
             state.last_host_dispatch_sequence + 1
@@ -270,7 +276,12 @@ def _reduce_step_command_event(
                 "blocked replan ticket must bind the resulting basis",
             )
         _new_ticket(
-            replace(state, basis=event.resulting_basis),
+            replace(
+                state,
+                basis=event.resulting_basis,
+                prepared_intent_plan=None,
+                planning_ticket=None,
+            ),
             event.replan_ticket,
             (PlanningCause.UNCERTAINTY, PlanningCause.REPLAN_REQUIRED),
         )
@@ -280,6 +291,7 @@ def _reduce_step_command_event(
             basis=event.resulting_basis,
             compile_pending=False,
             plan=None,
+            prepared_intent_plan=None,
             active_dispatch=None,
             planning_ticket=event.replan_ticket,
         )
@@ -294,6 +306,10 @@ def _reduce_step_command_event(
             state,
             basis=event.resulting_basis,
             active_dispatch=None,
+            prepared_intent_plan=_prepared_after_basis(
+                state,
+                event.resulting_basis,
+            ),
             planning_ticket=_ticket_after_basis(
                 state,
                 event.resulting_basis,
@@ -309,10 +325,30 @@ def _reduce_step_command_event(
             basis=event.resulting_basis,
             plan=replace(active_plan, cursor=next_cursor),
             active_dispatch=None,
+            prepared_intent_plan=_prepared_after_basis(
+                state,
+                event.resulting_basis,
+            ),
             planning_ticket=_ticket_after_basis(
                 state,
                 event.resulting_basis,
             ),
+            intent_progress=progress,
+        )
+    retained_ticket = _ticket_after_basis(state, event.resulting_basis)
+    if retained_ticket is not None:
+        return _next(
+            state,
+            phase=AgentPhase.PLANNING,
+            basis=event.resulting_basis,
+            compile_pending=False,
+            plan=None,
+            prepared_intent_plan=_prepared_after_basis(
+                state,
+                event.resulting_basis,
+            ),
+            active_dispatch=None,
+            planning_ticket=retained_ticket,
             intent_progress=progress,
         )
     return _next(
@@ -321,6 +357,7 @@ def _reduce_step_command_event(
         basis=event.resulting_basis,
         compile_pending=True,
         plan=None,
+        prepared_intent_plan=None,
         active_dispatch=None,
         planning_ticket=None,
         intent_progress=progress,

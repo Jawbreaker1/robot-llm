@@ -1,10 +1,11 @@
 import pickle
 import unittest
-from typing import get_type_hints
+from typing import get_args, get_type_hints
 
 from robot_agent import _physical_agent_core as core
 from robot_agent import _physical_agent_dispatch_contract as dispatch_contract
 from robot_agent import _physical_agent_events as events
+from robot_agent import _physical_agent_prepared_contract as prepared_contract
 from robot_agent import _physical_agent_reducer as reducer
 from robot_agent import _physical_agent_snapshot as snapshot
 from robot_agent import physical_agent_contract as contract
@@ -27,6 +28,7 @@ EXPECTED_CONTRACT_EXPORTS = (
     "GoalOutcome",
     "GoalTerminal",
     "IntentAccepted",
+    "IntentPrepared",
     "IntentPolicy",
     "IntentProgress",
     "MAX_PLANNING_TICKET_TTL_MS",
@@ -48,6 +50,9 @@ EXPECTED_CONTRACT_EXPORTS = (
     "PlanningTicket",
     "PlanningTicketConsumed",
     "PlanningTicketExpired",
+    "PreparedIntentAccepted",
+    "PreparedIntentExpired",
+    "PreparedIntentPlan",
     "PrimitiveStep",
     "ReceiptOutcome",
     "ReplanRequested",
@@ -82,6 +87,7 @@ EXPECTED_STATE_EXPORTS = (
     "GoalOutcome",
     "GoalTerminal",
     "IntentAccepted",
+    "IntentPrepared",
     "IntentPolicy",
     "IntentProgress",
     "MAX_PLANNING_TICKET_TTL_MS",
@@ -104,6 +110,9 @@ EXPECTED_STATE_EXPORTS = (
     "PlanningTicket",
     "PlanningTicketConsumed",
     "PlanningTicketExpired",
+    "PreparedIntentAccepted",
+    "PreparedIntentExpired",
+    "PreparedIntentPlan",
     "PrimitiveStep",
     "ReceiptOutcome",
     "ReplanRequested",
@@ -130,7 +139,13 @@ class PhysicalAgentPublicSurfaceTests(unittest.TestCase):
         self.assertEqual(state.__all__, EXPECTED_STATE_EXPORTS)
 
     def test_every_contract_export_is_the_private_definition_object(self):
-        owners = (core, dispatch_contract, events, snapshot)
+        owners = (
+            core,
+            dispatch_contract,
+            events,
+            prepared_contract,
+            snapshot,
+        )
 
         for name in contract.__all__:
             public_value = getattr(contract, name)
@@ -206,6 +221,32 @@ class PhysicalAgentPublicSurfaceTests(unittest.TestCase):
         self.assertEqual(restored_key, key)
         self.assertIs(type(restored_snapshot), contract.PhysicalAgentState)
         self.assertEqual(restored_snapshot, snapshot_value)
+
+    def test_every_live_event_is_routed_exactly_once(self):
+        routed_groups = (
+            reducer._PLANNING_EVENTS,
+            reducer._COMMAND_EVENTS,
+            reducer._PREPARED_INTENT_EVENTS,
+            reducer._PLAN_LIFECYCLE_EVENTS,
+            reducer._STOP_EVENTS,
+        )
+        routed = tuple(item for group in routed_groups for item in group)
+        live_events = get_args(events.PhysicalAgentEvent)
+
+        self.assertEqual(set(routed), set(live_events))
+        self.assertEqual(len(routed), len(set(routed)))
+        self.assertNotIn(events.IntentAccepted, live_events)
+
+    def test_new_snapshot_field_does_not_shift_legacy_positional_fields(self):
+        self.assertEqual(
+            contract.PhysicalAgentState.__match_args__[-4:],
+            (
+                "active_dispatch",
+                "planning_ticket",
+                "terminal",
+                "prepared_intent_plan",
+            ),
+        )
 
 
 if __name__ == "__main__":

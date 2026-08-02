@@ -17,6 +17,7 @@ from robot_agent.physical_agent_state import (
     GoalOutcome,
     GoalTerminal,
     IntentAccepted,
+    IntentPrepared,
     IntentPolicy,
     MAX_PLANNING_TICKET_TTL_MS,
     MAX_STEP_COMMAND_SETTLE_MS,
@@ -36,6 +37,9 @@ from robot_agent.physical_agent_state import (
     PlanningTicket,
     PlanningTicketConsumed,
     PlanningTicketExpired,
+    PreparedIntentAccepted,
+    PreparedIntentExpired,
+    PreparedIntentPlan,
     PrimitiveStep,
     ReceiptOutcome,
     ReplanRequested,
@@ -197,11 +201,7 @@ def consumed_planning_state(initial=None):
     state, assigned_goal, nav_basis, planning_ticket = activated_state(initial)
     state = reduce_physical_agent_state(
         state,
-        PlanningTicketConsumed(
-            planning_ticket.ticket_id,
-            planning_ticket.basis,
-            102,
-        ),
+        PlanningTicketConsumed(planning_ticket, 102),
     )
     return state, assigned_goal, nav_basis, planning_ticket
 
@@ -217,16 +217,50 @@ def executing_state(initial=None):
         intent,
         nav_basis,
     )
-    state = reduce_physical_agent_state(
-        state,
-        IntentAccepted(
-            planning_ticket.ticket_id,
-            planning_ticket.basis,
-            intent,
-            active_plan,
+    state = accept_intent_plan(state, intent, active_plan)
+    return state, assigned_goal, nav_basis, intent, active_plan
+
+
+def prepared_for_state(
+    state,
+    intent,
+    plan,
+    *,
+    proposal_id="proposal-test",
+    compilation_basis=None,
+):
+    planning_ticket = state.planning_ticket
+    prepared_at_ms = max(
+        planning_ticket.consumed_at_ms,
+        intent.accepted_at_ms,
+        plan.created_at_ms,
+    )
+    return PreparedIntentPlan(
+        ticket=planning_ticket,
+        proposal_id=proposal_id,
+        compilation_basis=compilation_basis or state.basis,
+        intent=intent,
+        plan=plan,
+        prepared_at_ms=prepared_at_ms,
+        valid_until_ms=min(
+            planning_ticket.valid_until_ms,
+            prepared_at_ms + 1_000,
         ),
     )
-    return state, assigned_goal, nav_basis, intent, active_plan
+
+
+def accept_intent_plan(state, intent, plan, *, proposal_id="proposal-test"):
+    prepared = prepared_for_state(
+        state,
+        intent,
+        plan,
+        proposal_id=proposal_id,
+    )
+    state = reduce_physical_agent_state(state, IntentPrepared(prepared))
+    return reduce_physical_agent_state(
+        state,
+        PreparedIntentAccepted(prepared, prepared.prepared_at_ms),
+    )
 
 
 def step_authorization(
@@ -598,6 +632,31 @@ class PhysicalAgentValueTests(unittest.TestCase):
 
 
 class PhysicalAgentTransitionTests(unittest.TestCase):
+    def test_legacy_direct_intent_acceptance_is_not_a_live_transition(self):
+        state, assigned_goal, nav_basis, planning_ticket = (
+            consumed_planning_state()
+        )
+        intent = active_intent(nav_basis, assigned_goal)
+        active_plan = execution_plan(
+            state.controller_key,
+            assigned_goal,
+            intent,
+            nav_basis,
+        )
+
+        with self.assertRaises(PhysicalAgentStateError) as caught:
+            reduce_physical_agent_state(
+                state,
+                IntentAccepted(
+                    planning_ticket.ticket_id,
+                    nav_basis,
+                    intent,
+                    active_plan,
+                ),
+            )
+
+        self.assertEqual(caught.exception.code, "unsupported_state_event")
+
     def test_complete_legal_lifecycle_is_monotonic(self):
         reducer = PhysicalAgentStateReducer(PhysicalAgentState(controller()))
         nav_basis = basis()
@@ -610,15 +669,23 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
         )
         versions.append(planning.agent_state_version)
         claimed = reducer.apply(
-            PlanningTicketConsumed("ticket-1", nav_basis, 102)
+            PlanningTicketConsumed(planning_ticket, 102)
         )
         versions.append(claimed.agent_state_version)
         intent = active_intent(nav_basis, assigned_goal)
         active_plan = execution_plan(
             controller(), assigned_goal, intent, nav_basis
         )
+        prepared = prepared_for_state(
+            reducer.snapshot(),
+            intent,
+            active_plan,
+            proposal_id="proposal-lifecycle",
+        )
+        prepared_state = reducer.apply(IntentPrepared(prepared))
+        versions.append(prepared_state.agent_state_version)
         executing = reducer.apply(
-            IntentAccepted("ticket-1", nav_basis, intent, active_plan)
+            PreparedIntentAccepted(prepared, prepared.prepared_at_ms)
         )
         versions.append(executing.agent_state_version)
         step_basis = replace(
@@ -706,7 +773,7 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
         state, assigned_goal, nav_basis, planning_ticket = consumed_planning_state()
         held = reduce_physical_agent_state(
             state,
-            PlanningHeld(planning_ticket.ticket_id, nav_basis),
+            PlanningHeld(state.planning_ticket, "proposal-hold"),
         )
 
         self.assertEqual(held.phase, AgentPhase.PLANNING)
@@ -714,7 +781,7 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
         with self.assertRaises(PhysicalAgentStateError) as caught:
             reduce_physical_agent_state(
                 held,
-                PlanningHeld(planning_ticket.ticket_id, nav_basis),
+                PlanningHeld(state.planning_ticket, "proposal-hold"),
             )
         self.assertEqual(caught.exception.code, "planning_ticket_mismatch")
 
@@ -729,6 +796,35 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
             PlanningRequested(next_ticket),
         )
         self.assertEqual(requested.planning_ticket, next_ticket)
+
+    def test_stale_hold_cannot_clear_reused_ticket_id_and_basis(self):
+        state, _goal, nav_basis, _ticket = consumed_planning_state()
+        first_consumed = state.planning_ticket
+        state = reduce_physical_agent_state(
+            state,
+            PlanningHeld(first_consumed, "proposal-first"),
+        )
+        second = ticket(
+            nav_basis,
+            ticket_id=first_consumed.ticket_id,
+            cause=PlanningCause.UNCERTAINTY,
+            created_at_ms=200,
+        )
+        state = reduce_physical_agent_state(state, PlanningRequested(second))
+        state = reduce_physical_agent_state(
+            state,
+            PlanningTicketConsumed(second, 201),
+        )
+        second_consumed = state.planning_ticket
+
+        with self.assertRaises(PhysicalAgentStateError) as caught:
+            reduce_physical_agent_state(
+                state,
+                PlanningHeld(first_consumed, "proposal-first"),
+            )
+
+        self.assertEqual(caught.exception.code, "planning_ticket_mismatch")
+        self.assertEqual(state.planning_ticket, second_consumed)
 
     def test_planning_is_orthogonal_to_the_authoritative_execution_plan(self):
         state, _goal, nav_basis, intent, active_plan = executing_state()
@@ -761,15 +857,14 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
         )
         consumed = reduce_physical_agent_state(
             requested,
-            PlanningTicketConsumed(
-                parallel_ticket.ticket_id,
-                nav_basis,
-                121,
-            ),
+            PlanningTicketConsumed(parallel_ticket, 121),
         )
         held = reduce_physical_agent_state(
             consumed,
-            PlanningHeld(parallel_ticket.ticket_id, nav_basis),
+            PlanningHeld(
+                consumed.planning_ticket,
+                "proposal-parallel-hold",
+            ),
         )
 
         for current in (requested, consumed, held):
@@ -795,11 +890,7 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
         )
         pending = reduce_physical_agent_state(
             pending,
-            PlanningTicketConsumed(
-                parallel_ticket.ticket_id,
-                nav_basis,
-                121,
-            ),
+            PlanningTicketConsumed(parallel_ticket, 121),
         )
         replacement_intent = active_intent(
             nav_basis,
@@ -821,14 +912,11 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
             revision=2,
         )
 
-        replaced = reduce_physical_agent_state(
+        replaced = accept_intent_plan(
             pending,
-            IntentAccepted(
-                parallel_ticket.ticket_id,
-                nav_basis,
-                replacement_intent,
-                replacement_plan,
-            ),
+            replacement_intent,
+            replacement_plan,
+            proposal_id="proposal-replacement",
         )
 
         self.assertEqual(pending.phase, AgentPhase.EXECUTING)
@@ -888,7 +976,7 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
         )
         claimed = reduce_physical_agent_state(
             planning,
-            PlanningTicketConsumed("ticket-2", next_basis, 121),
+            PlanningTicketConsumed(next_ticket, 121),
         )
         revised = active_intent(
             next_basis,
@@ -908,9 +996,11 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
             plan_id="plan-2",
             revision=2,
         )
-        executing = reduce_physical_agent_state(
+        executing = accept_intent_plan(
             claimed,
-            IntentAccepted("ticket-2", next_basis, revised, next_plan),
+            revised,
+            next_plan,
+            proposal_id="proposal-replan",
         )
 
         self.assertEqual(planning.phase, AgentPhase.PLANNING)
@@ -961,11 +1051,7 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
         )
         consumed = reduce_physical_agent_state(
             pending,
-            PlanningTicketConsumed(
-                abort_ticket.ticket_id,
-                nav_basis,
-                121,
-            ),
+            PlanningTicketConsumed(abort_ticket, 121),
         )
         terminal = GoalTerminal(
             GoalOutcome.FAILED,
@@ -975,8 +1061,8 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
         stopping = reduce_physical_agent_state(
             consumed,
             PlanningAbortRequested(
-                abort_ticket.ticket_id,
-                nav_basis,
+                consumed.planning_ticket,
+                "proposal-abort",
                 terminal,
             ),
         )
@@ -990,8 +1076,8 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
             reduce_physical_agent_state(
                 pending,
                 PlanningAbortRequested(
-                    abort_ticket.ticket_id,
-                    nav_basis,
+                    abort_ticket,
+                    "proposal-abort",
                     terminal,
                 ),
             )
@@ -1004,8 +1090,8 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
             reduce_physical_agent_state(
                 consumed,
                 PlanningAbortRequested(
-                    abort_ticket.ticket_id,
-                    nav_basis,
+                    consumed.planning_ticket,
+                    "proposal-abort",
                     GoalTerminal(
                         GoalOutcome.SUCCEEDED,
                         "not_an_abort",
@@ -1032,12 +1118,9 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
         )
         state = reduce_physical_agent_state(
             state,
-            PlanningTicketConsumed(
-                old_ticket.ticket_id,
-                nav_basis,
-                121,
-            ),
+            PlanningTicketConsumed(old_ticket, 121),
         )
+        consumed_old_ticket = state.planning_ticket
         changed_basis = replace(
             nav_basis,
             controller_state_version=2,
@@ -1054,8 +1137,8 @@ class PhysicalAgentTransitionTests(unittest.TestCase):
             reduce_physical_agent_state(
                 superseded,
                 PlanningAbortRequested(
-                    old_ticket.ticket_id,
-                    nav_basis,
+                    consumed_old_ticket,
+                    "proposal-stale-abort",
                     GoalTerminal(
                         GoalOutcome.FAILED,
                         "stale_abort",
@@ -1108,7 +1191,10 @@ class PhysicalAgentTransitionMatrixTests(unittest.TestCase):
         consumed, _goal, _basis, _ticket = consumed_planning_state()
         held = reduce_physical_agent_state(
             consumed,
-            PlanningHeld(planning_ticket.ticket_id, nav_basis),
+            PlanningHeld(
+                consumed.planning_ticket,
+                "proposal-matrix-held",
+            ),
         )
         executing, _goal, _basis, intent, active_plan = executing_state()
         stopping, _goal, _basis, pending_terminal = stopping_state()
@@ -1134,6 +1220,12 @@ class PhysicalAgentTransitionMatrixTests(unittest.TestCase):
         intent_plan = execution_plan(
             controller(), assigned_goal, intent, nav_basis
         )
+        matrix_prepared = prepared_for_state(
+            consumed,
+            intent,
+            intent_plan,
+            proposal_id="proposal-matrix-prepared",
+        )
         authorization = step_authorization(executing)
         receipt = command_receipt(authorization, successor)
         events = (
@@ -1142,33 +1234,47 @@ class PhysicalAgentTransitionMatrixTests(unittest.TestCase):
                 {AgentPhase.IDLE, AgentPhase.TERMINAL},
             ),
             (
-                PlanningTicketConsumed("ticket-1", nav_basis, 102),
+                PlanningTicketConsumed(planning_ticket, 102),
                 {AgentPhase.PLANNING, AgentPhase.EXECUTING},
             ),
             (
                 PlanningTicketExpired(
-                    "ticket-1",
-                    nav_basis,
+                    planning_ticket,
                     planning_ticket.valid_until_ms,
                 ),
                 {AgentPhase.PLANNING, AgentPhase.EXECUTING},
             ),
             (
-                IntentAccepted(
-                    "ticket-1", nav_basis, intent, intent_plan
+                IntentPrepared(matrix_prepared),
+                {AgentPhase.PLANNING, AgentPhase.EXECUTING},
+            ),
+            (
+                PreparedIntentAccepted(
+                    matrix_prepared,
+                    matrix_prepared.prepared_at_ms,
+                ),
+                {AgentPhase.PLANNING, AgentPhase.EXECUTING},
+            ),
+            (
+                PreparedIntentExpired(
+                    matrix_prepared,
+                    matrix_prepared.valid_until_ms,
                 ),
                 {AgentPhase.PLANNING, AgentPhase.EXECUTING},
             ),
             (
                 PlanningAbortRequested(
-                    "ticket-1",
-                    nav_basis,
+                    consumed.planning_ticket,
+                    "proposal-matrix-abort",
                     pending_terminal,
                 ),
                 {AgentPhase.PLANNING, AgentPhase.EXECUTING},
             ),
             (
-                PlanningHeld("ticket-1", nav_basis),
+                PlanningHeld(
+                    consumed.planning_ticket,
+                    "proposal-matrix-held",
+                ),
                 {AgentPhase.PLANNING, AgentPhase.EXECUTING},
             ),
             (
@@ -1267,15 +1373,15 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
             "planning_ticket_already_consumed",
         )
 
-        state, _goal, _basis, _ticket = activated_state()
+        state, _goal, _basis, planning_ticket = activated_state()
         state = reduce_physical_agent_state(
             state,
-            PlanningTicketConsumed("ticket-1", nav_basis, 102),
+            PlanningTicketConsumed(planning_ticket, 102),
         )
         with self.assertRaises(PhysicalAgentStateError):
             reduce_physical_agent_state(
                 state,
-                PlanningTicketConsumed("ticket-1", nav_basis, 103),
+                PlanningTicketConsumed(planning_ticket, 103),
             )
 
     def test_expired_unconsumed_ticket_can_be_dismissed_without_wedging(self):
@@ -1285,8 +1391,7 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
             reduce_physical_agent_state(
                 state,
                 PlanningTicketExpired(
-                    planning_ticket.ticket_id,
-                    nav_basis,
+                    planning_ticket,
                     planning_ticket.valid_until_ms - 1,
                 ),
             )
@@ -1295,8 +1400,7 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
         dismissed = reduce_physical_agent_state(
             state,
             PlanningTicketExpired(
-                planning_ticket.ticket_id,
-                nav_basis,
+                planning_ticket,
                 planning_ticket.valid_until_ms,
             ),
         )
@@ -1315,6 +1419,33 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
         self.assertIsNone(dismissed.planning_ticket)
         self.assertEqual(resumed.planning_ticket, replacement)
 
+    def test_stale_ticket_events_cannot_target_reused_id_and_basis(self):
+        state, _goal, nav_basis, first = activated_state()
+        state = reduce_physical_agent_state(
+            state,
+            PlanningTicketExpired(first, first.valid_until_ms),
+        )
+        second = ticket(
+            nav_basis,
+            ticket_id=first.ticket_id,
+            cause=PlanningCause.UNCERTAINTY,
+            created_at_ms=first.valid_until_ms,
+        )
+        state = reduce_physical_agent_state(state, PlanningRequested(second))
+
+        for event in (
+            PlanningTicketConsumed(first, first.created_at_ms + 1),
+            PlanningTicketExpired(first, second.valid_until_ms),
+        ):
+            with self.subTest(event=type(event).__name__):
+                with self.assertRaises(PhysicalAgentStateError) as caught:
+                    reduce_physical_agent_state(state, event)
+                self.assertEqual(
+                    caught.exception.code,
+                    "planning_ticket_mismatch",
+                )
+                self.assertEqual(state.planning_ticket, second)
+
     def test_expired_parallel_ticket_is_cleared_without_stopping_plan(self):
         state, _goal, nav_basis, intent, active_plan = executing_state()
         parallel_ticket = ticket(
@@ -1330,11 +1461,7 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
         )
         dismissed = reduce_physical_agent_state(
             pending,
-            PlanningTicketExpired(
-                parallel_ticket.ticket_id,
-                nav_basis,
-                130,
-            ),
+            PlanningTicketExpired(parallel_ticket, 130),
         )
 
         self.assertEqual(dismissed.phase, AgentPhase.EXECUTING)
@@ -1347,8 +1474,7 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
         consumed = reduce_physical_agent_state(
             state,
             PlanningTicketConsumed(
-                planning_ticket.ticket_id,
-                nav_basis,
+                planning_ticket,
                 planning_ticket.created_at_ms + 1,
             ),
         )
@@ -1356,8 +1482,7 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
         recovered = reduce_physical_agent_state(
             consumed,
             PlanningTicketExpired(
-                planning_ticket.ticket_id,
-                nav_basis,
+                consumed.planning_ticket,
                 planning_ticket.valid_until_ms,
             ),
         )
@@ -1380,11 +1505,7 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
         with self.assertRaises(PhysicalAgentStateError) as caught:
             reduce_physical_agent_state(
                 state,
-                PlanningTicketConsumed(
-                    expiring.ticket_id,
-                    nav_basis,
-                    110,
-                ),
+                PlanningTicketConsumed(expiring, 110),
             )
         self.assertEqual(caught.exception.code, "planning_ticket_expired")
 
@@ -1550,15 +1671,14 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
         )
         planning = reduce_physical_agent_state(
             planning,
-            PlanningTicketConsumed(
-                replan_ticket.ticket_id,
-                replan_basis,
-                121,
-            ),
+            PlanningTicketConsumed(replan_ticket, 121),
         )
         held = reduce_physical_agent_state(
             planning,
-            PlanningHeld(replan_ticket.ticket_id, replan_basis),
+            PlanningHeld(
+                planning.planning_ticket,
+                "proposal-recompile-hold",
+            ),
         )
         candidate = execution_plan(
             state.controller_key,
@@ -1593,14 +1713,11 @@ class PhysicalAgentTicketAndCursorTests(unittest.TestCase):
         first_plan = execution_plan(
             state.controller_key, assigned_goal, intent, nav_basis
         )
-        state = reduce_physical_agent_state(
+        state = accept_intent_plan(
             state,
-            IntentAccepted(
-                planning_ticket.ticket_id,
-                nav_basis,
-                intent,
-                first_plan,
-            ),
+            intent,
+            first_plan,
+            proposal_id="proposal-budget",
         )
         second_basis = replace(
             nav_basis,
@@ -2137,11 +2254,7 @@ class PhysicalAgentDispatchTests(unittest.TestCase):
         )
         pending = reduce_physical_agent_state(
             pending,
-            PlanningTicketConsumed(
-                planning_ticket.ticket_id,
-                nav_basis,
-                121,
-            ),
+            PlanningTicketConsumed(planning_ticket, 121),
         )
         authorization = step_authorization(pending)
         active = reduce_physical_agent_state(
@@ -2163,13 +2276,30 @@ class PhysicalAgentDispatchTests(unittest.TestCase):
             plan_id="plan-2",
             revision=2,
         )
+        prepared = prepared_for_state(
+            active,
+            replacement_intent,
+            replacement_plan,
+            proposal_id="proposal-active-dispatch",
+        )
+        prepared_active = reduce_physical_agent_state(
+            active,
+            IntentPrepared(prepared),
+        )
+        with self.assertRaises(PhysicalAgentStateError) as activation:
+            reduce_physical_agent_state(
+                prepared_active,
+                PreparedIntentAccepted(
+                    prepared,
+                    prepared.prepared_at_ms,
+                ),
+            )
+        self.assertEqual(
+            activation.exception.code,
+            "active_dispatch_conflict",
+        )
+
         events = (
-            IntentAccepted(
-                planning_ticket.ticket_id,
-                nav_basis,
-                replacement_intent,
-                replacement_plan,
-            ),
             PlanRecompiled(replacement_plan, nav_basis),
             ReplanRequested(
                 ticket(
@@ -2336,9 +2466,7 @@ class PhysicalAgentFreshnessTests(unittest.TestCase):
         state, _goal, nav_basis, planning_ticket = activated_state()
         state = reduce_physical_agent_state(
             state,
-            PlanningTicketConsumed(
-                planning_ticket.ticket_id, nav_basis, 102
-            ),
+            PlanningTicketConsumed(planning_ticket, 102),
         )
         changed = replace(
             nav_basis,
@@ -2354,7 +2482,13 @@ class PhysicalAgentFreshnessTests(unittest.TestCase):
         with self.assertRaises(PhysicalAgentStateError) as caught:
             reduce_physical_agent_state(
                 updated,
-                PlanningHeld(planning_ticket.ticket_id, nav_basis),
+                PlanningHeld(
+                    replace(
+                        planning_ticket,
+                        consumed_at_ms=102,
+                    ),
+                    "proposal-stale-hold",
+                ),
             )
         self.assertEqual(caught.exception.code, "planning_ticket_mismatch")
 
@@ -2362,9 +2496,7 @@ class PhysicalAgentFreshnessTests(unittest.TestCase):
         state, assigned_goal, nav_basis, planning_ticket = activated_state()
         state = reduce_physical_agent_state(
             state,
-            PlanningTicketConsumed(
-                planning_ticket.ticket_id, nav_basis, 102
-            ),
+            PlanningTicketConsumed(planning_ticket, 102),
         )
         same_evidence = replace(nav_basis, world_model_version=20)
         updated = reduce_physical_agent_state(
@@ -2378,14 +2510,11 @@ class PhysicalAgentFreshnessTests(unittest.TestCase):
             same_evidence,
         )
 
-        accepted = reduce_physical_agent_state(
+        accepted = accept_intent_plan(
             updated,
-            IntentAccepted(
-                planning_ticket.ticket_id,
-                nav_basis,
-                intent,
-                active_plan,
-            ),
+            intent,
+            active_plan,
+            proposal_id="proposal-irrelevant-update",
         )
 
         self.assertEqual(accepted.phase, AgentPhase.EXECUTING)
@@ -2432,16 +2561,11 @@ class PhysicalAgentFreshnessTests(unittest.TestCase):
         )
 
         with self.assertRaises(PhysicalAgentStateError) as caught:
-            reduce_physical_agent_state(
-                state,
-                IntentAccepted(
-                    planning_ticket.ticket_id,
-                    nav_basis,
-                    intent,
-                    wrong_plan,
-                ),
-            )
-        self.assertEqual(caught.exception.code, "plan_basis_mismatch")
+            prepared_for_state(state, intent, wrong_plan)
+        self.assertEqual(
+            caught.exception.code,
+            "prepared_intent_binding_mismatch",
+        )
 
 
 if __name__ == "__main__":

@@ -3,9 +3,9 @@
 The coordinator owns no loop and performs no motion.  One ``run_once`` call
 may consume one planning ticket, invoke the injected planner exactly once,
 validate its host-bound envelope, compile one deterministic execution plan,
-and commit one canonical reducer transition.  A failed external call is held
-in an explicit, ticket-free PLANNING state; a later retry requires a new host
-``PlanningRequested`` event.
+and durably prepare then activate it through canonical reducer events.  A
+failed external call is held in an explicit, ticket-free PLANNING state; a
+later retry requires a new host ``PlanningRequested`` event.
 """
 
 from dataclasses import dataclass
@@ -32,7 +32,7 @@ from .physical_agent_state import (
     FollowDirectionIntent,
     GoalOutcome,
     GoalTerminal,
-    IntentAccepted,
+    IntentPrepared,
     IntentPolicy,
     PhysicalAgentState,
     PhysicalAgentStateError,
@@ -42,6 +42,9 @@ from .physical_agent_state import (
     PlanningTicket,
     PlanningTicketConsumed,
     PlanningTicketExpired,
+    PreparedIntentAccepted,
+    PreparedIntentExpired,
+    PreparedIntentPlan,
     ScanTargetIntent,
 )
 from .physical_intent_contract import (
@@ -176,8 +179,7 @@ class PhysicalIntentCoordinator:
         return (
             state.phase in (AgentPhase.PLANNING, AgentPhase.EXECUTING)
             and current is not None
-            and current.ticket_id == ticket.ticket_id
-            and current.basis == ticket.basis
+            and current == ticket
             and current.consumed
         )
 
@@ -216,8 +218,8 @@ class PhysicalIntentCoordinator:
         try:
             self._reducer.apply(
                 PlanningHeld(
-                    ticket_id=ticket.ticket_id,
-                    based_on_basis=ticket.basis,
+                    ticket=ticket,
+                    proposal_id=proposal_id,
                 )
             )
         except PhysicalAgentStateError:
@@ -244,8 +246,7 @@ class PhysicalIntentCoordinator:
         try:
             self._reducer.apply(
                 PlanningTicketExpired(
-                    ticket_id=ticket.ticket_id,
-                    based_on_basis=ticket.basis,
+                    ticket=ticket,
                     observed_at_ms=observed_at_ms,
                 )
             )
@@ -261,6 +262,103 @@ class PhysicalIntentCoordinator:
             ticket=ticket,
             proposal_id=proposal_id,
             error_code="planning_ticket_expired",
+        )
+
+    def _expire_prepared_intent(
+        self,
+        *,
+        prepared: PreparedIntentPlan,
+        observed_at_ms: int,
+    ) -> PhysicalIntentCoordinatorResult:
+        try:
+            state = self._reducer.apply(
+                PreparedIntentExpired(
+                    prepared=prepared,
+                    observed_at_ms=observed_at_ms,
+                )
+            )
+        except PhysicalAgentStateError as exc:
+            return self._result(
+                CoordinatorOutcome.SUPERSEDED,
+                ticket=self._reducer.snapshot().planning_ticket,
+                proposal_id=prepared.proposal_id,
+                error_code=exc.code,
+            )
+        return PhysicalIntentCoordinatorResult(
+            outcome=CoordinatorOutcome.PROPOSAL_REJECTED,
+            state=state,
+            ticket_id=prepared.ticket_id,
+            proposal_id=prepared.proposal_id,
+            error_code="expired_proposal",
+        )
+
+    def _accept_prepared_intent(
+        self,
+        *,
+        state: PhysicalAgentState,
+        prepared: PreparedIntentPlan,
+        accepted_at_ms: int,
+    ) -> PhysicalIntentCoordinatorResult:
+        ticket = state.planning_ticket
+        if state.active_dispatch is not None:
+            return self._result(
+                CoordinatorOutcome.DEFERRED,
+                ticket=ticket,
+                proposal_id=prepared.proposal_id,
+            )
+        try:
+            accepted = self._reducer.apply(
+                PreparedIntentAccepted(
+                    prepared=prepared,
+                    accepted_at_ms=accepted_at_ms,
+                )
+            )
+        except PhysicalAgentStateError as exc:
+            return self._result(
+                CoordinatorOutcome.SUPERSEDED,
+                ticket=ticket,
+                proposal_id=prepared.proposal_id,
+                error_code=exc.code,
+            )
+        return PhysicalIntentCoordinatorResult(
+            outcome=CoordinatorOutcome.INTENT_ACCEPTED,
+            state=accepted,
+            ticket_id=prepared.ticket_id,
+            proposal_id=prepared.proposal_id,
+        )
+
+    def _resume_prepared_intent(
+        self,
+    ) -> Optional[PhysicalIntentCoordinatorResult]:
+        current = self._reducer.snapshot()
+        prepared = current.prepared_intent_plan
+        if prepared is None:
+            return None
+        ticket = current.planning_ticket
+        try:
+            now_ms = self._now_ms()
+        except Exception as exc:
+            return self._result(
+                CoordinatorOutcome.HOST_FAILED,
+                ticket=ticket,
+                proposal_id=prepared.proposal_id,
+                error_code=_exception_code(exc, "clock_failed"),
+            )
+        if now_ms >= ticket.valid_until_ms:
+            return self._expire_ticket(
+                ticket=ticket,
+                observed_at_ms=now_ms,
+                proposal_id=prepared.proposal_id,
+            )
+        if now_ms >= prepared.valid_until_ms:
+            return self._expire_prepared_intent(
+                prepared=prepared,
+                observed_at_ms=now_ms,
+            )
+        return self._accept_prepared_intent(
+            state=current,
+            prepared=prepared,
+            accepted_at_ms=now_ms,
         )
 
     @staticmethod
@@ -407,8 +505,7 @@ class PhysicalIntentCoordinator:
                 )
             consumed = self._reducer.apply(
                 PlanningTicketConsumed(
-                    ticket_id=ticket.ticket_id,
-                    based_on_basis=ticket.basis,
+                    ticket=ticket,
                     consumed_at_ms=consumed_at_ms,
                 )
             )
@@ -419,7 +516,7 @@ class PhysicalIntentCoordinator:
                 error_code=_exception_code(exc, "ticket_consume_failed"),
             )
         return _TicketAcquisition(
-            ticket=ticket,
+            ticket=consumed.planning_ticket,
             consumed_state=consumed,
         )
 
@@ -502,8 +599,8 @@ class PhysicalIntentCoordinator:
             try:
                 state = self._reducer.apply(
                     PlanningHeld(
-                        ticket_id=ticket.ticket_id,
-                        based_on_basis=ticket.basis,
+                        ticket=ticket,
+                        proposal_id=proposal_id,
                     )
                 )
             except PhysicalAgentStateError as exc:
@@ -524,8 +621,8 @@ class PhysicalIntentCoordinator:
             try:
                 state = self._reducer.apply(
                     PlanningAbortRequested(
-                        ticket_id=ticket.ticket_id,
-                        based_on_basis=ticket.basis,
+                        ticket=ticket,
+                        proposal_id=proposal_id,
                         terminal=GoalTerminal(
                             outcome=self._abort_outcome,
                             reason=proposal.reason,
@@ -703,14 +800,19 @@ class PhysicalIntentCoordinator:
                     "compilation evidence is stale before commit",
                 )
             self._validate_plan_evidence(compiled.plan, capture.evidence)
-            state = self._reducer.apply(
-                IntentAccepted(
-                    ticket_id=ticket.ticket_id,
-                    based_on_basis=ticket.basis,
-                    intent=compiled.intent,
-                    plan=compiled.plan,
-                )
+            prepared = PreparedIntentPlan(
+                ticket=ticket,
+                proposal_id=proposal_id,
+                compilation_basis=capture.evidence.basis,
+                intent=compiled.intent,
+                plan=compiled.plan,
+                prepared_at_ms=commit_at_ms,
+                valid_until_ms=min(
+                    ticket.valid_until_ms,
+                    planner_result.envelope.valid_until_ms,
+                ),
             )
+            prepared_state = self._reducer.apply(IntentPrepared(prepared))
         except NavigationIntentProposalError as exc:
             return self._hold_if_current(
                 outcome=CoordinatorOutcome.PROPOSAL_REJECTED,
@@ -731,6 +833,21 @@ class PhysicalIntentCoordinator:
                 proposal_id=proposal_id,
                 error_code=exc.code,
             )
+        except PhysicalAgentStateError as exc:
+            current = self._reducer.snapshot()
+            if current.prepared_intent_plan is not None:
+                return self._result(
+                    CoordinatorOutcome.SUPERSEDED,
+                    ticket=ticket,
+                    proposal_id=proposal_id,
+                    error_code=exc.code,
+                )
+            return self._hold_if_current(
+                outcome=CoordinatorOutcome.COMPILER_FAILED,
+                ticket=ticket,
+                proposal_id=proposal_id,
+                error_code=exc.code,
+            )
         except Exception as exc:
             return self._hold_if_current(
                 outcome=CoordinatorOutcome.COMPILER_FAILED,
@@ -738,15 +855,18 @@ class PhysicalIntentCoordinator:
                 proposal_id=proposal_id,
                 error_code=_exception_code(exc, "plan_compiler_failed"),
             )
-        return PhysicalIntentCoordinatorResult(
-            outcome=CoordinatorOutcome.INTENT_ACCEPTED,
-            state=state,
-            ticket_id=ticket.ticket_id,
-            proposal_id=proposal_id,
+        return self._accept_prepared_intent(
+            state=prepared_state,
+            prepared=prepared,
+            accepted_at_ms=commit_at_ms,
         )
 
     def run_once(self) -> PhysicalIntentCoordinatorResult:
         """Process one eligible ticket; never retries or starts a loop."""
+
+        prepared = self._resume_prepared_intent()
+        if prepared is not None:
+            return prepared
 
         acquisition = self._acquire_planning_ticket()
         if isinstance(acquisition, PhysicalIntentCoordinatorResult):

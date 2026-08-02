@@ -17,12 +17,14 @@ from robot_agent.physical_agent_state import (
     GoalOutcome,
     GoalTerminal,
     NavigationBasis,
+    NavigationBasisUpdated,
     PhysicalAgentState,
     PhysicalAgentStateReducer,
     PlanBinding,
     PlanRecompiled,
     PlanStepKey,
     PlanningCause,
+    PlanningRequested,
     PlanningTicket,
     PrimitiveStep,
     ReceiptOutcome,
@@ -153,7 +155,7 @@ def successor(current, *, controller_version, basis_id):
     )
 
 
-def settle_completed_step(reducer, resulting_basis, *, now_ms):
+def dispatch_active_step(reducer, *, now_ms):
     state = reducer.snapshot()
     sequence = state.last_host_dispatch_sequence + 1
     authorization = StepCommandAuthorization(
@@ -183,6 +185,17 @@ def settle_completed_step(reducer, resulting_basis, *, now_ms):
             settle_by_host_ms=now_ms + 30_000,
         )
     )
+    return authorization, authorized, dispatched
+
+
+def settle_active_dispatch(
+    reducer,
+    authorization,
+    resulting_basis,
+    *,
+    received_at_ms,
+    disposition=StepDisposition.COMPLETE,
+):
     receipt = ControllerCommandReceipt(
         outcome=ReceiptOutcome.COMPLETED,
         controller_key=authorization.controller_key,
@@ -200,7 +213,7 @@ def settle_completed_step(reducer, resulting_basis, *, now_ms):
         resulting_controller_state_version=(
             resulting_basis.controller_state_version
         ),
-        received_at_host_ms=now_ms + 2,
+        received_at_host_ms=received_at_ms,
         stop_confirmed=True,
         code="completed",
     )
@@ -208,8 +221,22 @@ def settle_completed_step(reducer, resulting_basis, *, now_ms):
         StepCommandSettled(
             receipt=receipt,
             resulting_basis=resulting_basis,
-            disposition=StepDisposition.COMPLETE,
+            disposition=disposition,
         )
+    )
+    return receipt, settled
+
+
+def settle_completed_step(reducer, resulting_basis, *, now_ms):
+    authorization, authorized, dispatched = dispatch_active_step(
+        reducer,
+        now_ms=now_ms,
+    )
+    _receipt, settled = settle_active_dispatch(
+        reducer,
+        authorization,
+        resulting_basis,
+        received_at_ms=now_ms + 2,
     )
     return authorized, dispatched, settled
 
@@ -420,6 +447,217 @@ class PhysicalAgentReplayTests(unittest.TestCase):
         )
         self.assertEqual(set(phase_trace), set(AgentPhase))
         self.assertEqual(len(planner.calls), 2)
+
+
+class PreparedIntentReplayTests(unittest.TestCase):
+    @staticmethod
+    def _coordinator(
+        reducer,
+        planner,
+        compiler,
+        now_ms,
+        evidence_provider,
+    ):
+        return PhysicalIntentCoordinator(
+            reducer=reducer,
+            intent_planner=planner,
+            compilation_evidence_provider=evidence_provider,
+            plan_compiler=compiler,
+            clock_ms=lambda: now_ms[0],
+            id_factory=SequentialIds(),
+            default_scan_profile_id="front-arc-profile-a",
+        )
+
+    def _prepare_while_command_is_active(self, *, ticket_valid_until=5_000):
+        key = ControllerKey(
+            robot_id="ev3rstorm-1",
+            controller_id="drive-1",
+            controller_instance_id="prepared-controller-1",
+        )
+        basis = NavigationBasis(
+            controller_key=key,
+            goal_epoch=1,
+            controller_state_version=1,
+            world_generation_id="world-generation-1",
+            world_model_version=1,
+            navigation_basis_id="basis-route-clear",
+            frame_id="robot-local-1",
+            calibration_fingerprint="drive-calibration-a",
+        )
+        goal = GoalAssignment(
+            goal_id="goal-1",
+            goal_epoch=1,
+            objective="Continue through the room and adapt",
+            source="USER",
+            locale="sv",
+            activated_at_ms=100,
+        )
+        initial_ticket = PlanningTicket(
+            ticket_id="ticket-new-goal",
+            cause=PlanningCause.NEW_GOAL,
+            basis=basis,
+            created_at_ms=101,
+            valid_until_ms=5_000,
+        )
+        reducer = PhysicalAgentStateReducer(PhysicalAgentState(key))
+        planner = CountingPlanner()
+        compiler = RecordingCompiler()
+        evidence_calls = []
+
+        def evidence_provider(state, proposal):
+            evidence_calls.append((state, proposal))
+            return compilation_evidence(state, proposal)
+
+        now_ms = [NOW_MS]
+        worker = self._coordinator(
+            reducer,
+            planner,
+            compiler,
+            now_ms,
+            evidence_provider,
+        )
+        reducer.apply(GoalActivated(goal, basis, initial_ticket))
+        first = worker.run_once()
+        self.assertEqual(first.outcome, CoordinatorOutcome.INTENT_ACCEPTED)
+
+        authorization, _authorized, dispatched = dispatch_active_step(
+            reducer,
+            now_ms=1_010,
+        )
+        parallel_ticket = PlanningTicket(
+            ticket_id="ticket-parallel-replan",
+            cause=PlanningCause.UNCERTAINTY,
+            basis=dispatched.basis,
+            created_at_ms=1_020,
+            valid_until_ms=ticket_valid_until,
+        )
+        reducer.apply(PlanningRequested(parallel_ticket))
+        now_ms[0] = 1_100
+        deferred = worker.run_once()
+
+        self.assertEqual(deferred.outcome, CoordinatorOutcome.DEFERRED)
+        self.assertEqual(len(planner.calls), 2)
+        self.assertEqual(len(compiler.model_intent_calls), 2)
+        self.assertEqual(len(evidence_calls), 2)
+        self.assertEqual(
+            deferred.state.prepared_intent_plan.valid_until_ms,
+            min(ticket_valid_until, NOW_MS + 1_000),
+        )
+        return {
+            "authorization": authorization,
+            "basis": basis,
+            "compiler": compiler,
+            "evidence_calls": evidence_calls,
+            "evidence_provider": evidence_provider,
+            "now_ms": now_ms,
+            "planner": planner,
+            "prepared": deferred.state.prepared_intent_plan,
+            "reducer": reducer,
+        }
+
+    def test_new_coordinator_accepts_after_exact_receipt_without_new_calls(self):
+        scenario = self._prepare_while_command_is_active()
+        reducer = scenario["reducer"]
+        restarted = self._coordinator(
+            reducer,
+            scenario["planner"],
+            scenario["compiler"],
+            scenario["now_ms"],
+            scenario["evidence_provider"],
+        )
+
+        self.assertEqual(restarted.run_once().outcome, CoordinatorOutcome.DEFERRED)
+        self.assertEqual(len(scenario["planner"].calls), 2)
+        self.assertEqual(len(scenario["compiler"].model_intent_calls), 2)
+        self.assertEqual(len(scenario["evidence_calls"]), 2)
+
+        resulting_basis = successor(
+            reducer.snapshot().basis,
+            controller_version=2,
+            basis_id=scenario["basis"].navigation_basis_id,
+        )
+        receipt, settled = settle_active_dispatch(
+            reducer,
+            scenario["authorization"],
+            resulting_basis,
+            received_at_ms=1_200,
+            disposition=StepDisposition.CONTINUE,
+        )
+        self.assertEqual(
+            receipt.host_dispatch_sequence,
+            scenario["authorization"].host_dispatch_sequence,
+        )
+        self.assertEqual(
+            settled.prepared_intent_plan,
+            scenario["prepared"],
+        )
+        scenario["now_ms"][0] = 1_300
+
+        accepted = restarted.run_once()
+
+        self.assertEqual(accepted.outcome, CoordinatorOutcome.INTENT_ACCEPTED)
+        self.assertEqual(accepted.state.plan, scenario["prepared"].plan)
+        self.assertIsNone(accepted.state.prepared_intent_plan)
+        self.assertEqual(len(scenario["planner"].calls), 2)
+        self.assertEqual(len(scenario["compiler"].model_intent_calls), 2)
+        self.assertEqual(len(scenario["evidence_calls"]), 2)
+
+    def test_relevant_basis_change_discards_without_replaying_the_model(self):
+        scenario = self._prepare_while_command_is_active()
+        reducer = scenario["reducer"]
+        changed_basis = successor(
+            reducer.snapshot().basis,
+            controller_version=2,
+            basis_id="basis-obstacle-changed",
+        )
+        reducer.apply(NavigationBasisUpdated(changed_basis))
+        restarted = self._coordinator(
+            reducer,
+            scenario["planner"],
+            scenario["compiler"],
+            scenario["now_ms"],
+            scenario["evidence_provider"],
+        )
+
+        result = restarted.run_once()
+
+        self.assertEqual(result.outcome, CoordinatorOutcome.NO_WORK)
+        self.assertIsNone(result.state.prepared_intent_plan)
+        self.assertIsNone(result.state.planning_ticket)
+        self.assertEqual(len(scenario["planner"].calls), 2)
+        self.assertEqual(len(scenario["compiler"].model_intent_calls), 2)
+        self.assertEqual(len(scenario["evidence_calls"]), 2)
+
+    def test_proposal_and_ticket_expiry_clear_prepared_state(self):
+        scenarios = (
+            (5_000, 2_000, CoordinatorOutcome.PROPOSAL_REJECTED),
+            (1_500, 1_500, CoordinatorOutcome.TICKET_EXPIRED),
+        )
+        for ticket_expiry, now_ms, expected in scenarios:
+            with self.subTest(expected=expected):
+                scenario = self._prepare_while_command_is_active(
+                    ticket_valid_until=ticket_expiry
+                )
+                scenario["now_ms"][0] = now_ms
+                restarted = self._coordinator(
+                    scenario["reducer"],
+                    scenario["planner"],
+                    scenario["compiler"],
+                    scenario["now_ms"],
+                    scenario["evidence_provider"],
+                )
+
+                expired = restarted.run_once()
+
+                self.assertEqual(expired.outcome, expected)
+                self.assertIsNone(expired.state.prepared_intent_plan)
+                self.assertIsNone(expired.state.planning_ticket)
+                self.assertEqual(len(scenario["planner"].calls), 2)
+                self.assertEqual(
+                    len(scenario["compiler"].model_intent_calls),
+                    2,
+                )
+                self.assertEqual(len(scenario["evidence_calls"]), 2)
 
 
 if __name__ == "__main__":

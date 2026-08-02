@@ -25,6 +25,7 @@ from robot_agent.physical_agent_state import (
     GoalActivated,
     GoalAssignment,
     GoalOutcome,
+    IntentPrepared,
     NavigationBasis,
     NavigationBasisUpdated,
     PhysicalAgentState,
@@ -404,13 +405,18 @@ class PhysicalIntentCoordinatorEligibilityTests(unittest.TestCase):
         consumed = planning_reducer()
         ticket = consumed.snapshot().planning_ticket
         consumed.apply(
-            PlanningTicketConsumed(ticket.ticket_id, ticket.basis, NOW_MS)
+            PlanningTicketConsumed(ticket, NOW_MS)
         )
         self.assertEqual(
             coordinator(consumed, planner).run_once().outcome,
             CoordinatorOutcome.NO_WORK,
         )
-        consumed.apply(PlanningHeld(ticket.ticket_id, ticket.basis))
+        consumed.apply(
+            PlanningHeld(
+                consumed.snapshot().planning_ticket,
+                "proposal-held",
+            )
+        )
         self.assertEqual(
             coordinator(consumed, planner).run_once().outcome,
             CoordinatorOutcome.NO_WORK,
@@ -494,11 +500,7 @@ class PhysicalIntentCoordinatorEligibilityTests(unittest.TestCase):
                 ticket = reducer.snapshot().planning_ticket
                 if consumed:
                     reducer.apply(
-                        PlanningTicketConsumed(
-                            ticket.ticket_id,
-                            ticket.basis,
-                            NOW_MS,
-                        )
+                        PlanningTicketConsumed(ticket, NOW_MS)
                     )
                 calls = []
                 result = coordinator(
@@ -994,6 +996,57 @@ class PhysicalIntentCoordinatorFreshnessTests(unittest.TestCase):
 
 
 class PhysicalIntentCoordinatorFailureTests(unittest.TestCase):
+    def test_losing_prepare_never_holds_or_erases_canonical_winner(self):
+        reducer = planning_reducer()
+        planner_calls = []
+
+        def planner(request):
+            planner_calls.append(request)
+            return envelope_for(
+                request,
+                NavigationIntentProposal(intent=FOLLOW_DIRECTION),
+            )
+
+        compiler = RecordingCompiler()
+        original_apply = reducer.apply
+        winner = {}
+
+        def inject_winner(event):
+            if isinstance(event, IntentPrepared) and not winner:
+                winning_prepared = replace(
+                    event.prepared,
+                    proposal_id="proposal-winning-producer",
+                    plan=replace(
+                        event.prepared.plan,
+                        plan_id="plan-winning-producer",
+                    ),
+                )
+                winner["prepared"] = winning_prepared
+                original_apply(IntentPrepared(winning_prepared))
+            return original_apply(event)
+
+        reducer.apply = inject_winner
+        worker = coordinator(reducer, planner, compiler)
+
+        losing = worker.run_once()
+
+        self.assertEqual(losing.outcome, CoordinatorOutcome.SUPERSEDED)
+        self.assertEqual(
+            losing.state.prepared_intent_plan,
+            winner["prepared"],
+        )
+        self.assertIsNotNone(losing.state.planning_ticket)
+        self.assertTrue(losing.state.planning_ticket.consumed)
+        self.assertEqual(len(planner_calls), 1)
+        self.assertEqual(len(compiler.calls), 1)
+
+        accepted = worker.run_once()
+
+        self.assertEqual(accepted.outcome, CoordinatorOutcome.INTENT_ACCEPTED)
+        self.assertEqual(accepted.state.plan, winner["prepared"].plan)
+        self.assertEqual(len(planner_calls), 1)
+        self.assertEqual(len(compiler.calls), 1)
+
     def test_evidence_provider_failure_holds_without_compiling_or_retrying(self):
         reducer = planning_reducer()
         planner_calls = []

@@ -35,6 +35,7 @@ class PhysicalIntentCoordinatorError(ValueError):
 class CoordinatorOutcome(str, Enum):
     NO_WORK = "NO_WORK"
     TICKET_EXPIRED = "TICKET_EXPIRED"
+    DEFERRED = "DEFERRED"
     INTENT_ACCEPTED = "INTENT_ACCEPTED"
     HELD = "HELD"
     ABORTED = "ABORTED"

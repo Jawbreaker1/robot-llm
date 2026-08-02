@@ -41,6 +41,37 @@ nested state machines, or containers for dialogue and UI state. A material
 change in intent, geometry, topology, calibration, or localization creates a
 new plan revision rather than mutating the old plan in place.
 
+A fully validated and compiled planner result MUST become a canonical
+`PreparedIntentPlan` before it can replace an executing plan. There may be at
+most one prepared result. It stores the exact consumed ticket, its ticket
+basis, the separate exact compilation-evidence basis, proposal, intent
+revision, plan revision, and a deadline equal to the earlier of the ticket and
+proposal deadlines and never more than 60 seconds after preparation. This
+durable intermediate fact is not a new lifecycle phase: without an active
+command it is activated immediately; with one active command it waits for
+that command's exact receipt.
+
+While a prepared result exists, no new step may be authorized. A
+decision-equivalent basis update or receipt may retain it; relevant evidence,
+a blocked command, stop, supersession, or expiry discards it deterministically.
+If the old plan finishes while a compatible planning ticket is still active,
+the ticket and prepared result remain in `PLANNING` with `compile_pending`
+false until activation. Because preparation is canonical rather than a worker
+cache, a restarted coordinator can activate the same plan without another
+model or compiler call.
+
+`ActiveIntent.accepted_at_ms` records when the proposal was semantically
+accepted and compiled. A later `PreparedIntentAccepted.accepted_at_ms` records
+when that already accepted result became the active execution plan; delayed
+activation does not rewrite the earlier semantic-acceptance timestamp.
+
+Ticket consumption, expiry, hold, and abort transitions compare the complete
+immutable ticket value rather than only its ID and basis. Prepared activation
+and expiry likewise compare the complete immutable prepared value. Reused or
+replayed identifiers therefore cannot affect a newer ticket or plan. The old
+`IntentAccepted` value remains importable only for historical deserialization;
+it is not part of `PhysicalAgentEvent` and the live reducer never routes it.
+
 ### Factual state
 
 `ControllerState` is factual state for one motor-capable device: connection,

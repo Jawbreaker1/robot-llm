@@ -46,6 +46,7 @@ def _reduce_stop_event(
             basis=event.resulting_basis,
             compile_pending=False,
             plan=None,
+            prepared_intent_plan=None,
             active_dispatch=_dispatch_for_stopping(state),
             planning_ticket=None,
             terminal=event.terminal,
@@ -66,6 +67,7 @@ def _reduce_stop_event(
             phase=AgentPhase.STOPPING,
             compile_pending=False,
             plan=None,
+            prepared_intent_plan=None,
             active_dispatch=_dispatch_for_stopping(state),
             planning_ticket=None,
             terminal=event.terminal,
@@ -134,6 +136,7 @@ def _reduce_stop_event(
             compile_pending=False,
             intent=None,
             intent_progress=None,
+            prepared_intent_plan=None,
             active_dispatch=None,
         )
 
@@ -155,6 +158,7 @@ def _reduce_stop_event(
             intent=None,
             intent_progress=None,
             plan=None,
+            prepared_intent_plan=None,
             active_dispatch=None,
             planning_ticket=None,
             terminal=None,

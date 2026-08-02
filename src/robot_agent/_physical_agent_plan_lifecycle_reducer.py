@@ -19,6 +19,7 @@ from ._physical_agent_reducer_support import (
     _next,
     _recompiled_progress,
     _require_no_active_dispatch,
+    _require_no_prepared_intent,
     _require_phase,
     _successor,
 )
@@ -36,6 +37,7 @@ def _reduce_plan_lifecycle_event(
             AgentPhase.EXECUTING,
         )
         _require_no_active_dispatch(state, event)
+        _require_no_prepared_intent(state, event)
         if state.phase == AgentPhase.PLANNING and not state.compile_pending:
             raise PhysicalAgentStateError(
                 "deterministic_compile_not_pending",
@@ -56,6 +58,7 @@ def _reduce_plan_lifecycle_event(
             plan=event.plan,
             plan_revision=event.plan.revision,
             intent_progress=progress,
+            prepared_intent_plan=None,
             active_dispatch=None,
             planning_ticket=None,
         )
@@ -63,6 +66,7 @@ def _reduce_plan_lifecycle_event(
     if isinstance(event, ReplanRequested):
         _require_phase(state, event, AgentPhase.EXECUTING)
         _require_no_active_dispatch(state, event)
+        _require_no_prepared_intent(state, event)
         _identifier("replan_reason", event.reason, 160)
         _successor(state, event.resulting_basis)
         if event.ticket.basis != event.resulting_basis:
@@ -81,6 +85,7 @@ def _reduce_plan_lifecycle_event(
             basis=event.resulting_basis,
             compile_pending=False,
             plan=None,
+            prepared_intent_plan=None,
             active_dispatch=None,
             planning_ticket=event.ticket,
         )

@@ -18,6 +18,7 @@ from ._physical_agent_dispatch_contract import (
     StepCommandAuthorization,
     StepDisposition,
 )
+from ._physical_agent_prepared_contract import PreparedIntentPlan
 
 
 @dataclass(frozen=True)
@@ -29,20 +30,20 @@ class GoalActivated:
 
 @dataclass(frozen=True)
 class PlanningTicketConsumed:
-    ticket_id: str
-    based_on_basis: NavigationBasis
+    ticket: PlanningTicket
     consumed_at_ms: int
 
 
 @dataclass(frozen=True)
 class PlanningTicketExpired:
-    ticket_id: str
-    based_on_basis: NavigationBasis
+    ticket: PlanningTicket
     observed_at_ms: int
 
 
 @dataclass(frozen=True)
 class IntentAccepted:
+    """Legacy value retained for deserialization, not a live state event."""
+
     ticket_id: str
     based_on_basis: NavigationBasis
     intent: ActiveIntent
@@ -50,16 +51,33 @@ class IntentAccepted:
 
 
 @dataclass(frozen=True)
+class IntentPrepared:
+    prepared: PreparedIntentPlan
+
+
+@dataclass(frozen=True)
+class PreparedIntentAccepted:
+    prepared: PreparedIntentPlan
+    accepted_at_ms: int
+
+
+@dataclass(frozen=True)
+class PreparedIntentExpired:
+    prepared: PreparedIntentPlan
+    observed_at_ms: int
+
+
+@dataclass(frozen=True)
 class PlanningAbortRequested:
-    ticket_id: str
-    based_on_basis: NavigationBasis
+    ticket: PlanningTicket
+    proposal_id: Optional[str]
     terminal: GoalTerminal
 
 
 @dataclass(frozen=True)
 class PlanningHeld:
-    ticket_id: str
-    based_on_basis: NavigationBasis
+    ticket: PlanningTicket
+    proposal_id: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -146,7 +164,9 @@ PhysicalAgentEvent = Union[
     GoalActivated,
     PlanningTicketConsumed,
     PlanningTicketExpired,
-    IntentAccepted,
+    IntentPrepared,
+    PreparedIntentAccepted,
+    PreparedIntentExpired,
     PlanningAbortRequested,
     PlanningHeld,
     PlanningRequested,

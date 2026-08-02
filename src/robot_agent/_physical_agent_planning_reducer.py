@@ -1,14 +1,11 @@
 """Private reducer for goal, ticket, intent, and basis events."""
 
 from .physical_agent_contract import (
-    ActiveIntent,
     AgentPhase,
-    ExecutionPlan,
     GoalActivated,
     GoalAssignment,
     GoalOutcome,
     GoalTerminal,
-    IntentAccepted,
     NavigationBasis,
     NavigationBasisUpdated,
     PhysicalAgentEvent,
@@ -21,16 +18,15 @@ from .physical_agent_contract import (
     PlanningTicket,
     PlanningTicketConsumed,
     PlanningTicketExpired,
+    _identifier,
     _integer,
 )
 from ._physical_agent_reducer_support import (
     _current_ticket,
     _dispatch_for_stopping,
-    _initial_progress,
-    _new_plan,
     _new_ticket,
     _next,
-    _require_no_active_dispatch,
+    _require_no_prepared_intent,
     _require_phase,
     _successor,
 )
@@ -67,6 +63,7 @@ def _reduce_planning_event(
             intent=None,
             intent_progress=None,
             plan=None,
+            prepared_intent_plan=None,
             active_dispatch=None,
             planning_ticket=event.ticket,
             terminal=None,
@@ -79,9 +76,7 @@ def _reduce_planning_event(
             AgentPhase.PLANNING,
             AgentPhase.EXECUTING,
         )
-        value = _current_ticket(
-            state, event.ticket_id, event.based_on_basis, False
-        )
+        value = _current_ticket(state, event.ticket, False)
         return _next(
             state, planning_ticket=value.consume(event.consumed_at_ms)
         )
@@ -95,8 +90,7 @@ def _reduce_planning_event(
         )
         value = _current_ticket(
             state,
-            event.ticket_id,
-            event.based_on_basis,
+            event.ticket,
             None,
         )
         _integer("planning_ticket_observed_at_ms", event.observed_at_ms)
@@ -108,51 +102,7 @@ def _reduce_planning_event(
         return _next(
             state,
             compile_pending=False,
-            planning_ticket=None,
-        )
-
-    if isinstance(event, IntentAccepted):
-        _require_phase(
-            state,
-            event,
-            AgentPhase.PLANNING,
-            AgentPhase.EXECUTING,
-        )
-        _require_no_active_dispatch(state, event)
-        _current_ticket(state, event.ticket_id, event.based_on_basis, True)
-        value = event.intent
-        if (
-            not isinstance(value, ActiveIntent)
-            or not isinstance(event.plan, ExecutionPlan)
-            or value.goal_id != state.goal.goal_id
-            or value.goal_epoch != state.goal_epoch
-            or value.accepted_basis != event.based_on_basis
-        ):
-            raise PhysicalAgentStateError(
-                "invalid_accepted_intent",
-                "accepted intent is not bound to the ticket and goal",
-            )
-        if state.intent is None:
-            valid_revision = value.revision == 1
-        elif value.intent_id == state.intent.intent_id:
-            valid_revision = value.revision == state.intent.revision + 1
-        else:
-            valid_revision = value.revision == 1
-        if not valid_revision:
-            raise PhysicalAgentStateError(
-                "invalid_intent_revision", "accepted intent revision is invalid"
-            )
-        _new_plan(state, event.plan, value, state.basis)
-        progress = _initial_progress(value, state.basis)
-        return _next(
-            state,
-            phase=AgentPhase.EXECUTING,
-            compile_pending=False,
-            intent=value,
-            intent_progress=progress,
-            plan=event.plan,
-            plan_revision=event.plan.revision,
-            active_dispatch=None,
+            prepared_intent_plan=None,
             planning_ticket=None,
         )
 
@@ -163,12 +113,14 @@ def _reduce_planning_event(
             AgentPhase.PLANNING,
             AgentPhase.EXECUTING,
         )
-        _current_ticket(
-            state,
-            event.ticket_id,
-            event.based_on_basis,
-            True,
-        )
+        _require_no_prepared_intent(state, event)
+        if state.planning_ticket != event.ticket or not event.ticket.consumed:
+            raise PhysicalAgentStateError(
+                "planning_ticket_mismatch",
+                "planning abort does not match the exact consumed ticket",
+            )
+        if event.proposal_id is not None:
+            _identifier("planning_abort_proposal_id", event.proposal_id)
         if (
             not isinstance(event.terminal, GoalTerminal)
             or event.terminal.outcome == GoalOutcome.SUCCEEDED
@@ -182,6 +134,7 @@ def _reduce_planning_event(
             phase=AgentPhase.STOPPING,
             compile_pending=False,
             plan=None,
+            prepared_intent_plan=None,
             active_dispatch=_dispatch_for_stopping(state),
             planning_ticket=None,
             terminal=event.terminal,
@@ -194,10 +147,18 @@ def _reduce_planning_event(
             AgentPhase.PLANNING,
             AgentPhase.EXECUTING,
         )
-        _current_ticket(state, event.ticket_id, event.based_on_basis, True)
+        _require_no_prepared_intent(state, event)
+        if state.planning_ticket != event.ticket or not event.ticket.consumed:
+            raise PhysicalAgentStateError(
+                "planning_ticket_mismatch",
+                "planning hold does not match the exact consumed ticket",
+            )
+        if event.proposal_id is not None:
+            _identifier("planning_hold_proposal_id", event.proposal_id)
         return _next(
             state,
             compile_pending=False,
+            prepared_intent_plan=None,
             planning_ticket=None,
         )
 
@@ -232,6 +193,14 @@ def _reduce_planning_event(
             event.basis
         ):
             active_ticket = None
+        prepared = state.prepared_intent_plan
+        if (
+            prepared is not None
+            and not prepared.compilation_basis.decision_equivalent(
+                event.basis
+            )
+        ):
+            prepared = None
         return _next(
             state,
             basis=event.basis,
@@ -239,6 +208,7 @@ def _reduce_planning_event(
                 state.compile_pending
                 and state.basis.decision_equivalent(event.basis)
             ),
+            prepared_intent_plan=prepared,
             planning_ticket=active_ticket,
         )
 

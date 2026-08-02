@@ -14,6 +14,7 @@ from ._physical_agent_core import (
     PlanningTicket,
 )
 from ._physical_agent_dispatch_contract import ActiveDispatch, PlanStepKey
+from ._physical_agent_prepared_contract import PreparedIntentPlan
 from ._physical_agent_snapshot import PhysicalAgentState
 
 
@@ -41,15 +42,13 @@ def _next(state: PhysicalAgentState, **changes) -> PhysicalAgentState:
 
 def _current_ticket(
     state: PhysicalAgentState,
-    ticket_id: str,
-    based_on_basis: NavigationBasis,
+    ticket: PlanningTicket,
     consumed: Optional[bool],
 ) -> PlanningTicket:
     value = state.planning_ticket
     if (
-        value is None
-        or value.ticket_id != ticket_id
-        or value.basis != based_on_basis
+        not isinstance(ticket, PlanningTicket)
+        or value != ticket
         or (consumed is not None and value.consumed is not consumed)
     ):
         raise PhysicalAgentStateError(
@@ -102,6 +101,19 @@ def _require_no_active_dispatch(
         )
 
 
+def _require_no_prepared_intent(
+    state: PhysicalAgentState,
+    event: object,
+) -> None:
+    if state.prepared_intent_plan is not None:
+        raise PhysicalAgentStateError(
+            "prepared_intent_conflict",
+            "{} cannot bypass a prepared intent plan".format(
+                type(event).__name__
+            ),
+        )
+
+
 def _active_step_key(state: PhysicalAgentState) -> PlanStepKey:
     active_plan = state.plan
     return PlanStepKey(
@@ -120,6 +132,18 @@ def _ticket_after_basis(
 ) -> Optional[PlanningTicket]:
     value = state.planning_ticket
     if value is not None and not value.basis.decision_equivalent(
+        resulting_basis
+    ):
+        return None
+    return value
+
+
+def _prepared_after_basis(
+    state: PhysicalAgentState,
+    resulting_basis: NavigationBasis,
+) -> Optional[PreparedIntentPlan]:
+    value = state.prepared_intent_plan
+    if value is not None and not value.compilation_basis.decision_equivalent(
         resulting_basis
     ):
         return None
@@ -157,6 +181,38 @@ def _new_plan(
         intent=intent,
         basis=nav_basis,
     )
+
+
+def _validate_new_intent_plan(
+    state: PhysicalAgentState,
+    intent: ActiveIntent,
+    plan: ExecutionPlan,
+    accepted_basis: NavigationBasis,
+    current_basis: NavigationBasis,
+) -> None:
+    if (
+        not isinstance(intent, ActiveIntent)
+        or not isinstance(plan, ExecutionPlan)
+        or intent.goal_id != state.goal.goal_id
+        or intent.goal_epoch != state.goal_epoch
+        or intent.accepted_basis != accepted_basis
+    ):
+        raise PhysicalAgentStateError(
+            "invalid_accepted_intent",
+            "accepted intent is not bound to the ticket and goal",
+        )
+    if state.intent is None:
+        valid_revision = intent.revision == 1
+    elif intent.intent_id == state.intent.intent_id:
+        valid_revision = intent.revision == state.intent.revision + 1
+    else:
+        valid_revision = intent.revision == 1
+    if not valid_revision:
+        raise PhysicalAgentStateError(
+            "invalid_intent_revision",
+            "accepted intent revision is invalid",
+        )
+    _new_plan(state, plan, intent, current_basis)
 
 
 def _initial_progress(intent: ActiveIntent, nav_basis: NavigationBasis) -> IntentProgress:
