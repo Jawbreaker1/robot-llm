@@ -27,7 +27,9 @@ from .ev3rstorm_profile import (
     EV3SSHBinding,
 )
 from .lm_studio import DEFAULT_BASE_URL, DEFAULT_MODEL
+from .hybrid_navigation_planner import HybridNavigationPlanner
 from .lm_studio_navigation import LMStudioNavigationPlanner
+from .lm_studio_navigation_intent import LMStudioNavigationIntentClient
 from .robot_control_contract import RobotControlSettings
 from .robot_control_http import RobotControlHTTPRouter
 from .robot_control_service import RobotControlService
@@ -41,6 +43,12 @@ ROBOT_PROFILE_DISABLED = "disabled"
 ROBOT_PROFILE_CHOICES = (
     ROBOT_PROFILE_DISABLED,
     EV3RSTORM_PROFILE_ID,
+)
+ROBOT_PLANNER_MODE_LEGACY = "legacy"
+ROBOT_PLANNER_MODE_HYBRID_CANARY = "hybrid-canary"
+ROBOT_PLANNER_MODE_CHOICES = (
+    ROBOT_PLANNER_MODE_LEGACY,
+    ROBOT_PLANNER_MODE_HYBRID_CANARY,
 )
 
 
@@ -361,6 +369,16 @@ def _parser() -> argparse.ArgumentParser:
         default=30.0,
         help="Structured physical planner timeout (default: %(default)s)",
     )
+    parser.add_argument(
+        "--robot-planner-mode",
+        choices=ROBOT_PLANNER_MODE_CHOICES,
+        default=ROBOT_PLANNER_MODE_LEGACY,
+        help=(
+            "Physical planner path; hybrid-canary accelerates only "
+            "unambiguous follow/scan states and otherwise uses legacy "
+            "(default: %(default)s)"
+        ),
+    )
     stt_source = parser.add_mutually_exclusive_group()
     stt_source.add_argument(
         "--stt-model",
@@ -449,10 +467,20 @@ def _configured_robot_runtime_adapter(args):
     )
 
     def planner_factory(model):
-        return LMStudioNavigationPlanner(
+        legacy = LMStudioNavigationPlanner(
             base_url=args.lm_studio_url,
             model=model,
             timeout_seconds=args.robot_planner_timeout_seconds,
+        )
+        if args.robot_planner_mode == ROBOT_PLANNER_MODE_LEGACY:
+            return legacy
+        return HybridNavigationPlanner(
+            legacy_planner=legacy,
+            compact_client=LMStudioNavigationIntentClient(
+                base_url=args.lm_studio_url,
+                model=model,
+                timeout_seconds=args.robot_planner_timeout_seconds,
+            ),
         )
 
     return profile.build_adapter(

@@ -142,6 +142,8 @@ class NavigationPlannerResult:
     accounted_prompt_bytes: int = 0
     context_target_byte_count: int = 0
     context_hard_byte_count: int = 0
+    decision_path: str = "legacy_full"
+    model_call_count: int = 1
 
 
 def _usage_token_count(usage, field: str) -> Optional[int]:

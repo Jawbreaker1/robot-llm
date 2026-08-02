@@ -36,6 +36,7 @@ from robot_agent.lm_studio_navigation import (
     LMStudioNavigationDecisionError,
     LMStudioNavigationError,
     LMStudioNavigationPlanner,
+    NavigationPlannerResult,
     _maneuver_schema,
 )
 from robot_agent.navigation_memory_store import NavigationMemoryStore
@@ -3436,6 +3437,51 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             [item for item in transport.calls if item[0] == "shutdown"],
             [("shutdown", {})],
         )
+
+    def test_runtime_counts_explicit_zero_call_planner_results_truthfully(self):
+        class ZeroCallPlanner(FakeRuntimePlanner):
+            def decide(self, **context):
+                decision = super().decide(**context)
+                return NavigationPlannerResult(
+                    decision=decision,
+                    latency_ms=0,
+                    served_model=None,
+                    usage=None,
+                    stats=None,
+                    decision_path="compact_zero_call_test",
+                    model_call_count=0,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "zero-call-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=305),
+            )
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-zero-call",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Move forward at least 100 mm",
+                    locale="sv",
+                    minimum_forward_progress_mm=100,
+                    max_turns=3,
+                    max_episode_seconds=10,
+                ),
+                transport=FakeRuntimeTransport(),
+                planner=ZeroCallPlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+            )
+
+            result = runtime.run()
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.model_calls, 0)
+        self.assertEqual(result.actions, (ADVANCE, ADVANCE, FINISH))
 
     def test_invalid_model_output_gets_bounded_feedback_retry(self):
         with tempfile.TemporaryDirectory() as directory:

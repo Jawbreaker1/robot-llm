@@ -10,6 +10,7 @@ from http.server import ThreadingHTTPServer
 
 from robot_agent.dashboard_cli import (
     _LoopbackThreadingHTTPServer,
+    _configured_robot_runtime_adapter,
     _handler_class,
     _parser,
     _raise_termination_interrupt,
@@ -236,6 +237,61 @@ class DashboardCLITests(unittest.TestCase):
 
         self.assertFalse(defaults.simulation_map_demo)
         self.assertTrue(enabled.simulation_map_demo)
+
+    def test_physical_planner_canary_is_explicit_opt_in(self):
+        defaults = _parser().parse_args([])
+        enabled = _parser().parse_args(
+            ["--robot-planner-mode", "hybrid-canary"]
+        )
+
+        self.assertEqual(defaults.robot_planner_mode, "legacy")
+        self.assertEqual(enabled.robot_planner_mode, "hybrid-canary")
+
+    def test_canary_factory_wraps_legacy_and_compact_clients(self):
+        args = _parser().parse_args([
+            "--robot-profile",
+            "ev3rstorm-01",
+            "--robot-target",
+            "robot@ev3dev.local",
+            "--robot-planner-mode",
+            "hybrid-canary",
+        ])
+        legacy = object()
+        compact = object()
+        hybrid = object()
+
+        with (
+            mock.patch(
+                "robot_agent.dashboard_cli.LMStudioNavigationPlanner",
+                return_value=legacy,
+            ) as legacy_factory,
+            mock.patch(
+                "robot_agent.dashboard_cli.LMStudioNavigationIntentClient",
+                return_value=compact,
+            ) as compact_factory,
+            mock.patch(
+                "robot_agent.dashboard_cli.HybridNavigationPlanner",
+                return_value=hybrid,
+            ) as hybrid_factory,
+        ):
+            adapter = _configured_robot_runtime_adapter(args)
+            value = adapter.planner_factory("model-a")
+
+        self.assertIs(value, hybrid)
+        legacy_factory.assert_called_once_with(
+            base_url=args.lm_studio_url,
+            model="model-a",
+            timeout_seconds=args.robot_planner_timeout_seconds,
+        )
+        compact_factory.assert_called_once_with(
+            base_url=args.lm_studio_url,
+            model="model-a",
+            timeout_seconds=args.robot_planner_timeout_seconds,
+        )
+        hybrid_factory.assert_called_once_with(
+            legacy_planner=legacy,
+            compact_client=compact,
+        )
 
     def test_run_injects_robot_adapter_into_separate_control_service(self):
         adapter = mock.Mock()

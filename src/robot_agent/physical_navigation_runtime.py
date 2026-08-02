@@ -753,7 +753,6 @@ class PhysicalNavigationRuntime(
     ) -> NavigationDecision:
         feedback = None
         for attempt in range(1, self.config.max_validation_attempts + 1):
-            counters["model_calls"] += 1
             planner_maneuver_state = maneuver.state(turn)
             self._shadow_record_planner_input(
                 turn=turn,
@@ -787,6 +786,7 @@ class PhysicalNavigationRuntime(
                 # not satisfy the decision contract. This is model feedback,
                 # not a transport failure and never an invitation for the
                 # host to substitute an action.
+                counters["model_calls"] += 1
                 counters["model_latency_ms"] += max(0, error.latency_ms)
                 self._post_planner_gate(
                     deadline,
@@ -805,6 +805,7 @@ class PhysicalNavigationRuntime(
                 )
                 continue
             except LMStudioNavigationError as error:
+                counters["model_calls"] += 1
                 latency_ms = getattr(error, "latency_ms", 0)
                 if (
                     isinstance(latency_ms, bool)
@@ -856,23 +857,45 @@ class PhysicalNavigationRuntime(
                 decision = planner_result.decision
                 latency_ms = planner_result.latency_ms
                 served_model = planner_result.served_model
+                model_call_count = planner_result.model_call_count
+                if (
+                    isinstance(model_call_count, bool)
+                    or not isinstance(model_call_count, int)
+                    or model_call_count not in (0, 1)
+                ):
+                    model_call_count = 1
+                decision_path = planner_result.decision_path
+                if (
+                    not isinstance(decision_path, str)
+                    or not decision_path
+                    or len(decision_path) > 128
+                ):
+                    decision_path = "legacy_unlabelled"
                 planner_telemetry = {
                     "planner_context_bytes": planner_result.context_byte_count,
                     "prompt_tokens": planner_result.prompt_tokens,
                     "completion_tokens": planner_result.completion_tokens,
                     "total_tokens": planner_result.total_tokens,
+                    "decision_path": decision_path,
+                    "model_call_count": model_call_count,
                 }
             elif isinstance(planner_result, NavigationDecision):
                 decision = planner_result
                 latency_ms = 0
                 served_model = None
-                planner_telemetry = {}
+                model_call_count = 1
+                planner_telemetry = {
+                    "decision_path": "legacy_raw_decision",
+                    "model_call_count": model_call_count,
+                }
             else:
+                counters["model_calls"] += 1
                 self._post_planner_gate(deadline, "after_planner_return")
                 raise PhysicalNavigationRuntimeError(
                     "invalid_planner_result",
                     "Planner returned the wrong result type",
                 )
+            counters["model_calls"] += model_call_count
             counters["model_latency_ms"] += latency_ms
             self._post_planner_gate(deadline, "after_planner_return")
             self._emit(
