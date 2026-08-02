@@ -11,6 +11,7 @@ from robot_agent.navigation_intent_proposal import (
     HOLD,
     LEFT,
     MAX_NAVIGATION_INTENT_TTL_MS,
+    MAX_NAVIGATION_INTENT_REASON_LENGTH,
     NavigationIntentOffer,
     NavigationIntentProposal,
     NavigationIntentProposalError,
@@ -19,13 +20,11 @@ from robot_agent.navigation_intent_proposal import (
     bind_navigation_intent_proposal,
     build_navigation_intent_proposal_schema,
     decode_navigation_intent_proposal,
-    size_metrics,
 )
 from robot_agent.physical_agent_state import ControllerKey, NavigationBasis
 from robot_agent.physical_navigation_contract import (
     ACTIONS,
     ADVANCE,
-    OBSERVE,
 )
 
 
@@ -71,6 +70,40 @@ def offer(**changes):
 
 def encoded(value):
     return json.dumps(value, separators=(",", ":")).encode("utf-8")
+
+
+def canonical_size(value):
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def size_metrics(*, current_schema, current_output, current_offer, proposal):
+    current_offer.assert_allows(proposal)
+    shadow_schema = build_navigation_intent_proposal_schema(current_offer)
+    shadow_output = proposal.to_dict()
+    current_schema_bytes = canonical_size(current_schema)
+    shadow_schema_bytes = canonical_size(shadow_schema)
+    current_output_bytes = canonical_size(current_output)
+    shadow_output_bytes = canonical_size(shadow_output)
+    return {
+        "schema_saved_bytes": current_schema_bytes - shadow_schema_bytes,
+        "schema_reduction_milli": (
+            (current_schema_bytes - shadow_schema_bytes) * 1_000
+        ) // current_schema_bytes,
+        "output_saved_bytes": current_output_bytes - shadow_output_bytes,
+        "output_reduction_milli": (
+            (current_output_bytes - shadow_output_bytes) * 1_000
+        ) // current_output_bytes,
+        "shadow_schema_bytes": shadow_schema_bytes,
+        "shadow_output_bytes": shadow_output_bytes,
+    }
 
 
 class NavigationIntentSchemaTests(unittest.TestCase):
@@ -188,6 +221,30 @@ class NavigationIntentSchemaTests(unittest.TestCase):
             )
 
         self.assertEqual(caught.exception.code, "offer_schema_too_large")
+
+    def test_offer_reason_limit_matches_the_decoded_proposal_contract(self):
+        maximum = "R" * MAX_NAVIGATION_INTENT_REASON_LENGTH
+        current_offer = offer(
+            hold_reasons=(maximum,),
+            abort_reasons=(maximum,),
+        )
+
+        self.assertEqual(
+            decode_navigation_intent_proposal(
+                encoded({"intent": HOLD, "reason": maximum}),
+                current_offer,
+            ),
+            NavigationIntentProposal(HOLD, reason=maximum),
+        )
+        with self.assertRaises(NavigationIntentProposalError) as caught:
+            offer(hold_reasons=(maximum + "R",))
+        self.assertEqual(caught.exception.code, "invalid_offer")
+
+    def test_detour_sides_cannot_form_ambiguous_cross_target_choices(self):
+        with self.assertRaises(NavigationIntentProposalError) as caught:
+            offer(detour_target_ids=("hazard-1", "hazard-2"))
+
+        self.assertEqual(caught.exception.code, "invalid_offer")
 
 
 class NavigationIntentDecodeTests(unittest.TestCase):
@@ -473,13 +530,13 @@ class NavigationIntentSizeTests(unittest.TestCase):
         first = size_metrics(
             current_schema=current_schema,
             current_output=current_output,
-            offer=current_offer,
+            current_offer=current_offer,
             proposal=proposal,
         )
         second = size_metrics(
             current_schema=current_schema,
             current_output=current_output,
-            offer=current_offer,
+            current_offer=current_offer,
             proposal=proposal,
         )
 
@@ -490,18 +547,6 @@ class NavigationIntentSizeTests(unittest.TestCase):
         self.assertGreaterEqual(first["output_reduction_milli"], 900)
         self.assertLess(first["shadow_schema_bytes"], 2_000)
         self.assertLess(first["shadow_output_bytes"], 40)
-
-    def test_size_metrics_rejects_non_json_baselines(self):
-        with self.assertRaises(NavigationIntentProposalError):
-            size_metrics(
-                current_schema={"bad": object()},
-                current_output={"intent": OBSERVE},
-                offer=offer(),
-                proposal=NavigationIntentProposal(
-                    intent=FOLLOW_DIRECTION,
-                ),
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

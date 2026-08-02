@@ -235,6 +235,11 @@ those ceilings: 758 B of system instructions, a 980–1,025 B response schema,
 the 2,048 B wrapper reserve. Its minimal `FOLLOW_DIRECTION` output is 29 B.
 These are deterministic contract measurements, not live model-latency claims.
 
+The compact planner bridge makes no model call when the host offer contains
+exactly one concrete valid proposal. When a genuine choice remains it makes
+exactly one model call for the ticket. Retry and backoff remain scheduler
+policy; the bridge owns neither a loop nor another planning state machine.
+
 For reference, the current response schema measures 1,557 B for the minimal
 `OBSERVE`/empty-maneuver fixture and 6,366 B with all actions and 64 target
 identifiers. The target contract sends mission, accepted intent, current plan,

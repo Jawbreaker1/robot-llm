@@ -34,6 +34,7 @@ DETOUR_SIDES = (LEFT, RIGHT)
 MAX_NAVIGATION_INTENT_BYTES = 4 * 1024
 MAX_NAVIGATION_INTENT_SCHEMA_BYTES = 3 * 1024
 MAX_NAVIGATION_INTENT_TTL_MS = 60_000
+MAX_NAVIGATION_INTENT_REASON_LENGTH = 64
 _MAX_INT = 2**63 - 1
 
 
@@ -173,6 +174,14 @@ class NavigationIntentOffer:
             "abort_reason",
             self.abort_reasons,
         )
+        if any(
+            len(reason) > MAX_NAVIGATION_INTENT_REASON_LENGTH
+            for reason in hold_reasons + abort_reasons
+        ):
+            raise NavigationIntentProposalError(
+                "invalid_offer",
+                "Hold and abort reasons exceed the proposal contract",
+            )
 
         requirements = (
             (SCAN_TARGET, scan_targets, "scan_target_ids"),
@@ -190,6 +199,12 @@ class NavigationIntentOffer:
                         intent,
                     ),
                 )
+        if DETOUR_TARGET in offered_set and len(detour_targets) != 1:
+            raise NavigationIntentProposalError(
+                "invalid_offer",
+                "A detour offer must name exactly one target; its sides apply "
+                "only to that target",
+            )
 
         object.__setattr__(self, "offered_intents", offered)
         object.__setattr__(self, "scan_target_ids", scan_targets)
@@ -289,7 +304,11 @@ class NavigationIntentProposal:
                 )
             expected = (self.target_id, self.side, None)
         else:
-            _identifier("reason", self.reason, 64)
+            _identifier(
+                "reason",
+                self.reason,
+                MAX_NAVIGATION_INTENT_REASON_LENGTH,
+            )
             expected = (None, None, self.reason)
         if (self.target_id, self.side, self.reason) != expected:
             raise NavigationIntentProposalError(
@@ -570,77 +589,6 @@ def _navigation_basis_dict(basis: NavigationBasis) -> Mapping[str, object]:
     }
 
 
-def _canonical_json_size(value: object) -> int:
-    try:
-        encoded = json.dumps(
-            value,
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    except (TypeError, ValueError):
-        raise NavigationIntentProposalError(
-            "invalid_size_input",
-            "Size metric input must be finite JSON data",
-        ) from None
-    return len(encoded)
-
-
-def _reduction_milli(current: int, shadow: int) -> int:
-    return ((current - shadow) * 1_000) // current
-
-
-def size_metrics(
-    *,
-    current_schema: Mapping[str, object],
-    current_output: Mapping[str, object],
-    offer: NavigationIntentOffer,
-    proposal: NavigationIntentProposal,
-) -> Mapping[str, int]:
-    """Return deterministic canonical-byte comparisons with the v1 contract."""
-
-    if not isinstance(current_schema, Mapping) or not current_schema:
-        raise NavigationIntentProposalError(
-            "invalid_size_input",
-            "current_schema must be a non-empty mapping",
-        )
-    if not isinstance(current_output, Mapping) or not current_output:
-        raise NavigationIntentProposalError(
-            "invalid_size_input",
-            "current_output must be a non-empty mapping",
-        )
-    if not isinstance(offer, NavigationIntentOffer):
-        raise NavigationIntentProposalError(
-            "invalid_offer",
-            "offer must be NavigationIntentOffer",
-        )
-    offer.assert_allows(proposal)
-
-    shadow_schema = build_navigation_intent_proposal_schema(offer)
-    shadow_output = proposal.to_dict()
-    current_schema_bytes = _canonical_json_size(current_schema)
-    shadow_schema_bytes = _canonical_json_size(shadow_schema)
-    current_output_bytes = _canonical_json_size(current_output)
-    shadow_output_bytes = _canonical_json_size(shadow_output)
-    return {
-        "current_schema_bytes": current_schema_bytes,
-        "shadow_schema_bytes": shadow_schema_bytes,
-        "schema_saved_bytes": current_schema_bytes - shadow_schema_bytes,
-        "schema_reduction_milli": _reduction_milli(
-            current_schema_bytes,
-            shadow_schema_bytes,
-        ),
-        "current_output_bytes": current_output_bytes,
-        "shadow_output_bytes": shadow_output_bytes,
-        "output_saved_bytes": current_output_bytes - shadow_output_bytes,
-        "output_reduction_milli": _reduction_milli(
-            current_output_bytes,
-            shadow_output_bytes,
-        ),
-    }
-
-
 __all__ = (
     "ABORT",
     "DETOUR_SIDES",
@@ -650,6 +598,7 @@ __all__ = (
     "INTENT_KINDS",
     "LEFT",
     "MAX_NAVIGATION_INTENT_BYTES",
+    "MAX_NAVIGATION_INTENT_REASON_LENGTH",
     "MAX_NAVIGATION_INTENT_SCHEMA_BYTES",
     "MAX_NAVIGATION_INTENT_TTL_MS",
     "NavigationBasis",
@@ -662,5 +611,4 @@ __all__ = (
     "bind_navigation_intent_proposal",
     "build_navigation_intent_proposal_schema",
     "decode_navigation_intent_proposal",
-    "size_metrics",
 )
