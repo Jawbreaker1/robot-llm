@@ -1,3 +1,4 @@
+from dataclasses import replace
 import unittest
 
 from robot_agent.active_ir_scan_contract import ActiveIrRay, ActiveIrScanResult
@@ -135,10 +136,11 @@ class AllClearScanApplicabilityTests(unittest.TestCase):
 
     def test_backing_beyond_blocked_range_does_not_erase_hazard(self):
         mapped = hazard_map()
+        pose = PhysicalPose(x_mm=-236)
 
         recorded = mapped.record_scan_result(
             all_clear_result(),
-            scan_pose=PhysicalPose(x_mm=-236),
+            scan_pose=pose,
         )
 
         attempt = recorded.scan_evidence_history[-1]
@@ -148,6 +150,41 @@ class AllClearScanApplicabilityTests(unittest.TestCase):
         self.assertEqual(attempt.hypothesis_relation, "NO_EVIDENCE")
         self.assertTrue(recorded.active_for_collision)
         self.assertIsNone(recorded.collision_contested_at_ms)
+        evidence = mapped.route_evidence("hazard-a", pose=pose)
+        self.assertFalse(evidence["ready"])
+        self.assertTrue(evidence["best_effort_ready"])
+        self.assertEqual(evidence["strength"], "ALL_CLEAR_ARC")
+        self.assertEqual(
+            evidence["reason"],
+            "ALL_CLEAR_ARC_AT_CURRENT_VERIFIED_POSE",
+        )
+
+        state = ManeuverCommitment().apply(
+            {
+                "id": "route-all-clear",
+                "revision": 1,
+                "transition": "START",
+                "objective": "Pass the remembered obstacle",
+                "target_hypothesis_id": "hazard-a",
+                "detour_side": "RIGHT_OF_GOAL",
+                "success_fact_keys": [
+                    FACT_GOAL_CORRIDOR_CLEAR,
+                    FACT_GOAL_HEADING_ALIGNED,
+                    FACT_TARGET_BEHIND,
+                ],
+                "current_focus_fact_key": FACT_GOAL_CORRIDOR_CLEAR,
+                "revision_reason": None,
+            },
+            action=OBSERVE,
+            turn=1,
+            hazard_map=mapped,
+            pose=pose,
+            fact_values={},
+        )
+        self.assertEqual(
+            state["active"]["target_hypothesis_id"],
+            "hazard-a",
+        )
 
     def test_explicit_scan_applicability_round_trips(self):
         mapped = hazard_map()
@@ -163,6 +200,23 @@ class AllClearScanApplicabilityTests(unittest.TestCase):
             reloaded.scan_evidence_history[-1]
             .all_clear_arc_covers_target_hypothesis
         )
+
+    def test_partial_all_clear_scan_does_not_authorize_a_route(self):
+        mapped = hazard_map()
+        pose = PhysicalPose(x_mm=-236)
+        result = replace(
+            all_clear_result(),
+            scan_id="scan-all-clear-timeout",
+            reason="scan_deadline_exceeded",
+        )
+
+        recorded = mapped.record_scan_result(result, scan_pose=pose)
+        evidence = mapped.route_evidence("hazard-a", pose=pose)
+
+        self.assertTrue(recorded.active_for_collision)
+        self.assertFalse(evidence["ready"])
+        self.assertFalse(evidence["best_effort_ready"])
+        self.assertEqual(evidence["strength"], "NONE")
 
     def test_clear_arc_must_cover_collision_support_radius_too(self):
         mapped = hazard_map()

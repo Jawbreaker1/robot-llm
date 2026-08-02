@@ -81,7 +81,10 @@ def goal_conflict(hypothesis_id):
 
 class DetourScanGateTests(unittest.TestCase):
     def test_prepare_publishes_json_list_for_planner_scan_targets(self):
-        navigation = {"action_feasibility": {}}
+        navigation = {
+            "action_feasibility": {},
+            "navigation_hazard_hypotheses": [],
+        }
         with mock.patch(
             "robot_agent.physical_action_feasibility.detour_scan_gate",
             return_value=(True, ()),
@@ -139,6 +142,41 @@ class DetourScanGateTests(unittest.TestCase):
         )
 
         self.assertEqual(result, ())
+
+    def test_route_ready_target_is_not_offered_for_rescan(self):
+        navigation = detour_navigation(
+            hazards=(detour_hazard("box-a", route_ready=True),),
+            conflicts=(goal_conflict("box-a"),),
+        )
+        navigation["action_feasibility"] = {}
+
+        with mock.patch(
+            "robot_agent.physical_action_feasibility.detour_scan_gate",
+            return_value=(False, ()),
+        ) as scan_gate, mock.patch(
+            "robot_agent.physical_action_feasibility.available_navigation_actions",
+            return_value=(OBSERVE,),
+        ):
+            prepare_navigation_availability(
+                navigation,
+                active_maneuver=None,
+                scan_eligible_target_ids=("box-a",),
+                scan_blocked_target_ids=(),
+                scan_budget_available=True,
+                reverse_budget_available=True,
+                action_specs={},
+                observation={},
+                repeated_uninformative_observe=False,
+            )
+
+        self.assertEqual(
+            navigation["scan_eligible_target_hypothesis_ids"],
+            [],
+        )
+        self.assertEqual(
+            scan_gate.call_args.kwargs["scan_eligible_target_ids"],
+            [],
+        )
 
     def test_active_maneuver_target_is_exempt(self):
         navigation = detour_navigation(

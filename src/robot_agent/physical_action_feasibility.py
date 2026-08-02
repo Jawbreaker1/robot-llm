@@ -220,7 +220,18 @@ def prepare_navigation_availability(
     # This value is part of the JSON-shaped planner contract.  Keep it a
     # list even when the internal callers use tuples or sets; the planner
     # deliberately rejects non-JSON sequence types before inference.
-    eligible = sorted(scan_eligible_target_ids)
+    route_ready_ids = frozenset(
+        hypothesis["hypothesis_id"]
+        for hypothesis in navigation[
+            "navigation_hazard_hypotheses"
+        ]
+        if hypothesis["route_commitment_ready"] is True
+    )
+    eligible = sorted(
+        hypothesis_id
+        for hypothesis_id in scan_eligible_target_ids
+        if hypothesis_id not in route_ready_ids
+    )
     navigation["scan_eligible_target_hypothesis_ids"] = eligible
     navigation["scan_progress_blocked_target_hypothesis_ids"] = sorted(
         scan_blocked_target_ids

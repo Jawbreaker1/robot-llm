@@ -2924,7 +2924,12 @@ class ScanObserveChangedThenScanPlanner(SingleScanPlanner):
                 "navigation_hazard_hypotheses"
             ]
         )
-        action = SCAN_FRONT_ARC if self.calls in (1, 3) else OBSERVE
+        wants_scan = self.calls in (1, 3)
+        action = (
+            SCAN_FRONT_ARC
+            if wants_scan and SCAN_FRONT_ARC in available
+            else OBSERVE
+        )
         return NavigationDecision.from_mapping(
             decision_mapping(
                 episode_id=context["episode_id"],
@@ -4830,7 +4835,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         self.assertEqual(scan_event["scan"]["status"], "CANCELLED")
         self.assertTrue(scan_event["scan"]["restored_start_heading"])
 
-    def test_restored_unilateral_scan_requires_progress_before_rescan(self):
+    def test_restored_unilateral_scan_is_not_repeated_after_progress(self):
         with tempfile.TemporaryDirectory() as directory:
             memory = NavigationMemoryStore.load(
                 path=Path(directory) / "scan-progress-memory.json",
@@ -4866,24 +4871,17 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
 
         self.assertEqual(
             result.actions,
-            (SCAN_FRONT_ARC, OBSERVE, SCAN_FRONT_ARC),
+            (SCAN_FRONT_ARC, OBSERVE, OBSERVE),
         )
-        self.assertEqual(scan_executor.calls, 2)
+        self.assertEqual(scan_executor.calls, 1)
         self.assertIn(SCAN_FRONT_ARC, planner.available_history[0])
         self.assertNotIn(SCAN_FRONT_ARC, planner.available_history[1])
-        self.assertIn(SCAN_FRONT_ARC, planner.available_history[2])
+        self.assertNotIn(SCAN_FRONT_ARC, planner.available_history[2])
         hazard = memory.hazard_map.hazards[0]
-        self.assertEqual(len(hazard.scan_evidence_history), 2)
-        first, second = hazard.scan_evidence_history
+        self.assertEqual(len(hazard.scan_evidence_history), 1)
+        first = hazard.scan_evidence_history[0]
         self.assertEqual(first.left_boundary_mdeg, 7_500)
         self.assertIsNone(first.right_boundary_mdeg)
-        self.assertEqual(
-            second.hypothesis_relation,
-            "NO_EVIDENCE",
-        )
-        self.assertFalse(
-            second.all_clear_arc_covers_target_hypothesis
-        )
 
     def test_scan_progress_barrier_rearms_for_pose_or_target_change(self):
         baseline = observation(2, blocked=True)
@@ -4914,6 +4912,18 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             pose=PhysicalPose(),
             hazard_ids=("hazard-a",),
             observation=arm_only,
+        ))
+
+        drive_anchor_only = copy.deepcopy(baseline)
+        drive_anchor_only["state_version"] = 4
+        for motor in drive_anchor_only["motors"]:
+            if motor["role"] in motor_roles:
+                motor["position"] += 180
+        self.assertIsNone(barrier.rearm_reason(
+            map_generation_id="map-a",
+            pose=PhysicalPose(),
+            hazard_ids=("hazard-a",),
+            observation=drive_anchor_only,
         ))
 
         self.assertIsNone(barrier.rearm_reason(

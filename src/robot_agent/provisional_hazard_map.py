@@ -1587,6 +1587,12 @@ class ProvisionalHazardMap:
             any(ray.blocked for ray in attempt.rays)
             for attempt in applicable
         )
+        all_clear_arc = any(
+            attempt.observation_pattern == "ALL_CLEAR"
+            and attempt.arc_coverage == "BILATERAL_ARC"
+            and attempt.reason == "bilateral_boundaries_not_observed"
+            for attempt in applicable
+        )
         ready = (
             hazard.active_for_collision
             and bool(positive)
@@ -1594,7 +1600,7 @@ class ProvisionalHazardMap:
         )
         best_effort_ready = (
             hazard.active_for_collision
-            and bool(positive or negative or blocked_arc)
+            and bool(positive or negative or blocked_arc or all_clear_arc)
         )
         if not hazard.active_for_collision:
             reason = "HYPOTHESIS_CONTESTED_BY_FULL_ALL_CLEAR"
@@ -1602,6 +1608,8 @@ class ProvisionalHazardMap:
             reason = "NO_SCAN_EVIDENCE_AT_CURRENT_VERIFIED_POSE"
         elif blocked_arc and not (positive or negative):
             reason = "BLOCKED_ARC_WITHOUT_BOUNDARY"
+        elif all_clear_arc and not (positive or negative):
+            reason = "ALL_CLEAR_ARC_AT_CURRENT_VERIFIED_POSE"
         elif not positive or not negative:
             reason = "COMPLEMENTARY_BOUNDARY_EVIDENCE_REQUIRED"
         else:
@@ -1615,7 +1623,9 @@ class ProvisionalHazardMap:
                 else "UNILATERAL_BOUNDARY"
                 if positive or negative
                 else "BLOCKED_ARC"
-                if best_effort_ready
+                if best_effort_ready and blocked_arc
+                else "ALL_CLEAR_ARC"
+                if best_effort_ready and all_clear_arc
                 else "NONE"
             ),
             "reason": reason,

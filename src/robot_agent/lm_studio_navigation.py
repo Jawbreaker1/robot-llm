@@ -440,10 +440,13 @@ for that published target while keeping maneuver_commitment at the exact NONE
 sentinel. The deterministic scan samples both sides but does not choose a
 route. START a route only when route_commitment_ready is true for that target
 at the current verified pose. route_commitment_evidence_strength distinguishes
-bilateral boundaries from explicitly best-effort unilateral or blocked-arc
-evidence; use weaker evidence cautiously, but keep making physical progress
-instead of abandoning the maneuver state. Historical rays from other poses
-still inform collision geometry but do not authorize a new route.
+bilateral boundaries from explicitly best-effort unilateral, blocked-arc, or
+all-clear-arc evidence; use weaker evidence cautiously, but keep making
+physical progress instead of abandoning the maneuver state. ALL_CLEAR_ARC
+means only that the sampled front arc was clear at the current verified pose;
+it does not erase the remembered obstacle or prove the whole route. Historical
+rays from other poses still inform collision geometry but do not authorize a
+new route.
 
 Authorize a ready target and detour_side with START on singleton OBSERVE. Do
 not START with a turn or other motion. The host then builds the geometric route

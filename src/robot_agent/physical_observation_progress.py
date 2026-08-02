@@ -113,13 +113,25 @@ class RestoredScanProgressBarrier:
             return "VERIFIED_POSE_CHANGED"
         if tuple(sorted(hazard_ids)) != self.hazard_ids:
             return "TARGET_HYPOTHESES_CHANGED"
-        if (
-            observation_progress_signature(
+        # A restored active scan changes the drive encoder anchors even when
+        # the verified robot pose is unchanged.  PhysicalPose above owns
+        # navigation progress; treating those anchor-only changes as progress
+        # lets scans of two targets unlock each other forever.  Sensor and
+        # fault facts remain decision-relevant here.
+        prior_observation = tuple(
+            item
+            for item in self.observation_signature
+            if item[0] != "motor_positions"
+        )
+        current_observation = tuple(
+            item
+            for item in observation_progress_signature(
                 observation,
                 motor_roles=self.motor_roles,
             )
-            != self.observation_signature
-        ):
+            if item[0] != "motor_positions"
+        )
+        if current_observation != prior_observation:
             return "DECISION_RELEVANT_OBSERVATION_CHANGED"
         return None
 
