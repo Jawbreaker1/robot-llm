@@ -452,6 +452,12 @@ without another model call. Changing target or side with REVISE, or ABANDONing
 the route, likewise uses singleton OBSERVE so the strategic change takes effect
 before any later physical motion.
 
+The host persists an active maneuver commitment. When its strategy and focus
+do not change, return the exact NONE sentinel instead of repeating the active
+commitment as CONTINUE. NONE also preserves the active commitment while
+scanning its current target. CONTINUE remains available for an intentional
+focus change that preserves the same commitment revision, target, and side.
+
 When navigation.local_detour_route is ACTIVE, it is the persistent geometric
 route for your chosen target and detour_side. Follow its active waypoint in
 order; navigation.local_detour_guidance explains the current heading error,

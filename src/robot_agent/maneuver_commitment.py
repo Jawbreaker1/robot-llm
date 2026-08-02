@@ -23,7 +23,6 @@ FACT_KEYS = frozenset(
         FACT_TARGET_BEHIND,
     )
 )
-COMMITMENT_TTL_TURNS = 14
 FIELDS = {
     "id",
     "revision",
@@ -101,19 +100,6 @@ class ManeuverCommitment:
         self.last_terminal = None
 
     def state(self, turn: int) -> Mapping[str, object]:
-        expired = (
-            self.active is not None
-            and turn - self.active.last_confirmed_turn
-            > COMMITMENT_TTL_TURNS
-        )
-        if expired:
-            self.last_terminal = {
-                "transition": "EXPIRED",
-                "id": self.active.commitment_id,
-                "turn": turn,
-                "success_claimed": False,
-            }
-            self.active = None
         return {
             "active": (
                 None if self.active is None else self.active.prompt_dict()
@@ -234,8 +220,11 @@ class ManeuverCommitment:
                     "A first scan must keep the maneuver commitment NONE",
                 )
             if self.active is not None and (
-                transition != "CONTINUE"
-                or not self._same_revision(proposal, self.active)
+                transition not in ("NONE", "CONTINUE")
+                or (
+                    transition == "CONTINUE"
+                    and not self._same_revision(proposal, self.active)
+                )
                 or perception_target_hypothesis_id
                 != self.active.target_hypothesis_id
             ):
@@ -297,7 +286,9 @@ class ManeuverCommitment:
                 "evicted_target_requires_abandon",
                 "A disappeared target can only be abandoned",
             )
-        if transition == "NONE" or proposal["id"] != active.commitment_id:
+        if transition == "NONE":
+            return self.state(turn)
+        if proposal["id"] != active.commitment_id:
             raise ManeuverCommitmentError(
                 "active_commitment_lost",
                 "The active commitment must be explicitly continued",
