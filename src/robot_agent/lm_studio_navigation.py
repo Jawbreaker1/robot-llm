@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from .lm_studio import _stdlib_post
 from .maneuver_commitment import (
     DETOUR_SIDES,
+    FACT_GOAL_CORRIDOR_CLEAR,
     FACT_KEYS,
     FIELDS as MANEUVER_FIELDS,
     TRANSITIONS,
@@ -18,6 +19,7 @@ from .physical_navigation_contract import (
     DECISION_SCHEMA,
     MOTION_ACTIONS,
     NavigationDecision,
+    OBSERVE,
     PhysicalNavigationContractError,
     REASON_CODES,
     SCAN_FRONT_ARC,
@@ -293,6 +295,35 @@ def _maneuver_schema() -> Mapping[str, object]:
     }
 
 
+def _start_maneuver_schema(
+    target_hypothesis_ids: Sequence[str],
+) -> Mapping[str, object]:
+    """Constrain only the authorization carrier; the model owns its route."""
+
+    schema = _active_maneuver_schema()
+    properties = dict(schema["properties"])
+    properties.update(
+        {
+            "revision": {"type": "integer", "const": 1},
+            "transition": {"type": "string", "const": "START"},
+            "target_hypothesis_id": {
+                "type": "string",
+                "enum": sorted(set(target_hypothesis_ids)),
+            },
+            "success_fact_keys": {
+                "type": "array",
+                "const": sorted(FACT_KEYS),
+            },
+            "current_focus_fact_key": {
+                "type": "string",
+                "const": FACT_GOAL_CORRIDOR_CLEAR,
+            },
+            "revision_reason": {"type": "null"},
+        }
+    )
+    return {**schema, "properties": properties}
+
+
 def _response_schema(
     *,
     episode_id: str,
@@ -301,6 +332,7 @@ def _response_schema(
     available_actions: Sequence[str],
     target_ids: Sequence[str],
     empty_maneuver_required: bool,
+    start_maneuver_target_ids: Sequence[str] = (),
 ) -> Mapping[str, object]:
     actions = tuple(dict.fromkeys(available_actions))
     motion = [item for item in actions if item in MOTION_ACTIONS]
@@ -361,6 +393,36 @@ def _response_schema(
             else _maneuver_schema()
         ),
     }
+    if start_maneuver_target_ids:
+        if OBSERVE not in actions:
+            raise LMStudioNavigationError(
+                "Route authorization requires OBSERVE"
+            )
+        start_properties = dict(properties)
+        start_properties.update(
+            {
+                "action": {"type": "string", "const": OBSERVE},
+                "plan": {
+                    "type": "array",
+                    "items": {"type": "string", "const": OBSERVE},
+                    "minItems": 1,
+                    "maxItems": 1,
+                },
+                "maneuver_commitment": _start_maneuver_schema(
+                    start_maneuver_target_ids
+                ),
+            }
+        )
+        return {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": start_properties,
+                    "required": sorted(start_properties),
+                    "additionalProperties": False,
+                }
+            ]
+        }
     variants = []
     if SCAN_FRONT_ARC in actions:
         scan_properties = dict(properties)
@@ -409,8 +471,9 @@ tail if safety, map generation, hazard identities, commitment, focus truth, or
 localization changed. OBSERVE, SCAN_FRONT_ARC, and FINISH are singleton plans.
 The host classifies whether a fresh OBSERVE changed any decision-relevant
 physical fact. If latest_tool_result reports information_gain NONE, OBSERVE is
-temporarily removed from available_actions; choose another listed action or
-finish only when the mission facts permit it.
+temporarily removed from available_actions unless it must carry a ready route
+authorization; choose another listed action or finish only when the mission
+facts permit it.
 
 navigation.action_feasibility publishes deterministic swept-body facts for
 every motion and the active scan. An action that does not fit the current
@@ -624,6 +687,27 @@ class LMStudioNavigationPlanner:
             maneuver_state.get("active") is None
             and not route_ready_target_ids
         )
+        start_maneuver_target_ids = navigation.get(
+            "route_authorization_required_target_hypothesis_ids",
+            [],
+        )
+        if (
+            not isinstance(start_maneuver_target_ids, list)
+            or len(set(start_maneuver_target_ids))
+            != len(start_maneuver_target_ids)
+            or any(
+                item not in route_ready_target_ids
+                for item in start_maneuver_target_ids
+            )
+            or (
+                start_maneuver_target_ids
+                and maneuver_state.get("active") is not None
+            )
+        ):
+            raise LMStudioNavigationError(
+                "Route authorization targets are invalid"
+            )
+        start_maneuver_target_ids = sorted(start_maneuver_target_ids)
         actions = [
             item
             for item in available_actions
@@ -643,6 +727,7 @@ class LMStudioNavigationPlanner:
             available_actions=actions,
             target_ids=scan_target_ids,
             empty_maneuver_required=empty_maneuver_required,
+            start_maneuver_target_ids=start_maneuver_target_ids,
         )
         prompt_token_budget = (
             PLANNER_CONTEXT_WINDOW_TOKENS

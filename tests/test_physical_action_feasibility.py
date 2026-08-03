@@ -177,6 +177,127 @@ class DetourScanGateTests(unittest.TestCase):
             scan_gate.call_args.kwargs["scan_eligible_target_ids"],
             [],
         )
+        self.assertEqual(
+            navigation[
+                "route_authorization_required_target_hypothesis_ids"
+            ],
+            [],
+        )
+
+    def test_route_ready_goal_conflict_keeps_start_observe_available(self):
+        navigation = detour_navigation(
+            hazards=(detour_hazard("box-a", route_ready=True),),
+            conflicts=(goal_conflict("box-a"),),
+        )
+        navigation["action_feasibility"] = {}
+
+        with mock.patch(
+            "robot_agent.physical_action_feasibility.detour_scan_gate",
+            return_value=(False, ()),
+        ), mock.patch(
+            "robot_agent.physical_action_feasibility.available_navigation_actions",
+            return_value=(OBSERVE,),
+        ) as available_actions:
+            result = prepare_navigation_availability(
+                navigation,
+                active_maneuver=None,
+                scan_eligible_target_ids=(),
+                scan_blocked_target_ids=(),
+                scan_budget_available=True,
+                reverse_budget_available=True,
+                action_specs={},
+                observation={},
+                repeated_uninformative_observe=True,
+            )
+
+        self.assertFalse(
+            available_actions.call_args.kwargs[
+                "repeated_uninformative_observe"
+            ]
+        )
+        self.assertEqual(result, (OBSERVE,))
+        self.assertEqual(
+            navigation[
+                "route_authorization_required_target_hypothesis_ids"
+            ],
+            ["box-a"],
+        )
+
+    def test_route_ready_lateral_hazard_does_not_reenable_observe(self):
+        navigation = detour_navigation(
+            hazards=(detour_hazard("box-side", route_ready=True),),
+            conflicts=(),
+        )
+        navigation["action_feasibility"] = {}
+
+        with mock.patch(
+            "robot_agent.physical_action_feasibility.detour_scan_gate",
+            return_value=(False, ()),
+        ), mock.patch(
+            "robot_agent.physical_action_feasibility.available_navigation_actions",
+            return_value=(),
+        ) as available_actions:
+            prepare_navigation_availability(
+                navigation,
+                active_maneuver=None,
+                scan_eligible_target_ids=(),
+                scan_blocked_target_ids=(),
+                scan_budget_available=True,
+                reverse_budget_available=True,
+                action_specs={},
+                observation={},
+                repeated_uninformative_observe=True,
+            )
+
+        self.assertTrue(
+            available_actions.call_args.kwargs[
+                "repeated_uninformative_observe"
+            ]
+        )
+        self.assertEqual(
+            navigation[
+                "route_authorization_required_target_hypothesis_ids"
+            ],
+            [],
+        )
+
+    def test_active_maneuver_does_not_reenable_start_observe(self):
+        navigation = detour_navigation(
+            hazards=(detour_hazard("box-a", route_ready=True),),
+            conflicts=(goal_conflict("box-a"),),
+        )
+        navigation["action_feasibility"] = {}
+
+        with mock.patch(
+            "robot_agent.physical_action_feasibility.detour_scan_gate",
+            return_value=(False, ()),
+        ), mock.patch(
+            "robot_agent.physical_action_feasibility.available_navigation_actions",
+            return_value=(),
+        ) as available_actions:
+            prepare_navigation_availability(
+                navigation,
+                active_maneuver={"target_hypothesis_id": "box-a"},
+                scan_eligible_target_ids=(),
+                scan_blocked_target_ids=(),
+                scan_budget_available=True,
+                reverse_budget_available=True,
+                action_specs={},
+                observation={},
+                repeated_uninformative_observe=True,
+            )
+
+        self.assertTrue(
+            available_actions.call_args.kwargs[
+                "repeated_uninformative_observe"
+            ]
+        )
+        self.assertEqual(
+            navigation[
+                "route_authorization_required_target_hypothesis_ids"
+            ],
+            [],
+        )
 
     def test_active_maneuver_target_is_exempt(self):
         navigation = detour_navigation(
@@ -341,6 +462,21 @@ class DetourCommitmentGateTests(unittest.TestCase):
                 self._navigation(),
             )[0],
             "detour_commitment_required",
+        )
+
+    def test_required_route_authorization_rejects_observe_none(self):
+        navigation = self._navigation()
+        navigation[
+            "route_authorization_required_target_hypothesis_ids"
+        ] = ["box-a"]
+
+        self.assertEqual(
+            detour_turn_commitment_error(
+                OBSERVE,
+                {"transition": "NONE"},
+                navigation,
+            )[0],
+            "route_authorization_required",
         )
 
     def test_start_must_target_scanned_goal_conflict(self):

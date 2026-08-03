@@ -117,6 +117,27 @@ def detour_turn_commitment_error(
             "detour_start_requires_observe",
             "Authorize a detour with singleton OBSERVE before route execution",
         )
+    authorization_required_ids = frozenset(
+        navigation.get(
+            "route_authorization_required_target_hypothesis_ids",
+            (),
+        )
+    )
+    if authorization_required_ids and transition != "START":
+        return (
+            "route_authorization_required",
+            "Authorize one ready goal-conflict route before continuing",
+        )
+    if (
+        transition == "START"
+        and authorization_required_ids
+        and commitment.get("target_hypothesis_id")
+        not in authorization_required_ids
+    ):
+        return (
+            "detour_commitment_target_mismatch",
+            "The detour commitment must target the ready goal conflict",
+        )
     conflict_ids = _active_goal_conflict_ids(navigation)
     required_ids = frozenset(
         hypothesis["hypothesis_id"]
@@ -227,6 +248,14 @@ def prepare_navigation_availability(
         ]
         if hypothesis["route_commitment_ready"] is True
     )
+    route_authorization_required_ids = sorted(
+        route_ready_ids & _active_goal_conflict_ids(navigation)
+    ) if (
+        active_maneuver is None and repeated_uninformative_observe
+    ) else []
+    navigation[
+        "route_authorization_required_target_hypothesis_ids"
+    ] = route_authorization_required_ids
     eligible = sorted(
         hypothesis_id
         for hypothesis_id in scan_eligible_target_ids
@@ -246,14 +275,20 @@ def prepare_navigation_availability(
     navigation["detour_scan_required_target_hypothesis_ids"] = list(
         required
     )
-    return available_navigation_actions(
+    available = available_navigation_actions(
         action_feasibility=navigation["action_feasibility"],
         action_specs=action_specs,
         observation=observation,
-        repeated_uninformative_observe=repeated_uninformative_observe,
+        repeated_uninformative_observe=(
+            repeated_uninformative_observe
+            and not route_authorization_required_ids
+        ),
         scan_available=scan_available,
         detour_scan_required_target_ids=required,
     )
+    if route_authorization_required_ids:
+        return (OBSERVE,)
+    return available
 
 
 def detour_decision_error(

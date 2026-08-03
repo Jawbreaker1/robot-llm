@@ -27,6 +27,7 @@ from robot_agent.ev3_navigation_transport import (
 from robot_agent.maneuver_commitment import (
     FACT_GOAL_CORRIDOR_CLEAR,
     FACT_GOAL_HEADING_ALIGNED,
+    FACT_KEYS,
     FACT_TARGET_BEHIND,
     ManeuverCommitment,
     ManeuverCommitmentError,
@@ -6456,6 +6457,104 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
                         schema["properties"]["transition"]["const"],
                         "NONE",
                     )
+
+    def test_repeated_ready_goal_conflict_schema_requires_route_start(self):
+        captured = {}
+        commitment = {
+            "id": "route-a",
+            "revision": 1,
+            "transition": "START",
+            "objective": "Pass the blocking obstacle",
+            "target_hypothesis_id": "hazard-1",
+            "detour_side": "LEFT_OF_GOAL",
+            "success_fact_keys": [
+                FACT_GOAL_CORRIDOR_CLEAR,
+                FACT_GOAL_HEADING_ALIGNED,
+                FACT_TARGET_BEHIND,
+            ],
+            "current_focus_fact_key": FACT_GOAL_CORRIDOR_CLEAR,
+            "revision_reason": None,
+        }
+
+        def transport(_url, body, _headers, _timeout, _maximum):
+            captured["payload"] = json.loads(body.decode("utf-8"))
+            response_decision = decision_mapping(
+                episode_id="episode-required-start-schema",
+                turn=2,
+                state_version=2,
+                action=OBSERVE,
+                plan=[OBSERVE],
+                reason_code="VERIFY_RESULT",
+                commitment=commitment,
+            )
+            return json.dumps({
+                "choices": [{
+                    "message": {
+                        "content": json.dumps(response_decision),
+                    },
+                }],
+            }).encode("utf-8")
+
+        planner = LMStudioNavigationPlanner(
+            base_url="http://127.0.0.1:1234",
+            model="test-model",
+            transport=transport,
+            clock=lambda: 1.0,
+        )
+        planner.decide(
+            episode_id="episode-required-start-schema",
+            turn=2,
+            locale="en",
+            observation=observation(2, blocked=True),
+            mission={"completed": False},
+            navigation={
+                "navigation_hazard_hypotheses": [
+                    {
+                        "hypothesis_id": "hazard-1",
+                        "route_commitment_ready": True,
+                    },
+                    {
+                        "hypothesis_id": "hazard-2",
+                        "route_commitment_ready": True,
+                    },
+                ],
+                "route_authorization_required_target_hypothesis_ids": [
+                    "hazard-1",
+                    "hazard-2",
+                ],
+            },
+            maneuver_state={"active": None},
+            available_actions=[OBSERVE],
+            last_tool_result={"information_gain": "NONE"},
+        )
+
+        decision_schema = captured["payload"]["response_format"][
+            "json_schema"
+        ]["schema"]
+        self.assertEqual(len(decision_schema["oneOf"]), 1)
+        properties = decision_schema["oneOf"][0]["properties"]
+        maneuver = properties["maneuver_commitment"]["properties"]
+        self.assertEqual(properties["action"]["const"], OBSERVE)
+        self.assertEqual(properties["plan"]["items"]["const"], OBSERVE)
+        self.assertEqual(maneuver["transition"]["const"], "START")
+        self.assertEqual(maneuver["revision"]["const"], 1)
+        self.assertEqual(
+            maneuver["target_hypothesis_id"]["enum"],
+            ["hazard-1", "hazard-2"],
+        )
+        self.assertEqual(
+            set(maneuver["detour_side"]["enum"]),
+            {"LEFT_OF_GOAL", "RIGHT_OF_GOAL"},
+        )
+        self.assertEqual(
+            maneuver["success_fact_keys"]["const"],
+            sorted(FACT_KEYS),
+        )
+        self.assertEqual(
+            maneuver["current_focus_fact_key"]["const"],
+            FACT_GOAL_CORRIDOR_CLEAR,
+        )
+        self.assertEqual(maneuver["revision_reason"], {"type": "null"})
 
     def test_schema_binds_perception_target_to_scan_action(self):
         captured = {}
