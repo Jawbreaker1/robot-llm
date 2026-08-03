@@ -8,6 +8,7 @@ from robot_agent.motor_phase_diagnostics import (
     aggregate_motor_phase_events,
     motor_phase_events_from_result,
 )
+from robot_agent.physical_navigation_contract import EXPECTED_ACTION_SPECS
 from tests.test_physical_navigation_core import (
     degraded_motion_result,
     partial_start_motion_result,
@@ -26,10 +27,18 @@ def set_segment_start_positions(result, left_before, right_before):
     return result
 
 
+def advance_undertravel_delta():
+    spec = EXPECTED_ACTION_SPECS["ADVANCE"]
+    expected = (
+        abs(spec["left_speed_dps"]) * spec["total_duration_ms"] + 500
+    ) // 1000
+    return expected - 1
+
+
 class MotorPhaseDiagnosticsTests(unittest.TestCase):
     def test_extracts_wrapped_phase_from_existing_encoder_receipts(self):
         result = set_segment_start_positions(
-            degraded_motion_result(),
+            degraded_motion_result(left_delta=advance_undertravel_delta()),
             -1,
             370,
         )

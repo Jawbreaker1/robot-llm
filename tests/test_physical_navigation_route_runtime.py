@@ -49,6 +49,10 @@ from robot_agent.provisional_hazard_map import (
 
 
 TARGET_ID = "box-a"
+# The route fixture needs this many completed calibrated actions before its
+# first PASS_BEYOND_TARGET pulse.  Keep the interruption tied to that route
+# boundary rather than to the previous 800 dps pulse count.
+PASS_ACTION_INDEX = 6
 
 
 def footprint():
@@ -505,7 +509,7 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
     def test_first_right_pass_block_trims_right_and_continues_route(self):
         host = RouteRuntimeHost()
         host.motion_statuses.extend(
-            ["completed"] * 5 + ["interrupted"]
+            ["completed"] * PASS_ACTION_INDEX + ["interrupted"]
         )
         host.motion_noncompletion_reason = "infrared_blocked"
 
@@ -517,14 +521,18 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.outcome, EXECUTION_COMPLETE)
         self.assertEqual(host.heading_trims, [-PASS_HEADING_TRIM_MDEG])
-        self.assertTrue(host.deferred_hazard_actions[5][1])
-        self.assertEqual(host.executed_actions[5], "ADVANCE")
-        self.assertEqual(host.executed_actions[6], "ADVANCE")
+        self.assertTrue(host.deferred_hazard_actions[PASS_ACTION_INDEX][1])
+        self.assertEqual(
+            host.executed_actions[PASS_ACTION_INDEX], "ADVANCE"
+        )
+        self.assertEqual(
+            host.executed_actions[PASS_ACTION_INDEX + 1], "ADVANCE"
+        )
 
     def test_first_left_pass_block_trims_left(self):
         host = RouteRuntimeHost()
         host.motion_statuses.extend(
-            ["completed"] * 5 + ["interrupted"]
+            ["completed"] * PASS_ACTION_INDEX + ["interrupted"]
         )
         host.motion_noncompletion_reason = "infrared_blocked"
 
@@ -536,7 +544,7 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
     def test_pass_trim_replans_when_opening_remains_blocked(self):
         host = RouteRuntimeHost()
         host.motion_statuses.extend(
-            ["completed"] * 5 + ["interrupted"]
+            ["completed"] * PASS_ACTION_INDEX + ["interrupted"]
         )
         host.motion_noncompletion_reason = "infrared_blocked"
         host.heading_trim_openings.append(False)
@@ -553,7 +561,7 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
             ROUTE_EXECUTION_REASON_MOTION_INCOMPLETE,
         )
         self.assertEqual(host.heading_trims, [-PASS_HEADING_TRIM_MDEG])
-        self.assertEqual(len(result.actions), 6)
+        self.assertEqual(len(result.actions), PASS_ACTION_INDEX + 1)
 
     def test_route_restart_at_pass_can_trim_once_but_not_twice(self):
         route = active_route(side="RIGHT_OF_GOAL")
@@ -584,12 +592,12 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
     def test_pass_trim_does_not_start_after_route_deadline(self):
         host = RouteRuntimeHost()
         host.motion_statuses.extend(
-            ["completed"] * 5 + ["interrupted"]
+            ["completed"] * PASS_ACTION_INDEX + ["interrupted"]
         )
         host.motion_noncompletion_reason = "infrared_blocked"
 
         def expire_after_block(runtime, _action):
-            if len(runtime.executed_actions) == 6:
+            if len(runtime.executed_actions) == PASS_ACTION_INDEX + 1:
                 runtime.clock = 100.0
 
         host.after_motion = expire_after_block

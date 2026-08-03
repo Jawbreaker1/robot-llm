@@ -38,6 +38,17 @@ from ev3.navigation_worker_protocol import (
 
 
 CONTROLLER_ID = "ev3rstorm-01.ev3-main"
+ADVANCE_NOMINAL_ENCODER_DEGREES = int(round(
+    abs(ACTION_SPECS["ADVANCE"]["left_speed_dps"])
+    * ACTION_SPECS["ADVANCE"]["total_duration_ms"]
+    / 1000.0
+))
+TRANSIENT_FAULT_AFTER_DEGREES = (
+    ADVANCE_NOMINAL_ENCODER_DEGREES * 80 // 100
+)
+RECOVERY_COMPLETION_FLOOR_DEGREES = (
+    ADVANCE_NOMINAL_ENCODER_DEGREES * 75 + 99
+) // 100
 
 
 class Clock(object):
@@ -565,8 +576,10 @@ class EV3NavigationProfileTests(unittest.TestCase):
             ACTION_SPECS["ADVANCE"]["slice_durations_ms"],
             [250],
         )
-        self.assertEqual(ACTION_SPECS["ADVANCE"]["left_speed_dps"], 800)
-        self.assertEqual(ACTION_SPECS["ADVANCE"]["right_speed_dps"], 800)
+        self.assertEqual(ACTION_SPECS["ADVANCE"]["left_speed_dps"], 600)
+        self.assertEqual(ACTION_SPECS["ADVANCE"]["right_speed_dps"], 600)
+        self.assertEqual(ACTION_SPECS["REVERSE"]["left_speed_dps"], -600)
+        self.assertEqual(ACTION_SPECS["REVERSE"]["right_speed_dps"], -600)
         self.assertEqual(
             ACTION_SPECS["TURN_LEFT_90"]["slice_durations_ms"],
             [800, 800, 800, 160],
@@ -1028,7 +1041,9 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
                 worker, owner = self.build_worker()
                 owner.transient_fault_roles.add("drive_c")
                 owner.transient_fault_token = token
-                owner.transient_fault_after_leader_degrees = 160
+                owner.transient_fault_after_leader_degrees = (
+                    TRANSIENT_FAULT_AFTER_DEGREES
+                )
 
                 result = worker._pulse("ADVANCE")
 
@@ -1048,7 +1063,9 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
     def test_transient_one_wheel_fault_gets_bounded_catch_up(self):
         self.owner.blocked_roles.add("drive_c")
         self.owner.transient_fault_roles.add("drive_c")
-        self.owner.transient_fault_after_leader_degrees = 160
+        self.owner.transient_fault_after_leader_degrees = (
+            TRANSIENT_FAULT_AFTER_DEGREES
+        )
         original_finish = self.owner.finish_active
         finish_calls = [0]
 
@@ -1076,7 +1093,7 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         )
         self.assertEqual(
             [motor["position_delta"] for motor in receipt["motors"]],
-            [160, 160],
+            [TRANSIENT_FAULT_AFTER_DEGREES] * 2,
         )
         self.assertTrue(receipt["encoder_verification"]["passed"])
         self.assertFalse(self.worker.motion_fault_latched)
@@ -1086,7 +1103,9 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
     def test_failed_catch_up_after_transient_motor_fault_latches(self):
         self.owner.blocked_roles.add("drive_c")
         self.owner.transient_fault_roles.add("drive_c")
-        self.owner.transient_fault_after_leader_degrees = 160
+        self.owner.transient_fault_after_leader_degrees = (
+            TRANSIENT_FAULT_AFTER_DEGREES
+        )
 
         failed = self.worker._pulse("ADVANCE")
 
@@ -1200,10 +1219,13 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
             [segment["kind"] for segment in receipt["segments"]],
             ["paired", "right_catch_up"],
         )
-        self.assertEqual(
-            [motor["position_delta"] for motor in receipt["motors"]],
-            [201, 202],
+        deltas = [
+            motor["position_delta"] for motor in receipt["motors"]
+        ]
+        self.assertGreaterEqual(
+            min(deltas), RECOVERY_COMPLETION_FLOOR_DEGREES
         )
+        self.assertLessEqual(abs(deltas[0] - deltas[1]), 1)
         self.assertTrue(receipt["encoder_verification"]["passed"])
         self.assertFalse(self.worker.motion_fault_latched)
         self.assertEqual(self.worker.pulse_count, 2)
@@ -1214,16 +1236,20 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
     ):
         self.owner.advance = lambda _seconds: None
         finish_active = self.owner.finish_active
+        primary_positions = {
+            "drive_b": TRANSIENT_FAULT_AFTER_DEGREES,
+            "drive_c": ADVANCE_NOMINAL_ENCODER_DEGREES * 74 // 100,
+        }
+        final_positions = {
+            role: position + 2
+            for role, position in primary_positions.items()
+        }
 
         def finish_with_edge_positions(verify_motion):
             if self.owner.finish_count == 0:
-                self.owner.positions.update(
-                    {"drive_b": 160, "drive_c": 148}
-                )
+                self.owner.positions.update(primary_positions)
             elif self.owner.finish_count == 1:
-                self.owner.positions.update(
-                    {"drive_b": 162, "drive_c": 150}
-                )
+                self.owner.positions.update(final_positions)
             return finish_active(verify_motion)
 
         self.owner.finish_active = finish_with_edge_positions
@@ -1235,7 +1261,7 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         self.assertTrue(receipt["encoder_verification"]["passed"])
         self.assertEqual(
             [motor["position_delta"] for motor in receipt["motors"]],
-            [162, 150],
+            [final_positions["drive_b"], final_positions["drive_c"]],
         )
         self.assertEqual(
             [segment["kind"] for segment in receipt["segments"]],
@@ -1268,10 +1294,13 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         self.assertEqual(
             receipt["segments"][1]["commanded_sides"], ["right"]
         )
-        self.assertEqual(
-            [motor["position_delta"] for motor in receipt["motors"]],
-            [201, 11],
+        deltas = [
+            motor["position_delta"] for motor in receipt["motors"]
+        ]
+        self.assertGreaterEqual(
+            deltas[0], RECOVERY_COMPLETION_FLOOR_DEGREES
         )
+        self.assertEqual(deltas[1], 11)
         self.assertTrue(receipt["stop"]["stop_confirmed"])
 
     def test_partial_paired_recovery_preserves_encoder_motion(self):

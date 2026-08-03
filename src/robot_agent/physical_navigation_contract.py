@@ -88,8 +88,8 @@ REASON_CODES = frozenset(
 # worker.  They are not host-selected motor commands.
 EXPECTED_ACTION_SPECS = {
     ADVANCE: {
-        "left_speed_dps": 800,
-        "right_speed_dps": 800,
+        "left_speed_dps": 600,
+        "right_speed_dps": 600,
         "slice_durations_ms": [250],
         "slice_count": 1,
         "total_duration_ms": 250,
@@ -99,8 +99,8 @@ EXPECTED_ACTION_SPECS = {
         "calibration": "not_applicable",
     },
     REVERSE: {
-        "left_speed_dps": -800,
-        "right_speed_dps": -800,
+        "left_speed_dps": -600,
+        "right_speed_dps": -600,
         "slice_durations_ms": [250],
         "slice_count": 1,
         "total_duration_ms": 250,

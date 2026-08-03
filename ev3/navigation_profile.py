@@ -180,12 +180,11 @@ def scan_sample_profile():
 ACTION_SPECS = {
     "ADVANCE": {
         # The assembled EV3RSTORM intermittently fails to leave one motor
-        # phase at the old 250 dps command.  A short high-speed launch keeps
-        # approximately the same nominal 200 encoder-degree travel while
-        # giving the regulated motor controller substantially more starting
-        # authority and shortening each closed-loop pulse.
-        "left_speed_dps": 800,
-        "right_speed_dps": 800,
+        # phase at the old 250 dps command.  Live obstacle-pass testing found
+        # that 800 dps introduced enough wheel slip to corrupt local
+        # positioning, while a short 600 dps pulse still started reliably.
+        "left_speed_dps": 600,
+        "right_speed_dps": 600,
         "slice_durations_ms": [250],
         "slice_count": 1,
         "total_duration_ms": 250,
@@ -195,8 +194,8 @@ ACTION_SPECS = {
         "calibration": "not_applicable",
     },
     "REVERSE": {
-        "left_speed_dps": -800,
-        "right_speed_dps": -800,
+        "left_speed_dps": -600,
+        "right_speed_dps": -600,
         "slice_durations_ms": [250],
         "slice_count": 1,
         "total_duration_ms": 250,
