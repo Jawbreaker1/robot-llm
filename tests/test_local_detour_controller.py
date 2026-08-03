@@ -20,7 +20,12 @@ from robot_agent.local_detour_controller import (
     local_detour_tail_action_allowed,
     synchronize_local_detour_route,
 )
-from robot_agent.local_detour_route import ROUTE_COMPLETE, ROUTE_INVALID
+from robot_agent.local_detour_route import (
+    MERGE_GOAL_AXIS,
+    PASS_BEYOND_TARGET,
+    ROUTE_COMPLETE,
+    ROUTE_INVALID,
+)
 from robot_agent.maneuver_commitment import ActiveManeuver
 from robot_agent.physical_action_feasibility import (
     navigation_action_feasibility,
@@ -175,6 +180,53 @@ def built_route(*, side="LEFT_OF_GOAL", pose=PhysicalPose()):
     return result.route
 
 
+class ActiveCollisionGroupTests(unittest.TestCase):
+    def test_live_white_box_hypotheses_form_one_derived_group(self):
+        value = hazard_map(values=(
+            hazard(
+                hypothesis_id="h2",
+                centroid_x_mm=256,
+                centroid_y_mm=-4,
+                radius_mm=70,
+            ),
+            hazard(
+                hypothesis_id="h1",
+                centroid_x_mm=377,
+                centroid_y_mm=-12,
+                radius_mm=70,
+            ),
+            hazard(
+                hypothesis_id="separate",
+                centroid_x_mm=800,
+                centroid_y_mm=0,
+                radius_mm=70,
+            ),
+        ))
+
+        group = value.active_collision_group("h2")
+
+        self.assertEqual(
+            tuple(item.hypothesis_id for item in group),
+            ("h1", "h2"),
+        )
+        self.assertEqual(value.hazard_ids, ("h1", "h2", "separate"))
+
+    def test_collision_group_includes_a_transitive_envelope_chain(self):
+        value = hazard_map(values=(
+            hazard(hypothesis_id="a", centroid_x_mm=0, radius_mm=70),
+            hazard(hypothesis_id="b", centroid_x_mm=130, radius_mm=70),
+            hazard(hypothesis_id="c", centroid_x_mm=260, radius_mm=70),
+        ))
+
+        self.assertEqual(
+            tuple(
+                item.hypothesis_id
+                for item in value.active_collision_group("a")
+            ),
+            ("a", "b", "c"),
+        )
+
+
 class LocalDetourRouteSynchronizationTests(unittest.TestCase):
     def test_model_side_builds_and_persists_the_route(self):
         first = synchronize_local_detour_route(
@@ -265,6 +317,154 @@ class LocalDetourRouteSynchronizationTests(unittest.TestCase):
         self.assertGreater(
             result.route.route_lateral_offset_mm,
             first.route_lateral_offset_mm,
+        )
+
+    def test_route_clears_the_complete_connected_hazard_group(self):
+        live_hazards = (
+            hazard(
+                hypothesis_id="h2",
+                centroid_x_mm=256,
+                centroid_y_mm=-4,
+                radius_mm=70,
+            ),
+            hazard(
+                hypothesis_id="h1",
+                centroid_x_mm=377,
+                centroid_y_mm=-12,
+                radius_mm=70,
+            ),
+        )
+
+        result = synchronize_local_detour_route(
+            None,
+            active_maneuver=maneuver(
+                side="LEFT_OF_GOAL",
+                target_id="h2",
+            ),
+            current_pose=PhysicalPose(),
+            mission=mission(),
+            hazard_map=hazard_map(values=live_hazards),
+        )
+
+        self.assertEqual(result.event, SYNC_BUILT)
+        self.assertEqual(result.route.target_hypothesis_id, "h2")
+        self.assertEqual(result.route.detour_side, "LEFT_OF_GOAL")
+        self.assertEqual(
+            set(result.route.target_support_points),
+            {(256, -4), (377, -12)},
+        )
+        self.assertGreater(result.route.pass_longitudinal_offset_mm, 377)
+
+    def test_connected_new_hazard_rebuilds_but_disjoint_hazard_does_not(self):
+        target = hazard(
+            hypothesis_id="h2",
+            centroid_x_mm=256,
+            centroid_y_mm=-4,
+            radius_mm=70,
+        )
+        first = synchronize_local_detour_route(
+            None,
+            active_maneuver=maneuver(target_id="h2"),
+            current_pose=PhysicalPose(),
+            mission=mission(),
+            hazard_map=hazard_map(values=(target,)),
+        ).route
+        disjoint = synchronize_local_detour_route(
+            first,
+            active_maneuver=maneuver(target_id="h2"),
+            current_pose=PhysicalPose(),
+            mission=mission(),
+            hazard_map=hazard_map(
+                values=(
+                    target,
+                    hazard(
+                        hypothesis_id="far",
+                        centroid_x_mm=800,
+                        centroid_y_mm=0,
+                        radius_mm=70,
+                    ),
+                ),
+                revision=8,
+            ),
+        )
+        connected = synchronize_local_detour_route(
+            disjoint.route,
+            active_maneuver=maneuver(target_id="h2"),
+            current_pose=PhysicalPose(),
+            mission=mission(),
+            hazard_map=hazard_map(
+                values=(
+                    target,
+                    hazard(
+                        hypothesis_id="h1",
+                        centroid_x_mm=377,
+                        centroid_y_mm=-12,
+                        radius_mm=70,
+                    ),
+                ),
+                revision=9,
+            ),
+        )
+
+        self.assertIs(disjoint.route, first)
+        self.assertEqual(connected.event, SYNC_REBUILT)
+        self.assertEqual(connected.reason, "TARGET_GEOMETRY_MISMATCH")
+        self.assertGreater(
+            connected.route.pass_longitudinal_offset_mm,
+            first.pass_longitudinal_offset_mm,
+        )
+
+    def test_route_does_not_merge_until_the_complete_group_is_passed(self):
+        starting_pose = PhysicalPose(y_mm=300)
+        target = hazard(
+            hypothesis_id="h2",
+            centroid_x_mm=256,
+            centroid_y_mm=-4,
+            radius_mm=70,
+        )
+        group_route = synchronize_local_detour_route(
+            None,
+            active_maneuver=maneuver(target_id="h2"),
+            current_pose=starting_pose,
+            mission=mission(),
+            hazard_map=hazard_map(values=(
+                target,
+                hazard(
+                    hypothesis_id="h1",
+                    centroid_x_mm=377,
+                    centroid_y_mm=-12,
+                    radius_mm=70,
+                ),
+            )),
+        ).route
+        target_only_route = synchronize_local_detour_route(
+            None,
+            active_maneuver=maneuver(target_id="h2"),
+            current_pose=starting_pose,
+            mission=mission(),
+            hazard_map=hazard_map(values=(target,)),
+        ).route
+
+        at_old_pass_point = PhysicalPose(
+            x_mm=target_only_route.pass_longitudinal_offset_mm,
+            y_mm=group_route.route_lateral_offset_mm,
+        )
+        at_group_pass_point = PhysicalPose(
+            x_mm=group_route.pass_longitudinal_offset_mm,
+            y_mm=group_route.route_lateral_offset_mm,
+        )
+
+        self.assertEqual(
+            group_route.advance_reached(
+                at_old_pass_point
+            ).active_waypoint.kind,
+            PASS_BEYOND_TARGET,
+        )
+        self.assertEqual(
+            group_route.advance_reached(
+                at_group_pass_point
+            ).active_waypoint.kind,
+            MERGE_GOAL_AXIS,
         )
 
     def test_new_map_generation_invalidates_instead_of_mixing_frames(self):

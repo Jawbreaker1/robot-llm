@@ -645,6 +645,54 @@ class ProvisionalHazardMap:
             return ()
         return self._collision_envelopes(hazard)
 
+    def active_collision_group(
+        self,
+        hypothesis_id: str,
+    ) -> Tuple[ProvisionalHazard, ...]:
+        """Return the connected active collision geometry around one target.
+
+        This does not merge object identities.  It only derives the geometry
+        a route must clear when conservative hazard envelopes overlap.
+        """
+
+        active = {
+            hazard.hypothesis_id: (
+                hazard,
+                self._collision_envelopes(hazard),
+            )
+            for hazard in self._hazards
+        }
+        active = {
+            key: value
+            for key, value in active.items()
+            if value[1]
+        }
+        if hypothesis_id not in active:
+            return ()
+
+        connected = {hypothesis_id}
+        pending = [hypothesis_id]
+        while pending:
+            current_id = pending.pop(0)
+            current, current_supports = active[current_id]
+            for candidate_id in sorted(active):
+                if candidate_id in connected:
+                    continue
+                candidate, candidate_supports = active[candidate_id]
+                maximum_distance = current.radius_mm + candidate.radius_mm
+                if any(
+                    math.hypot(
+                        current_x_mm - candidate_x_mm,
+                        current_y_mm - candidate_y_mm,
+                    ) <= maximum_distance
+                    for current_x_mm, current_y_mm in current_supports
+                    for candidate_x_mm, candidate_y_mm in candidate_supports
+                ):
+                    connected.add(candidate_id)
+                    pending.append(candidate_id)
+
+        return tuple(active[key][0] for key in sorted(connected))
+
     def _stable_id(
         self,
         pose: PhysicalPose,

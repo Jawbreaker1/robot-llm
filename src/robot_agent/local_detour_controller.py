@@ -150,6 +150,26 @@ def _maneuver_route_choice(active_maneuver) -> Optional[Tuple[str, str]]:
     return target_id, detour_side
 
 
+def _route_target_geometry(
+    hazard_map: ProvisionalHazardMap,
+    target_id: str,
+):
+    target = hazard_map.get(target_id)
+    group = hazard_map.active_collision_group(target_id)
+    if target is None or not group:
+        return None
+    support_points = tuple(dict.fromkeys(
+        point
+        for hazard in group
+        for point in hazard_map.active_collision_support_points(
+            hazard.hypothesis_id
+        )
+    ))
+    if not support_points:
+        return None
+    return target, max(hazard.radius_mm for hazard in group), support_points
+
+
 def _build_route(
     *,
     current_pose: PhysicalPose,
@@ -160,12 +180,10 @@ def _build_route(
     position_tolerance_mm: int,
     heading_tolerance_mdeg: int,
 ) -> Optional[LocalDetourRoute]:
-    hazard = hazard_map.get(target_id)
-    target_support_points = (
-        hazard_map.active_collision_support_points(target_id)
-    )
-    if hazard is None or not target_support_points:
+    geometry = _route_target_geometry(hazard_map, target_id)
+    if geometry is None:
         return None
+    hazard, target_radius_mm, target_support_points = geometry
     footprint = hazard_map.calibration.robot_footprint
     if footprint is None:
         raise LocalDetourControllerError(
@@ -178,7 +196,7 @@ def _build_route(
         target_hypothesis_id=target_id,
         target_centroid_x_mm=hazard.centroid_x_mm,
         target_centroid_y_mm=hazard.centroid_y_mm,
-        target_radius_mm=hazard.radius_mm,
+        target_radius_mm=target_radius_mm,
         target_support_points=target_support_points,
         footprint=footprint,
         frame_id=hazard_map.frame_id,
@@ -230,11 +248,14 @@ def synchronize_local_detour_route(
             reason="NO_ACTIVE_MANEUVER",
         )
     target_id, detour_side = choice
-    hazard = hazard_map.get(target_id)
-    target_support_points = (
-        hazard_map.active_collision_support_points(target_id)
-    )
-    target_active = hazard is not None and bool(target_support_points)
+    geometry = _route_target_geometry(hazard_map, target_id)
+    target_active = geometry is not None
+    if target_active:
+        hazard, target_radius_mm, target_support_points = geometry
+    else:
+        hazard = None
+        target_radius_mm = None
+        target_support_points = ()
 
     if route is None:
         built = _build_route(
@@ -293,7 +314,7 @@ def synchronize_local_detour_route(
         target_centroid_y_mm=(
             None if not target_active else hazard.centroid_y_mm
         ),
-        target_radius_mm=None if not target_active else hazard.radius_mm,
+        target_radius_mm=target_radius_mm,
         target_support_points=(
             None if not target_active else target_support_points
         ),
