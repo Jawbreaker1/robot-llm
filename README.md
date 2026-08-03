@@ -3,7 +3,7 @@
 [![Quality](https://github.com/Jawbreaker1/robot-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/Jawbreaker1/robot-llm/actions/workflows/ci.yml)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![EV3 hardware: live](https://img.shields.io/badge/EV3%20hardware-live%20over%20Wi--Fi%2FSSH-2ea44f)
-![Live autonomous validation: pending](https://img.shields.io/badge/live%20autonomy-pending-f59e0b)
+![Physical obstacle pass: successful](https://img.shields.io/badge/physical%20obstacle%20pass-successful-2ea44f)
 
 **A real LEGO robot controlled by a local agentic AI that can plan, observe,
 speak, and adapt as it goes.**
@@ -58,13 +58,15 @@ or language-specific command menus. The model never receives raw motor access.
 |---|---|
 | Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
 | Working in the application | English/Swedish web dashboard, Robot and Workbench conversation targets, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, and persistent physical navigation memory |
-| Experimental | Physical obstacle investigation, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
+| Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
 | Planned | Repeatable autonomous obstacle navigation, continuous hands-free voice interaction, color-sensor fusion, cameras, vision, sound localization, Robot Inventor 51515, BOOST, and multi-robot coordination |
 
-The physical EV3 has moved, sensed an obstacle, spoken, backed away to make
-room, completed a restored IR scan, turned, and replanned under agent control.
-A clean and repeatable autonomous route around an obstacle is still pending
-validation.
+The physical EV3 has completed its first operator-confirmed obstacle pass. It
+investigated and routed around a real box, recovered its travel heading,
+continued after imperfect motor startup, spoke while navigating, and finished
+with the box still standing and the robot clear by a wide margin. This is one
+successful live trial; repeatability and broader acceptance runs remain in
+progress.
 
 The current EV3 map is intentionally qualitative. IR reflection can support
 obstacle hypotheses, but it is not vision, object recognition, or precise
