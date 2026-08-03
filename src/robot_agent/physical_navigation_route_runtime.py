@@ -32,24 +32,49 @@ from .physical_navigation_experience import ROUTE_EXECUTOR_ACTION_SOURCE
 from .physical_navigation_mission import DirectionalMission
 
 
-HANDOFF_ROUTE_COMPLETE = "ROUTE_COMPLETE"
-HANDOFF_ROUTE_INVALID = "ROUTE_INVALID"
-HANDOFF_ROUTE_MISSING = "ROUTE_MISSING"
-HANDOFF_ROUTE_REPLAN_REQUIRED = "ROUTE_REPLAN_REQUIRED"
-HANDOFF_NO_UNIQUE_FEASIBLE_MOTION = "NO_UNIQUE_FEASIBLE_MOTION"
-HANDOFF_EXECUTION_VETOED = "EXECUTION_VETOED"
-HANDOFF_MOTION_NOT_COMPLETED = "MOTION_NOT_COMPLETED"
-HANDOFF_EPISODE_DEADLINE_ELAPSED = "EPISODE_DEADLINE_ELAPSED"
-HANDOFF_REASONS = frozenset((
-    HANDOFF_ROUTE_COMPLETE,
-    HANDOFF_ROUTE_INVALID,
-    HANDOFF_ROUTE_MISSING,
-    HANDOFF_ROUTE_REPLAN_REQUIRED,
-    HANDOFF_NO_UNIQUE_FEASIBLE_MOTION,
-    HANDOFF_EXECUTION_VETOED,
-    HANDOFF_MOTION_NOT_COMPLETED,
-    HANDOFF_EPISODE_DEADLINE_ELAPSED,
+EXECUTION_CONTINUE = "CONTINUE"
+EXECUTION_REPLAN = "REPLAN"
+EXECUTION_COMPLETE = "COMPLETE"
+EXECUTION_FAILED = "FAILED"
+EXECUTION_OUTCOMES = frozenset((
+    EXECUTION_CONTINUE,
+    EXECUTION_REPLAN,
+    EXECUTION_COMPLETE,
+    EXECUTION_FAILED,
 ))
+
+ROUTE_EXECUTION_REASON_COMPLETE = "ROUTE_COMPLETE"
+ROUTE_EXECUTION_REASON_INVALID = "ROUTE_INVALID"
+ROUTE_EXECUTION_REASON_MISSING = "ROUTE_MISSING"
+ROUTE_EXECUTION_REASON_REPLAN_REQUIRED = "ROUTE_REPLAN_REQUIRED"
+ROUTE_EXECUTION_REASON_NO_UNIQUE_MOTION = "NO_UNIQUE_FEASIBLE_MOTION"
+ROUTE_EXECUTION_REASON_VETOED = "EXECUTION_VETOED"
+ROUTE_EXECUTION_REASON_MOTION_INCOMPLETE = "MOTION_NOT_COMPLETED"
+ROUTE_EXECUTION_REASON_DEADLINE = "EPISODE_DEADLINE_ELAPSED"
+ROUTE_EXECUTION_REPLAN_REASONS = frozenset((
+    ROUTE_EXECUTION_REASON_INVALID,
+    ROUTE_EXECUTION_REASON_MISSING,
+    ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
+    ROUTE_EXECUTION_REASON_NO_UNIQUE_MOTION,
+    ROUTE_EXECUTION_REASON_VETOED,
+    ROUTE_EXECUTION_REASON_MOTION_INCOMPLETE,
+))
+ROUTE_EXECUTION_REASONS = frozenset((
+    ROUTE_EXECUTION_REASON_COMPLETE,
+    ROUTE_EXECUTION_REASON_DEADLINE,
+)).union(ROUTE_EXECUTION_REPLAN_REASONS)
+
+
+def _valid_execution_outcome_reason(outcome, reason_code) -> bool:
+    if outcome == EXECUTION_CONTINUE:
+        return reason_code is None
+    if outcome == EXECUTION_COMPLETE:
+        return reason_code == ROUTE_EXECUTION_REASON_COMPLETE
+    if outcome == EXECUTION_FAILED:
+        return reason_code == ROUTE_EXECUTION_REASON_DEADLINE
+    if outcome == EXECUTION_REPLAN:
+        return reason_code in ROUTE_EXECUTION_REPLAN_REASONS
+    return False
 
 
 class PhysicalNavigationRouteRuntimeError(ValueError):
@@ -91,7 +116,8 @@ def _guidance_summary(guidance):
 def _with_handoff(
     last_tool_result,
     *,
-    reason: str,
+    outcome: str,
+    reason_code: Optional[str],
     route: Optional[LocalDetourRoute],
     action_count: int,
     detail=None,
@@ -105,14 +131,15 @@ def _with_handoff(
         value["operation"] = "local_detour_route"
     if "status" not in value:
         value["status"] = "planner_handoff"
-    if "reason" not in value:
-        value["reason"] = reason
+    if "reason" not in value and reason_code is not None:
+        value["reason"] = reason_code
     value["target_hypothesis_id"] = (
         None if route is None else route.target_hypothesis_id
     )
     handoff = {
         "status": "planner_handoff",
-        "reason": reason,
+        "outcome": outcome,
+        "reason_code": reason_code,
         "executed_action_count": action_count,
         "route": _route_summary(route),
         "host_selected_route_or_side": False,
@@ -131,7 +158,8 @@ class PhysicalNavigationRouteRuntimeResult:
     route: Optional[LocalDetourRoute]
     last_tool_result: Mapping[str, object]
     actions: Tuple[str, ...]
-    handoff_reason: str
+    outcome: str
+    reason_code: Optional[str]
 
     def __post_init__(self) -> None:
         if (
@@ -143,7 +171,11 @@ class PhysicalNavigationRouteRuntimeResult:
             or not isinstance(self.last_tool_result, Mapping)
             or not isinstance(self.actions, tuple)
             or any(action not in MOTION_ACTIONS for action in self.actions)
-            or self.handoff_reason not in HANDOFF_REASONS
+            or self.outcome not in EXECUTION_OUTCOMES
+            or not _valid_execution_outcome_reason(
+                self.outcome,
+                self.reason_code,
+            )
         ):
             raise PhysicalNavigationRouteRuntimeError(
                 "route runtime result is invalid"
@@ -211,19 +243,22 @@ class PhysicalNavigationRouteRuntimeMixin:
         route,
         last_tool_result,
         actions,
-        handoff_reason,
+        outcome,
+        reason_code,
         detail=None,
     ) -> PhysicalNavigationRouteRuntimeResult:
         updated_tool_result = _with_handoff(
             last_tool_result,
-            reason=handoff_reason,
+            outcome=outcome,
+            reason_code=reason_code,
             route=route,
             action_count=len(actions),
             detail=detail,
         )
         self._emit(
             "local_detour_route_handoff",
-            handoff_reason=handoff_reason,
+            outcome=outcome,
+            reason_code=reason_code,
             route=_route_summary(route),
             executed_actions=list(actions),
             detail=deepcopy(detail),
@@ -234,7 +269,8 @@ class PhysicalNavigationRouteRuntimeMixin:
             route=route,
             last_tool_result=updated_tool_result,
             actions=tuple(actions),
-            handoff_reason=handoff_reason,
+            outcome=outcome,
+            reason_code=reason_code,
         )
 
     def _route_deadline_elapsed(self, deadline: float, stage: str) -> bool:
@@ -364,7 +400,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_EPISODE_DEADLINE_ELAPSED,
+                    outcome=EXECUTION_FAILED,
+                    reason_code=ROUTE_EXECUTION_REASON_DEADLINE,
                 )
             if current_route is None:
                 return self._route_runtime_result(
@@ -372,7 +409,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=None,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_ROUTE_MISSING,
+                    outcome=EXECUTION_REPLAN,
+                    reason_code=ROUTE_EXECUTION_REASON_MISSING,
                 )
             if current_route.status == ROUTE_COMPLETE:
                 return self._route_runtime_result(
@@ -380,7 +418,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_ROUTE_COMPLETE,
+                    outcome=EXECUTION_COMPLETE,
+                    reason_code=ROUTE_EXECUTION_REASON_COMPLETE,
                 )
             if current_route.status != ROUTE_ACTIVE:
                 return self._route_runtime_result(
@@ -388,7 +427,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_ROUTE_INVALID,
+                    outcome=EXECUTION_REPLAN,
+                    reason_code=ROUTE_EXECUTION_REASON_INVALID,
                 )
             if getattr(self.memory, "localization_valid", None) is not True:
                 return self._route_runtime_result(
@@ -396,7 +436,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_ROUTE_REPLAN_REQUIRED,
+                    outcome=EXECUTION_REPLAN,
+                    reason_code=ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
                     detail={"reason": "LOCALIZATION_INVALID"},
                 )
 
@@ -414,7 +455,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_EPISODE_DEADLINE_ELAPSED,
+                    outcome=EXECUTION_FAILED,
+                    reason_code=ROUTE_EXECUTION_REASON_DEADLINE,
                 )
             refreshed = self._refresh_authorized_local_detour_route(
                 route=current_route,
@@ -430,7 +472,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_ROUTE_COMPLETE,
+                    outcome=EXECUTION_COMPLETE,
+                    reason_code=ROUTE_EXECUTION_REASON_COMPLETE,
                 )
             if refreshed.sync_event == SYNC_REBUILT:
                 return self._route_runtime_result(
@@ -438,7 +481,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_ROUTE_REPLAN_REQUIRED,
+                    outcome=EXECUTION_REPLAN,
+                    reason_code=ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
                     detail={
                         "sync_event": refreshed.sync_event,
                         "reason": refreshed.sync_reason,
@@ -446,18 +490,19 @@ class PhysicalNavigationRouteRuntimeMixin:
                 )
             if refreshed.sync_event not in (SYNC_UNCHANGED, SYNC_ADVANCED):
                 reason = (
-                    HANDOFF_ROUTE_MISSING
+                    ROUTE_EXECUTION_REASON_MISSING
                     if current_route is None
-                    else HANDOFF_ROUTE_INVALID
+                    else ROUTE_EXECUTION_REASON_INVALID
                     if current_route.status == ROUTE_INVALID
-                    else HANDOFF_ROUTE_REPLAN_REQUIRED
+                    else ROUTE_EXECUTION_REASON_REPLAN_REQUIRED
                 )
                 return self._route_runtime_result(
                     observation=current_observation,
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=reason,
+                    outcome=EXECUTION_REPLAN,
+                    reason_code=reason,
                     detail={
                         "sync_event": refreshed.sync_event,
                         "reason": refreshed.sync_reason,
@@ -470,7 +515,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_ROUTE_COMPLETE,
+                    outcome=EXECUTION_COMPLETE,
+                    reason_code=ROUTE_EXECUTION_REASON_COMPLETE,
                 )
             if current_route is None:
                 return self._route_runtime_result(
@@ -478,7 +524,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=None,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_ROUTE_MISSING,
+                    outcome=EXECUTION_REPLAN,
+                    reason_code=ROUTE_EXECUTION_REASON_MISSING,
                 )
             if current_route.status == ROUTE_INVALID:
                 return self._route_runtime_result(
@@ -486,7 +533,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_ROUTE_INVALID,
+                    outcome=EXECUTION_REPLAN,
+                    reason_code=ROUTE_EXECUTION_REASON_INVALID,
                 )
 
             allowed = guidance.allowed_motion_actions
@@ -496,7 +544,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_NO_UNIQUE_FEASIBLE_MOTION,
+                    outcome=EXECUTION_REPLAN,
+                    reason_code=ROUTE_EXECUTION_REASON_NO_UNIQUE_MOTION,
                     detail={
                         "guidance": _guidance_summary(guidance),
                         "allowed_motion_actions": sorted(allowed or ()),
@@ -534,7 +583,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_EXECUTION_VETOED,
+                    outcome=EXECUTION_REPLAN,
+                    reason_code=ROUTE_EXECUTION_REASON_VETOED,
                     detail={"action": action, "veto": veto},
                 )
             if self._route_deadline_elapsed(
@@ -546,7 +596,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_EPISODE_DEADLINE_ELAPSED,
+                    outcome=EXECUTION_FAILED,
+                    reason_code=ROUTE_EXECUTION_REASON_DEADLINE,
                 )
 
             self._emit(
@@ -576,23 +627,29 @@ class PhysicalNavigationRouteRuntimeMixin:
                     route=current_route,
                     last_tool_result=current_tool_result,
                     actions=executed_actions,
-                    handoff_reason=HANDOFF_MOTION_NOT_COMPLETED,
+                    outcome=EXECUTION_REPLAN,
+                    reason_code=ROUTE_EXECUTION_REASON_MOTION_INCOMPLETE,
                     detail={"action": action},
                 )
 
 
 __all__ = (
-    "HANDOFF_EPISODE_DEADLINE_ELAPSED",
-    "HANDOFF_EXECUTION_VETOED",
-    "HANDOFF_MOTION_NOT_COMPLETED",
-    "HANDOFF_NO_UNIQUE_FEASIBLE_MOTION",
-    "HANDOFF_REASONS",
-    "HANDOFF_ROUTE_COMPLETE",
-    "HANDOFF_ROUTE_INVALID",
-    "HANDOFF_ROUTE_MISSING",
-    "HANDOFF_ROUTE_REPLAN_REQUIRED",
+    "EXECUTION_COMPLETE",
+    "EXECUTION_CONTINUE",
+    "EXECUTION_FAILED",
+    "EXECUTION_OUTCOMES",
+    "EXECUTION_REPLAN",
     "PhysicalNavigationRouteRuntimeError",
     "PhysicalNavigationRouteRuntimeMixin",
     "PhysicalNavigationRouteRefresh",
     "PhysicalNavigationRouteRuntimeResult",
+    "ROUTE_EXECUTION_REASON_COMPLETE",
+    "ROUTE_EXECUTION_REASON_DEADLINE",
+    "ROUTE_EXECUTION_REASON_INVALID",
+    "ROUTE_EXECUTION_REASON_MISSING",
+    "ROUTE_EXECUTION_REASON_MOTION_INCOMPLETE",
+    "ROUTE_EXECUTION_REASON_NO_UNIQUE_MOTION",
+    "ROUTE_EXECUTION_REASON_REPLAN_REQUIRED",
+    "ROUTE_EXECUTION_REASON_VETOED",
+    "ROUTE_EXECUTION_REASONS",
 )

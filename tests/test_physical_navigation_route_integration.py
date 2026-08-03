@@ -31,7 +31,8 @@ from robot_agent.physical_navigation_runtime import (
     PhysicalNavigationRuntimeConfig,
 )
 from robot_agent.physical_navigation_route_runtime import (
-    HANDOFF_ROUTE_REPLAN_REQUIRED,
+    EXECUTION_REPLAN,
+    ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
 )
 from robot_agent.physical_odometry import (
     DriveMotorRoles,
@@ -140,8 +141,8 @@ class RouteAuthorizationPlanner:
         elif (
             context["last_tool_result"]
             .get("route_execution", {})
-            .get("reason")
-            == HANDOFF_ROUTE_REPLAN_REQUIRED
+            .get("reason_code")
+            == ROUTE_EXECUTION_REASON_REPLAN_REQUIRED
         ):
             commitment = {
                 "id": active["id"],
@@ -230,7 +231,8 @@ class ReplanAfterOneRoutePulseRuntime(PhysicalNavigationRuntime):
             route=route,
             last_tool_result=result,
             actions=[ADVANCE],
-            handoff_reason=HANDOFF_ROUTE_REPLAN_REQUIRED,
+            outcome=EXECUTION_REPLAN,
+            reason_code=ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
             detail={"reason": "test_geometry_changed_after_pulse"},
         )
 

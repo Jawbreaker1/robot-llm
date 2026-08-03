@@ -15,15 +15,21 @@ from robot_agent.physical_navigation_experience import (
 )
 from robot_agent.physical_navigation_mission import DirectionalMission
 from robot_agent.physical_navigation_route_runtime import (
-    HANDOFF_EPISODE_DEADLINE_ELAPSED,
-    HANDOFF_EXECUTION_VETOED,
-    HANDOFF_MOTION_NOT_COMPLETED,
-    HANDOFF_NO_UNIQUE_FEASIBLE_MOTION,
-    HANDOFF_ROUTE_COMPLETE,
-    HANDOFF_ROUTE_INVALID,
-    HANDOFF_ROUTE_MISSING,
-    HANDOFF_ROUTE_REPLAN_REQUIRED,
+    EXECUTION_COMPLETE,
+    EXECUTION_CONTINUE,
+    EXECUTION_FAILED,
+    EXECUTION_REPLAN,
+    PhysicalNavigationRouteRuntimeError,
     PhysicalNavigationRouteRuntimeMixin,
+    PhysicalNavigationRouteRuntimeResult,
+    ROUTE_EXECUTION_REASON_COMPLETE,
+    ROUTE_EXECUTION_REASON_DEADLINE,
+    ROUTE_EXECUTION_REASON_INVALID,
+    ROUTE_EXECUTION_REASON_MISSING,
+    ROUTE_EXECUTION_REASON_MOTION_INCOMPLETE,
+    ROUTE_EXECUTION_REASON_NO_UNIQUE_MOTION,
+    ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
+    ROUTE_EXECUTION_REASON_VETOED,
 )
 from robot_agent.physical_odometry import (
     OdometryCalibration,
@@ -238,12 +244,38 @@ def execute(host, route, **changes):
 
 
 class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
+    def test_result_rejects_contradictory_outcome_and_reason(self):
+        values = {
+            "observation": {},
+            "route": None,
+            "last_tool_result": {},
+            "actions": (),
+        }
+
+        with self.assertRaises(PhysicalNavigationRouteRuntimeError):
+            PhysicalNavigationRouteRuntimeResult(
+                **values,
+                outcome=EXECUTION_FAILED,
+                reason_code=ROUTE_EXECUTION_REASON_MISSING,
+            )
+
+        continuing = PhysicalNavigationRouteRuntimeResult(
+            **values,
+            outcome=EXECUTION_CONTINUE,
+            reason_code=None,
+        )
+        self.assertIsNone(continuing.reason_code)
+
     def test_executes_unique_route_actions_until_the_route_is_complete(self):
         host = RouteRuntimeHost()
 
         result = execute(host, active_route())
 
-        self.assertEqual(result.handoff_reason, HANDOFF_ROUTE_COMPLETE)
+        self.assertEqual(result.outcome, EXECUTION_COMPLETE)
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_COMPLETE,
+        )
         self.assertEqual(result.route.status, ROUTE_COMPLETE)
         self.assertEqual(result.actions, tuple(host.executed_actions))
         self.assertGreater(len(result.actions), 4)
@@ -254,8 +286,16 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
             for item in host.experiences
         ))
         self.assertEqual(
-            result.last_tool_result["route_execution"]["reason"],
-            HANDOFF_ROUTE_COMPLETE,
+            result.last_tool_result["route_execution"]["outcome"],
+            EXECUTION_COMPLETE,
+        )
+        self.assertEqual(
+            result.last_tool_result["route_execution"]["reason_code"],
+            ROUTE_EXECUTION_REASON_COMPLETE,
+        )
+        self.assertNotIn(
+            "reason",
+            result.last_tool_result["route_execution"],
         )
         self.assertFalse(
             result.last_tool_result["route_execution"][
@@ -284,8 +324,16 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
         invalid_route = active_route().invalidate("TARGET_MISSING")
         invalid = execute(host, invalid_route)
 
-        self.assertEqual(missing.handoff_reason, HANDOFF_ROUTE_MISSING)
-        self.assertEqual(invalid.handoff_reason, HANDOFF_ROUTE_INVALID)
+        self.assertEqual(missing.outcome, EXECUTION_REPLAN)
+        self.assertEqual(
+            missing.reason_code,
+            ROUTE_EXECUTION_REASON_MISSING,
+        )
+        self.assertEqual(invalid.outcome, EXECUTION_REPLAN)
+        self.assertEqual(
+            invalid.reason_code,
+            ROUTE_EXECUTION_REASON_INVALID,
+        )
         self.assertEqual(invalid.route.status, ROUTE_INVALID)
         self.assertEqual(host.goal_calls, 0)
         self.assertEqual(host.executed_actions, [])
@@ -303,7 +351,11 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
 
         result = execute(host, completed)
 
-        self.assertEqual(result.handoff_reason, HANDOFF_ROUTE_COMPLETE)
+        self.assertEqual(result.outcome, EXECUTION_COMPLETE)
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_COMPLETE,
+        )
         self.assertEqual(host.goal_calls, 0)
         self.assertEqual(result.actions, ())
 
@@ -322,8 +374,12 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
                 result = execute(host, route)
 
                 self.assertEqual(
-                    result.handoff_reason,
-                    HANDOFF_NO_UNIQUE_FEASIBLE_MOTION,
+                    result.outcome,
+                    EXECUTION_REPLAN,
+                )
+                self.assertEqual(
+                    result.reason_code,
+                    ROUTE_EXECUTION_REASON_NO_UNIQUE_MOTION,
                 )
                 self.assertEqual(result.actions, ())
                 self.assertEqual(host.executed_actions, [])
@@ -341,7 +397,11 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
 
         result = execute(host, active_route())
 
-        self.assertEqual(result.handoff_reason, HANDOFF_EXECUTION_VETOED)
+        self.assertEqual(result.outcome, EXECUTION_REPLAN)
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_VETOED,
+        )
         self.assertEqual(result.actions, ())
         self.assertEqual(host.executed_actions, [])
         self.assertEqual(len(host.experiences), 1)
@@ -360,7 +420,11 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
 
         result = execute(host, active_route())
 
-        self.assertEqual(result.handoff_reason, HANDOFF_MOTION_NOT_COMPLETED)
+        self.assertEqual(result.outcome, EXECUTION_REPLAN)
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_MOTION_INCOMPLETE,
+        )
         self.assertEqual(len(result.actions), 1)
         self.assertEqual(result.actions, tuple(host.executed_actions))
         self.assertEqual(result.last_tool_result["status"], "interrupted")
@@ -390,8 +454,12 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
         result = execute(host, original)
 
         self.assertEqual(
-            result.handoff_reason,
-            HANDOFF_ROUTE_REPLAN_REQUIRED,
+            result.outcome,
+            EXECUTION_REPLAN,
+        )
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
         )
         self.assertEqual(len(result.actions), 1)
         self.assertNotEqual(result.route.route_id, original.route_id)
@@ -420,7 +488,11 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
 
         result = execute(host, original)
 
-        self.assertEqual(result.handoff_reason, HANDOFF_ROUTE_INVALID)
+        self.assertEqual(result.outcome, EXECUTION_REPLAN)
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_INVALID,
+        )
         self.assertEqual(result.route.status, ROUTE_INVALID)
         updates = [
             item for item in host.events
@@ -437,7 +509,11 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
 
         result = execute(host, active_route())
 
-        self.assertEqual(result.handoff_reason, HANDOFF_ROUTE_REPLAN_REQUIRED)
+        self.assertEqual(result.outcome, EXECUTION_REPLAN)
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
+        )
         self.assertEqual(result.actions, ())
         self.assertEqual(
             result.last_tool_result["route_execution"]["detail"]["reason"],
@@ -450,7 +526,11 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
 
         result = execute(host, active_route())
 
-        self.assertEqual(result.handoff_reason, HANDOFF_ROUTE_COMPLETE)
+        self.assertEqual(result.outcome, EXECUTION_COMPLETE)
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_COMPLETE,
+        )
         self.assertEqual(result.route.status, ROUTE_COMPLETE)
         self.assertGreater(len(result.actions), 4)
 
@@ -461,8 +541,12 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
         result = execute(deadline_host, active_route(), deadline=10.0)
 
         self.assertEqual(
-            result.handoff_reason,
-            HANDOFF_EPISODE_DEADLINE_ELAPSED,
+            result.outcome,
+            EXECUTION_FAILED,
+        )
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_DEADLINE,
         )
         self.assertEqual(deadline_host.goal_calls, 0)
         self.assertEqual(deadline_host.executed_actions, [])
@@ -485,8 +569,12 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            result.handoff_reason,
-            HANDOFF_ROUTE_REPLAN_REQUIRED,
+            result.outcome,
+            EXECUTION_REPLAN,
+        )
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
         )
         self.assertEqual(result.route.detour_side, "RIGHT_OF_GOAL")
         self.assertEqual(result.actions, ())

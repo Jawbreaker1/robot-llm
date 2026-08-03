@@ -54,7 +54,7 @@ from .physical_navigation_scan_runtime import (
     PhysicalNavigationScanRuntimeMixin,
 )
 from .physical_navigation_route_runtime import (
-    HANDOFF_EPISODE_DEADLINE_ELAPSED,
+    EXECUTION_FAILED,
     PhysicalNavigationRouteRuntimeMixin,
 )
 from .physical_navigation_plan_tail_runtime import (
@@ -1461,10 +1461,7 @@ class PhysicalNavigationRuntime(
                     local_route = route_result.route
                     last_tool_result = route_result.last_tool_result
                     actions.extend(route_result.actions)
-                    if (
-                        route_result.handoff_reason
-                        == HANDOFF_EPISODE_DEADLINE_ELAPSED
-                    ):
+                    if route_result.outcome == EXECUTION_FAILED:
                         terminal_reason = "episode_deadline_elapsed"
                         break
                     # Route execution may have consumed several physical
