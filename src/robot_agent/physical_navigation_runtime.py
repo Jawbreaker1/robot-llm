@@ -1442,7 +1442,6 @@ class PhysicalNavigationRuntime(
                     pending_validation_feedback is None
                     and local_route is not None
                     and local_route.status == ROUTE_ACTIVE
-                    and route_refresh.guidance.gate_active
                 ):
                     route_result = (
                         self._execute_authorized_local_detour_route(
@@ -1686,7 +1685,7 @@ class PhysicalNavigationRuntime(
                     )
                     continue
                 tail = None
-                if not route_refresh.guidance.gate_active:
+                if route_refresh.guidance.allowed_motion_actions is None:
                     tail = NavigationPlanTail.from_decision(
                         decision,
                         now_monotonic=self.monotonic(),

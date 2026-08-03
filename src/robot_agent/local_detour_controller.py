@@ -11,6 +11,7 @@ import math
 from typing import Mapping, Optional, Tuple
 
 from .local_detour_route import (
+    ROUTE_ACTIVE,
     ROUTE_COMPLETE,
     ROUTE_INVALID,
     LocalDetourRoute,
@@ -98,13 +99,16 @@ class LocalDetourGuidance:
     """Motion gate derived from one freshly synchronized route."""
 
     route: Optional[LocalDetourRoute]
-    gate_active: bool
     allowed_motion_actions: Optional[frozenset]
     reason: str
     active_waypoint_index: Optional[int] = None
     active_waypoint_kind: Optional[str] = None
     distance_to_waypoint_mm: Optional[int] = None
     heading_error_mdeg: Optional[int] = None
+
+    @property
+    def gate_active(self) -> bool:
+        return self.allowed_motion_actions is not None
 
     def to_dict(self) -> Mapping[str, object]:
         return {
@@ -426,7 +430,6 @@ def derive_local_detour_guidance(
     if route is None:
         return LocalDetourGuidance(
             route=None,
-            gate_active=False,
             allowed_motion_actions=None,
             reason=GUIDANCE_INACTIVE,
         )
@@ -435,14 +438,12 @@ def derive_local_detour_guidance(
     if fresh_route.status == ROUTE_COMPLETE:
         return LocalDetourGuidance(
             route=fresh_route,
-            gate_active=False,
             allowed_motion_actions=None,
             reason=GUIDANCE_ROUTE_COMPLETE,
         )
     if fresh_route.status == ROUTE_INVALID:
         return LocalDetourGuidance(
             route=fresh_route,
-            gate_active=True,
             allowed_motion_actions=frozenset(),
             reason=GUIDANCE_ROUTE_INVALID,
         )
@@ -531,7 +532,6 @@ def derive_local_detour_guidance(
 
     return LocalDetourGuidance(
         route=fresh_route,
-        gate_active=True,
         allowed_motion_actions=allowed,
         reason=reason,
         active_waypoint_index=fresh_route.active_index,
@@ -587,7 +587,7 @@ def local_detour_tail_action_allowed(
     if guidance.route is None:
         return True
     return (
-        guidance.gate_active
+        guidance.route.status == ROUTE_ACTIVE
         and guidance.allowed_motion_actions is not None
         and action in guidance.allowed_motion_actions
     )

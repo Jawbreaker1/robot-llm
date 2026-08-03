@@ -335,6 +335,27 @@ class LocalDetourRouteSynchronizationTests(unittest.TestCase):
 
 
 class LocalDetourGuidanceTests(unittest.TestCase):
+    def test_gate_activity_is_derived_but_remains_serialized(self):
+        inactive = derive_local_detour_guidance(
+            None,
+            current_pose=PhysicalPose(),
+            motion_feasibility=feasibility(),
+            action_specs=EXPECTED_ACTION_SPECS,
+        )
+        active = derive_local_detour_guidance(
+            built_route(),
+            current_pose=PhysicalPose(),
+            motion_feasibility=feasibility(),
+            action_specs=EXPECTED_ACTION_SPECS,
+        )
+
+        self.assertNotIn("gate_active", vars(inactive))
+        self.assertFalse(inactive.gate_active)
+        self.assertFalse(inactive.to_dict()["gate_active"])
+        self.assertNotIn("gate_active", vars(active))
+        self.assertTrue(active.gate_active)
+        self.assertTrue(active.to_dict()["gate_active"])
+
     def test_ev3_route_reverses_until_close_target_allows_turn(self):
         profile = EV3RSTORMProfile()
         live_map = ProvisionalHazardMap(
