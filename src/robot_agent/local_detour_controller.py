@@ -11,6 +11,7 @@ import math
 from typing import Mapping, Optional, Tuple
 
 from .local_detour_route import (
+    LATERAL_CLEARANCE,
     ROUTE_ACTIVE,
     ROUTE_COMPLETE,
     ROUTE_INVALID,
@@ -375,6 +376,20 @@ def _distance_mm(pose: PhysicalPose, x_mm: int, y_mm: int) -> int:
     return int(round(math.hypot(x_mm - pose.x_mm, y_mm - pose.y_mm)))
 
 
+def _signed_lateral_position_mm(
+    route: LocalDetourRoute,
+    pose: PhysicalPose,
+) -> int:
+    angle = math.radians(route.goal_heading_mdeg / 1_000.0)
+    relative_x = pose.x_mm - route.goal_origin_x_mm
+    relative_y = pose.y_mm - route.goal_origin_y_mm
+    lateral = int(round(
+        -relative_x * math.sin(angle) + relative_y * math.cos(angle)
+    ))
+    side_sign = 1 if route.detour_side == "LEFT_OF_GOAL" else -1
+    return side_sign * lateral
+
+
 def _nominal_pose(
     pose: PhysicalPose,
     action: str,
@@ -526,7 +541,27 @@ def derive_local_detour_guidance(
             waypoint.x_mm,
             waypoint.y_mm,
         )
-        if projected_distance < distance:
+        side_sign = (
+            1 if fresh_route.detour_side == "LEFT_OF_GOAL" else -1
+        )
+        current_lateral = _signed_lateral_position_mm(
+            fresh_route,
+            current_pose,
+        )
+        projected_lateral = _signed_lateral_position_mm(
+            fresh_route,
+            projected,
+        )
+        # A coarse pulse can cross the clearance line while its Euclidean
+        # distance grows after a long backoff.  Crossing outward is still
+        # deterministic progress toward the lateral staging waypoint.
+        lateral_staging_progress = (
+            waypoint.kind == LATERAL_CLEARANCE
+            and current_lateral
+            < side_sign * fresh_route.route_lateral_offset_mm
+            and projected_lateral > current_lateral
+        )
+        if projected_distance < distance or lateral_staging_progress:
             allowed = frozenset((ADVANCE,))
             reason = GUIDANCE_ADVANCE_TO_WAYPOINT
 

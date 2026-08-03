@@ -110,6 +110,19 @@ class LocalDetourRouteGeometryTests(unittest.TestCase):
         self.assertNotEqual(value.waypoints[0].kind, LATERAL_CLEARANCE)
         self.assertEqual(value.waypoints[0].kind, PASS_BEYOND_TARGET)
 
+    def test_lateral_deficit_inside_tolerance_still_stages_outward(self):
+        value = route(pose=PhysicalPose(y_mm=190))
+
+        self.assertEqual(value.route_lateral_offset_mm, 205)
+        self.assertEqual(value.waypoints[0].kind, LATERAL_CLEARANCE)
+
+        mirrored = route(
+            side="RIGHT_OF_GOAL",
+            pose=PhysicalPose(y_mm=-170),
+        )
+        self.assertEqual(mirrored.route_lateral_offset_mm, -185)
+        self.assertEqual(mirrored.waypoints[0].kind, LATERAL_CLEARANCE)
+
     def test_goal_frame_rotation_produces_same_route_shape(self):
         value = route(
             goal_heading_mdeg=90_000,
@@ -158,10 +171,15 @@ class LocalDetourRouteLifecycleTests(unittest.TestCase):
         value = value.advance_reached(
             PhysicalPose(x_mm=0, y_mm=180, heading_mdeg=90_000)
         )
+        self.assertEqual(value.active_index, 0)
+        self.assertEqual(value.version, 1)
+        value = value.advance_reached(
+            PhysicalPose(x_mm=0, y_mm=205, heading_mdeg=90_000)
+        )
         self.assertEqual(value.active_index, 1)
         self.assertEqual(value.version, 2)
         value = value.advance_reached(
-            PhysicalPose(x_mm=0, y_mm=180, heading_mdeg=0)
+            PhysicalPose(x_mm=0, y_mm=204, heading_mdeg=0)
         )
         self.assertEqual(value.active_index, 2)
         value = value.advance_reached(

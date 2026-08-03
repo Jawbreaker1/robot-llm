@@ -460,6 +460,36 @@ class LocalDetourGuidanceTests(unittest.TestCase):
             frozenset((ADVANCE,)),
         )
 
+    def test_lateral_staging_can_cross_clearance_after_long_backoff(self):
+        cases = (
+            ("LEFT_OF_GOAL", 190, 90_000),
+            ("RIGHT_OF_GOAL", -170, -90_000),
+        )
+        for side, y_mm, heading_mdeg in cases:
+            with self.subTest(side=side):
+                route = built_route(side=side)
+                pose = PhysicalPose(
+                    x_mm=-210,
+                    y_mm=y_mm,
+                    heading_mdeg=heading_mdeg,
+                )
+
+                guidance = derive_local_detour_guidance(
+                    route,
+                    current_pose=pose,
+                    motion_feasibility=feasibility(),
+                    action_specs=EXPECTED_ACTION_SPECS,
+                )
+
+                self.assertEqual(
+                    guidance.reason,
+                    GUIDANCE_ADVANCE_TO_WAYPOINT,
+                )
+                self.assertEqual(
+                    guidance.allowed_motion_actions,
+                    frozenset((ADVANCE,)),
+                )
+
     def test_heading_drift_can_advance_only_when_it_closes_distance(self):
         route = built_route()
         pose = PhysicalPose(heading_mdeg=60_000)

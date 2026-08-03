@@ -402,6 +402,11 @@ class LocalDetourRoute:
             side_sign * (lateral - self.route_lateral_offset_mm)
             >= -self.position_tolerance_mm
         )
+        # The route already carries the position tolerance as clearance.
+        # Preserve that reserve until the outward staging leg is complete.
+        staging_side_clear = (
+            side_sign * (lateral - self.route_lateral_offset_mm) >= 0
+        )
         passed = (
             longitudinal
             >= self.pass_longitudinal_offset_mm
@@ -414,7 +419,7 @@ class LocalDetourRoute:
             pose, waypoint.heading_mdeg
         )
         if waypoint.kind == LATERAL_CLEARANCE:
-            return side_clear and heading_reached
+            return staging_side_clear and heading_reached
         if waypoint.kind == REACQUIRE_GOAL_HEADING:
             return side_clear and heading_reached
         if waypoint.kind == PASS_BEYOND_TARGET:
@@ -744,7 +749,7 @@ def build_local_detour_route(
 
     lateral_leg_required = (
         side_sign * (route_lateral - current_lateral)
-        > position_tolerance_mm
+        > 0
     )
     if lateral_leg_required:
         append_waypoint(
