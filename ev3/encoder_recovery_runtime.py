@@ -749,6 +749,13 @@ class EncoderRecoveryRuntime(object):
             initial_motors,
             final_observation,
         )
+        # The regulated motors can settle a few encoder degrees after the
+        # verified stop snapshot.  Use the later stopped observation for both
+        # the primary segment boundary and the slice aggregate so the strict
+        # receipt remains continuous without discarding physical movement.
+        primary_segment["motors"] = [
+            dict(motor) for motor in aggregate
+        ]
         budget = EncoderRecoveryBudget()
         stop = primary_finish["stop"]
         recovered = False

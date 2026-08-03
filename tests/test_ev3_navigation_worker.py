@@ -1231,6 +1231,40 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         self.assertEqual(self.worker.pulse_count, 2)
         self.assertEqual(self.worker.pulse_duration_ms, 502)
 
+    def test_post_stop_encoder_settling_uses_one_receipt_boundary(self):
+        original_finish = self.owner.finish_active
+        original_snapshot = self.owner.snapshot_all
+        settle_after_finish = [False]
+
+        def finish_then_settle(verify_motion):
+            result = original_finish(verify_motion)
+            settle_after_finish[0] = True
+            return result
+
+        def snapshot_with_one_settle():
+            if settle_after_finish[0]:
+                self.owner.positions["drive_b"] += 2
+                self.owner.positions["drive_c"] += 1
+                settle_after_finish[0] = False
+            return original_snapshot()
+
+        self.owner.finish_active = finish_then_settle
+        self.owner.snapshot_all = snapshot_with_one_settle
+
+        result = self.worker._pulse("ADVANCE")
+
+        self.assertEqual(result["outcome"]["status"], "completed")
+        receipt = result["outcome"]["slices"][0]
+        self.assertEqual(len(receipt["segments"]), 1)
+        self.assertEqual(
+            receipt["segments"][0]["motors"],
+            receipt["motors"],
+        )
+        self.assertEqual(
+            [motor["position_delta"] for motor in receipt["motors"]],
+            [153, 152],
+        )
+
     def test_failed_final_recovery_segment_can_complete_cumulative_motion(
         self,
     ):
