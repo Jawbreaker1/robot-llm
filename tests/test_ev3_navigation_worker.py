@@ -1209,6 +1209,46 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         self.assertEqual(self.worker.pulse_count, 2)
         self.assertEqual(self.worker.pulse_duration_ms, 502)
 
+    def test_failed_final_recovery_segment_can_complete_cumulative_motion(
+        self,
+    ):
+        self.owner.advance = lambda _seconds: None
+        finish_active = self.owner.finish_active
+
+        def finish_with_edge_positions(verify_motion):
+            if self.owner.finish_count == 0:
+                self.owner.positions.update(
+                    {"drive_b": 160, "drive_c": 148}
+                )
+            elif self.owner.finish_count == 1:
+                self.owner.positions.update(
+                    {"drive_b": 162, "drive_c": 150}
+                )
+            return finish_active(verify_motion)
+
+        self.owner.finish_active = finish_with_edge_positions
+
+        result = self.worker._pulse("ADVANCE")
+
+        receipt = result["outcome"]["slices"][0]
+        self.assertEqual(receipt["status"], "completed")
+        self.assertTrue(receipt["encoder_verification"]["passed"])
+        self.assertEqual(
+            [motor["position_delta"] for motor in receipt["motors"]],
+            [162, 150],
+        )
+        self.assertEqual(
+            [segment["kind"] for segment in receipt["segments"]],
+            ["paired", "paired_retry"],
+        )
+        self.assertEqual(
+            [segment["status"] for segment in receipt["segments"]],
+            ["completed", "verification_failed"],
+        )
+        self.assertFalse(
+            receipt["segments"][-1]["encoder_verification"]["passed"]
+        )
+
     def test_partial_single_wheel_recovery_preserves_encoder_motion(self):
         self.owner.blocked_roles.add("drive_c")
 

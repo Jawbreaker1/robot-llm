@@ -1913,6 +1913,23 @@ class EV3NavigationTransportTests(unittest.TestCase):
             response,
         )
 
+        cumulative_completion = copy.deepcopy(response)
+        final_segment = cumulative_completion["result"]["outcome"][
+            "slices"
+        ][0]["segments"][-1]
+        final_segment["status"] = "verification_failed"
+        final_segment["reason"] = "encoder_undertravel_observed"
+        final_segment["encoder_verification"] = {
+            "passed": False,
+            "error": "recovery segment undertravel",
+            "checks": [{"passed": False}],
+        }
+        transport._validate_success_result(
+            "pulse",
+            {"action": ADVANCE},
+            cumulative_completion,
+        )
+
         settled = copy.deepcopy(response)
         settled_motors = settled["result"]["observation"]["motors"]
         settled_motors[0]["position"] += 5

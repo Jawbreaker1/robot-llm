@@ -350,7 +350,8 @@ def _validate_pulse_segments(
         )
         or (
             outer_status == "completed"
-            and segments[-1]["status"] != "completed"
+            and segments[-1]["status"]
+            not in ("completed", "verification_failed")
         )
         or (
             segments[-1]["kind"] == "partial_start"
