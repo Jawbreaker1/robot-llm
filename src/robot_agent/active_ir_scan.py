@@ -7,6 +7,7 @@ from .active_ir_scan_contract import (
     ActiveIrScanContractError,
     ActiveIrScanRequest,
     ActiveIrScanResult,
+    CLOSED_SIDE_PROBE_OFFSETS_MDEG,
     relative_heading_mdeg,
 )
 
@@ -350,6 +351,34 @@ class ActiveIrScanExecutor:
         request: ActiveIrScanRequest,
         cancel_requested=lambda: False,
     ) -> ActiveIrScanResult:
+        return self._execute(
+            request,
+            cancel_requested=cancel_requested,
+        )
+
+    def execute_side_probe(
+        self,
+        request: ActiveIrScanRequest,
+        probe_offsets_mdeg: Tuple[int, ...],
+        cancel_requested=lambda: False,
+    ) -> ActiveIrScanResult:
+        if probe_offsets_mdeg not in CLOSED_SIDE_PROBE_OFFSETS_MDEG:
+            raise ActiveIrScanContractError(
+                "invalid_side_probe_offsets",
+                "Closed side probe offsets are invalid",
+            )
+        return self._execute(
+            request,
+            cancel_requested=cancel_requested,
+            probe_offsets_mdeg=probe_offsets_mdeg,
+        )
+
+    def _execute(
+        self,
+        request: ActiveIrScanRequest,
+        cancel_requested=lambda: False,
+        probe_offsets_mdeg: Optional[Tuple[int, ...]] = None,
+    ) -> ActiveIrScanResult:
         if not callable(cancel_requested):
             raise ActiveIrScanContractError(
                 "invalid_scan_cancellation_probe",
@@ -402,6 +431,8 @@ class ActiveIrScanExecutor:
                 begin_scan(request)
             schedule = self._coarse_schedule(
                 request.calibration.coarse_offsets_mdeg
+                if probe_offsets_mdeg is None
+                else probe_offsets_mdeg
             )
             for requested in schedule:
                 require_active()

@@ -3017,6 +3017,71 @@ class RestoredCancelledRuntimeScanExecutor:
         )
 
 
+class PassSideProbeScanExecutor:
+    def __init__(
+        self,
+        transport,
+        *,
+        blocked=True,
+        returned_offsets=None,
+    ):
+        self.transport = transport
+        self.blocked = blocked
+        self.returned_offsets = returned_offsets
+        self.requests = []
+        self.probe_offsets = []
+
+    def execute_side_probe(
+        self,
+        request,
+        probe_offsets_mdeg,
+        cancel_requested,
+    ):
+        self.requests.append(request)
+        self.probe_offsets.append(probe_offsets_mdeg)
+        if cancel_requested():
+            raise AssertionError("side probe was unexpectedly cancelled")
+        returned_offsets = (
+            probe_offsets_mdeg
+            if self.returned_offsets is None
+            else self.returned_offsets
+        )
+        rays = tuple(
+            ActiveIrRay(
+                ordinal=index,
+                requested_relative_bearing_mdeg=bearing,
+                actual_relative_bearing_mdeg=bearing,
+                observed_at_ms=request.created_at_ms + index,
+                state_version=request.start_state_version + index,
+                raw=20 if self.blocked else 60,
+                filtered=20 if self.blocked else 60,
+                blocked=self.blocked,
+            )
+            for index, bearing in enumerate(
+                returned_offsets,
+                start=1,
+            )
+        )
+        self.transport.left += 7
+        self.transport.right -= 6
+        return ActiveIrScanResult(
+            scan_id=request.scan_id,
+            target_hypothesis_id=request.target_hypothesis_id,
+            frame_id=request.frame_id,
+            map_generation_id=request.map_generation_id,
+            based_on_map_version=request.based_on_map_version,
+            started_at_ms=request.created_at_ms,
+            completed_at_ms=request.created_at_ms + len(rays) + 1,
+            status="CANCELLED",
+            reason="bilateral_boundaries_not_observed",
+            stop_confirmed=True,
+            restored_start_heading=True,
+            rays=rays,
+            left_boundary_mdeg=None,
+            right_boundary_mdeg=None,
+        )
+
+
 class RestoredEvidenceRuntimeScanExecutor:
     """Return live-shaped unilateral evidence, then optional all-clear."""
 
@@ -3152,6 +3217,202 @@ class ScanObserveChangedThenScanPlanner(SingleScanPlanner):
 
 
 class PhysicalNavigationRuntimeTests(unittest.TestCase):
+    def test_pass_side_probe_rejects_opposite_side_before_map_fusion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "wrong-side-probe-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=172),
+            )
+            memory.bind_drive_roles(
+                DriveMotorRoles(left="drive_b", right="drive_c")
+            )
+            starting_observation = observation(
+                1,
+                blocked=True,
+                left_role="drive_b",
+                right_role="drive_c",
+            )
+            memory.begin_episode(starting_observation, 1_001)
+            target_id = memory.hazard_map.hazard_ids[0]
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-wrong-side-probe",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Continue around the obstacle",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=60,
+                ),
+                transport=FakeRuntimeTransport(blocked=True),
+                planner=FakeRuntimePlanner(),
+                memory=memory,
+                active_scan_executor=PassSideProbeScanExecutor(
+                    FakeRuntimeTransport(blocked=True),
+                    returned_offsets=(30_000, 60_000),
+                ),
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+            )
+
+            with self.assertRaises(PhysicalNavigationRuntimeError) as caught:
+                runtime._execute_pass_side_probe(
+                    observation=starting_observation,
+                    deadline=60.0,
+                    target_hypothesis_id=target_id,
+                    probe_offsets_mdeg=(-60_000, -30_000),
+                )
+
+        self.assertEqual(caught.exception.code, "side_probe_result_mismatch")
+        self.assertFalse(memory.localization_valid)
+        self.assertEqual(
+            memory.hazard_map.get(target_id).collision_supports,
+            (),
+        )
+
+    def test_pass_side_probe_records_restored_support_at_probe_pose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "side-probe-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=171),
+            )
+            memory.bind_drive_roles(
+                DriveMotorRoles(left="drive_b", right="drive_c")
+            )
+            starting_observation = observation(
+                1,
+                blocked=True,
+                left_role="drive_b",
+                right_role="drive_c",
+            )
+            memory.begin_episode(starting_observation, 1_001)
+            target_id = memory.hazard_map.hazard_ids[0]
+            memory.pose = PhysicalPose(
+                x_mm=169,
+                y_mm=-334,
+                heading_mdeg=-3_894,
+            )
+            preserved_pose = memory.pose
+            transport = FakeRuntimeTransport(blocked=True)
+            scan_executor = PassSideProbeScanExecutor(transport)
+            runtime_times = iter((2_000, 2_100))
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-side-probe",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Continue around the obstacle",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=60,
+                ),
+                transport=transport,
+                planner=FakeRuntimePlanner(),
+                memory=memory,
+                active_scan_executor=scan_executor,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: next(runtime_times),
+            )
+
+            sampled, feedback = runtime._execute_pass_side_probe(
+                observation=starting_observation,
+                deadline=60.0,
+                target_hypothesis_id=target_id,
+                probe_offsets_mdeg=(-60_000, -30_000),
+            )
+
+        self.assertEqual(feedback["status"], "confirmed")
+        self.assertTrue(feedback["target_confirmed"])
+        self.assertTrue(feedback["new_spatial_support"])
+        self.assertEqual(scan_executor.probe_offsets, [
+            (-60_000, -30_000),
+        ])
+        self.assertEqual(memory.pose, preserved_pose)
+        self.assertTrue(memory.localization_valid)
+        self.assertEqual(
+            memory.motor_positions,
+            {"drive_b": 7, "drive_c": -6},
+        )
+        self.assertGreater(sampled["state_version"], 1)
+        supports = memory.hazard_map.get(target_id).collision_supports
+        self.assertEqual(len(supports), 2)
+        self.assertEqual(
+            {
+                (
+                    support.pose_x_mm,
+                    support.pose_y_mm,
+                    support.pose_heading_mdeg,
+                    support.actual_relative_bearing_mdeg,
+                )
+                for support in supports
+            },
+            {
+                (169, -334, -3_894, -60_000),
+                (169, -334, -3_894, -30_000),
+            },
+        )
+
+    def test_incomplete_restored_side_probe_replans_without_losing_pose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "partial-side-probe-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+                clock_ms=lambda: 1_000,
+                uuid_factory=lambda: uuid.UUID(int=173),
+            )
+            memory.bind_drive_roles(
+                DriveMotorRoles(left="drive_b", right="drive_c")
+            )
+            starting_observation = observation(
+                1,
+                blocked=True,
+                left_role="drive_b",
+                right_role="drive_c",
+            )
+            memory.begin_episode(starting_observation, 1_001)
+            target_id = memory.hazard_map.hazard_ids[0]
+            preserved_pose = memory.pose
+            transport = FakeRuntimeTransport(blocked=True)
+            runtime_times = iter((2_000, 2_100))
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-partial-side-probe",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Continue around the obstacle",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=60,
+                ),
+                transport=transport,
+                planner=FakeRuntimePlanner(),
+                memory=memory,
+                active_scan_executor=PassSideProbeScanExecutor(
+                    transport,
+                    returned_offsets=(-30_000,),
+                ),
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: next(runtime_times),
+            )
+
+            _, feedback = runtime._execute_pass_side_probe(
+                observation=starting_observation,
+                deadline=60.0,
+                target_hypothesis_id=target_id,
+                probe_offsets_mdeg=(-60_000, -30_000),
+            )
+
+        self.assertEqual(feedback["status"], "failed")
+        self.assertEqual(feedback["reason"], "SIDE_PROBE_INCOMPLETE")
+        self.assertFalse(feedback["side_probe_complete"])
+        self.assertTrue(feedback["new_spatial_support"])
+        self.assertTrue(memory.localization_valid)
+        self.assertEqual(memory.pose, preserved_pose)
+
     def test_pass_heading_trim_uses_fresh_sample_and_preserves_route_pose(self):
         with tempfile.TemporaryDirectory() as directory:
             memory = NavigationMemoryStore.load(
@@ -5190,6 +5451,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             planner.feedback["reason"],
             "scan_deadline_exceeded",
         )
+        self.assertNotIn("side_probe_complete", planner.feedback)
         scan_event = next(
             event for event in events if event["event"] == "scan_result"
         )
@@ -5383,6 +5645,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             planner.feedback["evidence_disposition"],
             "DISCARDED",
         )
+        self.assertNotIn("side_probe_complete", planner.feedback)
         scan_event = next(
             event
             for event in events

@@ -309,7 +309,7 @@ class PhysicalNavigationRuntime(
         self._recent_committed_utterances = deque(
             maxlen=MAX_RECENT_COMMITTED_UTTERANCES
         )
-        self._pass_heading_trim_attempted_route_ids = set()
+        self._pass_side_probe_attempted_route_ids = set()
         self._restored_scan_progress_barriers = {}
         self._experience_ledger = NavigationExperienceLedger(
             episode_id=episode_id,

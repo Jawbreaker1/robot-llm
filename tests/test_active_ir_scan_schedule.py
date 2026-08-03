@@ -3,6 +3,7 @@ import unittest
 from robot_agent.active_ir_scan import ActiveIrScanExecutor
 from robot_agent.active_ir_scan_contract import (
     ActiveIrScanCalibration,
+    ActiveIrScanContractError,
     ModelScanChoice,
     build_scan_request,
 )
@@ -52,6 +53,61 @@ class RecordingTransitionRig:
 
 
 class ActiveIrScanScheduleTests(unittest.TestCase):
+    def test_side_probe_rejects_arbitrary_host_bearings(self):
+        rig = RecordingTransitionRig()
+        request = build_scan_request(
+            choice=ModelScanChoice("target-a"),
+            frame_id="frame-a",
+            map_generation_id="generation-a",
+            map_version=1,
+            start_pose=PhysicalPose(),
+            start_state_version=1,
+            created_at_ms=rig.now,
+            deadline_ms=30_000,
+        )
+
+        with self.assertRaises(ActiveIrScanContractError):
+            ActiveIrScanExecutor(
+                rig=rig,
+                clock_ms=lambda: rig.now,
+            ).execute_side_probe(request, (15_000, 75_000))
+
+        self.assertEqual(rig.turn_deltas_mdeg, [])
+
+    def test_unilateral_schedule_samples_one_side_and_restores_heading(self):
+        rig = RecordingTransitionRig()
+        request = build_scan_request(
+            choice=ModelScanChoice("target-a"),
+            frame_id="frame-a",
+            map_generation_id="generation-a",
+            map_version=1,
+            start_pose=PhysicalPose(),
+            start_state_version=1,
+            created_at_ms=rig.now,
+            deadline_ms=30_000,
+            calibration=ActiveIrScanCalibration(
+                estimated_turn_ms_per_degree=1,
+            ),
+        )
+
+        result = ActiveIrScanExecutor(
+            rig=rig,
+            clock_ms=lambda: rig.now,
+        ).execute_side_probe(request, (30_000, 60_000))
+
+        requested = tuple(
+            ray.requested_relative_bearing_mdeg for ray in result.rays
+        )
+        self.assertEqual(requested, (30_000, 60_000, 45_000))
+        self.assertEqual(
+            tuple(rig.sampled_bearings_mdeg),
+            requested + (0,),
+        )
+        self.assertEqual(rig.heading_mdeg, 0)
+        self.assertTrue(result.restored_start_heading)
+        self.assertTrue(result.stop_confirmed)
+        self.assertFalse(result.bilateral_complete)
+
     def test_fine_rays_sweep_from_current_bearing_without_changing_set(self):
         rig = RecordingTransitionRig()
         request = build_scan_request(

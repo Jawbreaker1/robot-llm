@@ -11,6 +11,10 @@ from dataclasses import dataclass
 import math
 from typing import Mapping, MutableMapping, Optional, Tuple
 
+from .active_ir_scan_contract import (
+    NEGATIVE_SIDE_PROBE_OFFSETS_MDEG,
+    POSITIVE_SIDE_PROBE_OFFSETS_MDEG,
+)
 from .local_detour_controller import (
     SYNC_INACTIVE,
     SYNC_REBUILT,
@@ -62,10 +66,11 @@ ROUTE_EXECUTION_REASONS = frozenset((
     ROUTE_EXECUTION_REASON_COMPLETE,
     ROUTE_EXECUTION_REASON_DEADLINE,
 )).union(ROUTE_EXECUTION_REPLAN_REASONS)
-PASS_HEADING_TRIM_MDEG = 15_000
-PASS_HEADING_TRIM_DELTAS = {
-    "LEFT_OF_GOAL": PASS_HEADING_TRIM_MDEG,
-    "RIGHT_OF_GOAL": -PASS_HEADING_TRIM_MDEG,
+PASS_SIDE_PROBE_OFFSETS_MDEG = {
+    # The route side names where the robot travels.  Probe the opposite,
+    # obstacle-facing side and leave the route choice untouched.
+    "LEFT_OF_GOAL": NEGATIVE_SIDE_PROBE_OFFSETS_MDEG,
+    "RIGHT_OF_GOAL": POSITIVE_SIDE_PROBE_OFFSETS_MDEG,
 }
 
 
@@ -648,20 +653,18 @@ class PhysicalNavigationRouteRuntimeMixin:
                 guidance=_guidance_summary(guidance),
                 host_selected_route_or_side=False,
             )
-            pass_heading_trim_eligible = (
+            pass_side_probe_eligible = (
                 action == ADVANCE
                 and waypoint_kind == PASS_BEYOND_TARGET
                 and current_route.route_id
-                not in self._pass_heading_trim_attempted_route_ids
+                not in self._pass_side_probe_attempted_route_ids
             )
-            if pass_heading_trim_eligible:
-                self._pass_heading_trim_attempted_route_ids.add(
-                    current_route.route_id
-                )
+            hazard_ids_before_motion = frozenset(
+                self.memory.hazard_map.hazard_ids
+            )
             next_observation, current_tool_result = self._execute_motion(
                 action,
                 action_specs=action_specs,
-                defer_infrared_hazard=pass_heading_trim_eligible,
             )
             executed_actions.append(action)
             current_observation = next_observation
@@ -675,13 +678,33 @@ class PhysicalNavigationRouteRuntimeMixin:
             )
             if current_tool_result.get("status") != "completed":
                 if (
-                    pass_heading_trim_eligible
+                    pass_side_probe_eligible
                     and current_tool_result.get("reason")
                     == "infrared_blocked"
                 ):
+                    new_hazard_ids = sorted(
+                        set(self.memory.hazard_map.hazard_ids)
+                        - hazard_ids_before_motion
+                    )
+                    if new_hazard_ids:
+                        return self._route_runtime_result(
+                            observation=current_observation,
+                            route=current_route,
+                            last_tool_result=current_tool_result,
+                            actions=executed_actions,
+                            outcome=EXECUTION_REPLAN,
+                            reason_code=(
+                                ROUTE_EXECUTION_REASON_REPLAN_REQUIRED
+                            ),
+                            detail={
+                                "action": action,
+                                "reason": "NEW_FRONT_HAZARD_DETECTED",
+                                "new_hazard_ids": new_hazard_ids,
+                            },
+                        )
                     if self._route_deadline_elapsed(
                         deadline,
-                        "before_pass_heading_trim",
+                        "before_pass_side_probe",
                     ):
                         return self._route_runtime_result(
                             observation=current_observation,
@@ -692,30 +715,61 @@ class PhysicalNavigationRouteRuntimeMixin:
                             reason_code=ROUTE_EXECUTION_REASON_DEADLINE,
                             detail={"action": action},
                         )
+                    if not self._scan_budget_allows(
+                        current_observation,
+                        action_specs,
+                        deadline,
+                    ):
+                        return self._route_runtime_result(
+                            observation=current_observation,
+                            route=current_route,
+                            last_tool_result=current_tool_result,
+                            actions=executed_actions,
+                            outcome=EXECUTION_REPLAN,
+                            reason_code=(
+                                ROUTE_EXECUTION_REASON_REPLAN_REQUIRED
+                            ),
+                            detail={
+                                "action": action,
+                                "reason": "SIDE_PROBE_BUDGET_UNAVAILABLE",
+                            },
+                        )
                     interrupted_motion = deepcopy(current_tool_result)
-                    relative_delta_mdeg = PASS_HEADING_TRIM_DELTAS[
+                    self._pass_side_probe_attempted_route_ids.add(
+                        current_route.route_id
+                    )
+                    probe_offsets_mdeg = PASS_SIDE_PROBE_OFFSETS_MDEG[
                         current_route.detour_side
                     ]
                     (
                         current_observation,
-                        heading_trim,
-                    ) = self._execute_pass_heading_trim(
+                        side_probe,
+                    ) = self._execute_pass_side_probe(
                         observation=current_observation,
-                        relative_delta_mdeg=relative_delta_mdeg,
+                        deadline=deadline,
+                        target_hypothesis_id=(
+                            current_route.target_hypothesis_id
+                        ),
+                        probe_offsets_mdeg=probe_offsets_mdeg,
                     )
                     if (
-                        not isinstance(heading_trim, Mapping)
-                        or heading_trim.get("status")
-                        not in ("completed", "blocked", "failed")
-                        or type(heading_trim.get("opening_clear")) is not bool
+                        not isinstance(side_probe, Mapping)
+                        or side_probe.get("status") not in (
+                            "confirmed",
+                            "clear",
+                            "no_spatial_progress",
+                            "failed",
+                        )
+                        or type(side_probe.get("target_confirmed")) is not bool
+                        or type(side_probe.get("new_spatial_support")) is not bool
                     ):
                         raise PhysicalNavigationRouteRuntimeError(
-                            "pass heading trim result is invalid"
+                            "pass side probe result is invalid"
                         )
-                    current_tool_result = deepcopy(dict(heading_trim))
+                    current_tool_result = deepcopy(dict(side_probe))
                     current_tool_result.setdefault(
                         "operation",
-                        "pass_heading_trim",
+                        "pass_side_probe",
                     )
                     current_tool_result["trigger_motion"] = (
                         interrupted_motion
@@ -727,30 +781,37 @@ class PhysicalNavigationRouteRuntimeMixin:
                         False
                     )
                     self._emit(
-                        "local_detour_pass_heading_trimmed",
+                        "local_detour_pass_side_probed",
                         route=_route_summary(current_route),
-                        relative_delta_mdeg=relative_delta_mdeg,
+                        probe_offsets_mdeg=list(probe_offsets_mdeg),
                         result=deepcopy(current_tool_result),
                         host_selected_route_or_side=False,
                     )
                     if (
-                        current_tool_result["status"] == "completed"
-                        and current_tool_result["opening_clear"] is True
+                        current_tool_result["status"] == "confirmed"
+                        and current_tool_result["target_confirmed"] is True
+                        and current_tool_result["new_spatial_support"] is True
                     ):
                         continue
+                    reason_code = (
+                        ROUTE_EXECUTION_REASON_REPLAN_REQUIRED
+                        if current_tool_result["status"] in (
+                            "clear",
+                            "no_spatial_progress",
+                        )
+                        else ROUTE_EXECUTION_REASON_MOTION_INCOMPLETE
+                    )
                     return self._route_runtime_result(
                         observation=current_observation,
                         route=current_route,
                         last_tool_result=current_tool_result,
                         actions=executed_actions,
                         outcome=EXECUTION_REPLAN,
-                        reason_code=(
-                            ROUTE_EXECUTION_REASON_MOTION_INCOMPLETE
-                        ),
+                        reason_code=reason_code,
                         detail={
                             "action": action,
-                            "pass_heading_trim": deepcopy(
-                                dict(heading_trim)
+                            "pass_side_probe": deepcopy(
+                                dict(side_probe)
                             ),
                         },
                     )
@@ -775,7 +836,7 @@ __all__ = (
     "PhysicalNavigationRouteRuntimeMixin",
     "PhysicalNavigationRouteRefresh",
     "PhysicalNavigationRouteRuntimeResult",
-    "PASS_HEADING_TRIM_MDEG",
+    "PASS_SIDE_PROBE_OFFSETS_MDEG",
     "ROUTE_EXECUTION_REASON_COMPLETE",
     "ROUTE_EXECUTION_REASON_DEADLINE",
     "ROUTE_EXECUTION_REASON_INVALID",
