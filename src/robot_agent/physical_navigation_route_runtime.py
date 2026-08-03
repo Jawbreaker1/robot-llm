@@ -12,10 +12,7 @@ import math
 from typing import Mapping, MutableMapping, Optional, Tuple
 
 from .local_detour_controller import (
-    SYNC_ADVANCED,
-    SYNC_COMPLETED,
     SYNC_INACTIVE,
-    SYNC_REBUILT,
     SYNC_UNCHANGED,
     LocalDetourGuidance,
     derive_local_detour_guidance,
@@ -465,59 +462,12 @@ class PhysicalNavigationRouteRuntimeMixin:
                 navigation=navigation,
                 action_specs=action_specs,
             )
+            previous_route_id = current_route.route_id
             current_route = refreshed.route
-            if refreshed.sync_event == SYNC_COMPLETED:
-                return self._route_runtime_result(
-                    observation=current_observation,
-                    route=current_route,
-                    last_tool_result=current_tool_result,
-                    actions=executed_actions,
-                    outcome=EXECUTION_COMPLETE,
-                    reason_code=ROUTE_EXECUTION_REASON_COMPLETE,
-                )
-            if refreshed.sync_event == SYNC_REBUILT:
-                return self._route_runtime_result(
-                    observation=current_observation,
-                    route=current_route,
-                    last_tool_result=current_tool_result,
-                    actions=executed_actions,
-                    outcome=EXECUTION_REPLAN,
-                    reason_code=ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
-                    detail={
-                        "sync_event": refreshed.sync_event,
-                        "reason": refreshed.sync_reason,
-                    },
-                )
-            if refreshed.sync_event not in (SYNC_UNCHANGED, SYNC_ADVANCED):
-                reason = (
-                    ROUTE_EXECUTION_REASON_MISSING
-                    if current_route is None
-                    else ROUTE_EXECUTION_REASON_INVALID
-                    if current_route.status == ROUTE_INVALID
-                    else ROUTE_EXECUTION_REASON_REPLAN_REQUIRED
-                )
-                return self._route_runtime_result(
-                    observation=current_observation,
-                    route=current_route,
-                    last_tool_result=current_tool_result,
-                    actions=executed_actions,
-                    outcome=EXECUTION_REPLAN,
-                    reason_code=reason,
-                    detail={
-                        "sync_event": refreshed.sync_event,
-                        "reason": refreshed.sync_reason,
-                    },
-                )
-            guidance = refreshed.guidance
-            if current_route is not None and current_route.status == ROUTE_COMPLETE:
-                return self._route_runtime_result(
-                    observation=current_observation,
-                    route=current_route,
-                    last_tool_result=current_tool_result,
-                    actions=executed_actions,
-                    outcome=EXECUTION_COMPLETE,
-                    reason_code=ROUTE_EXECUTION_REASON_COMPLETE,
-                )
+            transition_detail = {
+                "sync_event": refreshed.sync_event,
+                "reason": refreshed.sync_reason,
+            }
             if current_route is None:
                 return self._route_runtime_result(
                     observation=current_observation,
@@ -526,6 +476,16 @@ class PhysicalNavigationRouteRuntimeMixin:
                     actions=executed_actions,
                     outcome=EXECUTION_REPLAN,
                     reason_code=ROUTE_EXECUTION_REASON_MISSING,
+                    detail=transition_detail,
+                )
+            if current_route.status == ROUTE_COMPLETE:
+                return self._route_runtime_result(
+                    observation=current_observation,
+                    route=current_route,
+                    last_tool_result=current_tool_result,
+                    actions=executed_actions,
+                    outcome=EXECUTION_COMPLETE,
+                    reason_code=ROUTE_EXECUTION_REASON_COMPLETE,
                 )
             if current_route.status == ROUTE_INVALID:
                 return self._route_runtime_result(
@@ -535,8 +495,20 @@ class PhysicalNavigationRouteRuntimeMixin:
                     actions=executed_actions,
                     outcome=EXECUTION_REPLAN,
                     reason_code=ROUTE_EXECUTION_REASON_INVALID,
+                    detail=transition_detail,
+                )
+            if current_route.route_id != previous_route_id:
+                return self._route_runtime_result(
+                    observation=current_observation,
+                    route=current_route,
+                    last_tool_result=current_tool_result,
+                    actions=executed_actions,
+                    outcome=EXECUTION_REPLAN,
+                    reason_code=ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
+                    detail=transition_detail,
                 )
 
+            guidance = refreshed.guidance
             allowed = guidance.allowed_motion_actions
             if allowed is None or len(allowed) != 1:
                 return self._route_runtime_result(

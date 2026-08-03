@@ -1,7 +1,10 @@
 from collections import deque
+from dataclasses import replace
 import unittest
 
 from robot_agent.local_detour_controller import (
+    SYNC_REBUILT,
+    SYNC_UNCHANGED,
     synchronize_local_detour_route,
 )
 from robot_agent.local_detour_route import ROUTE_COMPLETE, ROUTE_INVALID
@@ -318,6 +321,27 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
             host.navigations[-1]["local_detour_guidance"],
         )
 
+    def test_sync_event_is_diagnostic_for_an_unchanged_active_route(self):
+        host = RouteRuntimeHost()
+        original_refresh = host._refresh_authorized_local_detour_route
+
+        def refresh_with_misleading_event(**arguments):
+            refreshed = original_refresh(**arguments)
+            return replace(
+                refreshed,
+                sync_event=SYNC_REBUILT,
+                sync_reason="TEST_DIAGNOSTIC_ONLY",
+            )
+
+        host._refresh_authorized_local_detour_route = (
+            refresh_with_misleading_event
+        )
+
+        result = execute(host, active_route())
+
+        self.assertEqual(result.outcome, EXECUTION_COMPLETE)
+        self.assertGreater(len(result.actions), 4)
+
     def test_missing_or_invalid_route_never_reaches_goal_state(self):
         host = RouteRuntimeHost()
         missing = execute(host, None)
@@ -450,6 +474,17 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
             )
 
         host.after_motion = expand_target
+        original_refresh = host._refresh_authorized_local_detour_route
+
+        def refresh_without_rebuild_signal(**arguments):
+            refreshed = original_refresh(**arguments)
+            if refreshed.sync_event == SYNC_REBUILT:
+                return replace(refreshed, sync_event=SYNC_UNCHANGED)
+            return refreshed
+
+        host._refresh_authorized_local_detour_route = (
+            refresh_without_rebuild_signal
+        )
 
         result = execute(host, original)
 
