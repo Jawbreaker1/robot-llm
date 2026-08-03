@@ -19,12 +19,13 @@ from .local_detour_controller import (
     synchronize_local_detour_route,
 )
 from .local_detour_route import (
+    PASS_BEYOND_TARGET,
     ROUTE_ACTIVE,
     ROUTE_COMPLETE,
     ROUTE_INVALID,
     LocalDetourRoute,
 )
-from .physical_navigation_contract import MOTION_ACTIONS
+from .physical_navigation_contract import ADVANCE, MOTION_ACTIONS
 from .physical_navigation_experience import ROUTE_EXECUTOR_ACTION_SOURCE
 from .physical_navigation_mission import DirectionalMission
 
@@ -60,6 +61,11 @@ ROUTE_EXECUTION_REASONS = frozenset((
     ROUTE_EXECUTION_REASON_COMPLETE,
     ROUTE_EXECUTION_REASON_DEADLINE,
 )).union(ROUTE_EXECUTION_REPLAN_REASONS)
+PASS_HEADING_TRIM_MDEG = 15_000
+PASS_HEADING_TRIM_DELTAS = {
+    "LEFT_OF_GOAL": PASS_HEADING_TRIM_MDEG,
+    "RIGHT_OF_GOAL": -PASS_HEADING_TRIM_MDEG,
+}
 
 
 def _valid_execution_outcome_reason(outcome, reason_code) -> bool:
@@ -509,6 +515,7 @@ class PhysicalNavigationRouteRuntimeMixin:
                 )
 
             guidance = refreshed.guidance
+            waypoint_kind = guidance.active_waypoint_kind
             allowed = guidance.allowed_motion_actions
             if allowed is None or len(allowed) != 1:
                 return self._route_runtime_result(
@@ -579,9 +586,20 @@ class PhysicalNavigationRouteRuntimeMixin:
                 guidance=_guidance_summary(guidance),
                 host_selected_route_or_side=False,
             )
+            pass_heading_trim_eligible = (
+                action == ADVANCE
+                and waypoint_kind == PASS_BEYOND_TARGET
+                and current_route.route_id
+                not in self._pass_heading_trim_attempted_route_ids
+            )
+            if pass_heading_trim_eligible:
+                self._pass_heading_trim_attempted_route_ids.add(
+                    current_route.route_id
+                )
             next_observation, current_tool_result = self._execute_motion(
                 action,
                 action_specs=action_specs,
+                defer_infrared_hazard=pass_heading_trim_eligible,
             )
             executed_actions.append(action)
             current_observation = next_observation
@@ -594,6 +612,86 @@ class PhysicalNavigationRouteRuntimeMixin:
                 observation_after=current_observation,
             )
             if current_tool_result.get("status") != "completed":
+                if (
+                    pass_heading_trim_eligible
+                    and current_tool_result.get("reason")
+                    == "infrared_blocked"
+                ):
+                    if self._route_deadline_elapsed(
+                        deadline,
+                        "before_pass_heading_trim",
+                    ):
+                        return self._route_runtime_result(
+                            observation=current_observation,
+                            route=current_route,
+                            last_tool_result=current_tool_result,
+                            actions=executed_actions,
+                            outcome=EXECUTION_FAILED,
+                            reason_code=ROUTE_EXECUTION_REASON_DEADLINE,
+                            detail={"action": action},
+                        )
+                    interrupted_motion = deepcopy(current_tool_result)
+                    relative_delta_mdeg = PASS_HEADING_TRIM_DELTAS[
+                        current_route.detour_side
+                    ]
+                    (
+                        current_observation,
+                        heading_trim,
+                    ) = self._execute_pass_heading_trim(
+                        observation=current_observation,
+                        relative_delta_mdeg=relative_delta_mdeg,
+                    )
+                    if (
+                        not isinstance(heading_trim, Mapping)
+                        or heading_trim.get("status")
+                        not in ("completed", "blocked", "failed")
+                        or type(heading_trim.get("opening_clear")) is not bool
+                    ):
+                        raise PhysicalNavigationRouteRuntimeError(
+                            "pass heading trim result is invalid"
+                        )
+                    current_tool_result = deepcopy(dict(heading_trim))
+                    current_tool_result.setdefault(
+                        "operation",
+                        "pass_heading_trim",
+                    )
+                    current_tool_result["trigger_motion"] = (
+                        interrupted_motion
+                    )
+                    current_tool_result["target_hypothesis_id"] = (
+                        current_route.target_hypothesis_id
+                    )
+                    current_tool_result["host_selected_route_or_side"] = (
+                        False
+                    )
+                    self._emit(
+                        "local_detour_pass_heading_trimmed",
+                        route=_route_summary(current_route),
+                        relative_delta_mdeg=relative_delta_mdeg,
+                        result=deepcopy(current_tool_result),
+                        host_selected_route_or_side=False,
+                    )
+                    if (
+                        current_tool_result["status"] == "completed"
+                        and current_tool_result["opening_clear"] is True
+                    ):
+                        continue
+                    return self._route_runtime_result(
+                        observation=current_observation,
+                        route=current_route,
+                        last_tool_result=current_tool_result,
+                        actions=executed_actions,
+                        outcome=EXECUTION_REPLAN,
+                        reason_code=(
+                            ROUTE_EXECUTION_REASON_MOTION_INCOMPLETE
+                        ),
+                        detail={
+                            "action": action,
+                            "pass_heading_trim": deepcopy(
+                                dict(heading_trim)
+                            ),
+                        },
+                    )
                 return self._route_runtime_result(
                     observation=current_observation,
                     route=current_route,
@@ -615,6 +713,7 @@ __all__ = (
     "PhysicalNavigationRouteRuntimeMixin",
     "PhysicalNavigationRouteRefresh",
     "PhysicalNavigationRouteRuntimeResult",
+    "PASS_HEADING_TRIM_MDEG",
     "ROUTE_EXECUTION_REASON_COMPLETE",
     "ROUTE_EXECUTION_REASON_DEADLINE",
     "ROUTE_EXECUTION_REASON_INVALID",

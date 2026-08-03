@@ -44,14 +44,14 @@
       "evidence": "Linear scale is the current EV3RSTORM dead-reckoning estimate; turn scale is the rounded 90000 mdeg / 682 encoder-degree live calibration"
     },
     "physical_footprint": {
-      "status": "provisional-unmeasured-operator-observed",
+      "status": "operator-measured-current-build",
       "reference_point": "differential-drive-origin",
       "front_extent_mm": 110,
       "rear_extent_mm": 90,
-      "left_extent_mm": 105,
-      "right_extent_mm": 160,
+      "left_extent_mm": 100,
+      "right_extent_mm": 130,
       "clearance_margin_mm": 10,
-      "evidence": "The assembled right arm contacted the obstacle during an in-place scan; extents remain conservative until physically measured"
+      "evidence": "Measured on the current EV3RSTORM build without the removable propeller: 100 mm left and 130 mm right from the differential-drive origin"
     },
     "turn_in_place": {
       "status": "single-visual-estimate",
@@ -66,6 +66,7 @@
       "status": "provisional-static-and-motor-free-dynamic-evidence",
       "mode": "IR-PROX",
       "meaning": "relative reflection/proximity evidence, not distance or clearance",
+      "provisional_hazard_offset_mm": 210,
       "zones": {
         "strong_return_max": 16,
         "near_return_max": 35,

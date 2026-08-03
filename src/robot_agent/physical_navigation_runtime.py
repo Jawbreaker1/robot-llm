@@ -69,6 +69,8 @@ from .physical_navigation_contract import (
     OBSERVE,
     REVERSE,
     SCAN_FRONT_ARC,
+    SCAN_SAMPLE_OPERATION,
+    SCAN_TURN_OPERATION,
     NavigationDecision,
     PhysicalNavigationContractError,
     expected_scan_turn_profile,
@@ -77,9 +79,11 @@ from .physical_navigation_contract import (
     validate_observation,
 )
 from .physical_navigation_mission import DirectionalMission
+from .physical_navigation_motion_runtime import (
+    PhysicalNavigationMotionRuntimeMixin,
+)
 from .physical_odometry import (
     DriveMotorRoles,
-    verified_motion_from_result,
 )
 
 DEFAULT_MAX_TURNS = 14
@@ -211,6 +215,7 @@ class PhysicalNavigationResult:
 
 
 class PhysicalNavigationRuntime(
+    PhysicalNavigationMotionRuntimeMixin,
     PhysicalNavigationRouteRuntimeMixin,
     PhysicalNavigationPlanTailRuntimeMixin,
     PhysicalNavigationScanRuntimeMixin,
@@ -304,6 +309,7 @@ class PhysicalNavigationRuntime(
         self._recent_committed_utterances = deque(
             maxlen=MAX_RECENT_COMMITTED_UTTERANCES
         )
+        self._pass_heading_trim_attempted_route_ids = set()
         self._restored_scan_progress_barriers = {}
         self._experience_ledger = NavigationExperienceLedger(
             episode_id=episode_id,
@@ -481,6 +487,13 @@ class PhysicalNavigationRuntime(
         self._raise_if_cancelled(
             "immediately_before_{}_request".format(operation)
         )
+        physical_motion_operation = operation in (
+            "pulse",
+            SCAN_TURN_OPERATION,
+        )
+        cancellable_operation = physical_motion_operation or (
+            operation == SCAN_SAMPLE_OPERATION
+        )
         try:
             response = self.transport.request(
                 operation,
@@ -491,7 +504,7 @@ class PhysicalNavigationRuntime(
                 # finish their bounded response after STOP, preserving the
                 # channel long enough to obtain the verified shutdown receipt.
                 cancel_requested=(
-                    self._cancelled if operation == "pulse" else None
+                    self._cancelled if cancellable_operation else None
                 ),
             )
         except Exception:
@@ -502,7 +515,7 @@ class PhysicalNavigationRuntime(
             # closed, so without its correlated encoder receipt the persisted
             # pose is no longer trustworthy.
             if (
-                operation == "pulse"
+                physical_motion_operation
                 and self._cancelled()
                 and self.memory.localization_valid
             ):
@@ -515,7 +528,7 @@ class PhysicalNavigationRuntime(
         # If cancellation raced with a response that is already complete, let
         # the caller consume that stopped, validated encoder receipt.  The next
         # cancellation boundary will prevent any later physical action.
-        if operation == "pulse" and self._cancelled():
+        if cancellable_operation and self._cancelled():
             return response
         self._raise_if_cancelled("after_{}_request".format(operation))
         return response
@@ -660,6 +673,10 @@ class PhysicalNavigationRuntime(
                     "pulse_outcome_mismatch",
                     "Pulse observation lacks its correlated outcome",
                 )
+        elif operation in (SCAN_TURN_OPERATION, SCAN_SAMPLE_OPERATION):
+            # EV3NavigationSSHTransport has already validated the complete
+            # operation-specific receipt. Accept only its correlated snapshot.
+            observation = validate_observation(result.get("observation"))
         else:
             raise PhysicalNavigationRuntimeError(
                 "invalid_observation_operation",
@@ -1048,66 +1065,6 @@ class PhysicalNavigationRuntime(
                     validation_feedback=feedback,
                 )
         return None, feedback
-
-    def _execute_motion(
-        self,
-        action: str,
-        *,
-        action_specs: Mapping[str, Mapping[str, object]],
-    ) -> Tuple[Mapping[str, object], Mapping[str, object]]:
-        self._raise_if_cancelled("immediately_before_motion")
-        response = self._active_request(
-            "pulse",
-            {"action": action},
-            self.config.request_timeout_seconds,
-        )
-        observation = self._observation_from_response(
-            "pulse",
-            response,
-            action,
-        )
-        result = response["result"]
-        motion = verified_motion_from_result(
-            action,
-            result,
-            self.memory.drive_roles,
-        )
-        captured_at_ms = self.unix_ms()
-        try:
-            self.memory.apply_motion_result(
-                action,
-                result,
-                captured_at_ms,
-            )
-        except Exception:
-            self._offer_invalid_localization(
-                captured_at_ms=captured_at_ms,
-                publication_stage="motion_result_invalidated",
-                observation=observation,
-            )
-            raise
-        self._offer_observation(
-            observation,
-            captured_at_ms=captured_at_ms,
-            publication_stage="motion_result",
-        )
-        outcome = result["outcome"]
-        feedback = {
-            "operation": "pulse",
-            "requested_action": action,
-            "status": outcome["status"],
-            "reason": outcome["reason"],
-            "worker_response_state_version": response["state_version"],
-            "encoder_observation": motion.to_dict(),
-            "resulting_pose": self.memory.pose.to_dict(),
-        }
-        self._emit(
-            "motion_result",
-            action=action,
-            outcome=deepcopy(outcome),
-            navigation=self.memory.context(),
-        )
-        return observation, feedback
 
     @staticmethod
     def _transport_is_valid(transport) -> bool:

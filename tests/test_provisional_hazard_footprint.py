@@ -317,7 +317,7 @@ class ProvisionalHazardFootprintTests(unittest.TestCase):
             alignment_tolerance_mdeg=10_000,
         )
         backed_scan = map_value.validate_in_place_rotation(
-            PhysicalPose(x_mm=-180),
+            PhysicalPose(x_mm=-58),
             (-60_000, 0, 60_000),
             alignment_tolerance_mdeg=10_000,
         )
@@ -327,7 +327,7 @@ class ProvisionalHazardFootprintTests(unittest.TestCase):
         self.assertFalse(close_scan["allowed"])
         self.assertTrue(backed_scan["allowed"])
 
-    def test_ev3_profile_injects_operator_observed_asymmetric_geometry(self):
+    def test_ev3_profile_injects_operator_measured_asymmetric_geometry(self):
         profile = EV3RSTORMProfile()
         footprint = profile.hazard_calibration.robot_footprint
 
@@ -359,10 +359,10 @@ class ProvisionalHazardFootprintTests(unittest.TestCase):
             memory.context()["collision_geometry"][
                 "calibration_status"
             ],
-            "provisional-unmeasured-operator-observed",
+            "operator-measured-current-build",
         )
         self.assertIn(
-            "right arm contacted",
+            "100 mm left and 130 mm right",
             memory.context()["collision_geometry"][
                 "calibration_evidence"
             ],

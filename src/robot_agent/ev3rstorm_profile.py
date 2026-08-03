@@ -169,7 +169,10 @@ def _physical_footprint(value: object) -> Optional[RobotFootprint]:
         )
     if (
         value["status"]
-        != "provisional-unmeasured-operator-observed"
+        not in {
+            "provisional-unmeasured-operator-observed",
+            "operator-measured-current-build",
+        }
         or value["reference_point"] != "differential-drive-origin"
         or not isinstance(value["evidence"], str)
         or not value["evidence"]
@@ -225,6 +228,25 @@ def _odometry_calibration(value: object) -> OdometryCalibration:
         raise ControllerRuntimeProfileError(
             "EV3RSTORM odometry calibration is invalid"
         ) from error
+
+
+def _provisional_hazard_offset(value: object) -> int:
+    # Existing schema-v1 copies predate this host-side map calibration.
+    # Preserve their former HazardMapCalibration default until explicitly
+    # measured, while the checked-in EV3 profile supplies live evidence.
+    offset = value.get("provisional_hazard_offset_mm", 140) if isinstance(
+        value,
+        dict,
+    ) else None
+    if (
+        isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or not 50 <= offset <= 1_000
+    ):
+        raise ControllerRuntimeProfileError(
+            "EV3RSTORM provisional hazard offset is invalid"
+        )
+    return offset
 
 
 def _load_profile_config(path: Path):
@@ -283,7 +305,17 @@ def _load_profile_config(path: Path):
         calibration.get("physical_footprint")
     )
     odometry = _odometry_calibration(calibration.get("odometry"))
-    return resolved, robot_id, controller_id, footprint, odometry
+    hazard_offset = _provisional_hazard_offset(
+        calibration.get("infrared_proximity")
+    )
+    return (
+        resolved,
+        robot_id,
+        controller_id,
+        footprint,
+        odometry,
+        hazard_offset,
+    )
 
 
 @dataclass(frozen=True)
@@ -346,10 +378,12 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             controller_id,
             footprint,
             odometry,
+            hazard_offset,
         ) = _load_profile_config(config_path)
         self.config_path = resolved
         self.speech_profile = speech_profile
         self.hazard_calibration = HazardMapCalibration(
+            provisional_hazard_offset_mm=hazard_offset,
             robot_footprint=footprint,
         )
         self.odometry_calibration = odometry

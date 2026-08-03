@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -48,6 +49,10 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                 turn_mdeg_per_opposed_encoder_degree=132,
             ),
         )
+        self.assertEqual(
+            self.profile.hazard_calibration.provisional_hazard_offset_mm,
+            210,
+        )
 
     def test_worker_lifetime_can_cover_default_plan_scan_and_reanchor(self):
         # Dashboard planner (30 s) + EV3 scan (80 s) + post-scan request
@@ -59,6 +64,21 @@ class EV3RSTORMProfileTests(unittest.TestCase):
             + 2.0
         )
         self.assertGreaterEqual(MAX_PROCESS_SECONDS, required_seconds)
+
+    def test_legacy_schema_v1_config_keeps_prior_hazard_offset(self):
+        config = json.loads(self.profile.config_path.read_text("utf-8"))
+        del config["calibration"]["infrared_proximity"][
+            "provisional_hazard_offset_mm"
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            legacy = EV3RSTORMProfile(path)
+
+        self.assertEqual(
+            legacy.hazard_calibration.provisional_hazard_offset_mm,
+            140,
+        )
 
     def test_binding_validates_location_without_contacting_it(self):
         with tempfile.TemporaryDirectory() as directory:

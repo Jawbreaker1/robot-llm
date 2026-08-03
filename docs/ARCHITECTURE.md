@@ -226,11 +226,17 @@ den aktuella kartan för att fånga TOCTOU-förändringar.
 
 EV3RSTORM-profilen använder en asymmetrisk rektangel runt
 differential-drive-origo med separata extents fram, bak, vänster och höger.
-Högersidan är större eftersom den monterade armen observerades träffa
-testlådan. Både translation och rotation validerar hela den interpolerade
-svepta kroppen med marginal, inte bara mittpunkten eller IR-strålen. Profilen
-är märkt `provisional-unmeasured-operator-observed`; dashboardens kontur är
-konfigurerad geometri och får inte presenteras som en känd fysisk kontaktyta.
+Den aktuella konfigurationen utan den löstagbara propellern är operatörsmätt
+till 100 mm vänster och 130 mm höger från differential-drive-origo. Både
+translation och rotation validerar hela den interpolerade svepta kroppen med
+marginal, inte bara mittpunkten eller IR-strålen. Dashboardens kontur är
+fortfarande konfigurerad geometri och inte en kontinuerligt uppmätt fysisk
+kontaktyta.
+
+EV3-profilens provisoriska hindercentrum ligger 210 mm framför drivorigo.
+Värdet kommer från liveförsöket där lådans yta låg cirka 137 mm framför
+IR-sensorn när hindret låstes, plus kartans 70 mm hinderzon. Det är fortfarande
+ett kvalitativt ankare, inte ett påstående om att IR-värdet är metrisk distans.
 
 Varje återställd aktiv scan kan sparas på hinderhypotesen med:
 

@@ -935,6 +935,47 @@ class PhysicalMemoryAndMapTests(unittest.TestCase):
                 )
             self.assertFalse(memory.localization_valid)
 
+    def test_episode_start_adopts_one_degree_encoder_settling(self):
+        self.memory.begin_episode(observation(1), 1_001)
+
+        self.memory.begin_episode(
+            observation(
+                2,
+                left_position=-1,
+                right_position=1,
+            ),
+            1_002,
+        )
+
+        self.assertTrue(self.memory.localization_valid)
+        self.assertEqual(
+            self.memory.motor_positions,
+            {"left_drive": -1, "right_drive": 1},
+        )
+        self.assertEqual(self.memory.pose, PhysicalPose())
+
+    def test_episode_start_rejects_two_degree_encoder_change(self):
+        self.memory.begin_episode(observation(1), 1_001)
+
+        with self.assertRaises(NavigationMemoryError):
+            self.memory.begin_episode(
+                observation(2, left_position=2),
+                1_002,
+            )
+
+        self.assertFalse(self.memory.localization_valid)
+
+    def test_stationary_observation_still_rejects_one_degree_change(self):
+        self.memory.begin_episode(observation(1), 1_001)
+
+        with self.assertRaises(NavigationMemoryError):
+            self.memory.ingest_stationary_observation(
+                observation(2, right_position=1),
+                1_002,
+            )
+
+        self.assertFalse(self.memory.localization_valid)
+
     def test_clean_undertravel_updates_arc_pose_and_keeps_localization(self):
         self.memory.begin_episode(observation(1), 1_001)
         result = degraded_motion_result()
@@ -949,6 +990,73 @@ class PhysicalMemoryAndMapTests(unittest.TestCase):
             self.memory.motor_positions,
             {"left_drive": 174, "right_drive": 0},
         )
+
+    def test_motion_can_defer_one_ambiguous_hazard_observation(self):
+        self.memory.begin_episode(observation(1), 1_001)
+        result = degraded_motion_result()
+        result["observation"]["infrared"] = observation(
+            2,
+            blocked=True,
+        )["infrared"]
+
+        hazard = self.memory.apply_motion_result(
+            ADVANCE,
+            result,
+            1_002,
+            record_hazard_evidence=False,
+        )
+
+        self.assertIsNone(hazard)
+        self.assertEqual(self.memory.hazard_map.hazard_ids, ())
+        self.assertEqual(self.memory.pose.x_mm, 30)
+        self.assertEqual(self.memory.pose.y_mm, -3)
+        self.assertEqual(self.memory.pose.heading_mdeg, -11_484)
+        self.assertEqual(
+            self.memory.motor_positions,
+            {"left_drive": 174, "right_drive": 0},
+        )
+
+    def test_heading_trim_preserves_route_pose_and_adopts_encoders(self):
+        self.memory.begin_episode(observation(1), 1_001)
+        self.memory.pose = PhysicalPose(
+            x_mm=169,
+            y_mm=-334,
+            heading_mdeg=-3_894,
+        )
+        preserved_pose = self.memory.pose
+
+        hazard = self.memory.ingest_verified_heading_trim(
+            observation(
+                3,
+                left_position=114,
+                right_position=-113,
+            ),
+            1_003,
+        )
+
+        self.assertIsNone(hazard)
+        self.assertEqual(self.memory.pose, preserved_pose)
+        self.assertEqual(
+            self.memory.motor_positions,
+            {"left_drive": 114, "right_drive": -113},
+        )
+        self.assertEqual(self.memory.hazard_map.hazard_ids, ())
+
+    def test_blocked_heading_trim_sample_becomes_fresh_hazard_evidence(self):
+        self.memory.begin_episode(observation(1), 1_001)
+
+        hazard = self.memory.ingest_verified_heading_trim(
+            observation(
+                3,
+                blocked=True,
+                left_position=-114,
+                right_position=113,
+            ),
+            1_003,
+        )
+
+        self.assertIsNotNone(hazard)
+        self.assertEqual(len(self.memory.hazard_map.hazard_ids), 1)
 
 
 class PhysicalOdometryEvidenceTests(unittest.TestCase):
@@ -2261,6 +2369,80 @@ class FakeRuntimeTransport:
         self.calls.append(("close", None))
 
 
+class HeadingTrimTransport(FakeRuntimeTransport):
+    def __init__(self, *, blocked_after_trim=False):
+        super().__init__(blocked=False)
+        self.blocked_after_trim = blocked_after_trim
+        self.cancellation_callbacks = []
+        self.last_turn_outcome = None
+
+    def request(
+        self,
+        operation,
+        arguments,
+        timeout,
+        cancel_requested=None,
+    ):
+        if operation not in ("scan_turn", "scan_sample"):
+            return super().request(
+                operation,
+                arguments,
+                timeout,
+                cancel_requested=cancel_requested,
+            )
+        self.calls.append((operation, copy.deepcopy(arguments)))
+        self.cancellation_callbacks.append(cancel_requested)
+        if not callable(cancel_requested):
+            raise AssertionError(
+                "heading trim operation lacked cancellation callback"
+            )
+        self.version += 1
+        if operation == "scan_turn":
+            relative = arguments["relative_delta_mdeg"]
+            direction = 1 if relative > 0 else -1
+            left_delta = -direction * 114
+            right_delta = direction * 114
+            self.left += left_delta
+            self.right += right_delta
+            outcome = {
+                "kind": "scan_turn",
+                "requested_relative_delta_mdeg": relative,
+                "status": "completed",
+                "reason": "scan_turn_completed",
+                "stop_confirmed": True,
+                "encoder_verification": {
+                    "passed": True,
+                    "left_delta_degrees": left_delta,
+                    "right_delta_degrees": right_delta,
+                },
+            }
+            self.last_turn_outcome = outcome
+            return {
+                "state_version": self.version,
+                "result": {
+                    "relative_delta_mdeg": relative,
+                    "outcome": outcome,
+                    "observation": self._observation(outcome),
+                    "stop": stop_proof(),
+                },
+            }
+        self.blocked = self.blocked_after_trim
+        raw = 20 if self.blocked else 60
+        return {
+            "state_version": self.version,
+            "result": {
+                "sample_count": 5,
+                "raw_samples": [raw] * 5,
+                "started_monotonic_ms": 10,
+                "completed_monotonic_ms": 260,
+                "observation": self._observation(
+                    self.last_turn_outcome
+                ),
+                "stop": stop_proof(),
+            },
+        }
+
+
 class BlockingPulseTransport(FakeRuntimeTransport):
     def __init__(self):
         super().__init__()
@@ -2970,6 +3152,68 @@ class ScanObserveChangedThenScanPlanner(SingleScanPlanner):
 
 
 class PhysicalNavigationRuntimeTests(unittest.TestCase):
+    def test_pass_heading_trim_uses_fresh_sample_and_preserves_route_pose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = NavigationMemoryStore.load(
+                path=Path(directory) / "heading-trim-memory.json",
+                robot_id="ev3rstorm-01",
+                controller_instance_id="ev3-main",
+                reset=True,
+            )
+            memory.bind_drive_roles(
+                DriveMotorRoles(left="drive_b", right="drive_c")
+            )
+            starting_observation = observation(
+                1,
+                left_role="drive_b",
+                right_role="drive_c",
+            )
+            memory.begin_episode(starting_observation, 1_001)
+            memory.pose = PhysicalPose(
+                x_mm=169,
+                y_mm=-334,
+                heading_mdeg=-3_894,
+            )
+            preserved_pose = memory.pose
+            transport = HeadingTrimTransport()
+            runtime = PhysicalNavigationRuntime(
+                episode_id="episode-heading-trim",
+                config=PhysicalNavigationRuntimeConfig(
+                    goal="Continue around the obstacle",
+                    locale="en",
+                    max_turns=1,
+                    max_episode_seconds=10,
+                ),
+                transport=transport,
+                planner=FakeRuntimePlanner(),
+                memory=memory,
+                monotonic=lambda: 0.0,
+                unix_ms=lambda: 2_000,
+            )
+
+            sampled, feedback = runtime._execute_pass_heading_trim(
+                observation=starting_observation,
+                relative_delta_mdeg=-15_000,
+            )
+
+        self.assertEqual(
+            [call[0] for call in transport.calls],
+            ["scan_turn", "scan_sample"],
+        )
+        self.assertTrue(all(
+            callable(callback)
+            for callback in transport.cancellation_callbacks
+        ))
+        self.assertEqual(feedback["status"], "completed")
+        self.assertTrue(feedback["opening_clear"])
+        self.assertFalse(sampled["infrared"]["blocked"])
+        self.assertEqual(memory.pose, preserved_pose)
+        self.assertEqual(
+            memory.motor_positions,
+            {"drive_b": 114, "drive_c": -114},
+        )
+        self.assertEqual(memory.hazard_map.hazard_ids, ())
+
     def test_incomplete_mission_does_not_publish_finish_as_available(self):
         class AvailabilityPlanner:
             def __init__(self):

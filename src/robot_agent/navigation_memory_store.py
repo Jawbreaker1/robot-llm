@@ -34,6 +34,7 @@ from .provisional_hazard_map import (
 LEGACY_MEMORY_SCHEMA = "robot-physical-navigation-memory/v1"
 MEMORY_SCHEMA = "robot-physical-navigation-memory/v2"
 MAX_MEMORY_BYTES = 2 * 1024 * 1024
+MAX_SESSION_ENCODER_SETTLING_DEGREES = 1
 
 
 class NavigationMemoryError(RuntimeError):
@@ -370,13 +371,27 @@ class NavigationMemoryStore:
                 "worker observation lacks configured drive roles"
             )
         if self.motor_positions and current != self.motor_positions:
-            self.invalidate_localization(
-                "Drive encoders changed while the host was not observing",
-                now_ms,
+            settling_only = (
+                set(current) == set(self.motor_positions)
+                and all(
+                    abs(current[role] - self.motor_positions[role])
+                    <= MAX_SESSION_ENCODER_SETTLING_DEGREES
+                    for role in current
+                )
             )
-            raise NavigationMemoryError(
-                "persisted motor anchor no longer matches the robot"
-            )
+            if not settling_only:
+                self.invalidate_localization(
+                    "Drive encoders changed while the host was not observing",
+                    now_ms,
+                )
+                raise NavigationMemoryError(
+                    "persisted motor anchor no longer matches the robot"
+                )
+            # A cleanly stopped EV3 motor can settle by one integer encoder
+            # degree while the worker exits.  That is at most 0.35 mm of
+            # linear travel with this profile and is below usable odometry
+            # precision.  Adopt only this bounded session-boundary residue;
+            # stationary observations inside a live worker remain exact.
         self.motor_positions = dict(current)
         self.updated_at_ms = max(self.updated_at_ms, int(now_ms))
         self.hazard_map.record_observation(self.pose, checked, int(now_ms))
@@ -484,8 +499,13 @@ class NavigationMemoryStore:
         action: str,
         result: Mapping[str, object],
         now_ms: int,
+        *,
+        record_hazard_evidence: bool = True,
     ) -> Optional[ProvisionalHazard]:
-        if action not in MOTION_ACTIONS:
+        if (
+            action not in MOTION_ACTIONS
+            or type(record_hazard_evidence) is not bool
+        ):
             raise NavigationMemoryError("action is not motion")
         try:
             if self.drive_roles is None:
@@ -520,6 +540,56 @@ class NavigationMemoryStore:
             raise NavigationMemoryError(
                 "worker motion observation lacks configured drive roles"
             )
+        self.motor_positions = dict(positions)
+        hazard = (
+            self.hazard_map.record_observation(
+                self.pose,
+                checked,
+                int(now_ms),
+            )
+            if record_hazard_evidence
+            else None
+        )
+        self.updated_at_ms = max(self.updated_at_ms, int(now_ms))
+        self.save()
+        return hazard
+
+    def ingest_verified_heading_trim(
+        self,
+        sampled_observation: Mapping[str, object],
+        now_ms: int,
+    ) -> Optional[ProvisionalHazard]:
+        """Re-anchor after a verified trim without moving logical pose.
+
+        The transport/runtime validates the stopped turn and fresh sample.
+        Memory owns only the resulting encoder anchor and map observation.
+        """
+        try:
+            checked = validate_observation(sampled_observation)
+        except PhysicalNavigationContractError as error:
+            self.invalidate_localization(
+                "Unverifiable route heading trim",
+                now_ms,
+            )
+            raise NavigationMemoryError(
+                "heading trim sample is invalid"
+            ) from error
+        if self.drive_roles is None:
+            self.invalidate_localization(
+                "Unverifiable route heading trim",
+                now_ms,
+            )
+            raise NavigationMemoryError("drive motor roles are not bound")
+        positions = _motor_positions(checked, self.drive_roles)
+        if set(positions) != {self.drive_roles.left, self.drive_roles.right}:
+            self.invalidate_localization(
+                "Unverifiable route heading trim",
+                now_ms,
+            )
+            raise NavigationMemoryError(
+                "heading trim sample lacks configured drive roles"
+            )
+
         self.motor_positions = dict(positions)
         hazard = self.hazard_map.record_observation(
             self.pose,

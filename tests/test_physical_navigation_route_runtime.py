@@ -25,6 +25,7 @@ from robot_agent.physical_navigation_route_runtime import (
     PhysicalNavigationRouteRuntimeError,
     PhysicalNavigationRouteRuntimeMixin,
     PhysicalNavigationRouteRuntimeResult,
+    PASS_HEADING_TRIM_MDEG,
     ROUTE_EXECUTION_REASON_COMPLETE,
     ROUTE_EXECUTION_REASON_DEADLINE,
     ROUTE_EXECUTION_REASON_INVALID,
@@ -155,6 +156,11 @@ class RouteRuntimeHost(PhysicalNavigationRouteRuntimeMixin):
         self.experiences = []
         self.vetoes = deque()
         self.motion_statuses = deque()
+        self.motion_noncompletion_reason = None
+        self.deferred_hazard_actions = []
+        self.heading_trim_openings = deque()
+        self.heading_trims = []
+        self._pass_heading_trim_attempted_route_ids = set()
         self.feasibility_factory = lambda _host: all_motion_feasible()
         self.after_motion = None
 
@@ -200,10 +206,19 @@ class RouteRuntimeHost(PhysicalNavigationRouteRuntimeMixin):
         del action, observation, action_specs, deadline
         return self.vetoes.popleft() if self.vetoes else None
 
-    def _execute_motion(self, action, *, action_specs):
+    def _execute_motion(
+        self,
+        action,
+        *,
+        action_specs,
+        defer_infrared_hazard=False,
+    ):
         if len(self.executed_actions) >= 100:
             raise AssertionError("route runtime did not converge")
         self.executed_actions.append(action)
+        self.deferred_hazard_actions.append(
+            (action, defer_infrared_hazard)
+        )
         status = (
             self.motion_statuses.popleft()
             if self.motion_statuses
@@ -221,12 +236,45 @@ class RouteRuntimeHost(PhysicalNavigationRouteRuntimeMixin):
             "operation": "pulse",
             "requested_action": action,
             "status": status,
-            "reason": "fake_{}".format(status),
+            "reason": (
+                self.motion_noncompletion_reason
+                if status != "completed"
+                and self.motion_noncompletion_reason is not None
+                else "fake_{}".format(status)
+            ),
             "resulting_pose": self.memory.pose.to_dict(),
         }
         if self.after_motion is not None:
             self.after_motion(self, action)
         return observation, result
+
+    def _execute_pass_heading_trim(
+        self,
+        *,
+        observation,
+        relative_delta_mdeg,
+    ):
+        del observation
+        self.heading_trims.append(relative_delta_mdeg)
+        opening_clear = (
+            self.heading_trim_openings.popleft()
+            if self.heading_trim_openings
+            else True
+        )
+        return (
+            {"state_version": len(self.executed_actions) + 100},
+            {
+                "operation": "pass_heading_trim",
+                "status": "completed" if opening_clear else "blocked",
+                "reason": (
+                    "opening_clear"
+                    if opening_clear
+                    else "infrared_still_blocked"
+                ),
+                "opening_clear": opening_clear,
+                "relative_delta_mdeg": relative_delta_mdeg,
+            },
+        )
 
     def _record_experience(self, **fields):
         self.experiences.append(fields)
@@ -453,6 +501,107 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
         self.assertEqual(result.actions, tuple(host.executed_actions))
         self.assertEqual(result.last_tool_result["status"], "interrupted")
         self.assertEqual(len(host.experiences), 1)
+
+    def test_first_right_pass_block_trims_right_and_continues_route(self):
+        host = RouteRuntimeHost()
+        host.motion_statuses.extend(
+            ["completed"] * 5 + ["interrupted"]
+        )
+        host.motion_noncompletion_reason = "infrared_blocked"
+
+        result = execute(
+            host,
+            active_route(side="RIGHT_OF_GOAL"),
+            active_maneuver=authorization(side="RIGHT_OF_GOAL"),
+        )
+
+        self.assertEqual(result.outcome, EXECUTION_COMPLETE)
+        self.assertEqual(host.heading_trims, [-PASS_HEADING_TRIM_MDEG])
+        self.assertTrue(host.deferred_hazard_actions[5][1])
+        self.assertEqual(host.executed_actions[5], "ADVANCE")
+        self.assertEqual(host.executed_actions[6], "ADVANCE")
+
+    def test_first_left_pass_block_trims_left(self):
+        host = RouteRuntimeHost()
+        host.motion_statuses.extend(
+            ["completed"] * 5 + ["interrupted"]
+        )
+        host.motion_noncompletion_reason = "infrared_blocked"
+
+        result = execute(host, active_route(side="LEFT_OF_GOAL"))
+
+        self.assertEqual(result.outcome, EXECUTION_COMPLETE)
+        self.assertEqual(host.heading_trims, [PASS_HEADING_TRIM_MDEG])
+
+    def test_pass_trim_replans_when_opening_remains_blocked(self):
+        host = RouteRuntimeHost()
+        host.motion_statuses.extend(
+            ["completed"] * 5 + ["interrupted"]
+        )
+        host.motion_noncompletion_reason = "infrared_blocked"
+        host.heading_trim_openings.append(False)
+
+        result = execute(
+            host,
+            active_route(side="RIGHT_OF_GOAL"),
+            active_maneuver=authorization(side="RIGHT_OF_GOAL"),
+        )
+
+        self.assertEqual(result.outcome, EXECUTION_REPLAN)
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_MOTION_INCOMPLETE,
+        )
+        self.assertEqual(host.heading_trims, [-PASS_HEADING_TRIM_MDEG])
+        self.assertEqual(len(result.actions), 6)
+
+    def test_route_restart_at_pass_can_trim_once_but_not_twice(self):
+        route = active_route(side="RIGHT_OF_GOAL")
+        for waypoint in route.waypoints[:2]:
+            pose = PhysicalPose(
+                x_mm=waypoint.x_mm,
+                y_mm=waypoint.y_mm,
+                heading_mdeg=waypoint.heading_mdeg,
+            )
+            route = route.advance_reached(pose)
+        self.assertEqual(route.active_waypoint.kind, "PASS_BEYOND_TARGET")
+        host = RouteRuntimeHost()
+        host.memory.pose = pose
+        host.motion_statuses.extend(["interrupted", "interrupted"])
+        host.motion_noncompletion_reason = "infrared_blocked"
+
+        result = execute(
+            host,
+            route,
+            active_maneuver=authorization(side="RIGHT_OF_GOAL"),
+        )
+
+        self.assertEqual(result.outcome, EXECUTION_REPLAN)
+        self.assertEqual(host.heading_trims, [-PASS_HEADING_TRIM_MDEG])
+        self.assertTrue(host.deferred_hazard_actions[0][1])
+        self.assertFalse(host.deferred_hazard_actions[1][1])
+
+    def test_pass_trim_does_not_start_after_route_deadline(self):
+        host = RouteRuntimeHost()
+        host.motion_statuses.extend(
+            ["completed"] * 5 + ["interrupted"]
+        )
+        host.motion_noncompletion_reason = "infrared_blocked"
+
+        def expire_after_block(runtime, _action):
+            if len(runtime.executed_actions) == 6:
+                runtime.clock = 100.0
+
+        host.after_motion = expire_after_block
+
+        result = execute(host, active_route(), deadline=100.0)
+
+        self.assertEqual(result.outcome, EXECUTION_FAILED)
+        self.assertEqual(
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_DEADLINE,
+        )
+        self.assertEqual(host.heading_trims, [])
 
     def test_new_target_geometry_returns_rebuilt_route_before_another_pulse(self):
         host = RouteRuntimeHost()
