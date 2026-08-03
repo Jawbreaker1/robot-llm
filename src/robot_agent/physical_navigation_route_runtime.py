@@ -13,6 +13,7 @@ from typing import Mapping, MutableMapping, Optional, Tuple
 
 from .local_detour_controller import (
     SYNC_INACTIVE,
+    SYNC_REBUILT,
     SYNC_UNCHANGED,
     LocalDetourGuidance,
     derive_local_detour_guidance,
@@ -114,6 +115,59 @@ def _guidance_summary(guidance):
         "distance_to_waypoint_mm": guidance.distance_to_waypoint_mm,
         "heading_error_mdeg": guidance.heading_error_mdeg,
     }
+
+
+def _monotonic_target_growth(
+    previous: LocalDetourRoute,
+    refreshed: "PhysicalNavigationRouteRefresh",
+) -> bool:
+    """Allow only conservative growth of the already authorized obstacle."""
+
+    current = refreshed.route
+    if (
+        current is None
+        or refreshed.sync_event != SYNC_REBUILT
+        or refreshed.sync_reason != "TARGET_GEOMETRY_MISMATCH"
+        or current.target_hypothesis_id
+        != previous.target_hypothesis_id
+        or current.detour_side != previous.detour_side
+        or current.frame_id != previous.frame_id
+        or current.map_generation_id != previous.map_generation_id
+        or current.goal_origin_x_mm != previous.goal_origin_x_mm
+        or current.goal_origin_y_mm != previous.goal_origin_y_mm
+        or current.goal_heading_mdeg != previous.goal_heading_mdeg
+        or current.target_centroid_x_mm
+        != previous.target_centroid_x_mm
+        or current.target_centroid_y_mm
+        != previous.target_centroid_y_mm
+        or current.based_on_map_version < previous.based_on_map_version
+        or current.target_radius_mm < previous.target_radius_mm
+        or not set(previous.target_support_points).issubset(
+            current.target_support_points
+        )
+    ):
+        return False
+    geometry_grew = (
+        set(previous.target_support_points)
+        != set(current.target_support_points)
+        or current.target_radius_mm > previous.target_radius_mm
+    )
+    side_sign = 1 if current.detour_side == "LEFT_OF_GOAL" else -1
+    return (
+        geometry_grew
+        and current.inflated_lateral_clearance_mm
+        >= previous.inflated_lateral_clearance_mm
+        and current.inflated_pass_clearance_mm
+        >= previous.inflated_pass_clearance_mm
+        and current.pass_longitudinal_offset_mm
+        >= previous.pass_longitudinal_offset_mm
+        and side_sign
+        * (
+            current.route_lateral_offset_mm
+            - previous.route_lateral_offset_mm
+        )
+        >= 0
+    )
 
 
 def _with_handoff(
@@ -355,9 +409,10 @@ class PhysicalNavigationRouteRuntimeMixin:
         """Execute unique route-progressing pulses until the planner is needed.
 
         ``active_maneuver`` is the model-owned authorization for the supplied
-        route.  Synchronization may expose a rebuilt route after fresh map
-        evidence, but this method returns it to the planner without executing
-        it.  It never invents or changes the authorized detour side.
+        route.  Synchronization may continue a conservative route extension
+        when fresh evidence only grows the same obstacle.  Any other rebuild
+        returns to the planner.  This method never invents or changes the
+        authorized detour side.
         """
 
         if (
@@ -468,7 +523,8 @@ class PhysicalNavigationRouteRuntimeMixin:
                 navigation=navigation,
                 action_specs=action_specs,
             )
-            previous_route_id = current_route.route_id
+            previous_route = current_route
+            previous_route_id = previous_route.route_id
             current_route = refreshed.route
             transition_detail = {
                 "sync_event": refreshed.sync_event,
@@ -503,7 +559,13 @@ class PhysicalNavigationRouteRuntimeMixin:
                     reason_code=ROUTE_EXECUTION_REASON_INVALID,
                     detail=transition_detail,
                 )
-            if current_route.route_id != previous_route_id:
+            if (
+                current_route.route_id != previous_route_id
+                and not _monotonic_target_growth(
+                    previous_route,
+                    refreshed,
+                )
+            ):
                 return self._route_runtime_result(
                     observation=current_observation,
                     route=current_route,

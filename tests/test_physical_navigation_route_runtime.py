@@ -4,7 +4,6 @@ import unittest
 
 from robot_agent.local_detour_controller import (
     SYNC_REBUILT,
-    SYNC_UNCHANGED,
     synchronize_local_detour_route,
 )
 from robot_agent.local_detour_route import ROUTE_COMPLETE, ROUTE_INVALID
@@ -611,7 +610,7 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(host.heading_trims, [])
 
-    def test_new_target_geometry_returns_rebuilt_route_before_another_pulse(self):
+    def test_monotonic_target_growth_continues_the_rebuilt_route(self):
         host = RouteRuntimeHost()
         original = active_route()
 
@@ -631,45 +630,56 @@ class PhysicalNavigationRouteRuntimeTests(unittest.TestCase):
             )
 
         host.after_motion = expand_target
-        original_refresh = host._refresh_authorized_local_detour_route
-
-        def refresh_without_rebuild_signal(**arguments):
-            refreshed = original_refresh(**arguments)
-            if refreshed.sync_event == SYNC_REBUILT:
-                return replace(refreshed, sync_event=SYNC_UNCHANGED)
-            return refreshed
-
-        host._refresh_authorized_local_detour_route = (
-            refresh_without_rebuild_signal
-        )
 
         result = execute(host, original)
 
+        self.assertEqual(result.outcome, EXECUTION_COMPLETE)
         self.assertEqual(
-            result.outcome,
-            EXECUTION_REPLAN,
+            result.reason_code,
+            ROUTE_EXECUTION_REASON_COMPLETE,
         )
+        self.assertGreater(len(result.actions), 1)
+        self.assertNotEqual(result.route.route_id, original.route_id)
+        self.assertEqual(result.route.detour_side, original.detour_side)
+        updates = [
+            item for item in host.events
+            if item["event"] == "local_detour_route_updated"
+        ]
+        rebuilt_updates = [
+            item for item in updates
+            if item["sync_event"] == "REBUILT"
+        ]
+        self.assertEqual(len(rebuilt_updates), 1)
+        self.assertEqual(
+            rebuilt_updates[0]["route"]["route_id"],
+            result.route.route_id,
+        )
+
+    def test_non_monotonic_target_change_still_requires_replan(self):
+        host = RouteRuntimeHost()
+        original = active_route()
+
+        def move_target(runtime, _action):
+            runtime.memory.hazard_map = hazard_map(
+                value=replace(hazard(), centroid_x_mm=230),
+                revision=8,
+            )
+
+        host.after_motion = move_target
+
+        result = execute(host, original)
+
+        self.assertEqual(result.outcome, EXECUTION_REPLAN)
         self.assertEqual(
             result.reason_code,
             ROUTE_EXECUTION_REASON_REPLAN_REQUIRED,
         )
         self.assertEqual(len(result.actions), 1)
-        self.assertNotEqual(result.route.route_id, original.route_id)
-        self.assertEqual(result.route.detour_side, original.detour_side)
         self.assertEqual(
             result.last_tool_result["route_execution"]["detail"][
                 "reason"
             ],
             "TARGET_GEOMETRY_MISMATCH",
-        )
-        updates = [
-            item for item in host.events
-            if item["event"] == "local_detour_route_updated"
-        ]
-        self.assertEqual(updates[-1]["sync_event"], "REBUILT")
-        self.assertEqual(
-            updates[-1]["route"]["route_id"],
-            result.route.route_id,
         )
 
     def test_structural_invalidation_emits_the_full_invalid_route(self):
