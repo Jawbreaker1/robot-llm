@@ -429,6 +429,25 @@ class DashboardHTTPTests(unittest.TestCase):
             "session_token_rejected",
         )
 
+    def test_root_redirects_to_the_current_live_console_without_caching(self):
+        response = self.router.handle(
+            "GET",
+            "/",
+            self.headers(authenticated=False),
+        )
+        query = self.router.handle(
+            "GET",
+            "/?unexpected=true",
+            self.headers(authenticated=False),
+        )
+
+        self.assertEqual(response.status, 307)
+        headers = dict(response.headers)
+        self.assertEqual(headers["Location"], self.router.access_path)
+        self.assertEqual(headers["Cache-Control"], "no-store, max-age=0")
+        self.assertEqual(response.body, b"")
+        self.assertEqual(query.status, 404)
+
     def test_bootstrap_and_registry_are_read_only(self):
         bootstrap = self.router.handle(
             "GET",
@@ -625,7 +644,11 @@ class DashboardHTTPTests(unittest.TestCase):
 
         self.assertEqual(unauthenticated_api.status, 403)
         self.assertEqual(wrong_api.status, 403)
-        self.assertEqual(public_root.status, 404)
+        self.assertEqual(public_root.status, 307)
+        self.assertEqual(
+            dict(public_root.headers)["Location"],
+            self.router.access_path,
+        )
         self.assertEqual(old_asset_path.status, 404)
         self.assertEqual(old_i18n_asset_path.status, 404)
         self.assertEqual(old_logic_asset_path.status, 404)

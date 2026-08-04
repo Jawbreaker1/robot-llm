@@ -552,6 +552,16 @@ class DashboardRouter:
         path = parsed.path
         segments = self._path_segments(path)
 
+        if method == "GET" and path == "/" and not parsed.query:
+            return DashboardHTTPResponse(
+                status=307,
+                headers=(
+                    self._security_headers("text/plain; charset=utf-8")
+                    + (("Location", self._access_path),)
+                ),
+                body=b"",
+            )
+
         legacy_location = self._legacy_location(path)
         if method == "GET" and not parsed.query and legacy_location is not None:
             return DashboardHTTPResponse(

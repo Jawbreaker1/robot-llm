@@ -15,9 +15,12 @@ från Gemma.
 scripts/start_lab_console.sh
 ```
 
-Öppna sedan den privata liveadress som skrivs ut, i formen
+Öppna `http://127.0.0.1:8765`; den lokala roten skickar webbläsaren vidare
+till den aktuella liveadressen i formen
 `http://127.0.0.1:8765/live/<access-key>/`. Åtkomstnyckeln i länken är en
-lokal bearer-hemlighet: dela den inte. Startprofilen lagrar en
+lokal bearer-hemlighet: dela den inte. Redirecten innebär medvetet att andra
+lokala processer kan upptäcka nyckeln; servern är därför fortsatt strikt
+bunden till loopback. Startprofilen lagrar en
 slumpad 256-bitars nyckel i en owner-only-fil, så samma bookmark fortsätter
 peka på den aktuella konsolen efter en omstart. Äldre
 `/session/<key>/`-länkar omdirigeras till den kanoniska liveadressen.

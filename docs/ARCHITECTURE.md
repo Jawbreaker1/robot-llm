@@ -713,8 +713,10 @@ skapar en slumpad 256-bitars livekonsolnyckel i en owner-only-fil och serverar
 index/assets under `/live/<access-key>/`. Nyckeln är en stabil lokal
 access-capability, inte identitet för ett återupptagbart körläge. Gamla
 `/session/<key>/`-bootstrap- och assetlänkar valideras med samma nyckel och
-omdirigeras till den kanoniska liveadressen; interna `session_token`-namn finns
-kvar endast för kompatibilitet. Samtliga API-anrop, även läsningar, kräver
+omdirigeras till den kanoniska liveadressen. Den exakta lokala roten `/`
+omdirigeras också dit som en medveten loopback-only bekvämlighet; redirecten
+är inte cachebar. Interna `session_token`-namn finns kvar endast för
+kompatibilitet. Samtliga API-anrop, även läsningar, kräver
 samma nyckel. Gränsen kontrollerar dessutom `Host`, `Origin`, JSON-MIME,
 bodygräns och strikt JSON samt begränsar samtidiga HTTP-handlers. Browsern
 får endast tala med samma host; den kontaktar inte LM Studio, Open-Meteo
