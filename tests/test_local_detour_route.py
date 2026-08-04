@@ -91,6 +91,22 @@ class LocalDetourRouteGeometryTests(unittest.TestCase):
         with self.assertRaises(LocalDetourRouteError):
             route(side="AUTO")
 
+    def test_profile_margin_inflates_only_lateral_clearance(self):
+        baseline = route()
+        left = route(lateral_clearance_margin_mm=30)
+        right = route(
+            side="RIGHT_OF_GOAL",
+            lateral_clearance_margin_mm=30,
+        )
+
+        self.assertEqual(left.inflated_lateral_clearance_mm, 235)
+        self.assertEqual(right.inflated_lateral_clearance_mm, 215)
+        self.assertEqual(
+            left.inflated_pass_clearance_mm,
+            baseline.inflated_pass_clearance_mm,
+        )
+        self.assertEqual(left.position_tolerance_mm, 35)
+
     def test_waypoint_tolerance_cannot_consume_collision_clearance(self):
         value = route()
 

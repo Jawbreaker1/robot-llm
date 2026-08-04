@@ -249,6 +249,28 @@ def _provisional_hazard_offset(value: object) -> int:
     return offset
 
 
+def _detour_lateral_clearance_margin(value: object) -> int:
+    if value is None:
+        return 0
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"lateral_clearance_margin_mm"}
+    ):
+        raise ControllerRuntimeProfileError(
+            "EV3RSTORM local detour calibration is invalid"
+        )
+    margin = value["lateral_clearance_margin_mm"]
+    if (
+        isinstance(margin, bool)
+        or not isinstance(margin, int)
+        or not 0 <= margin <= 500
+    ):
+        raise ControllerRuntimeProfileError(
+            "EV3RSTORM local detour calibration is invalid"
+        )
+    return margin
+
+
 def _load_profile_config(path: Path):
     resolved = Path(path).expanduser().resolve()
     try:
@@ -308,6 +330,11 @@ def _load_profile_config(path: Path):
     hazard_offset = _provisional_hazard_offset(
         calibration.get("infrared_proximity")
     )
+    detour_lateral_clearance_margin = (
+        _detour_lateral_clearance_margin(
+            calibration.get("local_detour")
+        )
+    )
     return (
         resolved,
         robot_id,
@@ -315,6 +342,7 @@ def _load_profile_config(path: Path):
         footprint,
         odometry,
         hazard_offset,
+        detour_lateral_clearance_margin,
     )
 
 
@@ -379,11 +407,15 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             footprint,
             odometry,
             hazard_offset,
+            detour_lateral_clearance_margin,
         ) = _load_profile_config(config_path)
         self.config_path = resolved
         self.speech_profile = speech_profile
         self.hazard_calibration = HazardMapCalibration(
             provisional_hazard_offset_mm=hazard_offset,
+            detour_lateral_clearance_margin_mm=(
+                detour_lateral_clearance_margin
+            ),
             robot_footprint=footprint,
         )
         self.odometry_calibration = odometry

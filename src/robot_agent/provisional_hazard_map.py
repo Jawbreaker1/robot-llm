@@ -13,10 +13,7 @@ from typing import Iterable, Mapping, Optional, Tuple
 
 from .active_ir_scan_contract import ActiveIrScanResult
 from .physical_navigation_contract import MOTION_ACTIONS
-from .physical_footprint import (
-    RobotFootprint,
-    footprint_sweep_intersects,
-)
+from .physical_footprint import RobotFootprint, footprint_sweep_intersects
 from .physical_odometry import (
     OdometryCalibration,
     PhysicalPose,
@@ -66,9 +63,11 @@ class HazardMapCalibration:
     provisional_hazard_radius_mm: int = 70
     hazard_merge_distance_mm: int = 120
     maximum_anchor_heading_drift_mdeg: int = 5_000
+    detour_lateral_clearance_margin_mm: int = 0
     robot_footprint: Optional[RobotFootprint] = None
 
     def __post_init__(self) -> None:
+        margin = self.detour_lateral_clearance_margin_mm
         if any(
             isinstance(value, bool)
             or not isinstance(value, int)
@@ -80,7 +79,7 @@ class HazardMapCalibration:
                 self.hazard_merge_distance_mm,
                 self.maximum_anchor_heading_drift_mdeg,
             )
-        ):
+        ) or type(margin) is not int or not 0 <= margin <= 500:
             raise ValueError("hazard map calibration is invalid")
         if self.robot_footprint is not None and not isinstance(
             self.robot_footprint,

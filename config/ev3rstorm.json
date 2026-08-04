@@ -53,6 +53,9 @@
       "clearance_margin_mm": 10,
       "evidence": "Measured on the current EV3RSTORM build without the removable propeller: 100 mm left and 130 mm right from the differential-drive origin"
     },
+    "local_detour": {
+      "lateral_clearance_margin_mm": 30
+    },
     "turn_in_place": {
       "status": "single-visual-estimate",
       "surface": "unspecified-indoor-surface",

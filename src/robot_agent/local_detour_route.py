@@ -624,6 +624,7 @@ def build_local_detour_route(
     goal_origin_y_mm: Optional[int] = None,
     position_tolerance_mm: int = 35,
     heading_tolerance_mdeg: int = 20_000,
+    lateral_clearance_margin_mm: int = 0,
     target_support_points=(),
 ) -> LocalDetourRoute:
     """Build a route for an LLM-chosen side without selecting that side."""
@@ -665,6 +666,12 @@ def build_local_detour_route(
         minimum=1,
         maximum=45_000,
     )
+    _integer(
+        lateral_clearance_margin_mm,
+        "lateral clearance margin",
+        minimum=0,
+        maximum=500,
+    )
 
     side_sign = 1 if detour_side == "LEFT_OF_GOAL" else -1
     body_side_extent = (
@@ -677,6 +684,7 @@ def build_local_detour_route(
         + body_side_extent
         + footprint.clearance_margin_mm
         + position_tolerance_mm
+        + lateral_clearance_margin_mm
     )
     # Match the map's TARGET_ENVELOPE_BEHIND_GOAL_ORIGIN proof.  A route
     # waypoint must carry the complete, potentially asymmetric body beyond

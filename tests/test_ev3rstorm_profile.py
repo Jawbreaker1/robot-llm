@@ -53,6 +53,10 @@ class EV3RSTORMProfileTests(unittest.TestCase):
             self.profile.hazard_calibration.provisional_hazard_offset_mm,
             210,
         )
+        self.assertEqual(
+            self.profile.hazard_calibration.detour_lateral_clearance_margin_mm,
+            30,
+        )
 
     def test_worker_lifetime_can_cover_default_plan_scan_and_reanchor(self):
         # Dashboard planner (30 s) + EV3 scan (80 s) + post-scan request
@@ -78,6 +82,19 @@ class EV3RSTORMProfileTests(unittest.TestCase):
         self.assertEqual(
             legacy.hazard_calibration.provisional_hazard_offset_mm,
             140,
+        )
+
+    def test_legacy_schema_v1_config_has_no_detour_margin(self):
+        config = json.loads(self.profile.config_path.read_text("utf-8"))
+        del config["calibration"]["local_detour"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            legacy = EV3RSTORMProfile(path)
+
+        self.assertEqual(
+            legacy.hazard_calibration.detour_lateral_clearance_margin_mm,
+            0,
         )
 
     def test_binding_validates_location_without_contacting_it(self):

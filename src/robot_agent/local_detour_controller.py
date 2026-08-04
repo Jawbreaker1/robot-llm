@@ -206,6 +206,9 @@ def _build_route(
         goal_origin_y_mm=mission.origin_y_mm,
         position_tolerance_mm=position_tolerance_mm,
         heading_tolerance_mdeg=heading_tolerance_mdeg,
+        lateral_clearance_margin_mm=(
+            hazard_map.calibration.detour_lateral_clearance_margin_mm
+        ),
     ).advance_reached(current_pose)
 
 

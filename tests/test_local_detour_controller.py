@@ -572,6 +572,7 @@ class LocalDetourGuidanceTests(unittest.TestCase):
             mission=mission(),
             hazard_map=live_map,
         ).route
+        self.assertEqual(route.inflated_lateral_clearance_mm, 275)
         motion = navigation_action_feasibility(
             hazard_map=live_map,
             pose=PhysicalPose(),
