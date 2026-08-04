@@ -45,12 +45,12 @@ scripts/start_lab_console.sh --port 8877
 - **Experimenthistoriken** är read-only evidens från dokumenterade körningar.
   Den kan granskas men är inte en gammal fysisk robotinstans som kan startas
   igen.
-- **Världs-/kartminnet** är separat host-lokal navigationsdata. EV3-profilen
-  kan återanvända samma minnesfil över episoder och processomstarter, välja en
-  annan med `--robot-memory-path` eller tömma den explicit en gång med
-  `--robot-reset-memory`. Dashboardens heta events, snapshots och pose trail
-  är däremot processlokala. Någon GUI-toggle för kartpersistens finns ännu
-  inte.
+- **Världs-/kartminnet** är separat host-lokal navigationsdata. Varje fysisk
+  EV3-episod skapar automatiskt en ny lokal kartgeneration vid `(0, 0, 0)`.
+  Observationer bevaras under hela episoden men återanvänds inte i nästa,
+  eftersom EV3 saknar en absolut referens som kan upptäcka att roboten har
+  flyttats. `--robot-memory-path` väljer episodens atomiska arbetsfil.
+  Dashboardens heta events, snapshots och pose trail är processlokala.
 
 För att först köra den riktiga 2D-simulatornavigationen och därefter visa dess
 ackumulerade karta i dashboarden:
@@ -287,7 +287,7 @@ Den fysiska projektionen visar nu även två nya, strikt faktabaserade lager:
   hypotesrelation och gränsstatus. Strålarna får ingen uppfunnen fysisk längd
   eller objektyta.
 
-Scanprojektionen använder den persistenta, diversity-bevarande historiken
+Scanprojektionen använder den episodlokala, diversity-bevarande historiken
 från fysisk navigation memory, högst 16 försök per hinder och 64 i kartan.
 Det auktoritativa minnet räknar dessutom kumulativt varje äldre scanpost som
 har lämnat detaljhistoriken, med typad senaste orsak; räknaren överlever både

@@ -120,13 +120,12 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                         memory_path="memory.json",
                     )
 
-    def test_adapter_is_lazy_and_memory_reset_is_one_shot(self):
+    def test_adapter_is_lazy_and_memory_is_fresh_per_episode(self):
         with tempfile.TemporaryDirectory() as directory:
             binding = EV3SSHBinding(
                 profile_id=EV3RSTORM_PROFILE_ID,
                 target="robot@ev3dev.local",
                 memory_path=Path(directory) / "memory.json",
-                reset_memory=True,
             )
             planner_factory = mock.Mock(name="planner_factory")
             transport_value = mock.Mock(name="transport")
@@ -246,9 +245,9 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                         call.kwargs["reset"]
                         for call in memory_factory.call_args_list
                     ],
-                    [True, False],
+                    [True, True],
                 )
-                memory_value.save.assert_called_once_with()
+                self.assertEqual(memory_value.save.call_count, 2)
                 for call in memory_factory.call_args_list:
                     self.assertEqual(call.kwargs["path"], binding.memory_path)
                     self.assertEqual(call.kwargs["robot_id"], "ev3rstorm-01")

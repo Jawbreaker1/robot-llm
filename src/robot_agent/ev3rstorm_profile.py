@@ -471,27 +471,23 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             )
 
         reset_lock = threading.Lock()
-        reset_pending = binding.reset_memory
 
         def memory_factory():
-            nonlocal reset_pending
-            # The CLI reset flag applies to the next successfully loaded
-            # memory generation only. Persist it before consuming the flag so
-            # a later worker cold-start failure cannot resurrect the old map
-            # on the next episode. Serializing the load/save prevents
-            # concurrent attempts from both erasing the same persisted map.
+            # EV3 has no absolute localization anchor. Each physical episode
+            # therefore owns a fresh local-odometry frame; reusing a previous
+            # episode after the operator moved the robot would create false
+            # geometry. Persist the new empty generation before startup so a
+            # failed cold start cannot resurrect the preceding run.
             with reset_lock:
                 memory = NavigationMemoryStore.load(
                     path=binding.memory_path,
                     robot_id=self.descriptor.robot_id,
                     controller_instance_id=self.descriptor.controller_id,
-                    reset=reset_pending,
+                    reset=True,
                     odometry_calibration=self.odometry_calibration,
                     hazard_calibration=self.hazard_calibration,
                 )
-                if reset_pending:
-                    memory.save()
-                reset_pending = False
+                memory.save()
                 return memory
 
         def speech_runtime_factory(*, event_sink):

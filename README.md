@@ -57,7 +57,7 @@ or language-specific command menus. The model never receives raw motor access.
 | Status | Capabilities |
 |---|---|
 | Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
-| Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, and persistent physical navigation memory |
+| Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, and per-run physical navigation memory |
 | Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
 | Planned | Repeatable autonomous obstacle navigation, continuous hands-free voice interaction, color-sensor fusion, cameras, vision, sound localization, Robot Inventor 51515, BOOST, and multi-robot coordination |
 

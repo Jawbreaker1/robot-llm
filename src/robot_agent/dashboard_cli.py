@@ -360,7 +360,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--robot-reset-memory",
         action="store_true",
-        help="Reset navigation memory once, at the next EV3 episode",
+        help=(
+            "Compatibility flag; every EV3 episode already starts with "
+            "fresh navigation memory"
+        ),
     )
     parser.add_argument(
         "--robot-planner-timeout-seconds",

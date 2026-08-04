@@ -260,7 +260,7 @@ berörd hinderhypotes och kumulativt på kartan med typad orsak. Kartans räknar
 inkluderar även kvarvarande scanposter som försvinner tillsammans med en
 utkastad hinderhypotes och persisteras i navigation memory. Planner och
 dashboard kan därför skilja "inga äldre försök" från "äldre försök har
-komprimerats bort" även efter en processomstart.
+komprimerats bort" efter en save/load-rundtur inom samma kartgeneration.
 
 Den auktoritativa kartan behåller högst 64 hinderhypoteser och hela
 navigation-memory-filen högst 2 MiB. Om den 65:e distinkta hypotesen tillkommer
@@ -275,6 +275,12 @@ contest-fakta när källdatan räcker; nästa save skriver `v2`. Migrationen är
 avsiktligt framåtriktad: en äldre checkout som bara förstår `v1` kan inte läsa
 en fil som redan skrivits om som `v2`. Kodrollback kräver därför en bevarad
 `v1`-kopia eller en explicit minnesreset, aldrig tyst feltolkning.
+
+EV3-profilen återanvänder för närvarande inte en generation mellan fysiska
+episoder. Varje ny episod skapar och sparar en tom generation innan
+robotanslutningen startar. Persistensformatet ger atomisk lagring under
+episoden, men den gamla kartan matas inte till nästa körning eftersom manuell
+förflyttning saknar en absolut lokaliseringsreferens.
 
 Ruttvalets färskhet är strängare än kollisionsminnet. Positiv och negativ
 gränsevidens får komplettera varandra endast vid exakt samma verifierade pose
