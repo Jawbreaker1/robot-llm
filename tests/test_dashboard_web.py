@@ -2057,6 +2057,16 @@ const faulted = api.normalizeControl({
   enabled: true,
   accepting: true,
 });
+const running = api.normalizeControl({
+  state: "RUNNING",
+  enabled: true,
+  accepting: true,
+});
+const stopping = api.normalizeControl({
+  state: "STOPPING",
+  enabled: true,
+  accepting: true,
+});
 process.stdout.write(JSON.stringify({
   exports: Object.keys(api).sort(),
   frozen: Object.isFrozen(api),
@@ -2068,6 +2078,26 @@ process.stdout.write(JSON.stringify({
   preferredFaultedTarget: api.preferredInitialTarget(faulted, false),
   preferredAfterUserChoice: api.preferredInitialTarget(idle, true),
   robotPolicy: api.composerPolicy(idle, "robot", true, false),
+  runningRobotPolicy: api.composerPolicy(running, "robot", true, false),
+  stoppingRobotPolicy: api.composerPolicy(stopping, "robot", true, false),
+  faultedRobotPolicy: api.composerPolicy(faulted, "robot", true, false),
+  busyRobotPolicy: api.composerPolicy(running, "robot", true, true),
+  physicalTurnControl: api.physicalTurnControl({
+    intent: "PHYSICAL_TASK",
+    episode: { control: { sequence: 9, state: "STARTING" } },
+  }),
+  nonPhysicalTurnControl: api.physicalTurnControl({
+    intent: "READ_ONLY_TASK",
+    episode: { control: { sequence: 99, state: "RUNNING" } },
+  }),
+  stopTurnControl: api.physicalTurnControl({
+    intent: "STOP_TASK",
+    control: { sequence: 10, state: "STOPPING" },
+  }),
+  missingEpisodeControl: api.physicalTurnControl({
+    intent: "PHYSICAL_TASK",
+    episode: null,
+  }),
   workbenchPolicy: api.composerPolicy(idle, "workbench", true, false),
   workbenchWithoutRobot: api.composerPolicy(
     disabled,
@@ -2121,6 +2151,7 @@ process.stdout.write(JSON.stringify({
                 "createConversationTargetState",
                 "defaultConversationTarget",
                 "normalizeControl",
+                "physicalTurnControl",
                 "preferredInitialTarget",
                 "shouldApplySnapshot",
             ],
@@ -2157,6 +2188,21 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(
             contract["robotPolicy"]["composerEnabled"]
         )
+        self.assertTrue(contract["robotPolicy"]["robotInputEnabled"])
+        self.assertTrue(contract["runningRobotPolicy"]["composerEnabled"])
+        self.assertTrue(contract["stoppingRobotPolicy"]["composerEnabled"])
+        self.assertTrue(contract["faultedRobotPolicy"]["composerEnabled"])
+        self.assertFalse(contract["busyRobotPolicy"]["composerEnabled"])
+        self.assertEqual(
+            contract["physicalTurnControl"],
+            {"sequence": 9, "state": "STARTING"},
+        )
+        self.assertIsNone(contract["nonPhysicalTurnControl"])
+        self.assertEqual(
+            contract["stopTurnControl"],
+            {"sequence": 10, "state": "STOPPING"},
+        )
+        self.assertIsNone(contract["missingEpisodeControl"])
         self.assertFalse(
             contract["robotPolicy"]["turnModeEnabled"]
         )
@@ -2198,6 +2244,72 @@ process.stdout.write(JSON.stringify({
             self.robot_control,
         )
         self.assertNotIn("/api/v1/robot/motor", self.robot_control)
+
+    def test_robot_composer_uses_composite_turns_and_keeps_dialogue_separate(self):
+        submit_input = self.robot_control[
+            self.robot_control.index("    async function submitInput("):
+            self.robot_control.index(
+                "\n    async function command(",
+                self.robot_control.index("    async function submitInput("),
+            )
+        ]
+        self.assertIn('request("/api/v1/robot/turns"', submit_input)
+        self.assertIn("text: cleanText", submit_input)
+        self.assertIn("locale,", submit_input)
+        self.assertIn('client_request_id: randomId("robot-ui")', submit_input)
+        self.assertIn(
+            "expected_revision: control.settings.revision",
+            submit_input,
+        )
+        self.assertIn("timeout: 65000", submit_input)
+        self.assertNotIn("goal:", submit_input)
+        self.assertNotIn("/api/v1/robot/episodes", self.robot_control)
+        self.assertIn("physicalTurnControl(turn)", submit_input)
+        self.assertIn("setControl(nextControl)", submit_input)
+        self.assertIn("onInputAccepted(cleanText, turn)", submit_input)
+
+        self.assertIn("const MAX_ROBOT_DIALOGUE_MESSAGES = 40;", self.javascript)
+        self.assertIn("robotDialogue: []", self.javascript)
+        self.assertIn("robotOptimisticContent: null", self.javascript)
+        self.assertIn("robotControl.submitInput(", self.javascript)
+        self.assertIn('author_key: "robot"', self.javascript)
+        self.assertIn(
+            't(`chat.author.${safeText(message.author_key, role)}`)',
+            self.javascript,
+        )
+        self.assertIn("onInputAccepted: (originalText, turn) =>", self.javascript)
+        self.assertIn("onTargetChanged: renderConversation", self.javascript)
+        self.assertIn(".slice(-MAX_ROBOT_DIALOGUE_MESSAGES)", self.javascript)
+        self.assertIn(
+            'const robotTarget = selectedConversationTarget() === "robot";',
+            self.javascript,
+        )
+
+        catalogs = self.i18n_contract["catalogs"]
+        self.assertEqual(
+            catalogs["sv"]["values"]["robot.actions.start"],
+            "Skicka till roboten",
+        )
+        self.assertEqual(
+            catalogs["en"]["values"]["robot.actions.start"],
+            "Send to robot",
+        )
+        self.assertEqual(
+            catalogs["sv"]["values"]["chat.author.robot"],
+            "Roboten",
+        )
+        self.assertEqual(
+            catalogs["en"]["values"]["chat.author.robot"],
+            "Robot",
+        )
+        self.assertIn(
+            "under körning",
+            catalogs["sv"]["values"]["robot.composer.robot_note"],
+        )
+        self.assertIn(
+            "while moving",
+            catalogs["en"]["values"]["robot.composer.robot_note"],
+        )
 
     def test_robot_mission_history_is_cursor_safe_and_semantically_deduplicated(self):
         script = r"""

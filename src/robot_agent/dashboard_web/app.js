@@ -17,6 +17,7 @@
   } = window.RobotDashboardLogic;
   const EVENT_LIMIT = 100;
   const MAX_LOCAL_EVENTS = 2000;
+  const MAX_ROBOT_DIALOGUE_MESSAGES = 40;
   const MAP_POLL_INTERVAL_MS = 2000;
   let microphoneInput = null;
   let robotControl = null;
@@ -63,6 +64,10 @@
     robot_settings_revision_conflict: "errors.robot_settings_revision_conflict",
     robot_idempotency_conflict: "errors.robot_idempotency_conflict",
     robot_service_stopping: "errors.robot_service_stopping",
+    robot_input_disabled: "errors.robot_input_disabled",
+    robot_input_idempotency_conflict: "errors.robot_input_idempotency_conflict",
+    robot_input_inflight: "errors.robot_input_inflight",
+    invalid_robot_input: "errors.invalid_robot_request",
     invalid_robot_locale: "errors.invalid_robot_request",
     invalid_robot_text: "errors.invalid_robot_request",
     invalid_robot_identifier: "errors.invalid_robot_request",
@@ -88,6 +93,8 @@
     conversation: null,
     activeTurn: null,
     optimisticContent: null,
+    robotDialogue: [],
+    robotOptimisticContent: null,
     events: [],
     eventIds: new Set(),
     afterSequence: 0,
@@ -739,7 +746,7 @@
     header.appendChild(createElement(
       "span",
       "message-author",
-      t(`chat.author.${role}`),
+      t(`chat.author.${safeText(message.author_key, role)}`),
     ));
     header.appendChild(createElement("time", "message-time", formatTime(message.created_at_unix_ms)));
     article.appendChild(header);
@@ -797,23 +804,41 @@
     const keepAtBottom = (
       feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80
     );
-    const messages = state.conversation ? safeArray(state.conversation.messages) : [];
+    const robotTarget = selectedConversationTarget() === "robot";
+    const messages = robotTarget
+      ? state.robotDialogue
+      : safeArray(safeObject(state.conversation).messages);
+    const optimisticContent = robotTarget
+      ? state.robotOptimisticContent
+      : state.optimisticContent;
     feed.replaceChildren();
-    if (messages.length === 0 && !state.optimisticContent && !state.activeTurn) {
+    if (
+      messages.length === 0
+      && !optimisticContent
+      && (robotTarget || !state.activeTurn)
+    ) {
       feed.appendChild(welcomeMessage);
     } else {
       messages.forEach((message) => feed.appendChild(renderMessage(message)));
-      if (state.optimisticContent) {
+      if (optimisticContent) {
         feed.appendChild(renderMessage({
           role: "user",
-          content: state.optimisticContent,
+          content: optimisticContent,
           created_at_unix_ms: Date.now(),
           citation_ids: [],
-        }));
+        }, "is-pending"));
       }
-      if (state.activeTurn && !TERMINAL_TURN_STATES.has(state.activeTurn.status)) {
+      if (
+        !robotTarget
+        && state.activeTurn
+        && !TERMINAL_TURN_STATES.has(state.activeTurn.status)
+      ) {
         feed.appendChild(renderPendingMessage());
-      } else if (state.activeTurn && state.activeTurn.status === "failed") {
+      } else if (
+        !robotTarget
+        && state.activeTurn
+        && state.activeTurn.status === "failed"
+      ) {
         feed.appendChild(renderMessage({
           role: "system",
           content: t("chat.episode_aborted", {
@@ -1168,12 +1193,17 @@
       if (microphoneInput) {
         microphoneInput.cancel();
       }
-      const accepted = await robotControl.startGoal(
+      state.robotOptimisticContent = content;
+      renderConversation();
+      const accepted = await robotControl.submitInput(
         content,
         i18n.locale,
       );
       if (accepted) {
         input.value = "";
+      } else {
+        state.robotOptimisticContent = null;
+        renderConversation();
       }
       return;
     }
@@ -1813,9 +1843,31 @@
           enabled,
         );
       },
-      onGoalAccepted: () => {
+      onInputAccepted: (originalText, turn) => {
+        const acceptedAt = Date.now();
+        const additions = [{
+          role: "user",
+          content: originalText,
+          created_at_unix_ms: acceptedAt,
+          citation_ids: [],
+        }];
+        const answerText = safeText(safeObject(turn).answer_text, "");
+        if (answerText) {
+          additions.push({
+            role: "assistant", author_key: "robot",
+            content: answerText,
+            created_at_unix_ms: acceptedAt,
+            citation_ids: [],
+          });
+        }
+        state.robotDialogue = state.robotDialogue
+          .concat(additions)
+          .slice(-MAX_ROBOT_DIALOGUE_MESSAGES);
+        state.robotOptimisticContent = null;
         byId("message-input").value = "";
+        renderConversation();
       },
+      onTargetChanged: renderConversation,
     });
     try {
       const [bootstrapPayload, settingsPayload] = await Promise.all([

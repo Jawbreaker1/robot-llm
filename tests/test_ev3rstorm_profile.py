@@ -133,6 +133,9 @@ class EV3RSTORMProfileTests(unittest.TestCase):
             memory_value = mock.Mock(name="memory")
             scan_value = mock.Mock(name="scan")
             synthesizer_value = mock.Mock(name="synthesizer")
+            english_synthesizer_value = mock.Mock(
+                name="english_synthesizer"
+            )
             player_value = mock.Mock(name="player")
             speaker_value = mock.Mock(name="speaker")
             speech_runtime_value = mock.Mock(name="speech_runtime")
@@ -158,6 +161,11 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                     return_value=synthesizer_value,
                 ) as synthesizer_factory,
                 mock.patch(
+                    "robot_agent.ev3rstorm_profile."
+                    "MacOSSayWAVSynthesizer",
+                    return_value=english_synthesizer_value,
+                ) as english_synthesizer_factory,
+                mock.patch(
                     "robot_agent.ev3rstorm_profile.EV3WAVSSHSession",
                     return_value=player_value,
                 ) as player_factory,
@@ -179,6 +187,7 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                 memory_factory.assert_not_called()
                 scan_factory.assert_not_called()
                 synthesizer_factory.assert_not_called()
+                english_synthesizer_factory.assert_not_called()
                 player_factory.assert_not_called()
                 speaker_factory.assert_not_called()
                 speech_runtime_factory.assert_not_called()
@@ -269,23 +278,35 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                     adapter.speech_runtime_factory(event_sink=event_sink),
                     speech_runtime_value,
                 )
+                self.assertEqual(adapter.speech_locales, ("sv", "en"))
                 synthesizer_factory.assert_called_once_with(
                     self.profile.speech_profile,
                 )
+                english_synthesizer_factory.assert_called_once_with()
                 player_factory.assert_called_once_with(
                     "robot@ev3dev.local",
                     connect_timeout_seconds=5,
                 )
-                speaker_factory.assert_called_once_with(
+                routed_synthesizer = speaker_factory.call_args.args[0]
+                self.assertEqual(routed_synthesizer.locales, ("sv", "en"))
+                self.assertIs(
+                    routed_synthesizer._synthesizers["sv"],
                     synthesizer_value,
-                    player_value,
                 )
+                self.assertIs(
+                    routed_synthesizer._synthesizers["en"],
+                    english_synthesizer_value,
+                )
+                self.assertIs(speaker_factory.call_args.args[1], player_value)
                 speech_runtime_factory.assert_called_once_with(
-                    speaker=speaker_value,
+                    speaker=mock.ANY,
                     speaker_close=player_value.close,
                     event_sink=event_sink,
                     thread_name="ev3rstorm-01.ev3-main-speech",
                 )
+                self.assertTrue(callable(
+                    speech_runtime_factory.call_args.kwargs["speaker"]
+                ))
                 planner_factory.assert_not_called()
 
     def test_default_speech_profile_is_swedish_nst_deep_only(self):
@@ -294,6 +315,45 @@ class EV3RSTORMProfileTests(unittest.TestCase):
             PiperSpeechProfile(
                 voices=(("sv", "nst-deep"),),
             ),
+        )
+
+    def test_all_profile_speech_runtimes_share_one_playback_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binding = EV3SSHBinding(
+                profile_id=EV3RSTORM_PROFILE_ID,
+                target="robot@ev3dev.local",
+                memory_path=Path(directory) / "memory.json",
+            )
+            with (
+                mock.patch(
+                    "robot_agent.ev3rstorm_profile.PiperLoopbackSynthesizer",
+                ),
+                mock.patch(
+                    "robot_agent.ev3rstorm_profile.EV3WAVSSHSession",
+                ),
+                mock.patch(
+                    "robot_agent.ev3rstorm_profile.HostPiperEV3Speaker",
+                ),
+                mock.patch(
+                    "robot_agent.ev3rstorm_profile."
+                    "cancellable_serialized_speaker",
+                    side_effect=(mock.Mock(), mock.Mock()),
+                ) as serialize,
+                mock.patch(
+                    "robot_agent.ev3rstorm_profile.RobotSpeechRuntime",
+                ),
+            ):
+                adapter = self.profile.build_adapter(
+                    binding,
+                    planner_factory=mock.Mock(),
+                )
+                adapter.speech_runtime_factory(event_sink=None)
+                adapter.speech_runtime_factory(event_sink=None)
+
+        self.assertEqual(serialize.call_count, 2)
+        self.assertIs(
+            serialize.call_args_list[0].args[1],
+            serialize.call_args_list[1].args[1],
         )
 
     def test_profile_rejects_another_binding_identity(self):

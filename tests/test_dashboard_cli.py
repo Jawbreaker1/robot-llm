@@ -17,6 +17,7 @@ from robot_agent.dashboard_cli import (
     main,
 )
 from robot_agent.dashboard_http import DashboardHTTPResponse
+from robot_agent.robot_input_service import RobotInputService
 
 
 class FakeSocket:
@@ -271,10 +272,16 @@ class DashboardCLITests(unittest.TestCase):
             control_factory.call_args.kwargs["settings"].model,
             _parser().parse_args([]).model,
         )
-        server_factory.assert_called_once_with(
-            dashboard_service,
-            8765,
-            robot_control_service=control_service,
+        server_factory.assert_called_once()
+        server_args = server_factory.call_args
+        self.assertEqual(server_args.args, (dashboard_service, 8765))
+        self.assertIs(
+            server_args.kwargs["robot_control_service"],
+            control_service,
+        )
+        self.assertIsInstance(
+            server_args.kwargs["robot_input_service"],
+            RobotInputService,
         )
         control_service.shutdown.assert_called_once_with()
         self.assertTrue(
@@ -316,11 +323,20 @@ class DashboardCLITests(unittest.TestCase):
         key_loader.assert_called_once_with(
             Path("~/.robot-llm/test-key"),
         )
-        server_factory.assert_called_once_with(
-            dashboard_service,
-            8765,
-            robot_control_service=control_service,
-            session_token="a" * 64,
+        server_factory.assert_called_once()
+        server_args = server_factory.call_args
+        self.assertEqual(server_args.args, (dashboard_service, 8765))
+        self.assertIs(
+            server_args.kwargs["robot_control_service"],
+            control_service,
+        )
+        self.assertIsInstance(
+            server_args.kwargs["robot_input_service"],
+            RobotInputService,
+        )
+        self.assertEqual(
+            server_args.kwargs["session_token"],
+            "a" * 64,
         )
 
     def test_speech_source_is_explicit_and_mutually_exclusive(self):

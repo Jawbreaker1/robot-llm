@@ -33,6 +33,7 @@ class PhysicalNavigationRuntimeAdapter:
         memory_factory: Callable[[], NavigationMemoryStore],
         scan_executor_factory: Optional[Callable[[object], object]] = None,
         speech_runtime_factory: Optional[Callable[..., object]] = None,
+        speech_locales=(),
         spatial_map_bridge=None,
         minimum_forward_progress_mm: int = 420,
         goal_heading_tolerance_mdeg: int = 5_000,
@@ -62,6 +63,13 @@ class PhysicalNavigationRuntimeAdapter:
             speech_runtime_factory
         ):
             raise ValueError("speech runtime factory is invalid")
+        if (
+            not isinstance(speech_locales, tuple)
+            or len(set(speech_locales)) != len(speech_locales)
+            or any(locale not in ("sv", "en") for locale in speech_locales)
+            or speech_locales and speech_runtime_factory is None
+        ):
+            raise ValueError("runtime speech locales are invalid")
         spatial_map_offer = getattr(spatial_map_bridge, "offer", None)
         spatial_map_snapshot = getattr(
             spatial_map_bridge,
@@ -115,6 +123,7 @@ class PhysicalNavigationRuntimeAdapter:
         self.memory_factory = memory_factory
         self.scan_executor_factory = scan_executor_factory
         self.speech_runtime_factory = speech_runtime_factory
+        self.speech_locales = speech_locales
         self.spatial_map_bridge = spatial_map_bridge
         # Dashboard composition receives only the bridge's read capability;
         # physical runtime wiring below retains its non-blocking write seam.

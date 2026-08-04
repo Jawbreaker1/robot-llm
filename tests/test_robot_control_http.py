@@ -80,6 +80,40 @@ class FakeRobotControlService:
         }
 
 
+class FakeRobotInputService:
+    def __init__(self, intent="READ_ONLY_TASK"):
+        self.intent = intent
+        self.calls = []
+
+    def dispatch(self, text, locale, client_request_id, expected_revision):
+        self.calls.append(
+            (text, locale, client_request_id, expected_revision)
+        )
+        return {
+            "schema": "robot-input-turn/v1",
+            "request_id": client_request_id,
+            "intent": self.intent,
+            "confidence_milli": 900,
+            "answer_text": (
+                None
+                if self.intent == "PHYSICAL_TASK"
+                else "Status answer"
+            ),
+            "episode": (
+                {"accepted_episode_id": "episode-2"}
+                if self.intent == "PHYSICAL_TASK"
+                else None
+            ),
+            "control": (
+                {"state": "STOPPING", "sequence": 8}
+                if self.intent == "STOP_TASK"
+                else None
+            ),
+            "speech_queued": self.intent != "PHYSICAL_TASK",
+            "facts_captured_at_unix_ms": 1_000,
+        }
+
+
 def encoded(value):
     return json.dumps(
         value,
@@ -153,6 +187,70 @@ class RobotControlHTTPRouterTests(unittest.TestCase):
             raised.exception.code,
             "invalid_robot_request_fields",
         )
+
+    def test_composite_turn_delegates_exact_input_contract(self):
+        input_service = FakeRobotInputService()
+        router = RobotControlHTTPRouter(self.service, input_service)
+
+        response = router.handle(
+            "POST",
+            "/api/v1/robot/turns",
+            "",
+            encoded({
+                "text": "Hur går det?",
+                "locale": "sv",
+                "client_request_id": "ui-turn-1",
+                "expected_revision": 3,
+            }),
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            response.body["turn"]["intent"],
+            "READ_ONLY_TASK",
+        )
+        self.assertEqual(
+            input_service.calls,
+            [("Hur går det?", "sv", "ui-turn-1", 3)],
+        )
+
+        physical = FakeRobotInputService("PHYSICAL_TASK")
+        response = RobotControlHTTPRouter(
+            self.service,
+            physical,
+        ).handle(
+            "POST",
+            "/api/v1/robot/turns",
+            "",
+            encoded({
+                "text": "Sväng höger",
+                "locale": "sv",
+                "client_request_id": "ui-turn-2",
+                "expected_revision": 3,
+            }),
+        )
+        self.assertEqual(response.status, 202)
+        self.assertEqual(
+            response.body["turn"]["episode"][
+                "accepted_episode_id"
+            ],
+            "episode-2",
+        )
+
+    def test_composite_turn_fails_closed_when_service_is_missing(self):
+        with self.assertRaises(RobotControlHTTPError) as raised:
+            self.router.handle(
+                "POST",
+                "/api/v1/robot/turns",
+                "",
+                encoded({
+                    "text": "Hej",
+                    "locale": "sv",
+                    "client_request_id": "ui-turn-3",
+                    "expected_revision": 3,
+                }),
+            )
+        self.assertEqual(raised.exception.code, "robot_input_disabled")
 
     def test_stop_and_emergency_stop_require_empty_json_objects(self):
         stop = self.router.handle(

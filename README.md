@@ -57,7 +57,7 @@ or language-specific command menus. The model never receives raw motor access.
 | Status | Capabilities |
 |---|---|
 | Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
-| Working in the application | English/Swedish web dashboard, Robot and Workbench conversation targets, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, and persistent physical navigation memory |
+| Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, and persistent physical navigation memory |
 | Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
 | Planned | Repeatable autonomous obstacle navigation, continuous hands-free voice interaction, color-sensor fusion, cameras, vision, sound localization, Robot Inventor 51515, BOOST, and multi-robot coordination |
 
@@ -80,7 +80,7 @@ and external perception devices remain future integrations.
 
 ```mermaid
 flowchart TD
-    U["Goal or voice transcript"] --> H["Host agent"]
+    U["Goal, question, or voice transcript"] --> H["Host agent"]
     S["Sensors, encoders, and map memory"] --> H
     H --> L["Local LLM<br/>plan and expression"]
     L --> V["Typed proposal"]
@@ -116,7 +116,8 @@ More detail is available in [the architecture document](docs/ARCHITECTURE.md).
 
 The local web application has two conversation targets:
 
-- **Robot** turns text or a speech transcript into a physical goal.
+- **Robot** can answer, report what its current sensors and plan say, or turn a
+  text or speech instruction into a physical goal.
 - **Workbench** provides ordinary dialogue, configuration, evidence, and
   development tools.
 

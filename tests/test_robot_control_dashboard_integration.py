@@ -5,7 +5,10 @@ from robot_agent.dashboard_http import DashboardRouter
 from robot_agent.robot_control_http import RobotControlHTTPRouter
 
 from tests.test_dashboard_http import FakeDashboardService
-from tests.test_robot_control_http import FakeRobotControlService
+from tests.test_robot_control_http import (
+    FakeRobotControlService,
+    FakeRobotInputService,
+)
 
 
 TOKEN = "b" * 64
@@ -95,6 +98,40 @@ class RobotControlDashboardIntegrationTests(unittest.TestCase):
             ),
         )
         self.assertEqual(rejected.status, 403)
+
+    def test_authenticated_composite_robot_turn_is_delegated(self):
+        input_service = FakeRobotInputService()
+        router = DashboardRouter(
+            service=FakeDashboardService(),
+            session_token=TOKEN,
+            expected_host=HOST,
+            robot_control_router=RobotControlHTTPRouter(
+                self.robot,
+                input_service,
+            ),
+        )
+
+        response = router.handle(
+            "POST",
+            "/api/v1/robot/turns",
+            self.headers("POST"),
+            self.body({
+                "text": "Vad ser du?",
+                "locale": "sv",
+                "client_request_id": "robot-turn-1",
+                "expected_revision": 3,
+            }),
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            json.loads(response.body)["turn"]["intent"],
+            "READ_ONLY_TASK",
+        )
+        self.assertEqual(
+            input_service.calls,
+            [("Vad ser du?", "sv", "robot-turn-1", 3)],
+        )
 
     def test_emergency_stop_is_an_explicit_json_mutation(self):
         response = self.router.handle(

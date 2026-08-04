@@ -7,9 +7,11 @@ import io
 import json
 import math
 import subprocess
+import tempfile
 import threading
 import time
-from typing import Callable, Optional, Tuple
+from pathlib import Path
+from typing import Callable, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 import wave
 
@@ -17,6 +19,9 @@ import wave
 DEFAULT_PIPER_BASE_URL = "http://127.0.0.1:8179/v1"
 DEFAULT_PIPER_MODEL = "piper-sv"
 DEFAULT_SWEDISH_VOICE = "nst-deep"
+DEFAULT_ENGLISH_VOICE = "Daniel"
+MACOS_SAY_PATH = "/usr/bin/say"
+MACOS_SAY_TIMEOUT_SECONDS = 20.0
 REMOTE_AUDIO_PLAYER = "/home/robot/robot-llm/ev3/audio_playback_cli.py"
 MAX_TEXT_CHARACTERS = 160
 MAX_WAV_BYTES = 4 * 1024 * 1024
@@ -465,6 +470,151 @@ class PiperLoopbackSynthesizer:
         return stdout
 
 
+class MacOSSayWAVSynthesizer:
+    """Create bounded English WAV locally with an installed macOS voice."""
+
+    def __init__(
+        self,
+        voice: str = DEFAULT_ENGLISH_VOICE,
+        *,
+        process_factory: Callable[..., object] = subprocess.Popen,
+        monotonic: Callable[[], float] = time.monotonic,
+        say_path: str = MACOS_SAY_PATH,
+    ):
+        if (
+            not isinstance(voice, str)
+            or not voice
+            or voice != voice.strip()
+            or len(voice) > 64
+            or any(ord(character) < 32 for character in voice)
+            or not callable(process_factory)
+            or not callable(monotonic)
+            or not isinstance(say_path, str)
+            or not say_path.startswith("/")
+        ):
+            raise ValueError("macOS speech configuration is invalid")
+        self.voice = voice
+        self._process_factory = process_factory
+        self._monotonic = monotonic
+        self._say_path = say_path
+
+    def synthesize(
+        self,
+        text: str,
+        locale: str,
+        cancel_event: threading.Event,
+    ) -> Optional[bytes]:
+        if (
+            not isinstance(text, str)
+            or not text
+            or text != text.strip()
+            or len(text) > MAX_TEXT_CHARACTERS
+            or not isinstance(cancel_event, threading.Event)
+        ):
+            raise HostSpeechError("invalid_speech_text", "Speech text is invalid")
+        if locale != "en":
+            raise HostSpeechError(
+                "unsupported_tts_locale",
+                "macOS English speech received another locale",
+            )
+        if cancel_event.is_set():
+            return None
+        try:
+            payload = text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise HostSpeechError("invalid_speech_text", "Speech text is invalid") from None
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="robot-llm-english-tts-"
+            ) as directory:
+                output_path = Path(directory) / "speech.wav"
+                argv = [
+                    self._say_path,
+                    "-v",
+                    self.voice,
+                    "-o",
+                    str(output_path),
+                    "--data-format=LEI16@22050",
+                    "--file-format=WAVE",
+                    "-f",
+                    "-",
+                ]
+                try:
+                    process = self._process_factory(
+                        argv,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                except OSError:
+                    raise HostSpeechError(
+                        "tts_provider_unavailable",
+                        "macOS speech process could not start",
+                    ) from None
+                result = _capture_bounded_cancellable(
+                    process,
+                    payload,
+                    cancel_event,
+                    MACOS_SAY_TIMEOUT_SECONDS,
+                    self._monotonic,
+                )
+                if result is None:
+                    return None
+                _stdout, stderr = result
+                if process.returncode != 0 or stderr:
+                    raise HostSpeechError(
+                        "tts_provider_failed",
+                        "macOS speech synthesis failed",
+                    )
+                size = output_path.stat().st_size
+                if not 44 <= size <= MAX_WAV_BYTES:
+                    raise HostSpeechError(
+                        "invalid_tts_wav",
+                        "macOS speech WAV size is invalid",
+                    )
+                raw = output_path.read_bytes()
+        except HostSpeechError:
+            raise
+        except OSError:
+            raise HostSpeechError(
+                "tts_provider_failed",
+                "macOS speech output could not be read",
+            ) from None
+        validate_pcm16_mono_wav(raw)
+        return raw
+
+
+class LocaleSpeechSynthesizer:
+    """Route each locale to one explicit local synthesizer."""
+
+    def __init__(self, synthesizers: Mapping[str, object]):
+        if (
+            not isinstance(synthesizers, Mapping)
+            or not synthesizers
+            or any(
+                locale not in ("sv", "en")
+                or not callable(getattr(synthesizer, "synthesize", None))
+                for locale, synthesizer in synthesizers.items()
+            )
+        ):
+            raise ValueError("locale speech synthesizers are invalid")
+        self._synthesizers = dict(synthesizers)
+
+    @property
+    def locales(self):
+        return tuple(self._synthesizers)
+
+    def synthesize(self, text, locale, cancel_event):
+        try:
+            synthesizer = self._synthesizers[locale]
+        except KeyError:
+            raise HostSpeechError(
+                "unsupported_tts_locale",
+                "No local TTS synthesizer is configured for this locale",
+            ) from None
+        return synthesizer.synthesize(text, locale, cancel_event)
+
+
 class EV3WAVSSHPlayer:
     def __init__(
         self,
@@ -583,10 +733,13 @@ class HostPiperEV3Speaker:
 __all__ = (
     "DEFAULT_PIPER_BASE_URL",
     "DEFAULT_PIPER_MODEL",
+    "DEFAULT_ENGLISH_VOICE",
     "DEFAULT_SWEDISH_VOICE",
     "EV3WAVSSHPlayer",
     "HostPiperEV3Speaker",
     "HostSpeechError",
+    "LocaleSpeechSynthesizer",
+    "MacOSSayWAVSynthesizer",
     "PiperLoopbackSynthesizer",
     "PiperSpeechProfile",
     "REMOTE_AUDIO_PLAYER",

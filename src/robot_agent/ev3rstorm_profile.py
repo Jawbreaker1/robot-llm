@@ -21,6 +21,8 @@ from .ev3_audio_transport import EV3WAVSSHSession
 from .ev3_navigation_transport import EV3NavigationSSHTransport
 from .host_piper_speech import (
     HostPiperEV3Speaker,
+    LocaleSpeechSynthesizer,
+    MacOSSayWAVSynthesizer,
     PiperLoopbackSynthesizer,
     PiperSpeechProfile,
 )
@@ -31,6 +33,7 @@ from .physical_odometry import OdometryCalibration
 from .physical_spatial_map import PhysicalSpatialMapBridge
 from .provisional_hazard_map import HazardMapCalibration
 from .robot_speech_runtime import RobotSpeechRuntime
+from .robot_turn_speech import cancellable_serialized_speaker
 
 
 EV3RSTORM_PROFILE_ID = "ev3rstorm-01"
@@ -411,6 +414,7 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
         ) = _load_profile_config(config_path)
         self.config_path = resolved
         self.speech_profile = speech_profile
+        self._speech_lock = threading.Lock()
         self.hazard_calibration = HazardMapCalibration(
             provisional_hazard_offset_mm=hazard_offset,
             detour_lateral_clearance_margin_mm=(
@@ -491,12 +495,21 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
                 return memory
 
         def speech_runtime_factory(*, event_sink):
-            synthesizer = PiperLoopbackSynthesizer(self.speech_profile)
+            piper = PiperLoopbackSynthesizer(self.speech_profile)
+            synthesizer = LocaleSpeechSynthesizer(
+                {
+                    "sv": piper,
+                    "en": MacOSSayWAVSynthesizer(),
+                }
+            )
             speech_session = EV3WAVSSHSession(
                 binding.target,
                 connect_timeout_seconds=binding.connect_timeout_seconds,
             )
-            speaker = HostPiperEV3Speaker(synthesizer, speech_session)
+            speaker = cancellable_serialized_speaker(
+                HostPiperEV3Speaker(synthesizer, speech_session),
+                self._speech_lock,
+            )
             return RobotSpeechRuntime(
                 speaker=speaker,
                 speaker_close=speech_session.close,
@@ -528,6 +541,7 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             memory_factory=memory_factory,
             scan_executor_factory=scan_executor_factory,
             speech_runtime_factory=speech_runtime_factory,
+            speech_locales=("sv", "en"),
             spatial_map_bridge=spatial_map_bridge,
             goal_heading_tolerance_mdeg=(
                 EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG

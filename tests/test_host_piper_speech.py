@@ -7,9 +7,12 @@ import unittest
 import wave
 
 from robot_agent.host_piper_speech import (
+    DEFAULT_ENGLISH_VOICE,
     EV3WAVSSHPlayer,
     HostPiperEV3Speaker,
     HostSpeechError,
+    LocaleSpeechSynthesizer,
+    MacOSSayWAVSynthesizer,
     PiperLoopbackSynthesizer,
     PiperSpeechProfile,
     validate_pcm16_mono_wav,
@@ -175,6 +178,92 @@ class HostPiperSpeechTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(result, [None])
         self.assertTrue(process.terminated)
+
+    def test_macos_say_writes_text_on_stdin_and_returns_valid_wav(self):
+        audio = wav_bytes()
+        process = ImmediateProcess()
+        seen = []
+
+        def factory(argv, **kwargs):
+            seen.append((list(argv), kwargs))
+            output = argv[argv.index("-o") + 1]
+            with open(output, "wb") as target:
+                target.write(audio)
+            return process
+
+        synth = MacOSSayWAVSynthesizer(process_factory=factory)
+        result = synth.synthesize(
+            "Oh, for heaven's sake.",
+            "en",
+            threading.Event(),
+        )
+
+        self.assertEqual(result, audio)
+        argv = seen[0][0]
+        self.assertEqual(argv[0], "/usr/bin/say")
+        self.assertEqual(argv[argv.index("-v") + 1], DEFAULT_ENGLISH_VOICE)
+        self.assertNotIn("Oh, for heaven's sake.", argv)
+        self.assertEqual(
+            bytes(process.stdin.data),
+            b"Oh, for heaven's sake.",
+        )
+        self.assertIn("--data-format=LEI16@22050", argv)
+        self.assertIn("--file-format=WAVE", argv)
+
+    def test_macos_say_cancellation_terminates_its_process(self):
+        process = BlockingProcess()
+        synth = MacOSSayWAVSynthesizer(
+            process_factory=lambda *_args, **_kwargs: process,
+        )
+        cancel = threading.Event()
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                synth.synthesize("Please stop.", "en", cancel)
+            ),
+            daemon=True,
+        )
+
+        thread.start()
+        deadline = time.monotonic() + 1
+        while not process.stdin.data and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(process.stdin.data)
+        cancel.set()
+        thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [None])
+        self.assertTrue(process.terminated)
+
+    def test_locale_router_uses_only_the_configured_provider(self):
+        class Synthesizer:
+            def __init__(self, name):
+                self.name = name
+                self.calls = []
+
+            def synthesize(self, text, locale, cancel_event):
+                self.calls.append((text, locale, cancel_event))
+                return self.name.encode("ascii")
+
+        swedish = Synthesizer("swedish")
+        english = Synthesizer("english")
+        router = LocaleSpeechSynthesizer(
+            {"sv": swedish, "en": english}
+        )
+        cancel = threading.Event()
+
+        self.assertEqual(router.locales, ("sv", "en"))
+        self.assertEqual(router.synthesize("Hej", "sv", cancel), b"swedish")
+        self.assertEqual(
+            router.synthesize("Hello", "en", cancel),
+            b"english",
+        )
+        self.assertEqual(len(swedish.calls), 1)
+        self.assertEqual(len(english.calls), 1)
+        with self.assertRaises(HostSpeechError) as caught:
+            router.synthesize("Hallo", "de", cancel)
+        self.assertEqual(caught.exception.code, "unsupported_tts_locale")
 
     def test_chunked_style_oversized_output_is_stopped_at_capture_limit(self):
         process = BlockingProcess()

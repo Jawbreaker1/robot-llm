@@ -91,6 +91,19 @@
       : fallback;
   }
 
+  function physicalTurnControl(value) {
+    const turn = safeObject(value);
+    if (turn.intent === "STOP_TASK") {
+      const stoppedControl = safeObject(turn.control);
+      return Object.keys(stoppedControl).length > 0 ? stoppedControl : null;
+    }
+    if (turn.intent !== "PHYSICAL_TASK") {
+      return null;
+    }
+    const control = safeObject(safeObject(turn.episode).control);
+    return Object.keys(control).length > 0 ? control : null;
+  }
+
   function normalizeControl(value) {
     const source = safeObject(value);
     const state = CONTROL_STATES.includes(source.state)
@@ -151,12 +164,12 @@
     const robotReady = (
       control.enabled
       && control.accepting
-      && control.state === "IDLE"
       && !busy
     );
     return {
       robotTarget,
       composerEnabled: robotTarget ? robotReady : chatEnabled === true,
+      robotInputEnabled: robotReady,
       robotStartEnabled: robotReady,
       turnModeEnabled: !robotTarget && chatEnabled === true,
       newConversationEnabled: !robotTarget && chatEnabled === true,
@@ -216,8 +229,11 @@
         ? options.onAvailabilityChanged
         : () => {}
     );
-    const onGoalAccepted = typeof options.onGoalAccepted === "function"
-      ? options.onGoalAccepted
+    const onInputAccepted = typeof options.onInputAccepted === "function"
+      ? options.onInputAccepted
+      : () => {};
+    const onTargetChanged = typeof options.onTargetChanged === "function"
+      ? options.onTargetChanged
       : () => {};
     const byId = (id) => document.getElementById(id);
     const missionPanel = global.RobotMissionPanelUI.create({
@@ -249,6 +265,7 @@
       conversationTarget.override(target);
       syncTargetSelector();
       renderComposer();
+      onTargetChanged(selectedTarget());
       return selectedTarget();
     }
 
@@ -256,6 +273,7 @@
       conversationTarget.selectView(view);
       syncTargetSelector();
       renderComposer();
+      onTargetChanged(selectedTarget());
       return selectedTarget();
     }
 
@@ -530,15 +548,15 @@
       render();
     }
 
-    async function startGoal(goal, locale = getLocale()) {
-      const cleanGoal = typeof goal === "string" ? goal.trim() : "";
+    async function submitInput(text, locale = getLocale()) {
+      const cleanText = typeof text === "string" ? text.trim() : "";
       const policy = composerPolicy(
         control,
         "robot",
         chatEnabled,
         busy || stopped,
       );
-      if (!cleanGoal || !policy.robotStartEnabled) {
+      if (!cleanText || !policy.robotInputEnabled) {
         showToast(
           translate("robot.errors.not_ready", {
             state: stateTranslation(control.state),
@@ -550,20 +568,32 @@
       busy = true;
       render();
       try {
-        const payload = await request("/api/v1/robot/episodes", {
+        const payload = await request("/api/v1/robot/turns", {
           method: "POST",
           body: {
-            goal: cleanGoal,
+            text: cleanText,
             locale,
             client_request_id: randomId("robot-ui"),
             expected_revision: control.settings.revision,
           },
-          timeout: 20000,
+          // The configured LM Studio decision budget may be up to 60 s.
+          // Keep the client alive beyond it so a late physical decision
+          // cannot start after the UI has already reported a timeout.
+          timeout: 65000,
         });
-        const episode = safeObject(payload.episode);
-        setControl(episode.control);
-        onGoalAccepted(cleanGoal, episode);
-        showToast(translate("robot.toasts.started"));
+        const turn = safeObject(payload.turn);
+        const nextControl = physicalTurnControl(turn);
+        if (nextControl) {
+          setControl(nextControl);
+        }
+        onInputAccepted(cleanText, turn);
+        showToast(translate(
+          turn.intent === "PHYSICAL_TASK"
+            ? "robot.toasts.started"
+            : turn.intent === "STOP_TASK"
+              ? "robot.toasts.stop_requested"
+              : "robot.toasts.input_accepted",
+        ));
         return true;
       } catch (error) {
         showToast(formatError(error), true);
@@ -718,7 +748,7 @@
       renderLocale,
       selectConversationView,
       selectedTarget,
-      startGoal,
+      submitInput,
       stopPolling,
     });
   }
@@ -733,6 +763,7 @@
     createConversationTargetState,
     defaultConversationTarget,
     normalizeControl,
+    physicalTurnControl,
     preferredInitialTarget,
     shouldApplySnapshot,
   });

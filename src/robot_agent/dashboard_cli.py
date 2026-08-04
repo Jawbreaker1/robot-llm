@@ -28,9 +28,12 @@ from .ev3rstorm_profile import (
 )
 from .lm_studio import DEFAULT_BASE_URL, DEFAULT_MODEL
 from .lm_studio_navigation import LMStudioNavigationPlanner
+from .lm_studio_robot_input import LMStudioRobotInputModel
 from .robot_control_contract import RobotControlSettings
 from .robot_control_http import RobotControlHTTPRouter
 from .robot_control_service import RobotControlService
+from .robot_input_service import RobotInputService
+from .robot_turn_speech import RobotTurnSpeechSink
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -262,6 +265,7 @@ def build_server(
     port: int = DEFAULT_PORT,
     session_token: Optional[str] = None,
     robot_control_service=None,
+    robot_input_service=None,
 ):
     if (
         isinstance(port, bool)
@@ -280,7 +284,10 @@ def build_server(
         service=service,
         session_token=token,
         expected_host=expected_host,
-        robot_control_router=RobotControlHTTPRouter(control_service),
+        robot_control_router=RobotControlHTTPRouter(
+            control_service,
+            robot_input_service,
+        ),
     )
     server = _LoopbackThreadingHTTPServer(
         (LOOPBACK_HOST, port),
@@ -465,6 +472,7 @@ def _close_resources(
     server,
     service,
     robot_control_service,
+    robot_turn_speech,
     map_runtime,
     whisper_runtime,
     *,
@@ -481,15 +489,19 @@ def _close_resources(
                 robot_control_service.shutdown()
         finally:
             try:
-                if service is not None:
-                    service.shutdown()
+                if robot_turn_speech is not None:
+                    robot_turn_speech.close(drain=False)
             finally:
                 try:
-                    if map_runtime is not None:
-                        map_runtime.close(drain=drain_map)
+                    if service is not None:
+                        service.shutdown()
                 finally:
-                    if whisper_runtime is not None:
-                        whisper_runtime.stop()
+                    try:
+                        if map_runtime is not None:
+                            map_runtime.close(drain=drain_map)
+                    finally:
+                        if whisper_runtime is not None:
+                            whisper_runtime.stop()
 
 
 def _run(
@@ -503,6 +515,8 @@ def _run(
     whisper_runtime = None
     service = None
     robot_control_service = None
+    robot_input_service = None
+    robot_turn_speech = None
     server = None
     try:
         if injected_robot_runtime:
@@ -593,8 +607,38 @@ def _run(
             robot_runtime_adapter,
             settings=RobotControlSettings(model=args.model),
         )
+        try:
+            adapter_state = vars(robot_runtime_adapter)
+        except TypeError:
+            adapter_state = {}
+        speech_factory = adapter_state.get("speech_runtime_factory")
+        speech_locales = adapter_state.get("speech_locales", ())
+        if callable(speech_factory) and speech_locales:
+            robot_turn_speech = RobotTurnSpeechSink(
+                speech_factory,
+                supported_locales=speech_locales,
+            )
+
+        def robot_input_model_factory(model):
+            return LMStudioRobotInputModel(
+                base_url=args.lm_studio_url,
+                model=model,
+                timeout_seconds=args.robot_planner_timeout_seconds,
+            )
+
+        robot_input_service = RobotInputService(
+            control_service=robot_control_service,
+            model_factory=robot_input_model_factory,
+            spatial_map_provider=map_runtime,
+            speech_sink=(
+                robot_turn_speech.submit
+                if robot_turn_speech is not None
+                else None
+            ),
+        )
         server_options = {
             "robot_control_service": robot_control_service,
+            "robot_input_service": robot_input_service,
         }
         if args.console_access_key_file:
             server_options["session_token"] = (
@@ -663,6 +707,7 @@ def _run(
             server,
             service,
             robot_control_service,
+            robot_turn_speech,
             map_runtime,
             whisper_runtime,
             drain_map=server is not None,

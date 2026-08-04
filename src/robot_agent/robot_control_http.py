@@ -120,10 +120,11 @@ def _response_size(value: Mapping[str, object]) -> int:
 class RobotControlHTTPRouter:
     """Delegate only the explicitly enumerated robot control routes."""
 
-    def __init__(self, service):
+    def __init__(self, service, input_service=None):
         if service is None:
             raise ValueError("Robot control HTTP service is required")
         self._service = service
+        self._input_service = input_service
 
     @staticmethod
     def handles(path: str) -> bool:
@@ -218,6 +219,34 @@ class RobotControlHTTPRouter:
                 )
             )
             return RobotControlHTTPResponse(202, {"episode": value})
+
+        if method == "POST" and path == "/api/v1/robot/turns":
+            self._no_query(query, "Robot turn endpoint")
+            if self._input_service is None:
+                raise RobotControlHTTPError(
+                    503,
+                    "robot_input_disabled",
+                    "Robot input service is not configured",
+                )
+            request = _exact_object(
+                _body_object(body),
+                (
+                    "text",
+                    "locale",
+                    "client_request_id",
+                    "expected_revision",
+                ),
+            )
+            value = self._call(
+                lambda: self._input_service.dispatch(
+                    request["text"],
+                    request["locale"],
+                    request["client_request_id"],
+                    request["expected_revision"],
+                )
+            )
+            status = 202 if value.get("episode") is not None else 200
+            return RobotControlHTTPResponse(status, {"turn": value})
 
         if method == "POST" and path == "/api/v1/robot/stop":
             self._no_query(query, "Robot stop endpoint")
