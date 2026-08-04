@@ -42,7 +42,7 @@
           <span class="status-name">Gemma</span>
           <span class="status-value" data-i18n="shell.runtime.model.checking">kontrollerar…</span>
         </div>
-        <div class="status-item" data-status="ready" id="status-research">
+        <div class="status-item is-secondary-status" data-status="ready" id="status-research">
           <span class="status-light" aria-hidden="true"></span>
           <span class="status-name" data-i18n="shell.runtime.research.name">Aktuell info</span>
           <span class="status-value" data-i18n="shell.runtime.research.ready">väder redo</span>
@@ -52,7 +52,7 @@
           <span class="status-name">EV3RSTORM</span>
           <span class="status-value" data-i18n="shell.runtime.robot.unobserved">inte observerad</span>
         </div>
-        <div class="status-item" data-status="locked" id="status-motion">
+        <div class="status-item is-secondary-status" data-status="locked" id="status-motion">
           <span class="status-light" aria-hidden="true"></span>
           <span class="status-name" data-i18n="shell.runtime.motion.name">Rörelse</span>
           <span class="status-value" data-i18n="shell.runtime.motion.locked">låst</span>
@@ -80,53 +80,48 @@
         <button class="nav-item is-active" type="button" data-view="workbench" aria-current="page">
           <span class="nav-index" aria-hidden="true">01</span>
           <span>
-            <strong data-i18n="nav.workbench.title">Arbetsbänk</strong>
-            <small data-i18n="nav.workbench.subtitle">Chatt och aktivitet</small>
-          </span>
-        </button>
-        <button class="nav-item" type="button" data-view="bodies">
-          <span class="nav-index" aria-hidden="true">02</span>
-          <span>
-            <strong data-i18n="nav.bodies.title">Kroppar</strong>
-            <small data-i18n="nav.bodies.subtitle">Noder och status</small>
+            <strong data-i18n="nav.workbench.title">Körning</strong>
+            <small data-i18n="nav.workbench.subtitle">Prata och ge roboten mål</small>
           </span>
         </button>
         <button class="nav-item" type="button" data-view="map">
-          <span class="nav-index" aria-hidden="true">03</span>
+          <span class="nav-index" aria-hidden="true">02</span>
           <span>
             <strong data-i18n="nav.map.title">Karta</strong>
             <small data-i18n="nav.map.subtitle">Rumslig lägesbild</small>
           </span>
         </button>
         <button class="nav-item" type="button" data-view="events">
-          <span class="nav-index" aria-hidden="true">04</span>
+          <span class="nav-index" aria-hidden="true">03</span>
           <span>
             <strong data-i18n="nav.events.title">Händelser</strong>
             <small data-i18n="nav.events.subtitle">Teknisk logg</small>
           </span>
         </button>
-        <button class="nav-item" type="button" data-view="experiments">
-          <span class="nav-index" aria-hidden="true">05</span>
-          <span>
-            <strong data-i18n="nav.experiments.title">Experiment</strong>
-            <small data-i18n="nav.experiments.subtitle">Evidens och historik</small>
-          </span>
-        </button>
         <button class="nav-item" type="button" data-view="settings">
-          <span class="nav-index" aria-hidden="true">06</span>
+          <span class="nav-index" aria-hidden="true">04</span>
           <span>
             <strong data-i18n="nav.settings.title">Inställningar</strong>
             <small data-i18n="nav.settings.subtitle">Runtime och budgetar</small>
           </span>
         </button>
-      </div>
-
-      <div class="sidebar-note">
-        <span class="lock-glyph" aria-hidden="true">R</span>
-        <div>
-          <strong data-i18n="nav.safety.title">Separat robotkontroll</strong>
-          <p data-i18n="nav.safety.body">Wi-Fi/USB-SSH, navigation och tal körs bakom en egen kontrolltjänst.</p>
-        </div>
+        <details class="nav-more">
+          <summary data-i18n="nav.more">Mer</summary>
+          <button class="nav-item nav-item-secondary" type="button" data-view="bodies">
+            <span class="nav-index" aria-hidden="true">05</span>
+            <span>
+              <strong data-i18n="nav.bodies.title">Kroppar</strong>
+              <small data-i18n="nav.bodies.subtitle">Noder och status</small>
+            </span>
+          </button>
+          <button class="nav-item nav-item-secondary" type="button" data-view="experiments">
+            <span class="nav-index" aria-hidden="true">06</span>
+            <span>
+              <strong data-i18n="nav.experiments.title">Experiment</strong>
+              <small data-i18n="nav.experiments.subtitle">Evidens och historik</small>
+            </span>
+          </button>
+        </details>
       </div>
     </nav>
 
@@ -136,8 +131,8 @@
           <header class="panel-header conversation-header">
             <div>
               <p class="eyebrow" data-i18n="workbench.session.eyebrow">Aktuell konversation</p>
-              <h2 id="workbench-heading" data-i18n="workbench.title">Arbetsbänk</h2>
-              <p class="panel-subtitle" id="conversation-subtitle" data-i18n="workbench.subtitle">Lokal Gemma · samtal och robotmål är separata</p>
+              <h2 id="workbench-heading" data-i18n="workbench.title">Körning</h2>
+              <p class="panel-subtitle" id="conversation-subtitle" data-i18n="workbench.subtitle">Prata med roboten, ge den mål och följ vad den gör.</p>
             </div>
             <div class="conversation-actions">
               <button class="button button-secondary inspector-toggle" type="button" id="open-inspector-button" aria-controls="agent-inspector" aria-expanded="false">
@@ -158,35 +153,44 @@
               <span class="state-chip state-idle" id="robot-control-state" role="status">DISABLED</span>
             </header>
             <div class="robot-control-actions">
-              <button class="button button-primary" type="button" id="robot-start-button" disabled data-i18n="robot.actions.start">Starta mål</button>
               <button class="button button-secondary" type="button" id="robot-stop-button" disabled data-i18n="robot.actions.stop">Stoppa</button>
               <button class="button button-danger" type="button" id="robot-emergency-stop-button" disabled data-i18n="robot.actions.emergency_stop">Nödstopp</button>
               <span id="robot-control-summary" data-i18n="robot.summary.loading">Läser robotstatus…</span>
             </div>
-            <dl class="robot-runtime-grid">
+            <dl class="robot-runtime-grid robot-runtime-primary">
               <div><dt data-i18n="robot.runtime.action">Aktuell handling</dt><dd id="robot-current-action">—</dd></div>
-              <div><dt data-i18n="robot.runtime.obstacle">Hinder</dt><dd id="robot-obstacle">—</dd></div>
               <div><dt data-i18n="robot.runtime.plan">Plan</dt><dd id="robot-plan">—</dd></div>
-              <div><dt data-i18n="robot.runtime.scan">IR-skanning</dt><dd id="robot-scan">—</dd></div>
-              <div><dt data-i18n="robot.runtime.model_latency">Modell-latens</dt><dd id="robot-model-latency">—</dd></div>
               <div><dt data-i18n="robot.runtime.speech">Tal</dt><dd id="robot-speech-status">—</dd></div>
             </dl>
-            <form class="robot-settings" id="robot-settings-form">
-              <label class="field">
-                <span data-i18n="robot.settings.model">Navigationsmodell</span>
-                <input id="robot-setting-model" type="text" maxlength="256" autocomplete="off" spellcheck="false" disabled>
-              </label>
-              <label class="field">
-                <span data-i18n="robot.settings.max_episode">Maximal episod, ms</span>
-                <input id="robot-setting-max-episode-ms" type="number" min="1000" max="3600000" step="1000" disabled>
-              </label>
-              <label class="robot-speech-toggle">
-                <input id="robot-setting-speech-enabled" type="checkbox" disabled>
-                <span data-i18n="robot.settings.speech">Låt roboten prata under körning</span>
-              </label>
-              <button class="button button-secondary" type="submit" id="robot-save-settings-button" disabled data-i18n="robot.settings.save">Spara robotinställningar</button>
-              <span id="robot-settings-status" role="status"></span>
-            </form>
+            <details class="robot-technical-details">
+              <summary>
+                <span data-i18n="robot.details.title">Teknik och körinställningar</span>
+                <small data-i18n="robot.details.description">Sensorer, modell och episodgränser</small>
+              </summary>
+              <div class="robot-technical-content">
+                <dl class="robot-runtime-grid robot-runtime-diagnostics">
+                  <div><dt data-i18n="robot.runtime.obstacle">Hinder</dt><dd id="robot-obstacle">—</dd></div>
+                  <div><dt data-i18n="robot.runtime.scan">IR-skanning</dt><dd id="robot-scan">—</dd></div>
+                  <div><dt data-i18n="robot.runtime.model_latency">Modell-latens</dt><dd id="robot-model-latency">—</dd></div>
+                </dl>
+                <form class="robot-settings" id="robot-settings-form">
+                  <label class="field">
+                    <span data-i18n="robot.settings.model">Navigationsmodell</span>
+                    <input id="robot-setting-model" type="text" maxlength="256" autocomplete="off" spellcheck="false" disabled>
+                  </label>
+                  <label class="field">
+                    <span data-i18n="robot.settings.max_episode">Maximal episod, ms</span>
+                    <input id="robot-setting-max-episode-ms" type="number" min="1000" max="3600000" step="1000" disabled>
+                  </label>
+                  <label class="robot-speech-toggle">
+                    <input id="robot-setting-speech-enabled" type="checkbox" disabled>
+                    <span data-i18n="robot.settings.speech">Låt roboten prata under körning</span>
+                  </label>
+                  <button class="button button-secondary" type="submit" id="robot-save-settings-button" disabled data-i18n="robot.settings.save">Spara robotinställningar</button>
+                  <span id="robot-settings-status" role="status"></span>
+                </form>
+              </div>
+            </details>
           </section>
 
           <div class="message-feed" id="message-feed" role="region" aria-label="Konversationshistorik" data-i18n-aria-label="workbench.history.aria_label">
@@ -199,8 +203,8 @@
               <h3 data-i18n="workbench.welcome.title">Hallå! Vad ska vi hitta på?</h3>
               <p data-i18n="workbench.welcome.body">Jag kör lokalt på din Mac. Välj vem du vill prata med; när en fysisk runtime finns väljs roboten först.</p>
               <div class="starter-prompts" aria-label="Exempelfrågor" data-i18n-aria-label="workbench.starter.aria_label">
-                <button type="button" data-prompt="Behöver jag paraply i Stockholm just nu?" data-prompt-mode="research_required" data-i18n="workbench.starter.weather.label" data-i18n-prompt="workbench.starter.weather.prompt">Behöver jag paraply i Stockholm?</button>
-                <button type="button" data-prompt="Förklara vad du kan göra i det här läget." data-prompt-mode="conversation" data-i18n="workbench.starter.capabilities.label" data-i18n-prompt="workbench.starter.capabilities.prompt">Vad kan du göra just nu?</button>
+                <button type="button" data-prompt="Utforska rummet och kommentera vad du hittar." data-prompt-mode="conversation" data-i18n="workbench.starter.explore.label" data-i18n-prompt="workbench.starter.explore.prompt">Utforska rummet</button>
+                <button type="button" data-prompt="Navigera framåt och försök ta dig runt hinder på vägen." data-prompt-mode="conversation" data-i18n="workbench.starter.navigate.label" data-i18n-prompt="workbench.starter.navigate.prompt">Navigera runt hinder</button>
               </div>
             </div>
           </div>
@@ -213,12 +217,14 @@
                 <option value="robot" data-i18n="workbench.target.robot">Roboten</option>
                 <option value="workbench" data-i18n="workbench.target.workbench" selected>Arbetsbänken / applikationen</option>
               </select>
-              <span class="target-help" id="composer-target-help" data-i18n="workbench.target.help">Gäller både skrivna meddelanden och taltranskript.</span>
-              <label for="turn-mode" data-i18n="workbench.mode.label">Körläge</label>
-              <select id="turn-mode" name="mode">
-                <option value="conversation" data-i18n="workbench.mode.conversation">Lokalt samtal · kan kolla upp saker vid behov</option>
-                <option value="research_required" data-i18n="workbench.mode.research">Aktuell information · färska källor krävs</option>
-              </select>
+              <span class="target-help sr-only" id="composer-target-help" data-i18n="workbench.target.help">Gäller både skrivna meddelanden och taltranskript.</span>
+              <div class="composer-mode-control" id="turn-mode-control">
+                <label for="turn-mode" data-i18n="workbench.mode.label">Körläge</label>
+                <select id="turn-mode" name="mode">
+                  <option value="conversation" data-i18n="workbench.mode.conversation">Lokalt samtal · kan kolla upp saker vid behov</option>
+                  <option value="research_required" data-i18n="workbench.mode.research">Aktuell information · färska källor krävs</option>
+                </select>
+              </div>
               <span class="capability-note" id="mode-capability-note" data-i18n="workbench.mode.capability">Välj vart instruktionen ska skickas</span>
             </div>
             <label class="sr-only" for="message-input" data-i18n="workbench.composer.message_label">Meddelande till Gemma</label>
@@ -528,54 +534,63 @@
             </div>
           </section>
 
-          <aside class="map-detail-column" aria-label="Kartmetadata" data-i18n-aria-label="map.details.aria_label">
-            <section class="instrument-panel map-metadata-panel">
-              <header class="instrument-header">
-                <div>
-                  <p class="eyebrow" data-i18n="map.details.eyebrow">Snapshot</p>
-                  <h3 data-i18n="map.details.title">Ursprung och färskhet</h3>
-                </div>
-              </header>
-              <dl class="telemetry-list" id="map-metadata">
-                <div><dt data-i18n="map.details.source">Källa</dt><dd>—</dd></div>
-                <div><dt data-i18n="map.details.age">Ålder</dt><dd>—</dd></div>
-                <div><dt data-i18n="map.details.provenance">Märkning</dt><dd>—</dd></div>
-                <div><dt data-i18n="map.details.version">Kartversion</dt><dd>—</dd></div>
-                <div><dt data-i18n="map.details.robot">Robot</dt><dd>—</dd></div>
-              </dl>
-            </section>
+          <details class="map-technical-details">
+            <summary>
+              <span>
+                <strong data-i18n="map.technical.title">Sensorer och kartdetaljer</strong>
+                <small data-i18n="map.technical.description">Rå observation, objektshypoteser och proveniens</small>
+              </span>
+              <span class="map-technical-chevron" aria-hidden="true">›</span>
+            </summary>
+            <aside class="map-detail-column" aria-label="Kartmetadata" data-i18n-aria-label="map.details.aria_label">
+              <section class="instrument-panel map-metadata-panel">
+                <header class="instrument-header">
+                  <div>
+                    <p class="eyebrow" data-i18n="map.details.eyebrow">Snapshot</p>
+                    <h3 data-i18n="map.details.title">Ursprung och färskhet</h3>
+                  </div>
+                </header>
+                <dl class="telemetry-list" id="map-metadata">
+                  <div><dt data-i18n="map.details.source">Källa</dt><dd>—</dd></div>
+                  <div><dt data-i18n="map.details.age">Ålder</dt><dd>—</dd></div>
+                  <div><dt data-i18n="map.details.provenance">Märkning</dt><dd>—</dd></div>
+                  <div><dt data-i18n="map.details.version">Kartversion</dt><dd>—</dd></div>
+                  <div><dt data-i18n="map.details.robot">Robot</dt><dd>—</dd></div>
+                </dl>
+              </section>
 
-            <section class="instrument-panel map-qualitative-panel">
-              <header class="instrument-header">
-                <div>
-                  <p class="eyebrow" data-i18n="map.qualitative.eyebrow">Icke-metrisk perception</p>
-                  <h3 data-i18n="map.qualitative.title">Kvalitativa observationer</h3>
+              <section class="instrument-panel map-qualitative-panel">
+                <header class="instrument-header">
+                  <div>
+                    <p class="eyebrow" data-i18n="map.qualitative.eyebrow">Icke-metrisk perception</p>
+                    <h3 data-i18n="map.qualitative.title">Kvalitativa observationer</h3>
+                  </div>
+                  <span class="map-observation-count" id="map-qualitative-count">0</span>
+                </header>
+                <div class="map-qualitative-list" id="map-qualitative-list">
+                  <p class="map-qualitative-empty" data-i18n="map.qualitative.empty">Inga kvalitativa observationer i snapshoten.</p>
                 </div>
-                <span class="map-observation-count" id="map-qualitative-count">0</span>
-              </header>
-              <div class="map-qualitative-list" id="map-qualitative-list">
-                <p class="map-qualitative-empty" data-i18n="map.qualitative.empty">Inga kvalitativa observationer i snapshoten.</p>
+              </section>
+
+              <section class="instrument-panel map-objects-panel">
+                <header class="instrument-header">
+                  <div>
+                    <p class="eyebrow" data-i18n="map.objects.eyebrow">Aktuella hypoteser</p>
+                    <h3 data-i18n="map.objects.title">Objekt</h3>
+                  </div>
+                  <span class="map-object-count" id="map-object-count">0</span>
+                </header>
+                <div class="map-object-list" id="map-object-list">
+                  <p class="map-object-empty" data-i18n="map.objects.empty">Inga objekthypoteser i snapshoten.</p>
+                </div>
+              </section>
+
+              <div class="map-provenance-note">
+                <strong data-i18n="map.provenance.title">Tolka märkningen</strong>
+                <p data-i18n="map.provenance.body">SIMULATION är genererad geometri. PROVISIONAL IR är ännu inte en verifierad metrisk avståndsmätning.</p>
               </div>
-            </section>
-
-            <section class="instrument-panel map-objects-panel">
-              <header class="instrument-header">
-                <div>
-                  <p class="eyebrow" data-i18n="map.objects.eyebrow">Aktuella hypoteser</p>
-                  <h3 data-i18n="map.objects.title">Objekt</h3>
-                </div>
-                <span class="map-object-count" id="map-object-count">0</span>
-              </header>
-              <div class="map-object-list" id="map-object-list">
-                <p class="map-object-empty" data-i18n="map.objects.empty">Inga objekthypoteser i snapshoten.</p>
-              </div>
-            </section>
-
-            <div class="map-provenance-note">
-              <strong data-i18n="map.provenance.title">Tolka märkningen</strong>
-              <p data-i18n="map.provenance.body">SIMULATION är genererad geometri. PROVISIONAL IR är ännu inte en verifierad metrisk avståndsmätning.</p>
-            </div>
-          </aside>
+            </aside>
+          </details>
         </div>
       </section>
 
@@ -763,148 +778,159 @@
         </form>
 
         <form id="settings-form">
-          <section class="settings-section" aria-labelledby="settings-runtime-heading">
-            <header>
-              <div>
-                <span class="section-number" aria-hidden="true">02</span>
-                <div>
-                  <h3 id="settings-runtime-heading">LM Studio</h3>
-                  <p data-i18n="settings.runtime.description">Endast en lokal loopback-slutpunkt accepteras.</p>
+          <details class="settings-advanced-details">
+            <summary>
+              <span>
+                <strong data-i18n="settings.advanced.title">Agent och tekniska inställningar</strong>
+                <small data-i18n="settings.advanced.description">LM Studio, budgetar, verktyg och kontrollgränser</small>
+              </span>
+              <span class="settings-advanced-chevron" aria-hidden="true">›</span>
+            </summary>
+            <div class="settings-advanced-content">
+              <section class="settings-section" aria-labelledby="settings-runtime-heading">
+                <header>
+                  <div>
+                    <span class="section-number" aria-hidden="true">02</span>
+                    <div>
+                      <h3 id="settings-runtime-heading">LM Studio</h3>
+                      <p data-i18n="settings.runtime.description">Endast en lokal loopback-slutpunkt accepteras.</p>
+                    </div>
+                  </div>
+                  <button class="button button-secondary" type="button" id="probe-lm-studio-button" data-i18n="settings.runtime.probe">Testa anslutning</button>
+                </header>
+                <div class="form-grid">
+                  <label class="field field-wide">
+                    <span data-i18n="settings.runtime.endpoint">Slutpunkt</span>
+                    <input id="setting-lm-base-url" type="url" autocomplete="off" spellcheck="false" readonly>
+                    <small data-i18n="settings.runtime.endpoint_help">Runtimevärde · ändras utanför dashboarden</small>
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.runtime.model">Modell</span>
+                    <input id="setting-lm-model" type="text" autocomplete="off" spellcheck="false" readonly>
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.runtime.planner_timeout">Planerarens tidsgräns, ms</span>
+                    <input id="setting-planner-latency-ms" type="number" min="1" max="300000" step="1">
+                  </label>
                 </div>
-              </div>
-              <button class="button button-secondary" type="button" id="probe-lm-studio-button" data-i18n="settings.runtime.probe">Testa anslutning</button>
-            </header>
-            <div class="form-grid">
-              <label class="field field-wide">
-                <span data-i18n="settings.runtime.endpoint">Slutpunkt</span>
-                <input id="setting-lm-base-url" type="url" autocomplete="off" spellcheck="false" readonly>
-                <small data-i18n="settings.runtime.endpoint_help">Runtimevärde · ändras utanför dashboarden</small>
-              </label>
-              <label class="field">
-                <span data-i18n="settings.runtime.model">Modell</span>
-                <input id="setting-lm-model" type="text" autocomplete="off" spellcheck="false" readonly>
-              </label>
-              <label class="field">
-                <span data-i18n="settings.runtime.planner_timeout">Planerarens tidsgräns, ms</span>
-                <input id="setting-planner-latency-ms" type="number" min="1" max="300000" step="1">
-              </label>
-            </div>
-            <div class="inline-result" id="probe-result" role="status" data-i18n="settings.runtime.probe_idle">Ingen anslutningskontroll körd ännu.</div>
-          </section>
+                <div class="inline-result" id="probe-result" role="status" data-i18n="settings.runtime.probe_idle">Ingen anslutningskontroll körd ännu.</div>
+              </section>
 
-          <section class="settings-section" aria-labelledby="settings-agent-heading">
-            <header>
-              <div>
-                <span class="section-number" aria-hidden="true">03</span>
-                <div>
-                  <h3 id="settings-agent-heading" data-i18n="settings.budgets.title">Agentbudgetar</h3>
-                  <p data-i18n="settings.budgets.description">Hårda tak för varje lokal episod.</p>
+              <section class="settings-section" aria-labelledby="settings-agent-heading">
+                <header>
+                  <div>
+                    <span class="section-number" aria-hidden="true">03</span>
+                    <div>
+                      <h3 id="settings-agent-heading" data-i18n="settings.budgets.title">Agentbudgetar</h3>
+                      <p data-i18n="settings.budgets.description">Hårda tak för varje lokal episod.</p>
+                    </div>
+                  </div>
+                </header>
+                <div class="form-grid four-columns">
+                  <label class="field">
+                    <span data-i18n="settings.budgets.planner_turns">Planerarsteg</span>
+                    <input id="setting-max-planner-turns" type="number" min="1" max="100" step="1">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.budgets.replans">Omplaneringar</span>
+                    <input id="setting-max-replans" type="number" min="0" max="100" step="1">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.budgets.tool_calls">Verktygsanrop</span>
+                    <input id="setting-max-tool-calls" type="number" min="0" max="100" step="1">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.budgets.total_time">Total tid, ms</span>
+                    <input id="setting-max-elapsed-ms" type="number" min="1" max="300000" step="1">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.budgets.tool_request_ttl">Verktygsbegärans TTL, ms</span>
+                    <input id="setting-tool-request-ttl-ms" type="number" min="1" max="300000" step="1">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.budgets.evidence_ttl">Evidens-TTL, ms</span>
+                    <input id="setting-evidence-ttl-ms" type="number" min="1" max="86400000" step="1">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.budgets.weather_skew">Maximal väderskevhet, ms</span>
+                    <input id="setting-weather-skew-ms" type="number" min="1" max="86400000" step="1">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.budgets.default_mode">Standardläge</span>
+                    <select id="setting-chat-mode">
+                      <option value="conversation" data-i18n="settings.budgets.mode_conversation">Lokalt samtal</option>
+                      <option value="research_required" data-i18n="settings.budgets.mode_research">Research</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.budgets.log_level">Loggnivå</span>
+                    <select id="setting-log-level">
+                      <option value="debug" data-i18n="settings.budgets.log_debug">Felsökning</option>
+                      <option value="info" data-i18n="settings.budgets.log_info">Info</option>
+                      <option value="warning" data-i18n="settings.budgets.log_warning">Varning</option>
+                      <option value="error" data-i18n="settings.budgets.log_error">Fel</option>
+                    </select>
+                  </label>
                 </div>
-              </div>
-            </header>
-            <div class="form-grid four-columns">
-              <label class="field">
-                <span data-i18n="settings.budgets.planner_turns">Planerarsteg</span>
-                <input id="setting-max-planner-turns" type="number" min="1" max="100" step="1">
-              </label>
-              <label class="field">
-                <span data-i18n="settings.budgets.replans">Omplaneringar</span>
-                <input id="setting-max-replans" type="number" min="0" max="100" step="1">
-              </label>
-              <label class="field">
-                <span data-i18n="settings.budgets.tool_calls">Verktygsanrop</span>
-                <input id="setting-max-tool-calls" type="number" min="0" max="100" step="1">
-              </label>
-              <label class="field">
-                <span data-i18n="settings.budgets.total_time">Total tid, ms</span>
-                <input id="setting-max-elapsed-ms" type="number" min="1" max="300000" step="1">
-              </label>
-              <label class="field">
-                <span data-i18n="settings.budgets.tool_request_ttl">Verktygsbegärans TTL, ms</span>
-                <input id="setting-tool-request-ttl-ms" type="number" min="1" max="300000" step="1">
-              </label>
-              <label class="field">
-                <span data-i18n="settings.budgets.evidence_ttl">Evidens-TTL, ms</span>
-                <input id="setting-evidence-ttl-ms" type="number" min="1" max="86400000" step="1">
-              </label>
-              <label class="field">
-                <span data-i18n="settings.budgets.weather_skew">Maximal väderskevhet, ms</span>
-                <input id="setting-weather-skew-ms" type="number" min="1" max="86400000" step="1">
-              </label>
-              <label class="field">
-                <span data-i18n="settings.budgets.default_mode">Standardläge</span>
-                <select id="setting-chat-mode">
-                  <option value="conversation" data-i18n="settings.budgets.mode_conversation">Lokalt samtal</option>
-                  <option value="research_required" data-i18n="settings.budgets.mode_research">Research</option>
-                </select>
-              </label>
-              <label class="field">
-                <span data-i18n="settings.budgets.log_level">Loggnivå</span>
-                <select id="setting-log-level">
-                  <option value="debug" data-i18n="settings.budgets.log_debug">Felsökning</option>
-                  <option value="info" data-i18n="settings.budgets.log_info">Info</option>
-                  <option value="warning" data-i18n="settings.budgets.log_warning">Varning</option>
-                  <option value="error" data-i18n="settings.budgets.log_error">Fel</option>
-                </select>
-              </label>
-            </div>
-          </section>
+              </section>
 
-          <section class="settings-section" aria-labelledby="settings-tools-heading">
-            <header>
-              <div>
-                <span class="section-number" aria-hidden="true">04</span>
-                <div>
-                  <h3 id="settings-tools-heading" data-i18n="settings.tools.title">Verktyg</h3>
-                  <p data-i18n="settings.tools.description">Exakt tillåtelselista. Verktyg får endast producera passiv evidens.</p>
+              <section class="settings-section" aria-labelledby="settings-tools-heading">
+                <header>
+                  <div>
+                    <span class="section-number" aria-hidden="true">04</span>
+                    <div>
+                      <h3 id="settings-tools-heading" data-i18n="settings.tools.title">Verktyg</h3>
+                      <p data-i18n="settings.tools.description">Exakt tillåtelselista. Verktyg får endast producera passiv evidens.</p>
+                    </div>
+                  </div>
+                </header>
+                <div class="tool-registry" id="settings-tool-registry">
+                  <div class="tool-row">
+                    <div class="tool-symbol" aria-hidden="true">W</div>
+                    <div>
+                      <strong>weather.current</strong>
+                      <small data-i18n="settings.tools.weather_origin">Open-Meteo · fast HTTPS-ursprung</small>
+                    </div>
+                    <span class="state-chip state-ready" data-i18n="settings.tools.available">Tillgängligt</span>
+                  </div>
+                  <div class="tool-row is-disabled">
+                    <div class="tool-symbol" aria-hidden="true">F</div>
+                    <div>
+                      <strong data-i18n="settings.tools.generic_fetch">Generisk webbhämtning</strong>
+                      <small data-i18n="settings.tools.generic_fetch_help">Väntar på DNS-pinning och SSRF-grind</small>
+                    </div>
+                    <span class="state-chip state-idle" data-i18n="settings.tools.not_installed">Ej installerad</span>
+                  </div>
                 </div>
-              </div>
-            </header>
-            <div class="tool-registry" id="settings-tool-registry">
-              <div class="tool-row">
-                <div class="tool-symbol" aria-hidden="true">W</div>
-                <div>
-                  <strong>weather.current</strong>
-                  <small data-i18n="settings.tools.weather_origin">Open-Meteo · fast HTTPS-ursprung</small>
-                </div>
-                <span class="state-chip state-ready" data-i18n="settings.tools.available">Tillgängligt</span>
-              </div>
-              <div class="tool-row is-disabled">
-                <div class="tool-symbol" aria-hidden="true">F</div>
-                <div>
-                  <strong data-i18n="settings.tools.generic_fetch">Generisk webbhämtning</strong>
-                  <small data-i18n="settings.tools.generic_fetch_help">Väntar på DNS-pinning och SSRF-grind</small>
-                </div>
-                <span class="state-chip state-idle" data-i18n="settings.tools.not_installed">Ej installerad</span>
-              </div>
-            </div>
-          </section>
+              </section>
 
-          <section class="settings-section safety-section" aria-labelledby="settings-safety-heading">
-            <header>
-              <div>
-                <span class="section-number" aria-hidden="true">05</span>
-                <div>
-                  <h3 id="settings-safety-heading" data-i18n="settings.safety.title">Fysisk säkerhet</h3>
-                  <p data-i18n="settings.safety.description">Status för den separata exekveringsvägen.</p>
+              <section class="settings-section safety-section" aria-labelledby="settings-safety-heading">
+                <header>
+                  <div>
+                    <span class="section-number" aria-hidden="true">05</span>
+                    <div>
+                      <h3 id="settings-safety-heading" data-i18n="settings.safety.title">Fysisk säkerhet</h3>
+                      <p data-i18n="settings.safety.description">Status för den separata exekveringsvägen.</p>
+                    </div>
+                  </div>
+                  <span class="state-chip state-locked" data-i18n="settings.safety.locked">Separat</span>
+                </header>
+                <div class="safety-banner">
+                  <span class="large-lock" aria-hidden="true">×</span>
+                  <div>
+                    <strong data-i18n="settings.safety.banner_title">Fysisk körning har en separat kontrollgräns.</strong>
+                    <p data-i18n="settings.safety.banner_body">Dashboardchatten äger aldrig motorerna. En explicit injicerad robotruntime äger en episod åt gången och kan stoppas oberoende.</p>
+                  </div>
                 </div>
-              </div>
-              <span class="state-chip state-locked" data-i18n="settings.safety.locked">Separat</span>
-            </header>
-            <div class="safety-banner">
-              <span class="large-lock" aria-hidden="true">×</span>
-              <div>
-                <strong data-i18n="settings.safety.banner_title">Fysisk körning har en separat kontrollgräns.</strong>
-                <p data-i18n="settings.safety.banner_body">Dashboardchatten äger aldrig motorerna. En explicit injicerad robotruntime äger en episod åt gången och kan stoppas oberoende.</p>
-              </div>
+                <dl class="capability-matrix">
+                  <div><dt data-i18n="settings.safety.physical_control">Fysisk styrning</dt><dd data-i18n="settings.safety.off">Via robotkontrollpanelen</dd></div>
+                  <div><dt>SSH</dt><dd data-i18n="settings.safety.not_exposed">Ägs av robotruntimen</dd></div>
+                  <div><dt>TTS</dt><dd data-i18n="settings.safety.not_exposed">Ägs av robotruntimen</dd></div>
+                  <div><dt data-i18n="settings.safety.research">Research</dt><dd data-i18n="settings.safety.read_only">Skrivskyddat</dd></div>
+                </dl>
+              </section>
             </div>
-            <dl class="capability-matrix">
-              <div><dt data-i18n="settings.safety.physical_control">Fysisk styrning</dt><dd data-i18n="settings.safety.off">Via robotkontrollpanelen</dd></div>
-              <div><dt>SSH</dt><dd data-i18n="settings.safety.not_exposed">Ägs av robotruntimen</dd></div>
-              <div><dt>TTS</dt><dd data-i18n="settings.safety.not_exposed">Ägs av robotruntimen</dd></div>
-              <div><dt data-i18n="settings.safety.research">Research</dt><dd data-i18n="settings.safety.read_only">Skrivskyddat</dd></div>
-            </dl>
-          </section>
+          </details>
 
           <div class="settings-actions">
             <span id="settings-status" role="status" data-i18n="settings.actions.clean">Inga osparade ändringar.</span>
@@ -916,7 +942,7 @@
     </main>
 
     <footer class="mobile-nav" aria-label="Mobil navigation" data-i18n-aria-label="footer.mobile_nav.aria_label">
-      <button type="button" data-view="workbench" class="is-active" aria-current="page"><span aria-hidden="true">01</span><span data-i18n="footer.workbench">Arbetsbänk</span></button>
+      <button type="button" data-view="workbench" class="is-active" aria-current="page"><span aria-hidden="true">01</span><span data-i18n="footer.workbench">Körning</span></button>
       <button type="button" data-view="bodies"><span aria-hidden="true">02</span><span data-i18n="footer.bodies">Kroppar</span></button>
       <button type="button" data-view="map"><span aria-hidden="true">03</span><span data-i18n="footer.map">Karta</span></button>
       <button type="button" data-view="events"><span aria-hidden="true">04</span><span data-i18n="footer.events">Händelser</span></button>

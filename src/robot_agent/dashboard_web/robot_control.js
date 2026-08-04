@@ -394,10 +394,15 @@
       byId("new-conversation-button").disabled = (
         !policy.newConversationEnabled
       );
+      byId("new-conversation-button").hidden = policy.robotTarget;
       byId("turn-mode").disabled = !policy.turnModeEnabled;
-      byId("robot-start-button").disabled = (
-        !policy.robotStartEnabled || !hasGoal
+      byId("turn-mode-control").hidden = policy.robotTarget;
+      byId("send-button").querySelector(".button-label").textContent = (
+        policy.robotTarget
+          ? translate("robot.actions.start")
+          : translate("workbench.composer.send")
       );
+      byId("send-button").disabled = !policy.composerEnabled || !hasGoal;
       byId("mode-capability-note").textContent = policy.robotTarget
         ? translate("robot.composer.robot_note")
         : translate("robot.composer.workbench_note");
@@ -636,10 +641,6 @@
         overrideTarget(event.currentTarget.value);
       });
       byId("message-input").addEventListener("input", renderComposer);
-      byId("robot-start-button").addEventListener("click", () => {
-        overrideTarget("robot");
-        startGoal(byId("message-input").value, getLocale());
-      });
       byId("robot-stop-button").addEventListener(
         "click",
         () => command(
