@@ -28,7 +28,10 @@ from .ev3rstorm_profile import (
 )
 from .lm_studio import DEFAULT_BASE_URL, DEFAULT_MODEL
 from .lm_studio_navigation import LMStudioNavigationPlanner
-from .lm_studio_robot_input import LMStudioRobotInputModel
+from .lm_studio_robot_input import (
+    LMStudioRobotInputModel,
+    REQUEST_TIMEOUT_SECONDS as ROBOT_INPUT_TIMEOUT_SECONDS,
+)
 from .robot_control_contract import RobotControlSettings
 from .robot_control_http import RobotControlHTTPRouter
 from .robot_control_service import RobotControlService
@@ -371,6 +374,15 @@ def _parser() -> argparse.ArgumentParser:
         default=30.0,
         help="Structured physical planner timeout (default: %(default)s)",
     )
+    parser.add_argument(
+        "--robot-input-timeout-seconds",
+        type=float,
+        default=ROBOT_INPUT_TIMEOUT_SECONDS,
+        help=(
+            "Interactive robot message timeout, independent of the physical "
+            "planner (default: %(default)s)"
+        ),
+    )
     stt_source = parser.add_mutually_exclusive_group()
     stt_source.add_argument(
         "--stt-model",
@@ -522,6 +534,11 @@ def _run(
     robot_turn_speech = None
     server = None
     try:
+        if (
+            not math.isfinite(args.robot_input_timeout_seconds)
+            or not 0.1 <= args.robot_input_timeout_seconds <= 60.0
+        ):
+            raise ValueError("interactive robot input timeout is invalid")
         if injected_robot_runtime:
             if (
                 args.robot_profile != ROBOT_PROFILE_DISABLED
@@ -626,7 +643,7 @@ def _run(
             return LMStudioRobotInputModel(
                 base_url=args.lm_studio_url,
                 model=model,
-                timeout_seconds=args.robot_planner_timeout_seconds,
+                timeout_seconds=args.robot_input_timeout_seconds,
             )
 
         robot_input_service = RobotInputService(

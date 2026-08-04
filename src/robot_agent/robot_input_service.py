@@ -27,6 +27,18 @@ def _clarification(locale: str) -> str:
     return "I am not sure what you mean. Could you clarify?"
 
 
+def _active_episode_reply(locale: str) -> str:
+    if locale == "sv":
+        return (
+            "Jag kör redan. Be mig stoppa först, eller vänta tills "
+            "den här körningen är klar."
+        )
+    return (
+        "I am already moving. Ask me to stop first, or wait until "
+        "this run is finished."
+    )
+
+
 class RobotInputService:
     """Interpret once; only ``PHYSICAL_TASK`` may start a robot episode."""
 
@@ -149,16 +161,35 @@ class RobotInputService:
             control = None
             speech_queued = False
             if decision.intent == PHYSICAL_TASK:
-                episode = self._control.start(
-                    text,
-                    locale,
-                    client_request_id,
-                    expected_revision,
-                )
-            elif decision.intent == STOP_TASK:
+                try:
+                    episode = self._control.start(
+                        text,
+                        locale,
+                        client_request_id,
+                        expected_revision,
+                    )
+                except RobotControlServiceError as error:
+                    active_state = facts.get("control", {}).get("state")
+                    if (
+                        error.code != "robot_episode_active"
+                        or active_state not in (
+                            "STARTING",
+                            "RUNNING",
+                            "STOPPING",
+                        )
+                    ):
+                        raise
+                    decision = RobotInputDecision(
+                        intent=CLARIFY,
+                        confidence_milli=decision.confidence_milli,
+                        reply_text=_active_episode_reply(locale),
+                    )
+            if decision.intent == STOP_TASK:
                 control = self._control.stop()
             elif (
-                settings.get("speech_enabled") is True
+                decision.intent != PHYSICAL_TASK
+                and episode is None
+                and settings.get("speech_enabled") is True
                 and self._speech_sink is not None
             ):
                 try:

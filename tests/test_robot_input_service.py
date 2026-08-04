@@ -171,17 +171,20 @@ class RobotInputServiceTests(unittest.TestCase):
         self.assertIsNone(turn["episode"])
         self.assertEqual(control.started, [])
 
-    def test_physical_input_during_navigation_remains_rejected(self):
+    def test_physical_input_during_navigation_returns_visible_guidance(self):
         control = FakeControl("RUNNING")
-        service, _spoken, _seen = self.service(
+        service, spoken, _seen = self.service(
             control,
             RobotInputDecision(PHYSICAL_TASK, 900, None),
         )
 
-        with self.assertRaises(RobotControlServiceError) as caught:
-            service.dispatch("Sväng höger", "sv", "request-4", 3)
+        turn = service.dispatch("Sväng höger", "sv", "request-4", 3)
 
-        self.assertEqual(caught.exception.code, "robot_episode_active")
+        self.assertEqual(turn["intent"], CLARIFY)
+        self.assertIn("Be mig stoppa först", turn["answer_text"])
+        self.assertTrue(turn["speech_queued"])
+        self.assertEqual(control.started, [])
+        self.assertEqual(spoken[0][1], turn["answer_text"])
 
     def test_stop_intent_uses_stop_control_path_during_navigation(self):
         control = FakeControl("RUNNING")

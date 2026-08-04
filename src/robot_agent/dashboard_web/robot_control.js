@@ -244,6 +244,7 @@
     });
     let control = normalizeControl({});
     let busy = false;
+    let interpretingInput = false;
     let settingsDirty = false;
     let chatEnabled = false;
     let pollTimer = null;
@@ -431,7 +432,9 @@
         : translate("robot.composer.workbench_note");
       byId("composer-status").textContent = policy.robotTarget
         ? (
-          policy.composerEnabled
+          interpretingInput
+            ? translate("robot.composer.interpreting")
+            : policy.composerEnabled
             ? translate("robot.composer.ready")
             : translate("robot.composer.unavailable", {
               state: stateTranslation(control.state),
@@ -565,6 +568,7 @@
         );
         return false;
       }
+      interpretingInput = true;
       busy = true;
       render();
       try {
@@ -576,9 +580,9 @@
             client_request_id: randomId("robot-ui"),
             expected_revision: control.settings.revision,
           },
-          // The configured LM Studio decision budget may be up to 60 s.
-          // Keep the client alive beyond it so a late physical decision
-          // cannot start after the UI has already reported a timeout.
+          // The backend gives interactive input its own short deadline. Keep
+          // the browser request alive beyond the configurable upper bound so
+          // it never reports a timeout while the server can still act.
           timeout: 65000,
         });
         const turn = safeObject(payload.turn);
@@ -600,6 +604,7 @@
         await refresh(true);
         return false;
       } finally {
+        interpretingInput = false;
         busy = false;
         render();
       }

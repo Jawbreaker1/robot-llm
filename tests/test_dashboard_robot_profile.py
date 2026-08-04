@@ -22,6 +22,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
         self.assertEqual(args.robot_profile, ROBOT_PROFILE_DISABLED)
         self.assertIsNone(args.robot_target)
         self.assertEqual(args.robot_planner_timeout_seconds, 30.0)
+        self.assertEqual(args.robot_input_timeout_seconds, 10.0)
         self.assertIsNone(_configured_robot_runtime_adapter(args))
 
     def test_ev3_profile_requires_an_explicit_target(self):
@@ -174,6 +175,57 @@ class DashboardRobotProfileTests(unittest.TestCase):
             "physical_live",
         )
         map_provider.close.assert_called_once_with(drain=True)
+
+    def test_run_keeps_interactive_timeout_independent_of_planner(self):
+        adapter = mock.Mock()
+        dashboard_service = mock.Mock()
+        control_service = mock.Mock()
+        server = mock.Mock()
+        router = mock.Mock(session_path="/session/token/")
+        input_model = object()
+        with (
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+                return_value=dashboard_service,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.RobotControlService",
+                return_value=control_service,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.LMStudioRobotInputModel",
+                return_value=input_model,
+            ) as input_model_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+                return_value=(server, router),
+            ) as build_server,
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            result = _run(
+                [
+                    "--robot-planner-timeout-seconds",
+                    "60",
+                    "--robot-input-timeout-seconds",
+                    "8",
+                ],
+                robot_runtime_adapter=adapter,
+            )
+
+            input_service = build_server.call_args.kwargs[
+                "robot_input_service"
+            ]
+            self.assertIs(
+                input_service._model_factory("model-a"),
+                input_model,
+            )
+
+        self.assertEqual(result, 0)
+        input_model_type.assert_called_once_with(
+            base_url="http://127.0.0.1:1234",
+            model="model-a",
+            timeout_seconds=8.0,
+        )
 
     def test_simulation_map_cannot_be_mixed_with_physical_runtime(self):
         output = io.StringIO()
