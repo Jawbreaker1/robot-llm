@@ -174,7 +174,12 @@
       throw new TypeError("Target-selection state is invalid");
     }
     const candidate = normalizeControl(controlValue);
-    return candidate.enabled && !userSelectedTarget
+    const robotReady = (
+      candidate.enabled
+      && candidate.accepting
+      && candidate.state === "IDLE"
+    );
+    return robotReady && !userSelectedTarget
       ? "robot"
       : "workbench";
   }
@@ -450,7 +455,14 @@
               : translate("robot.summary.runtime_missing")
       );
       const active = ACTIVE_STATES.has(control.state);
-      byId("robot-stop-button").disabled = busy || !active;
+      const faulted = control.state === "FAULTED";
+      const stopButton = byId("robot-stop-button");
+      stopButton.disabled = busy || !(active || faulted);
+      stopButton.textContent = translate(
+        faulted
+          ? "robot.actions.acknowledge_fault"
+          : "robot.actions.stop",
+      );
       byId("robot-emergency-stop-button").disabled = (
         stopped || !control.enabled
       );

@@ -2052,6 +2052,11 @@ const idle = api.normalizeControl({
   },
 });
 const disabled = api.normalizeControl({ state: "unexpected" });
+const faulted = api.normalizeControl({
+  state: "FAULTED",
+  enabled: true,
+  accepting: true,
+});
 process.stdout.write(JSON.stringify({
   exports: Object.keys(api).sort(),
   frozen: Object.isFrozen(api),
@@ -2060,6 +2065,7 @@ process.stdout.write(JSON.stringify({
   disabled,
   preferredLiveTarget: api.preferredInitialTarget(idle, false),
   preferredDisabledTarget: api.preferredInitialTarget(disabled, false),
+  preferredFaultedTarget: api.preferredInitialTarget(faulted, false),
   preferredAfterUserChoice: api.preferredInitialTarget(idle, true),
   robotPolicy: api.composerPolicy(idle, "robot", true, false),
   workbenchPolicy: api.composerPolicy(idle, "workbench", true, false),
@@ -2135,6 +2141,7 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(contract["invalidTargetRejected"])
         self.assertEqual(contract["preferredLiveTarget"], "robot")
         self.assertEqual(contract["preferredDisabledTarget"], "workbench")
+        self.assertEqual(contract["preferredFaultedTarget"], "workbench")
         self.assertEqual(contract["preferredAfterUserChoice"], "workbench")
         self.assertEqual(
             contract["states"],
