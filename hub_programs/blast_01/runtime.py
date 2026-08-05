@@ -32,6 +32,8 @@ TURN_PULSE_SPEED_DPS = 180
 TURN_PULSE_ANGLE_DEG = 45
 CLAW_PULSE_SPEED_DPS = 180
 CLAW_PULSE_DURATION_MS = 500
+BODY_PULSE_SPEED_DPS = 120
+BODY_PULSE_DURATION_MS = 900
 
 hub = InventorHub(
     top_side=HUB_TOP_SIDE,
@@ -239,6 +241,33 @@ def claw_pulse(direction):
     }
 
 
+def body_pulse(direction):
+    if direction not in ("left", "right"):
+        raise ValueError("direction must be left or right")
+    if not motors["body"].done():
+        raise ValueError("body motor is busy")
+
+    speed = (
+        -BODY_PULSE_SPEED_DPS
+        if direction == "left"
+        else BODY_PULSE_SPEED_DPS
+    )
+    before = motors["body"].angle()
+    motors["body"].run_time(
+        speed,
+        BODY_PULSE_DURATION_MS,
+        then=Stop.BRAKE,
+        wait=False,
+    )
+    return {
+        "accepted": True,
+        "direction": direction,
+        "speed_dps": BODY_PULSE_SPEED_DPS,
+        "duration_ms": BODY_PULSE_DURATION_MS,
+        "before_angle_deg": before,
+    }
+
+
 wait(500)
 emit(
     {
@@ -274,6 +303,9 @@ while True:
         elif operation == "claw_pulse":
             arguments = request.get("args", {})
             result = claw_pulse(arguments.get("direction"))
+        elif operation == "body_pulse":
+            arguments = request.get("args", {})
+            result = body_pulse(arguments.get("direction"))
         elif operation == "shutdown":
             stop_all()
             emit(
