@@ -404,6 +404,22 @@ LEGO-controllers ansluts måste varje observation bära explicit frame och
 kalibrerad transform; kartor från olika controllers får inte fusioneras utan
 en verifierad gemensam ram.
 
+#### Framtida relativa observationer mellan robotar
+
+En EV3 IR-beacon monterad högt och fritt på Robot Inventor kan ge EV3 en
+identifierad men grov observation av den andra roboten: beaconkanal,
+riktning, signalbaserat avstånd, timestamp och confidence. Observationen ska
+publiceras som en riktad relation från observerande `robot_id` till observerat
+`robot_id`; den är inte i sig en gemensam global pose och får inte blandas med
+vanlig `IR-PROX`-hinderdata.
+
+Robot Inventors ultraljud kan senare bekräfta att ett objekt finns i den
+förväntade riktningen, men inte dess identitet. En verifierad transform mellan
+robotarnas lokala ramar kan etableras genom en kort känd förflyttning och nya
+beaconobservationer före/efter. Först därefter får relationen användas för
+beteenden som att vända robotarna mot varandra, följa efter eller mötas. Detta
+är en framtida experimenthypotes, inte en nuvarande controllerkapabilitet.
+
 ### Versionsbundet missionslager
 
 `MissionRunner` ligger ovanför den oförändrade waypointloopen och exekverar
