@@ -116,6 +116,17 @@ class BlastBLERuntime:
     async def observe(self) -> Dict[str, object]:
         return await self._request("observe")
 
+    async def stop(self) -> Dict[str, object]:
+        return await self._request("stop")
+
+    async def drive_pulse(self, direction: str) -> Dict[str, object]:
+        if direction not in ("forward", "reverse"):
+            raise ValueError("direction must be forward or reverse")
+        return await self._request(
+            "drive_pulse",
+            {"direction": direction},
+        )
+
     async def close(self) -> None:
         hub = self._hub
         if hub is None:
@@ -131,16 +142,29 @@ class BlastBLERuntime:
             self._hub = None
             await hub.disconnect()
 
-    async def _request(self, operation: str) -> Dict[str, object]:
-        if operation not in ("ping", "observe", "shutdown"):
+    async def _request(
+        self,
+        operation: str,
+        arguments: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        if operation not in (
+            "ping",
+            "observe",
+            "stop",
+            "drive_pulse",
+            "shutdown",
+        ):
             raise ValueError("unsupported BLAST operation")
         hub = self._hub
         if hub is None:
             raise BlastBLERuntimeError("session is not connected")
         request_id = self._next_request_id
         self._next_request_id += 1
+        request = {"id": request_id, "op": operation}
+        if arguments is not None:
+            request["args"] = arguments
         encoded = json.dumps(
-            {"id": request_id, "op": operation},
+            request,
             separators=(",", ":"),
             sort_keys=True,
         )

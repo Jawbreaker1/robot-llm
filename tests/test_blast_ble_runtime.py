@@ -41,11 +41,19 @@ class FakeHub:
         request = json.loads(line)
         self.writes.append(request)
         operation = request["op"]
-        result = (
-            {"echo": "pong"}
-            if operation == "ping"
-            else {"observed_ms": len(self.writes)}
-        )
+        if operation == "ping":
+            result = {"echo": "pong"}
+        elif operation == "observe":
+            result = {"observed_ms": len(self.writes)}
+        elif operation == "stop":
+            result = {"stopped": True}
+        elif operation == "drive_pulse":
+            result = {
+                "accepted": True,
+                "direction": request["args"]["direction"],
+            }
+        else:
+            result = {"shutting_down": True}
         await self.lines.put(
             json.dumps(
                 {
@@ -124,6 +132,37 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
             await runtime.connect()
 
         self.assertEqual(hub.disconnect_count, 1)
+
+    async def test_stop_and_fixed_drive_pulse_are_typed(self):
+        hub = FakeHub()
+
+        async def finder(_name):
+            return "device"
+
+        runtime = BlastBLERuntime(
+            program_path=self.program_path,
+            device_finder=finder,
+            hub_factory=lambda device: hub,
+        )
+        await runtime.connect()
+
+        self.assertEqual(await runtime.stop(), {"stopped": True})
+        self.assertEqual(
+            await runtime.drive_pulse("forward"),
+            {"accepted": True, "direction": "forward"},
+        )
+        with self.assertRaisesRegex(ValueError, "direction"):
+            await runtime.drive_pulse("sideways")
+        await runtime.close()
+
+        self.assertEqual(
+            hub.writes[1],
+            {
+                "id": 2,
+                "op": "drive_pulse",
+                "args": {"direction": "forward"},
+            },
+        )
 
     async def test_response_timeout_is_bounded(self):
         hub = FakeHub()

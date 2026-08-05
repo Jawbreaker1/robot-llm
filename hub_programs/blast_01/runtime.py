@@ -4,6 +4,7 @@ import json
 
 import pybricks
 from pybricks.hubs import InventorHub
+from pybricks.parameters import Stop
 from pybricks.pupdevices import ColorSensor, Motor, UltrasonicSensor
 from pybricks.tools import StopWatch, wait
 from uselect import poll
@@ -25,6 +26,8 @@ from wiring import (
 
 PROTOCOL_VERSION = 1
 MAX_INPUT_CHARS = 512
+DRIVE_PULSE_SPEED_DPS = 240
+DRIVE_PULSE_ANGLE_DEG = 90
 
 hub = InventorHub(
     top_side=HUB_TOP_SIDE,
@@ -105,8 +108,60 @@ def observation():
         "motor_angles_deg": {
             name: motor.angle() for name, motor in motors.items()
         },
+        "motion_active": not (
+            motors["right_drive"].done()
+            and motors["left_drive"].done()
+        ),
         "color": str(color_sensor.color()),
         "distance_mm": ultrasonic_sensor.distance(),
+    }
+
+
+def stop_all():
+    for motor in motors.values():
+        motor.brake()
+
+
+def drive_pulse(direction):
+    if direction not in ("forward", "reverse"):
+        raise ValueError("direction must be forward or reverse")
+    if (
+        not motors["right_drive"].done()
+        or not motors["left_drive"].done()
+    ):
+        raise ValueError("drive motors are busy")
+
+    angle = (
+        DRIVE_PULSE_ANGLE_DEG
+        if direction == "forward"
+        else -DRIVE_PULSE_ANGLE_DEG
+    )
+    before = {
+        "right_drive": motors["right_drive"].angle(),
+        "left_drive": motors["left_drive"].angle(),
+    }
+    motors["right_drive"].run_angle(
+        DRIVE_PULSE_SPEED_DPS,
+        angle,
+        then=Stop.BRAKE,
+        wait=False,
+    )
+    try:
+        motors["left_drive"].run_angle(
+            DRIVE_PULSE_SPEED_DPS,
+            angle,
+            then=Stop.BRAKE,
+            wait=False,
+        )
+    except Exception:
+        motors["right_drive"].brake()
+        raise
+    return {
+        "accepted": True,
+        "direction": direction,
+        "speed_dps": DRIVE_PULSE_SPEED_DPS,
+        "angle_deg": DRIVE_PULSE_ANGLE_DEG,
+        "before_angles_deg": before,
     }
 
 
@@ -133,7 +188,14 @@ while True:
             result = {"uptime_ms": clock.time()}
         elif operation == "observe":
             result = observation()
+        elif operation == "stop":
+            stop_all()
+            result = {"stopped": True}
+        elif operation == "drive_pulse":
+            arguments = request.get("args", {})
+            result = drive_pulse(arguments.get("direction"))
         elif operation == "shutdown":
+            stop_all()
             emit(
                 response(
                     request_id,
