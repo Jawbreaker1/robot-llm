@@ -60,7 +60,7 @@ or language-specific command menus. The model never receives raw motor access.
 | Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, complete port inventory, IMU and battery telemetry, plus verified display, speaker and motor control |
 | Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, and per-run physical navigation memory |
 | Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
-| Planned | Repeatable autonomous obstacle navigation, a persistent Robot Inventor controller runtime, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
+| Planned | Repeatable autonomous obstacle navigation, Robot Inventor application integration, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
 
 EV3 obstacle navigation has succeeded in an operator-confirmed physical trial;
 repeatability and broader acceptance runs remain experimental.
@@ -71,8 +71,8 @@ metric SLAM. The forward-facing color/light sensor is installed but is not yet
 used by the production navigation loop.
 
 EV3 is currently the only application-integrated physical worker. Robot
-Inventor has a live Pybricks/BLE hardware path, but its persistent controller
-runtime and application integration remain to be built.
+Inventor has a live persistent Pybricks/BLE controller prototype; its host
+worker and application integration remain to be built.
 
 ## Architecture
 
@@ -187,8 +187,9 @@ the dashboard.
 BLAST-01 runs Pybricks and accepts programs directly from the local repository
 over Bluetooth. Live diagnostics identify four angular motors, a color sensor,
 an ultrasonic sensor, the built-in six-axis IMU and battery telemetry. Display,
-speaker and bounded motor actuation are physically verified. This path is not
-yet exposed as an application runtime.
+speaker and bounded motor actuation are physically verified. A persistent BLE
+session exposes observations, stop and fixed forward/reverse drive pulses, but
+this path is not yet exposed as an application runtime.
 
 ```sh
 python3 -m venv .venv
@@ -218,8 +219,8 @@ not replace physical calibration or live stop tests.
   calibration and acceptance runs.
 - Add color sensing, continuous voice interaction, wireless cameras,
   microphones, vision, and sound-source reasoning.
-- Complete Robot Inventor motor mapping, add its persistent hub supervisor and
-  host worker, then add BOOST and coordinate several LEGO controllers.
+- Complete the Robot Inventor hub supervisor and host worker, then add BOOST
+  and coordinate several LEGO controllers.
 - Expand the asynchronous architecture with parallel perception, validation,
   and forward planning while preserving serialized motor ownership.
 

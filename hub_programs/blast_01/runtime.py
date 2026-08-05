@@ -1,4 +1,4 @@
-"""Persistent, motion-free observation runtime for BLAST-01."""
+"""Persistent bounded controller runtime for BLAST-01."""
 
 import json
 
@@ -35,8 +35,8 @@ hub = InventorHub(
 )
 clock = StopWatch()
 
-# reset_angle=False preserves positions. This runtime never calls a motor
-# command; the objects exist only so observe can read angle().
+# reset_angle=False preserves positions across runtime deployments. Motion
+# operations below are fixed, bounded, and finish with braking.
 motors = {
     "right_drive": Motor(
         RIGHT_DRIVE_PORT,
@@ -170,7 +170,7 @@ emit(
     {
         "type": "ready",
         "protocol_version": PROTOCOL_VERSION,
-        "motion_enabled": False,
+        "motion_enabled": True,
         "robot_id": "blast-01",
         "controller_id": "blast-01.hub",
         "firmware": list(pybricks.version),

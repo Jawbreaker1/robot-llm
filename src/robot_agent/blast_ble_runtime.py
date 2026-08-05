@@ -1,4 +1,4 @@
-"""Persistent, motion-free Pybricks session for BLAST-01."""
+"""Persistent bounded Pybricks controller session for BLAST-01."""
 
 import argparse
 import asyncio
@@ -96,7 +96,7 @@ class BlastBLERuntime:
                 ready.get("type") != "ready"
                 or ready.get("protocol_version")
                 != PROTOCOL_VERSION
-                or ready.get("motion_enabled") is not False
+                or ready.get("motion_enabled") is not True
             ):
                 raise BlastBLERuntimeError(
                     "hub sent an invalid ready message"

@@ -21,7 +21,7 @@ class FakeHub:
         self.ready = ready or {
             "type": "ready",
             "protocol_version": 1,
-            "motion_enabled": False,
+            "motion_enabled": True,
             "robot_id": "blast-01",
         }
 
@@ -112,7 +112,7 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
             ready={
                 "type": "ready",
                 "protocol_version": 1,
-                "motion_enabled": True,
+                "motion_enabled": False,
             }
         )
 
