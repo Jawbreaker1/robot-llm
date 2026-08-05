@@ -2692,6 +2692,49 @@ textarea:focus-visible,
   padding: 7px 17px 14px;
 }
 
+.controller-cards {
+  display: grid;
+  gap: 12px;
+  padding: 14px 17px 17px;
+}
+
+.controller-card {
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: var(--panel-deep);
+}
+
+.controller-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.controller-card-header strong,
+.controller-card-header small {
+  display: block;
+}
+
+.controller-card-header strong {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.controller-card-header small {
+  margin-top: 3px;
+  color: var(--faint);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 8px;
+}
+
+.controller-card .telemetry-list {
+  padding: 4px 14px 10px;
+}
+
 .safety-notice {
   display: flex;
   gap: 11px;

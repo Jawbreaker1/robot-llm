@@ -189,6 +189,11 @@
     return translated === key ? safeText(value, t("state.unknown")) : translated;
   }
 
+  const controllerPanel = window.RobotControllerPanel.create({
+    document, translate: t, humanState, setStatus, formatDateTime,
+    formatNumber: (value, options) => i18n.number(value, options),
+  });
+
   function localizedError(error, fallbackKey = "errors.generic") {
     const code = safeText(error && error.code, "");
     const key = ERROR_MESSAGE_KEYS[code] || fallbackKey;
@@ -368,6 +373,8 @@
       ev3State === "online" ? "online" : ev3State === "offline" ? "idle" : "idle",
       humanState(ev3State),
     );
+
+    controllerPanel.renderBlastStatus(runtimeObject.controllers);
   }
 
   function activeTurnComposerStatus(turn) {
@@ -482,8 +489,12 @@
     state.registry = safeObject(registry);
     const tree = byId("registry-tree");
     tree.replaceChildren();
-    const robots = safeArray(state.registry.robots);
     const nodes = safeArray(state.registry.nodes);
+    const runtimeControllers = controllerPanel.runtimes(
+      safeObject(safeObject(state.bootstrap).runtime).controllers,
+    );
+    const runtimeByController = controllerPanel.runtimeIndex(runtimeControllers);
+    const robots = controllerPanel.visibleRobots(safeArray(state.registry.robots), nodes, runtimeControllers);
     if (robots.length === 0) {
       appendNodeRow(tree, {
         display_name: "EV3RSTORM",
@@ -496,12 +507,17 @@
         display_name: safeText(robot.display_name, robot.robot_id),
         display_name_key: robot.display_name_key,
         node_kind: safeText(robot.robot_kind, "robot"),
-        lifecycle: safeText(robot.lifecycle, "configured"),
+        lifecycle: controllerPanel.stateForRobot(robot, runtimeControllers),
       }, true);
       const nodeIds = new Set(safeArray(robot.node_ids));
       nodes.filter((node) => (
         node.robot_id === robot.robot_id || nodeIds.has(node.node_id)
-      )).forEach((node) => appendNodeRow(tree, node));
+      )).forEach((node) => {
+        appendNodeRow(tree, controllerPanel.nodeWithRuntimeState(
+          node,
+          runtimeByController,
+        ));
+      });
     });
     const systemNodes = nodes.filter((node) => !node.robot_id);
     if (systemNodes.length > 0) {
@@ -525,30 +541,15 @@
       future.appendChild(createElement("span", "node-state", t("registry.not_configured")));
       tree.appendChild(future);
     }
-    const controller = nodes.find((node) => node.node_kind === "controller") || nodes[0] || {};
     const details = byId("controller-details");
-    details.replaceChildren();
-    [
-      [t("registry.field.state"), humanState(controller.lifecycle)],
-      [t("registry.field.controller_id"), safeText(controller.controller_id)],
-      [t("registry.field.instance_id"), safeText(controller.controller_instance_id)],
-      [t("registry.field.last_observed"), formatDateTime(controller.last_observed_at_unix_ms)],
-      [t("registry.field.status_reason"), safeText(controller.status_reason_code)],
-      [
-        t("registry.field.physical_capabilities"),
-        controller.control_exposed === true
-          ? t("registry.physical_rejected")
-          : t("registry.physical_locked"),
-      ],
-    ].forEach(([label, value]) => {
-      const row = createElement("div");
-      row.appendChild(createElement("dt", "", label));
-      row.appendChild(createElement("dd", "", value));
-      details.appendChild(row);
-    });
-    byId("fleet-aggregate-status").textContent = robots.length > 0
-      ? humanState(robots[0].lifecycle)
-      : t("registry.not_observed");
+    controllerPanel.render(details, nodes, runtimeControllers);
+    const onlineCount = runtimeControllers.filter(
+      (runtime) => runtime.state === "online",
+    ).length;
+    byId("fleet-aggregate-status").textContent = t(
+      "registry.robot_count",
+      { count: robots.length, online: onlineCount },
+    );
     if (
       !robotControl
       && nodes.some((node) => node.control_exposed === true)

@@ -20,6 +20,7 @@ from .dashboard_http import (
     new_session_token,
 )
 from .dashboard_service import DashboardService
+from .blast_observation_monitor import BlastObservationMonitor
 from .ev3rstorm_profile import (
     DEFAULT_EV3RSTORM_MEMORY_PATH,
     EV3RSTORM_PROFILE_ID,
@@ -346,6 +347,13 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--blast-hub-name",
+        help=(
+            "Observe one Robot Inventor hub over persistent BLE without "
+            "adding it to the physical navigation control service"
+        ),
+    )
+    parser.add_argument(
         "--robot-target",
         help=(
             "SSH target for ev3rstorm-01, for example robot@ev3dev.local; "
@@ -489,6 +497,7 @@ def _close_resources(
     robot_control_service,
     robot_turn_speech,
     map_runtime,
+    blast_monitor,
     whisper_runtime,
     *,
     drain_map: bool,
@@ -515,8 +524,12 @@ def _close_resources(
                         if map_runtime is not None:
                             map_runtime.close(drain=drain_map)
                     finally:
-                        if whisper_runtime is not None:
-                            whisper_runtime.stop()
+                        try:
+                            if blast_monitor is not None:
+                                blast_monitor.close()
+                        finally:
+                            if whisper_runtime is not None:
+                                whisper_runtime.stop()
 
 
 def _run(
@@ -527,6 +540,7 @@ def _run(
     args = _parser().parse_args(argv)
     injected_robot_runtime = robot_runtime_adapter is not None
     map_runtime = None
+    blast_monitor = None
     whisper_runtime = None
     service = None
     robot_control_service = None
@@ -617,11 +631,19 @@ def _run(
                 require_opaque_path=True,
             )
             speech_transcriber.probe()
+        if args.blast_hub_name:
+            blast_monitor = BlastObservationMonitor(
+                hub_name=args.blast_hub_name,
+            )
+            blast_monitor.start()
         service = DashboardService(
             base_url=args.lm_studio_url,
             model=args.model,
             spatial_map_provider=map_runtime,
             speech_transcriber=speech_transcriber,
+            controller_runtime_providers=(
+                (blast_monitor,) if blast_monitor is not None else ()
+            ),
         )
         robot_control_service = RobotControlService(
             robot_runtime_adapter,
@@ -693,6 +715,9 @@ def _run(
                     "speech_to_text_enabled": (
                         speech_transcriber is not None
                     ),
+                    "blast_observation_enabled": (
+                        blast_monitor is not None
+                    ),
                     "spatial_map_mode": (
                         "simulation_demo"
                         if args.simulation_map_demo
@@ -729,6 +754,7 @@ def _run(
             robot_control_service,
             robot_turn_speech,
             map_runtime,
+            blast_monitor,
             whisper_runtime,
             drain_map=server is not None,
         )

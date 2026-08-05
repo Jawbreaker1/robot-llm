@@ -69,6 +69,7 @@ SPATIAL_MAP_SCHEMA = "robot-spatial-map/v1"
 MAX_CHAT_JOBS = 8
 MAX_HISTORY_MESSAGES = 20
 MAX_SPATIAL_MAP_BYTES = 4 * 1024 * 1024
+MAX_CONTROLLER_RUNTIME_BYTES = 128 * 1024
 LM_PROBE_TIMEOUT_SECONDS = 2.0
 LM_PROBE_MAX_BYTES = 64 * 1024
 _LEVEL_ORDER = {
@@ -188,8 +189,8 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
         "ev3rstorm-01.front-camera",
         "ev3rstorm-01.microphone-array",
     )
+    blast_nodes = ("blast-01.hub",)
     composite_nodes = (
-        "lab-composite.robot-inventor",
         "lab-composite.boost-hub",
         "lab-composite.vision",
         "lab-composite.audio",
@@ -201,6 +202,13 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
             robot_kind="lego-ev3rstorm",
             lifecycle="declared",
             node_ids=ev3_nodes,
+        ),
+        RobotDescriptor(
+            robot_id="blast-01",
+            display_name="BLAST",
+            robot_kind="lego-robot-inventor-51515",
+            lifecycle="declared",
+            node_ids=blast_nodes,
         ),
         RobotDescriptor(
             robot_id="lab-composite",
@@ -253,17 +261,26 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
             status_reason_code="future_component",
         ),
         NodeDescriptor(
-            node_id=composite_nodes[0],
-            display_name="Robot Inventor 51515",
+            node_id=blast_nodes[0],
+            display_name="Robot Inventor Hub",
             node_kind="controller",
             lifecycle="declared",
-            robot_id="lab-composite",
-            controller_id="lab-composite.robot-inventor",
-            capabilities=("hub.motors", "hub.sensors"),
-            status_reason_code="future_component",
+            robot_id="blast-01",
+            controller_id="blast-01.hub",
+            capabilities=(
+                "motor.drive.left",
+                "motor.drive.right",
+                "motor.claw",
+                "motor.body",
+                "sensor.color",
+                "sensor.ultrasonic",
+                "sensor.imu",
+                "speaker.tone",
+            ),
+            status_reason_code="observer_not_configured",
         ),
         NodeDescriptor(
-            node_id=composite_nodes[1],
+            node_id=composite_nodes[0],
             display_name="BOOST Move Hub",
             node_kind="controller",
             lifecycle="declared",
@@ -273,7 +290,7 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
             status_reason_code="future_component",
         ),
         NodeDescriptor(
-            node_id=composite_nodes[2],
+            node_id=composite_nodes[1],
             display_name="Vision Node",
             node_kind="camera",
             display_name_key="registry.names.vision_node",
@@ -284,7 +301,7 @@ def _default_registry(server_instance_id: str) -> NodeRegistry:
             status_reason_code="future_component",
         ),
         NodeDescriptor(
-            node_id=composite_nodes[3],
+            node_id=composite_nodes[2],
             display_name="Audio Node",
             node_kind="microphone",
             display_name_key="registry.names.audio_node",
@@ -396,6 +413,7 @@ class DashboardService:
         server_instance_id: Optional[str] = None,
         spatial_map_provider: Optional[SpatialMapProvider] = None,
         speech_transcriber=None,
+        controller_runtime_providers: Tuple[object, ...] = (),
     ):
         spatial_snapshot = getattr(
             spatial_map_provider,
@@ -421,6 +439,7 @@ class DashboardService:
             or not callable(planner_factory)
             or not callable(weather_factory)
             or not callable(probe_transport)
+            or not isinstance(controller_runtime_providers, tuple)
         ):
             raise DashboardServiceError(
                 500,
@@ -446,6 +465,18 @@ class DashboardService:
         self._planner_factory = planner_factory
         self._weather_factory = weather_factory
         self._probe_transport = probe_transport
+        runtime_providers = []
+        for provider in controller_runtime_providers:
+            snapshot = getattr(provider, "snapshot", None)
+            resolved = snapshot if callable(snapshot) else provider
+            if not callable(resolved):
+                raise DashboardServiceError(
+                    500,
+                    "invalid_service_configuration",
+                    "Dashboard service configuration is invalid",
+                )
+            runtime_providers.append(resolved)
+        self._controller_runtime_providers = tuple(runtime_providers)
         if spatial_map_provider is None:
             self._spatial_map_provider = _empty_spatial_map
         elif callable(spatial_snapshot):
@@ -619,6 +650,44 @@ class DashboardService:
     def registry(self):
         return self._registry.snapshot().to_dict()
 
+    def _controller_runtimes(self):
+        snapshots = []
+        for provider in self._controller_runtime_providers:
+            try:
+                supplied = provider()
+                to_dict = getattr(supplied, "to_dict", None)
+                if callable(to_dict):
+                    supplied = to_dict()
+                encoded = json.dumps(
+                    supplied,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                if len(encoded) > MAX_CONTROLLER_RUNTIME_BYTES:
+                    raise ValueError("controller runtime is too large")
+                snapshot = strict_json_object(encoded)
+                if (
+                    snapshot.get("schema")
+                    != "controller-runtime-observation/v1"
+                    or not isinstance(snapshot.get("robot_id"), str)
+                    or not isinstance(snapshot.get("controller_id"), str)
+                    or snapshot.get("state")
+                    not in {
+                        "configured",
+                        "connecting",
+                        "online",
+                        "offline",
+                        "stopped",
+                    }
+                ):
+                    raise ValueError("controller runtime contract mismatch")
+            except Exception:
+                continue
+            snapshots.append(snapshot)
+        return snapshots
+
     def bootstrap(self):
         with self._runtime_lock:
             runtime = dict(self._lm_runtime)
@@ -652,6 +721,7 @@ class DashboardService:
             "runtime": {
                 "lm_studio": runtime,
                 "speech_to_text": self._stt.runtime_view(),
+                "controllers": self._controller_runtimes(),
                 "ev3": {
                     "state": "unobserved",
                     "reason_code": "physical_probe_not_run",

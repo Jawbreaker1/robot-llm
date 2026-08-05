@@ -10,6 +10,7 @@ export PYTHONPATH="$project_root/src${PYTHONPATH:+:$PYTHONPATH}"
 
 node --check src/robot_agent/dashboard_web/i18n.js
 node --check src/robot_agent/dashboard_web/dashboard_logic.js
+node --check src/robot_agent/dashboard_web/controller_panel.js
 node --check src/robot_agent/dashboard_web/spatial_map_presenter.js
 node --check src/robot_agent/dashboard_web/robot_mission_panel.js
 node --check src/robot_agent/dashboard_web/robot_control.js

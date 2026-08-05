@@ -67,6 +67,9 @@ class DashboardWebContractTests(unittest.TestCase):
         cls.speech_input_logic = (
             WEB_ROOT / "speech_input_logic.js"
         ).read_text(encoding="utf-8")
+        cls.controller_panel = (
+            WEB_ROOT / "controller_panel.js"
+        ).read_text(encoding="utf-8")
         cls.microphone_input = (
             WEB_ROOT / "microphone_input.js"
         ).read_text(encoding="utf-8")
@@ -87,6 +90,7 @@ class DashboardWebContractTests(unittest.TestCase):
             (
                 cls.i18n,
                 cls.dashboard_logic,
+                cls.controller_panel,
                 cls.speech_input_logic,
                 cls.microphone_input,
                 cls.pcm_capture_worklet,
@@ -493,6 +497,7 @@ process.stdout.write(JSON.stringify({
             [
                 "assets/i18n.js",
                 "assets/dashboard_logic.js",
+                "assets/controller_panel.js",
                 "assets/speech_input_logic.js",
                 "assets/microphone_input.js",
                 "assets/spatial_map_presenter.js",
@@ -615,9 +620,24 @@ process.stdout.write(JSON.stringify({
             "event-table-body",
             "settings-form",
             "status-motion",
+            "status-blast",
+            "controller-details",
         }
         self.assertTrue(required <= set(self.parser.ids))
         self.assertIn('lang="sv"', self.html)
+
+    def test_blast_runtime_is_rendered_as_read_only_controller_telemetry(self):
+        self.assertIn('controller.controller_id === "blast-01.hub"', self.controller_panel)
+        self.assertIn('"status-blast"', self.controller_panel)
+        self.assertIn("runtimeObject.controllers", self.javascript)
+        self.assertIn("observation.distance_mm", self.controller_panel)
+        self.assertIn("observation.motor_angles_deg", self.controller_panel)
+        self.assertIn(
+            'node.status_reason_code !== "future_component"',
+            self.controller_panel,
+        )
+        self.assertIn("controllerPanel.visibleRobots(", self.javascript)
+        self.assertNotIn("blast.drive_pulse", self.controller_panel)
         self.assertIn("Hallå! Vad ska vi hitta på?", self.html)
         self.assertIn("Jag kör lokalt på din Mac.", self.html)
         self.assertNotIn("God kväll.", self.html)
@@ -1954,6 +1974,7 @@ process.stdout.write(JSON.stringify({
         for filename, source in (
             ("i18n.js", self.i18n),
             ("dashboard_logic.js", self.dashboard_logic),
+            ("controller_panel.js", self.controller_panel),
             ("speech_input_logic.js", self.speech_input_logic),
             ("microphone_input.js", self.microphone_input),
             ("pcm_capture_worklet.js", self.pcm_capture_worklet),

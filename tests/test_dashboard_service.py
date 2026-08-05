@@ -747,6 +747,7 @@ class DashboardServiceTests(unittest.TestCase):
         self.assertTrue(
             all(not node["control_exposed"] for node in registry["nodes"])
         )
+        self.assertEqual(bootstrap["runtime"]["controllers"], [])
         self.assertFalse(bootstrap["capabilities"]["ssh"])
         self.assertEqual(
             bootstrap["capabilities"]["spatial_map"],
@@ -990,13 +991,62 @@ class DashboardServiceTests(unittest.TestCase):
             {
                 "EV3RSTORM",
                 "EV3 Main",
-                "Robot Inventor 51515",
+                "BLAST",
+                "Robot Inventor Hub",
                 "BOOST Move Hub",
                 "LM Studio",
                 "Open-Meteo",
             }
             <= raw_names
         )
+
+    def test_bootstrap_exposes_read_only_blast_runtime_snapshot(self):
+        runtime_snapshot = {
+            "schema": "controller-runtime-observation/v1",
+            "robot_id": "blast-01",
+            "controller_id": "blast-01.hub",
+            "display_name": "BLAST",
+            "hub_name": "BLAST-01",
+            "state": "online",
+            "reason_code": None,
+            "last_observed_at_unix_ms": 1_000,
+            "last_observed_at_monotonic_ms": 900,
+            "ready": {"protocol_version": 1},
+            "observation": {"distance_mm": 321},
+        }
+        service = self.make_service(
+            episode_runner=ScriptedRunner(),
+            controller_runtime_providers=(lambda: runtime_snapshot,),
+        )
+
+        bootstrap = service.bootstrap()
+        registry = bootstrap["registry"]
+
+        self.assertEqual(
+            bootstrap["runtime"]["controllers"],
+            [runtime_snapshot],
+        )
+        blast = next(
+            robot
+            for robot in registry["robots"]
+            if robot["robot_id"] == "blast-01"
+        )
+        self.assertEqual(blast["node_ids"], ["blast-01.hub"])
+        controller = next(
+            node
+            for node in registry["nodes"]
+            if node["controller_id"] == "blast-01.hub"
+        )
+        self.assertFalse(controller["control_exposed"])
+        self.assertIn("sensor.imu", controller["capabilities"])
+
+    def test_invalid_controller_runtime_does_not_break_bootstrap(self):
+        service = self.make_service(
+            episode_runner=ScriptedRunner(),
+            controller_runtime_providers=(lambda: {"schema": "wrong"},),
+        )
+
+        self.assertEqual(service.bootstrap()["runtime"]["controllers"], [])
 
     def test_lm_probe_is_fixed_loopback_get_and_bounded(self):
         calls = []

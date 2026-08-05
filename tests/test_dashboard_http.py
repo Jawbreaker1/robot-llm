@@ -291,6 +291,10 @@ def asset_directory():
         '"use strict";\n/* dashboard logic fixture */',
         encoding="utf-8",
     )
+    (root / "controller_panel.js").write_text(
+        '"use strict";\n/* controller panel fixture */',
+        encoding="utf-8",
+    )
     (root / "spatial_map_presenter.js").write_text(
         '"use strict";\n/* spatial map presenter fixture */',
         encoding="utf-8",
@@ -599,6 +603,11 @@ class DashboardHTTPTests(unittest.TestCase):
             self.router.session_path + "assets/dashboard_logic.js",
             self.headers(authenticated=False),
         )
+        controller_panel_asset = self.router.handle(
+            "GET",
+            self.router.session_path + "assets/controller_panel.js",
+            self.headers(authenticated=False),
+        )
         presenter_asset = self.router.handle(
             "GET",
             self.router.session_path
@@ -692,6 +701,7 @@ class DashboardHTTPTests(unittest.TestCase):
             b'"use strict";\n/* spatial map presenter fixture */',
         )
         self.assertEqual(mission_panel_asset.status, 200)
+        self.assertEqual(controller_panel_asset.status, 200)
         self.assertEqual(
             mission_panel_asset.body,
             b'"use strict";\n/* robot mission panel fixture */',
@@ -710,6 +720,10 @@ class DashboardHTTPTests(unittest.TestCase):
         )
         self.assertLess(
             static_routes.index("assets/dashboard_logic.js"),
+            static_routes.index("assets/controller_panel.js"),
+        )
+        self.assertLess(
+            static_routes.index("assets/controller_panel.js"),
             static_routes.index("assets/spatial_map_presenter.js"),
         )
         self.assertLess(

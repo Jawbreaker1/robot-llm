@@ -148,6 +148,24 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(hub.disconnect_count, 1)
 
+    async def test_disconnect_releases_ble_without_hub_command(self):
+        hub = FakeHub()
+
+        async def finder(_name):
+            return "device"
+
+        runtime = BlastBLERuntime(
+            program_path=self.program_path,
+            device_finder=finder,
+            hub_factory=lambda device: hub,
+        )
+        await runtime.connect()
+
+        await runtime.disconnect()
+
+        self.assertEqual(hub.disconnect_count, 1)
+        self.assertEqual(hub.writes, [])
+
     async def test_stop_and_fixed_motion_pulses_are_typed(self):
         hub = FakeHub()
 

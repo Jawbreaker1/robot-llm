@@ -237,6 +237,48 @@ class DashboardCLITests(unittest.TestCase):
 
         self.assertFalse(defaults.simulation_map_demo)
         self.assertTrue(enabled.simulation_map_demo)
+        self.assertIsNone(defaults.blast_hub_name)
+
+    def test_run_wires_optional_blast_observer_into_dashboard(self):
+        monitor = mock.Mock()
+        dashboard_service = mock.Mock()
+        control_service = mock.Mock()
+        http_server = mock.Mock()
+        router = mock.Mock(session_path="/live/token/")
+
+        with (
+            mock.patch(
+                "robot_agent.dashboard_cli.BlastObservationMonitor",
+                return_value=monitor,
+            ) as monitor_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+                return_value=dashboard_service,
+            ) as dashboard_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.RobotControlService",
+                return_value=control_service,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+                return_value=(http_server, router),
+            ),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            result = _run(["--blast-hub-name", "BLAST-TEST"])
+
+        self.assertEqual(result, 0)
+        monitor_type.assert_called_once_with(hub_name="BLAST-TEST")
+        monitor.start.assert_called_once_with()
+        self.assertEqual(
+            dashboard_type.call_args.kwargs[
+                "controller_runtime_providers"
+            ],
+            (monitor,),
+        )
+        monitor.close.assert_called_once_with()
+        ready = json.loads(stdout.getvalue())
+        self.assertTrue(ready["blast_observation_enabled"])
 
     def test_run_injects_robot_adapter_into_separate_control_service(self):
         adapter = mock.Mock()

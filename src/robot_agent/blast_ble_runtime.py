@@ -105,7 +105,10 @@ class BlastBLERuntime:
         except BaseException:
             self._hub = None
             try:
-                await hub.disconnect()
+                await asyncio.wait_for(
+                    hub.disconnect(),
+                    timeout=self.timeout_seconds,
+                )
             except Exception:
                 pass
             raise
@@ -151,6 +154,17 @@ class BlastBLERuntime:
             {"direction": direction},
         )
 
+    async def disconnect(self) -> None:
+        """Release BLE without sending a command to the hub program."""
+        hub = self._hub
+        if hub is None:
+            return
+        self._hub = None
+        await asyncio.wait_for(
+            hub.disconnect(),
+            timeout=self.timeout_seconds,
+        )
+
     async def close(self) -> None:
         hub = self._hub
         if hub is None:
@@ -163,8 +177,7 @@ class BlastBLERuntime:
             except Exception:
                 pass
         finally:
-            self._hub = None
-            await hub.disconnect()
+            await self.disconnect()
 
     async def _request(
         self,

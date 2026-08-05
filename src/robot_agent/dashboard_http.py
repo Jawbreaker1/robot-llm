@@ -153,6 +153,10 @@ class DashboardRouter:
             "dashboard_logic.js",
             "text/javascript; charset=utf-8",
         ),
+        "assets/controller_panel.js": (
+            "controller_panel.js",
+            "text/javascript; charset=utf-8",
+        ),
         "assets/spatial_map_presenter.js": (
             "spatial_map_presenter.js",
             "text/javascript; charset=utf-8",

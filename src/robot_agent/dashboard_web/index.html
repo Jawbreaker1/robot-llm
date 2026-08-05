@@ -10,6 +10,7 @@
   <link rel="icon" type="image/png" href="assets/robot-llm-head.png">
   <script src="assets/i18n.js" defer></script>
   <script src="assets/dashboard_logic.js" defer></script>
+  <script src="assets/controller_panel.js" defer></script>
   <script src="assets/speech_input_logic.js" defer></script>
   <script src="assets/microphone_input.js" defer></script>
   <script src="assets/spatial_map_presenter.js" defer></script>
@@ -50,6 +51,11 @@
         <div class="status-item" data-status="idle" id="status-ev3">
           <span class="status-light" aria-hidden="true"></span>
           <span class="status-name">EV3RSTORM</span>
+          <span class="status-value" data-i18n="shell.runtime.robot.unobserved">inte observerad</span>
+        </div>
+        <div class="status-item" data-status="idle" id="status-blast">
+          <span class="status-light" aria-hidden="true"></span>
+          <span class="status-name">BLAST</span>
           <span class="status-value" data-i18n="shell.runtime.robot.unobserved">inte observerad</span>
         </div>
         <div class="status-item is-secondary-status" data-status="locked" id="status-motion">
@@ -331,7 +337,7 @@
             <header class="instrument-header">
               <div>
                 <p class="eyebrow" data-i18n="bodies.logical.eyebrow">Logisk kropp</p>
-                <h3>EV3RSTORM</h3>
+                <h3 data-i18n="bodies.logical.title">Registrerade robotar</h3>
               </div>
               <span class="state-chip state-idle" id="fleet-aggregate-status" data-i18n="bodies.status.unobserved">Inte observerad</span>
             </header>
@@ -379,17 +385,10 @@
             <header class="instrument-header">
               <div>
                 <p class="eyebrow" data-i18n="bodies.controller.eyebrow">Styrenhetsdetaljer</p>
-                <h3>EV3 Main</h3>
+                <h3 data-i18n="bodies.controller.title">Styrenheter</h3>
               </div>
             </header>
-            <dl class="telemetry-list" id="controller-details">
-              <div><dt data-i18n="bodies.controller.state">Tillstånd</dt><dd data-i18n="bodies.status.unobserved">Inte observerad</dd></div>
-              <div><dt data-i18n="bodies.controller.controller_id">Styrenhets-ID</dt><dd data-i18n="shell.value.unavailable">—</dd></div>
-              <div><dt data-i18n="bodies.controller.instance_id">Instans-ID</dt><dd data-i18n="shell.value.unavailable">—</dd></div>
-              <div><dt data-i18n="bodies.controller.state_version">Tillståndsversion</dt><dd data-i18n="shell.value.unavailable">—</dd></div>
-              <div><dt data-i18n="bodies.controller.heartbeat">Hjärtslag</dt><dd data-i18n="shell.value.unavailable">—</dd></div>
-              <div><dt data-i18n="bodies.controller.physical_capabilities">Fysiska funktioner</dt><dd data-i18n="bodies.status.locked_plural">Via kontrolltjänsten</dd></div>
-            </dl>
+            <div class="controller-cards" id="controller-details"></div>
             <div class="safety-notice">
               <span aria-hidden="true">×</span>
               <div>
