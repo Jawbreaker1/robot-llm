@@ -3,8 +3,8 @@
 [![Quality](https://github.com/Jawbreaker1/robot-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/Jawbreaker1/robot-llm/actions/workflows/ci.yml)
 ![LLM: local](https://img.shields.io/badge/LLM-local%20via%20LM%20Studio-6f42c1)
 ![EV3 hardware: live](https://img.shields.io/badge/EV3%20hardware-live%20over%20Wi--Fi%2FSSH-2ea44f)
-![Robot Inventor: bring-up live](https://img.shields.io/badge/Robot%20Inventor-bring--up%20live%20over%20BLE-2ea44f)
-![Physical obstacle pass: successful](https://img.shields.io/badge/physical%20obstacle%20pass-successful-2ea44f)
+![Robot Inventor hardware: live](https://img.shields.io/badge/Robot%20Inventor%20hardware-live%20over%20BLE-2ea44f)
+![Physical navigation: experimental](https://img.shields.io/badge/physical%20navigation-experimental-d29922)
 
 **A real LEGO robot controlled by a local agentic AI that can plan, observe,
 speak, and adapt as it goes.**
@@ -16,7 +16,7 @@ disagrees. Robot Inventor 51515 has now completed its first physical bring-up
 with Pybricks and direct local deployment over Bluetooth.
 
 The language model chooses semantic intent and expression. The host application
-validates and dispatches typed actions, while a controller-specific worker
+validates and dispatches typed actions, while the active controller worker
 remains the sole owner of its motor ports.
 
 <p align="center">
@@ -57,26 +57,22 @@ or language-specific command menus. The model never receives raw motor access.
 | Status | Capabilities |
 |---|---|
 | Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
-| Physical Robot Inventor bring-up | Pybricks firmware on BLAST-01, local BLE discovery, program compilation, deployment and execution, plus verified display and speaker output |
+| Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, complete port inventory, IMU and battery telemetry, plus verified display, speaker and motor control |
 | Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, and per-run physical navigation memory |
 | Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
-| Planned | Repeatable autonomous obstacle navigation, Robot Inventor motor and sensor integration, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
+| Planned | Repeatable autonomous obstacle navigation, a persistent Robot Inventor controller runtime, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
 
-The physical EV3 has completed its first operator-confirmed obstacle pass. It
-investigated and routed around a real box, recovered its travel heading,
-continued after imperfect motor startup, spoke while navigating, and finished
-with the box still standing and the robot clear by a wide margin. This is one
-successful live trial; repeatability and broader acceptance runs remain in
-progress.
+EV3 obstacle navigation has succeeded in an operator-confirmed physical trial;
+repeatability and broader acceptance runs remain experimental.
 
 The current EV3 map is intentionally qualitative. IR reflection can support
 obstacle hypotheses, but it is not vision, object recognition, or precise
 metric SLAM. The forward-facing color/light sensor is installed but is not yet
 used by the production navigation loop.
 
-Only the EV3 has a production physical worker today. Robot Inventor is in
-hardware bring-up: firmware and local BLE deployment work, while its ports,
-motors, sensors and runtime integration are still being characterized.
+EV3 is currently the only application-integrated physical worker. Robot
+Inventor has a live Pybricks/BLE hardware path, but its persistent controller
+runtime and application integration remain to be built.
 
 ## Architecture
 
@@ -88,8 +84,8 @@ flowchart TD
     L --> V["Typed proposal"]
     V --> P["Host validation and policy"]
     P --> A["One semantic action"]
-    A --> W["EV3 worker<br/>sole motor owner"]
-    W --> R["EV3RSTORM"]
+    A --> W["Controller worker<br/>sole motor owner"]
+    W --> R["Physical LEGO robot"]
     R --> S
     L -. speech .-> T["Host speech worker"]
     T -. audio .-> R
@@ -97,12 +93,14 @@ flowchart TD
 ```
 
 The host owns goals, state, navigation memory, model calls, and validation.
-The EV3 worker exposes a small set of fixed robot operations and processes one
-request at a time. It contains no planner, personality, or independent goal.
-Once the model has authorized a target and detour side, a deterministic route
-executive may serialize several freshly checked pulses before asking the model
-again. New geometry, ambiguous progress, a veto, or a failed movement returns
-control to the agent immediately.
+Each controller worker exposes a small set of fixed robot operations and
+processes one request at a time. It contains no planner, personality, or
+independent goal. The EV3 implementation is application-integrated today; the
+Robot Inventor worker is the next controller implementation. Once the model has
+authorized a target and detour side, a deterministic route executive may
+serialize several freshly checked pulses before asking the model again. New
+geometry, ambiguous progress, a veto, or a failed movement returns control to
+the agent immediately.
 
 Speech, map publication, and UI delivery already run alongside the physical
 loop. Future vision, audio, validation, and planning workers will publish
@@ -126,8 +124,8 @@ The local web application has two conversation targets:
 The dashboard shows the current live state rather than offering old physical
 runs to resume. It exposes the current goal, plan, action, speech state,
 active detour route and waypoint progress, technical events, and a read-only
-map. Navigation memory is separate from the UI history and may persist between
-runs.
+map. Navigation memory is retained during an EV3 episode and reset before the
+next physical run.
 
 The same Map view can display a completed simulator run or qualitative physical
 odometry and obstacle hypotheses:
@@ -187,13 +185,17 @@ the dashboard.
 ## Robot Inventor 51515 bring-up
 
 BLAST-01 runs Pybricks and accepts programs directly from the local repository
-over Bluetooth. This path currently verifies deployment without moving any
-motors; it is not yet exposed as an application runtime.
+over Bluetooth. Live diagnostics identify four angular motors, a color sensor,
+an ultrasonic sensor, the built-in six-axis IMU and battery telemetry. Display,
+speaker and bounded motor actuation are physically verified. This path is not
+yet exposed as an application runtime.
 
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-pybricks.txt
 ./scripts/run_blast_smoke.sh
+.venv/bin/python -m pybricksdev run ble --name BLAST-01 \
+  hub_programs/blast_01/inventory.py
 ```
 
 This optional toolchain requires Python 3.10 or newer. Disconnect Pybricks Code
@@ -216,8 +218,8 @@ not replace physical calibration or live stop tests.
   calibration and acceptance runs.
 - Add color sensing, continuous voice interaction, wireless cameras,
   microphones, vision, and sound-source reasoning.
-- Complete Robot Inventor motor and sensor characterization, add its production
-  worker, then add BOOST and coordinate several LEGO controllers.
+- Complete Robot Inventor motor mapping, add its persistent hub supervisor and
+  host worker, then add BOOST and coordinate several LEGO controllers.
 - Expand the asynchronous architecture with parallel perception, validation,
   and forward planning while preserving serialized motor ownership.
 
