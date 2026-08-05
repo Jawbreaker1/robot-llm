@@ -190,8 +190,8 @@
   }
 
   const controllerPanel = window.RobotControllerPanel.create({
-    document, translate: t, humanState, setStatus, formatDateTime,
-    formatNumber: (value, options) => i18n.number(value, options),
+    document, request: api, translate: t, humanState, setStatus, showToast, formatDateTime,
+    formatNumber: (value, options) => i18n.number(value, options), onCommandComplete: () => refreshBootstrap(true),
   });
 
   function localizedError(error, fallbackKey = "errors.generic") {

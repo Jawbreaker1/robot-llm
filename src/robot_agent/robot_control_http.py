@@ -20,8 +20,29 @@ from .robot_control_service import (
 
 
 ROBOT_API_PREFIX = "/api/v1/robot/"
+CONTROLLER_API_PREFIX = "/api/v1/controllers/"
+BLAST_COMMAND_PATH = "/api/v1/controllers/blast-01.hub/commands"
 MAX_ROBOT_REQUEST_BYTES = 16 * 1024
 MAX_ROBOT_PAGE_LIMIT = 500
+BLAST_COMMANDS = frozenset((
+    "drive_forward",
+    "drive_reverse",
+    "turn_left",
+    "turn_right",
+    "claw_open",
+    "claw_close",
+    "body_left",
+    "body_right",
+    "stop",
+))
+CONTROLLER_ERROR_STATUS = {
+    "controller_busy": 409,
+    "stale_controller_command": 409,
+    "controller_unavailable": 503,
+    "controller_command_failed": 502,
+    "controller_motion_not_stopped": 503,
+    "controller_command_timeout": 504,
+}
 
 
 class RobotControlHTTPError(RuntimeError):
@@ -120,15 +141,33 @@ def _response_size(value: Mapping[str, object]) -> int:
 class RobotControlHTTPRouter:
     """Delegate only the explicitly enumerated robot control routes."""
 
-    def __init__(self, service, input_service=None):
+    def __init__(
+        self,
+        service,
+        input_service=None,
+        controller_services=None,
+    ):
         if service is None:
             raise ValueError("Robot control HTTP service is required")
+        services = {} if controller_services is None else controller_services
+        if (
+            not isinstance(services, Mapping)
+            or any(
+                not isinstance(controller_id, str)
+                or not callable(getattr(controller, "command", None))
+                for controller_id, controller in services.items()
+            )
+        ):
+            raise ValueError("Controller services are invalid")
         self._service = service
         self._input_service = input_service
+        self._controller_services = dict(services)
 
     @staticmethod
     def handles(path: str) -> bool:
-        return isinstance(path, str) and path.startswith(ROBOT_API_PREFIX)
+        return isinstance(path, str) and path.startswith(
+            (ROBOT_API_PREFIX, CONTROLLER_API_PREFIX)
+        )
 
     def _call(self, operation):
         try:
@@ -146,6 +185,22 @@ class RobotControlHTTPRouter:
                 400,
                 error.code,
                 str(error),
+            ) from None
+
+    @staticmethod
+    def _controller_call(operation):
+        try:
+            return operation()
+        except RobotControlHTTPError:
+            raise
+        except Exception as error:
+            code = getattr(error, "code", "controller_command_failed")
+            if code not in CONTROLLER_ERROR_STATUS:
+                code = "controller_command_failed"
+            raise RobotControlHTTPError(
+                CONTROLLER_ERROR_STATUS[code],
+                code,
+                "Controller command failed",
             ) from None
 
     @staticmethod
@@ -174,6 +229,37 @@ class RobotControlHTTPRouter:
                 "robot_route_not_found",
                 "Robot route was not found",
             )
+
+        if path.startswith(CONTROLLER_API_PREFIX):
+            if method != "POST" or path != BLAST_COMMAND_PATH:
+                raise RobotControlHTTPError(
+                    404,
+                    "controller_route_not_found",
+                    "Controller route was not found",
+                )
+            self._no_query(query, "Controller command endpoint")
+            request = _exact_object(
+                _body_object(body),
+                ("command",),
+            )
+            command = request["command"]
+            if not isinstance(command, str) or command not in BLAST_COMMANDS:
+                raise RobotControlHTTPError(
+                    400,
+                    "invalid_controller_command",
+                    "Controller command is invalid",
+                )
+            controller = self._controller_services.get("blast-01.hub")
+            if controller is None:
+                raise RobotControlHTTPError(
+                    503,
+                    "controller_unavailable",
+                    "BLAST controller is not configured",
+                )
+            value = self._controller_call(
+                lambda: controller.command(command)
+            )
+            return RobotControlHTTPResponse(200, {"result": value})
 
         if method == "GET" and path == "/api/v1/robot/status":
             self._no_query(query, "Robot status endpoint")

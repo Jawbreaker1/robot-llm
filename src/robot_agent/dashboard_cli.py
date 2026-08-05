@@ -270,6 +270,7 @@ def build_server(
     session_token: Optional[str] = None,
     robot_control_service=None,
     robot_input_service=None,
+    controller_control_services=None,
 ):
     if (
         isinstance(port, bool)
@@ -291,6 +292,7 @@ def build_server(
         robot_control_router=RobotControlHTTPRouter(
             control_service,
             robot_input_service,
+            controller_control_services,
         ),
     )
     server = _LoopbackThreadingHTTPServer(
@@ -349,8 +351,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--blast-hub-name",
         help=(
-            "Observe one Robot Inventor hub over persistent BLE without "
-            "adding it to the physical navigation control service"
+            "Connect one Robot Inventor hub for telemetry and bounded manual "
+            "tests without adding it to the navigation control service"
         ),
     )
     parser.add_argument(
@@ -681,6 +683,11 @@ def _run(
         server_options = {
             "robot_control_service": robot_control_service,
             "robot_input_service": robot_input_service,
+            "controller_control_services": (
+                {"blast-01.hub": blast_monitor}
+                if blast_monitor is not None
+                else {}
+            ),
         }
         if args.console_access_key_file:
             server_options["session_token"] = (

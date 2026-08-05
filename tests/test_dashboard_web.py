@@ -633,6 +633,20 @@ process.stdout.write(JSON.stringify({
         self.assertIn("observation.distance_mm", self.controller_panel)
         self.assertIn("observation.motor_angles_deg", self.controller_panel)
         self.assertIn(
+            "/api/v1/controllers/${encodeURIComponent(controllerId)}/commands",
+            self.controller_panel,
+        )
+        self.assertIn('"drive_forward"', self.controller_panel)
+        self.assertIn('"claw_close"', self.controller_panel)
+        self.assertIn('"body_right"', self.controller_panel)
+        self.assertIn("pendingControllers", self.controller_panel)
+        self.assertIn(
+            "Number.isFinite(runtime.last_observed_at_unix_ms)",
+            self.controller_panel,
+        )
+        self.assertNotIn("set_speed", self.controller_panel)
+        self.assertNotIn("speed_dps", self.controller_panel)
+        self.assertIn(
             'node.status_reason_code !== "future_component"',
             self.controller_panel,
         )

@@ -2735,6 +2735,40 @@ textarea:focus-visible,
   padding: 4px 14px 10px;
 }
 
+.controller-controls {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px 14px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.controller-controls-title {
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.controller-control-group {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.controller-control-group:last-of-type {
+  grid-template-columns: 1fr;
+}
+
+.controller-control-group .button {
+  min-height: 34px;
+  padding: 7px 9px;
+  font-size: 9px;
+}
+
+.controller-control-status {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
 .safety-notice {
   display: flex;
   gap: 11px;

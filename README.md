@@ -58,9 +58,9 @@ or language-specific command menus. The model never receives raw motor access.
 |---|---|
 | Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
 | Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, complete port inventory, IMU and battery telemetry, plus verified display, speaker and motor control |
-| Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, per-run physical navigation memory, and read-only multi-controller telemetry |
+| Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, per-run physical navigation memory, multi-controller telemetry, and bounded manual BLAST tests |
 | Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
-| Planned | Repeatable autonomous obstacle navigation, Robot Inventor motion control and autonomy in the application, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
+| Planned | Repeatable autonomous obstacle navigation, Robot Inventor autonomy in the application, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
 
 EV3 obstacle navigation has succeeded in an operator-confirmed physical trial;
 repeatability and broader acceptance runs remain experimental.
@@ -70,10 +70,10 @@ obstacle hypotheses, but it is not vision, object recognition, or precise
 metric SLAM. The forward-facing color/light sensor is installed but is not yet
 used by the production navigation loop.
 
-EV3 remains the only motion-enabled application worker. BLAST-01 now has its
-own registered robot identity and an optional persistent BLE observer in the
-dashboard. That first integration is deliberately read-only; BLAST motion
-controls and autonomous plans are not exposed through the application yet.
+EV3 remains the only autonomous motion worker in the application. BLAST-01 has
+its own registered robot identity and an optional persistent BLE connection in
+the dashboard. That connection exposes live telemetry and a small set of fixed
+manual test controls; autonomous BLAST plans are not enabled yet.
 
 ## Architecture
 
@@ -190,8 +190,8 @@ over Bluetooth. Live diagnostics identify four angular motors, a color sensor,
 an ultrasonic sensor, the built-in six-axis IMU and battery telemetry. Display,
 speaker and bounded motor actuation are physically verified. A persistent BLE
 session exposes observations, stop, drive, turn, claw and body pulses. The
-dashboard can keep that session open and show battery, distance, color, IMU and
-motor telemetry without granting the web UI motor access.
+dashboard can keep that session open, show battery, distance, color, IMU and
+motor telemetry, and run those fixed actions manually.
 
 ```sh
 python3 -m venv .venv
@@ -201,7 +201,7 @@ python3 -m venv .venv
   hub_programs/blast_01/inventory.py
 ```
 
-To add the read-only BLAST observer to the dashboard:
+To add BLAST telemetry and manual test controls to the dashboard:
 
 ```sh
 ROBOT_LLM_PYTHON=.venv/bin/python ROBOT_LLM_STT_URL='' \

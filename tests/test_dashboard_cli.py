@@ -262,7 +262,7 @@ class DashboardCLITests(unittest.TestCase):
             mock.patch(
                 "robot_agent.dashboard_cli.build_server",
                 return_value=(http_server, router),
-            ),
+            ) as server_type,
             mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
         ):
             result = _run(["--blast-hub-name", "BLAST-TEST"])
@@ -275,6 +275,12 @@ class DashboardCLITests(unittest.TestCase):
                 "controller_runtime_providers"
             ],
             (monitor,),
+        )
+        self.assertEqual(
+            server_type.call_args.kwargs[
+                "controller_control_services"
+            ],
+            {"blast-01.hub": monitor},
         )
         monitor.close.assert_called_once_with()
         ready = json.loads(stdout.getvalue())

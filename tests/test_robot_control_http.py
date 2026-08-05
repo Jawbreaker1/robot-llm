@@ -114,6 +114,21 @@ class FakeRobotInputService:
         }
 
 
+class FakeControllerService:
+    def __init__(self):
+        self.commands = []
+
+    def command(self, command):
+        self.commands.append(command)
+        return {
+            "schema": "controller-command-result/v1",
+            "controller_id": "blast-01.hub",
+            "command": command,
+            "accepted": True,
+            "completed": True,
+        }
+
+
 def encoded(value):
     return json.dumps(
         value,
@@ -278,6 +293,83 @@ class RobotControlHTTPRouterTests(unittest.TestCase):
                 b"",
             )
 
+    def test_blast_route_accepts_only_fixed_controller_commands(self):
+        controller = FakeControllerService()
+        router = RobotControlHTTPRouter(
+            self.service,
+            controller_services={"blast-01.hub": controller},
+        )
+
+        response = router.handle(
+            "POST",
+            "/api/v1/controllers/blast-01.hub/commands",
+            "",
+            encoded({"command": "claw_close"}),
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(controller.commands, ["claw_close"])
+        self.assertTrue(response.body["result"]["completed"])
+        for body in (
+            {"command": "set_speed"},
+            {"command": []},
+            {"command": {}},
+            {"command": "drive_forward", "speed": 999},
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(RobotControlHTTPError) as raised:
+                    router.handle(
+                        "POST",
+                        "/api/v1/controllers/blast-01.hub/commands",
+                        "",
+                        encoded(body),
+                    )
+                self.assertEqual(raised.exception.status, 400)
+
+    def test_blast_route_fails_closed_when_unavailable_or_unknown(self):
+        with self.assertRaises(RobotControlHTTPError) as unavailable:
+            self.router.handle(
+                "POST",
+                "/api/v1/controllers/blast-01.hub/commands",
+                "",
+                encoded({"command": "stop"}),
+            )
+        self.assertEqual(unavailable.exception.code, "controller_unavailable")
+
+        with self.assertRaises(RobotControlHTTPError) as unknown:
+            self.router.handle(
+                "POST",
+                "/api/v1/controllers/other/commands",
+                "",
+                encoded({"command": "stop"}),
+            )
+        self.assertEqual(unknown.exception.code, "controller_route_not_found")
+
+    def test_blast_controller_errors_have_bounded_http_statuses(self):
+        class BusyController(FakeControllerService):
+            def command(self, command):
+                error = RuntimeError("details stay private")
+                error.code = "controller_busy"
+                raise error
+
+        router = RobotControlHTTPRouter(
+            self.service,
+            controller_services={
+                "blast-01.hub": BusyController(),
+            },
+        )
+
+        with self.assertRaises(RobotControlHTTPError) as raised:
+            router.handle(
+                "POST",
+                "/api/v1/controllers/blast-01.hub/commands",
+                "",
+                encoded({"command": "turn_left"}),
+            )
+
+        self.assertEqual(raised.exception.status, 409)
+        self.assertEqual(raised.exception.code, "controller_busy")
+
     def test_settings_errors_preserve_typed_status_and_code(self):
         with self.assertRaises(RobotControlHTTPError) as raised:
             self.router.handle(
@@ -347,6 +439,11 @@ class RobotControlHTTPRouterTests(unittest.TestCase):
             self.router.handles("/api/v1/robot/status")
         )
         self.assertFalse(self.router.handles("/api/v1/settings"))
+        self.assertTrue(
+            self.router.handles(
+                "/api/v1/controllers/blast-01.hub/commands"
+            )
+        )
         with self.assertRaises(RobotControlHTTPError) as raised:
             self.router.handle(
                 "POST",

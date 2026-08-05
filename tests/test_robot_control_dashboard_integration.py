@@ -6,6 +6,7 @@ from robot_agent.robot_control_http import RobotControlHTTPRouter
 
 from tests.test_dashboard_http import FakeDashboardService
 from tests.test_robot_control_http import (
+    FakeControllerService,
     FakeRobotControlService,
     FakeRobotInputService,
 )
@@ -151,6 +152,38 @@ class RobotControlDashboardIntegrationTests(unittest.TestCase):
             b"{}",
         )
         self.assertEqual(wrong_mime.status, 415)
+
+    def test_blast_command_reuses_dashboard_auth_and_origin_gate(self):
+        controller = FakeControllerService()
+        router = DashboardRouter(
+            service=FakeDashboardService(),
+            session_token=TOKEN,
+            expected_host=HOST,
+            robot_control_router=RobotControlHTTPRouter(
+                self.robot,
+                controller_services={"blast-01.hub": controller},
+            ),
+        )
+        path = "/api/v1/controllers/blast-01.hub/commands"
+        accepted = router.handle(
+            "POST",
+            path,
+            self.headers("POST"),
+            self.body({"command": "body_right"}),
+        )
+        rejected = router.handle(
+            "POST",
+            path,
+            {
+                "Host": HOST,
+                "Content-Type": "application/json",
+            },
+            self.body({"command": "body_right"}),
+        )
+
+        self.assertEqual(accepted.status, 200)
+        self.assertEqual(controller.commands, ["body_right"])
+        self.assertEqual(rejected.status, 403)
 
 
 if __name__ == "__main__":

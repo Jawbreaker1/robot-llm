@@ -1,6 +1,15 @@
 ((global) => {
   "use strict";
 
+  const BLAST_CONTROLLER_ID = "blast-01.hub";
+  const BLAST_COMMAND_GROUPS = Object.freeze([
+    ["drive_forward", "drive_reverse"],
+    ["turn_left", "turn_right"],
+    ["claw_open", "claw_close"],
+    ["body_left", "body_right"],
+    ["stop"],
+  ]);
+
   function record(value) {
     return value && typeof value === "object" && !Array.isArray(value)
       ? value
@@ -24,6 +33,9 @@
     const setStatus = options.setStatus;
     const formatDateTime = options.formatDateTime;
     const formatNumber = options.formatNumber;
+    const request = options.request;
+    const showToast = options.showToast;
+    const onCommandComplete = options.onCommandComplete;
     if (
       !document
       || typeof t !== "function"
@@ -31,9 +43,14 @@
       || typeof setStatus !== "function"
       || typeof formatDateTime !== "function"
       || typeof formatNumber !== "function"
+      || typeof request !== "function"
+      || typeof showToast !== "function"
+      || typeof onCommandComplete !== "function"
     ) {
       throw new TypeError("Controller panel options are invalid.");
     }
+    const pendingControllers = new Set();
+    let lastRender = null;
 
     function element(tag, className, content) {
       const node = document.createElement(tag);
@@ -51,6 +68,95 @@
       item.appendChild(element("dt", "", label));
       item.appendChild(element("dd", "", value));
       telemetry.appendChild(item);
+    }
+
+    function rerender() {
+      if (lastRender) {
+        render(
+          lastRender.container,
+          lastRender.nodes,
+          lastRender.runtimeControllers,
+        );
+      }
+    }
+
+    async function sendCommand(controllerId, command) {
+      if (pendingControllers.has(controllerId)) {
+        return;
+      }
+      pendingControllers.add(controllerId);
+      rerender();
+      try {
+        await request(
+          `/api/v1/controllers/${encodeURIComponent(controllerId)}/commands`,
+          {
+            method: "POST",
+            body: { command },
+            timeout: 16000,
+          },
+        );
+        showToast(t("registry.control.completed", {
+          command: t(`registry.control.${command}`),
+        }));
+      } catch (_error) {
+        showToast(t("registry.control.failed"), true);
+      } finally {
+        pendingControllers.delete(controllerId);
+        await onCommandComplete();
+        rerender();
+      }
+    }
+
+    function renderControls(card, controller, runtime, observation) {
+      if (controller.controller_id !== BLAST_CONTROLLER_ID) {
+        return;
+      }
+      const online = runtime.state === "online";
+      const observed = Number.isFinite(runtime.last_observed_at_unix_ms);
+      const moving = observation.motion_active === true;
+      const pending = pendingControllers.has(controller.controller_id);
+      const enabled = online && observed && !moving && !pending;
+      const controls = element("section", "controller-controls");
+      controls.appendChild(element(
+        "strong",
+        "controller-controls-title",
+        t("registry.control.title"),
+      ));
+      BLAST_COMMAND_GROUPS.forEach((commands) => {
+        const group = element("div", "controller-control-group");
+        commands.forEach((command) => {
+          const button = element(
+            "button",
+            command === "stop"
+              ? "button button-danger"
+              : "button button-secondary",
+            t(`registry.control.${command}`),
+          );
+          button.type = "button";
+          button.disabled = command === "stop"
+            ? !(online && observed && !pending)
+            : !enabled;
+          button.addEventListener("click", () => {
+            sendCommand(controller.controller_id, command);
+          });
+          group.appendChild(button);
+        });
+        controls.appendChild(group);
+      });
+      controls.appendChild(element(
+        "small",
+        "controller-control-status",
+        pending
+          ? t("registry.control.running")
+          : !online
+            ? t("registry.control.offline")
+            : moving
+              ? t("registry.control.moving")
+              : !observed
+                ? t("registry.control.waiting")
+                : t("registry.control.ready"),
+      ));
+      card.appendChild(controls);
     }
 
     function renderCard(controller, runtime) {
@@ -126,13 +232,20 @@
       row(
         telemetry,
         t("registry.field.status_reason"),
-        text(runtime.reason_code, text(controller.status_reason_code)),
+        text(
+          runtime.reason_code,
+          Number.isFinite(runtime.last_observed_at_unix_ms)
+            ? t("common.missing")
+            : text(controller.status_reason_code),
+        ),
       );
       card.appendChild(telemetry);
+      renderControls(card, controller, runtime, observation);
       return card;
     }
 
     function render(container, nodes, runtimeControllers) {
+      lastRender = { container, nodes, runtimeControllers };
       const runtimes = new Map(
         (Array.isArray(runtimeControllers) ? runtimeControllers : []).map(
           (runtime) => [runtime.controller_id, record(runtime)],
