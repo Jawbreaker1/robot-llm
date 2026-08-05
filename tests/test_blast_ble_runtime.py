@@ -52,6 +52,11 @@ class FakeHub:
                 "accepted": True,
                 "direction": request["args"]["direction"],
             }
+        elif operation == "turn_pulse":
+            result = {
+                "accepted": True,
+                "direction": request["args"]["direction"],
+            }
         else:
             result = {"shutting_down": True}
         await self.lines.put(
@@ -133,7 +138,7 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(hub.disconnect_count, 1)
 
-    async def test_stop_and_fixed_drive_pulse_are_typed(self):
+    async def test_stop_and_fixed_motion_pulses_are_typed(self):
         hub = FakeHub()
 
         async def finder(_name):
@@ -153,6 +158,12 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(ValueError, "direction"):
             await runtime.drive_pulse("sideways")
+        self.assertEqual(
+            await runtime.turn_pulse("left"),
+            {"accepted": True, "direction": "left"},
+        )
+        with self.assertRaisesRegex(ValueError, "direction"):
+            await runtime.turn_pulse("forward")
         await runtime.close()
 
         self.assertEqual(
@@ -161,6 +172,14 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "id": 2,
                 "op": "drive_pulse",
                 "args": {"direction": "forward"},
+            },
+        )
+        self.assertEqual(
+            hub.writes[2],
+            {
+                "id": 3,
+                "op": "turn_pulse",
+                "args": {"direction": "left"},
             },
         )
 

@@ -28,6 +28,8 @@ PROTOCOL_VERSION = 1
 MAX_INPUT_CHARS = 512
 DRIVE_PULSE_SPEED_DPS = 240
 DRIVE_PULSE_ANGLE_DEG = 90
+TURN_PULSE_SPEED_DPS = 180
+TURN_PULSE_ANGLE_DEG = 45
 
 hub = InventorHub(
     top_side=HUB_TOP_SIDE,
@@ -165,6 +167,50 @@ def drive_pulse(direction):
     }
 
 
+def turn_pulse(direction):
+    if direction not in ("left", "right"):
+        raise ValueError("direction must be left or right")
+    if (
+        not motors["right_drive"].done()
+        or not motors["left_drive"].done()
+    ):
+        raise ValueError("drive motors are busy")
+
+    right_angle = (
+        TURN_PULSE_ANGLE_DEG
+        if direction == "left"
+        else -TURN_PULSE_ANGLE_DEG
+    )
+    left_angle = -right_angle
+    before = {
+        "right_drive": motors["right_drive"].angle(),
+        "left_drive": motors["left_drive"].angle(),
+    }
+    motors["right_drive"].run_angle(
+        TURN_PULSE_SPEED_DPS,
+        right_angle,
+        then=Stop.BRAKE,
+        wait=False,
+    )
+    try:
+        motors["left_drive"].run_angle(
+            TURN_PULSE_SPEED_DPS,
+            left_angle,
+            then=Stop.BRAKE,
+            wait=False,
+        )
+    except Exception:
+        motors["right_drive"].brake()
+        raise
+    return {
+        "accepted": True,
+        "direction": direction,
+        "speed_dps": TURN_PULSE_SPEED_DPS,
+        "wheel_angle_deg": TURN_PULSE_ANGLE_DEG,
+        "before_angles_deg": before,
+    }
+
+
 wait(500)
 emit(
     {
@@ -194,6 +240,9 @@ while True:
         elif operation == "drive_pulse":
             arguments = request.get("args", {})
             result = drive_pulse(arguments.get("direction"))
+        elif operation == "turn_pulse":
+            arguments = request.get("args", {})
+            result = turn_pulse(arguments.get("direction"))
         elif operation == "shutdown":
             stop_all()
             emit(
