@@ -135,6 +135,14 @@ class BlastBLERuntime:
             {"direction": direction},
         )
 
+    async def claw_pulse(self, direction: str) -> Dict[str, object]:
+        if direction not in ("open", "close"):
+            raise ValueError("direction must be open or close")
+        return await self._request(
+            "claw_pulse",
+            {"direction": direction},
+        )
+
     async def close(self) -> None:
         hub = self._hub
         if hub is None:
@@ -161,6 +169,7 @@ class BlastBLERuntime:
             "stop",
             "drive_pulse",
             "turn_pulse",
+            "claw_pulse",
             "shutdown",
         ):
             raise ValueError("unsupported BLAST operation")

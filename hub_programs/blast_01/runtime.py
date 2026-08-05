@@ -30,6 +30,8 @@ DRIVE_PULSE_SPEED_DPS = 240
 DRIVE_PULSE_ANGLE_DEG = 90
 TURN_PULSE_SPEED_DPS = 180
 TURN_PULSE_ANGLE_DEG = 45
+CLAW_PULSE_SPEED_DPS = 180
+CLAW_PULSE_DURATION_MS = 500
 
 hub = InventorHub(
     top_side=HUB_TOP_SIDE,
@@ -110,9 +112,8 @@ def observation():
         "motor_angles_deg": {
             name: motor.angle() for name, motor in motors.items()
         },
-        "motion_active": not (
-            motors["right_drive"].done()
-            and motors["left_drive"].done()
+        "motion_active": not all(
+            motor.done() for motor in motors.values()
         ),
         "color": str(color_sensor.color()),
         "distance_mm": ultrasonic_sensor.distance(),
@@ -211,6 +212,33 @@ def turn_pulse(direction):
     }
 
 
+def claw_pulse(direction):
+    if direction not in ("open", "close"):
+        raise ValueError("direction must be open or close")
+    if not motors["claw"].done():
+        raise ValueError("claw motor is busy")
+
+    speed = (
+        CLAW_PULSE_SPEED_DPS
+        if direction == "open"
+        else -CLAW_PULSE_SPEED_DPS
+    )
+    before = motors["claw"].angle()
+    motors["claw"].run_time(
+        speed,
+        CLAW_PULSE_DURATION_MS,
+        then=Stop.BRAKE,
+        wait=False,
+    )
+    return {
+        "accepted": True,
+        "direction": direction,
+        "speed_dps": CLAW_PULSE_SPEED_DPS,
+        "duration_ms": CLAW_PULSE_DURATION_MS,
+        "before_angle_deg": before,
+    }
+
+
 wait(500)
 emit(
     {
@@ -243,6 +271,9 @@ while True:
         elif operation == "turn_pulse":
             arguments = request.get("args", {})
             result = turn_pulse(arguments.get("direction"))
+        elif operation == "claw_pulse":
+            arguments = request.get("args", {})
+            result = claw_pulse(arguments.get("direction"))
         elif operation == "shutdown":
             stop_all()
             emit(

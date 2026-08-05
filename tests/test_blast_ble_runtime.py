@@ -57,6 +57,11 @@ class FakeHub:
                 "accepted": True,
                 "direction": request["args"]["direction"],
             }
+        elif operation == "claw_pulse":
+            result = {
+                "accepted": True,
+                "direction": request["args"]["direction"],
+            }
         else:
             result = {"shutting_down": True}
         await self.lines.put(
@@ -164,6 +169,12 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(ValueError, "direction"):
             await runtime.turn_pulse("forward")
+        self.assertEqual(
+            await runtime.claw_pulse("open"),
+            {"accepted": True, "direction": "open"},
+        )
+        with self.assertRaisesRegex(ValueError, "direction"):
+            await runtime.claw_pulse("left")
         await runtime.close()
 
         self.assertEqual(
@@ -180,6 +191,14 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "id": 3,
                 "op": "turn_pulse",
                 "args": {"direction": "left"},
+            },
+        )
+        self.assertEqual(
+            hub.writes[3],
+            {
+                "id": 4,
+                "op": "claw_pulse",
+                "args": {"direction": "open"},
             },
         )
 
