@@ -58,10 +58,10 @@ or language-specific command menus. The model never receives raw motor access.
 | Status | Capabilities |
 |---|---|
 | Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
-| Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, complete port inventory, persistent sensor and motor telemetry, verified display and speaker control, bounded manual actions, and a stop that can interrupt active motion |
-| Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, per-run physical navigation memory, multi-controller telemetry, and bounded manual BLAST tests |
+| Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, persistent sensor and motor telemetry, bounded manual actions, interruptible stop, and a model-directed act → observe → replan loop |
+| Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, per-run physical navigation memory, multi-controller telemetry, and agent-directed BLAST episodes |
 | Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
-| Planned | Repeatable autonomous obstacle navigation, Robot Inventor autonomy in the application, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
+| Planned | Repeatable autonomous obstacle navigation, richer Robot Inventor goals, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
 
 EV3 obstacle navigation has succeeded in an operator-confirmed physical trial;
 repeatability and broader acceptance runs remain experimental.
@@ -71,10 +71,12 @@ obstacle hypotheses, but it is not vision, object recognition, or precise
 metric SLAM. The forward-facing color/light sensor is installed but is not yet
 used by the production navigation loop.
 
-EV3 remains the only autonomous motion worker in the application. BLAST-01 has
-its own registered robot identity and an optional persistent BLE connection in
-the dashboard. That connection exposes live telemetry and a small set of fixed
-manual test controls; autonomous BLAST plans are not enabled yet.
+BLAST-01 has its own registered robot identity and can be selected as the
+dashboard's physical agent profile. Gemma chooses one typed action at a time;
+the host executes it through the existing bounded BLE controller, feeds the
+fresh observation back to the model, and repeats until completion or abort.
+The first slice supports drive and turn decisions. Obstacle navigation and
+manipulation goals remain future work for this profile.
 
 ## Architecture
 
@@ -193,8 +195,9 @@ an ultrasonic sensor, the built-in six-axis IMU and battery telemetry. Display,
 speaker and bounded motor actuation are physically verified. A persistent BLE
 session exposes observations, stop, drive, turn, claw and body pulses. The
 dashboard can keep that session open, show battery, distance, color, IMU and
-motor telemetry, and run those fixed actions manually. Stop can interrupt an
-in-flight pulse and is verified against a fresh inactive observation.
+motor telemetry, run those fixed actions manually, or bind the same connection
+to a model-directed robot episode. Stop can interrupt an in-flight pulse and is
+verified against a fresh inactive observation.
 
 ```sh
 python3 -m venv .venv
@@ -204,11 +207,12 @@ python3 -m venv .venv
   hub_programs/blast_01/inventory.py
 ```
 
-To add BLAST telemetry and manual test controls to the dashboard:
+To run BLAST as the dashboard's active physical agent:
 
 ```sh
 ROBOT_LLM_PYTHON=.venv/bin/python ROBOT_LLM_STT_URL='' \
-  scripts/start_lab_console.sh --blast-hub-name BLAST-01
+  scripts/start_lab_console.sh --blast-hub-name BLAST-01 \
+  --robot-profile blast-01 --model 'EXACT-MODEL-ID-FROM-LM-STUDIO'
 ```
 
 This optional toolchain requires Python 3.10 or newer. Disconnect Pybricks Code
