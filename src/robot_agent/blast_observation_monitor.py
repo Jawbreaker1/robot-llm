@@ -22,6 +22,8 @@ DEFAULT_RECONNECT_INTERVAL_SECONDS = 3.0
 DISCONNECT_TIMEOUT_SECONDS = 3.0
 COMMAND_TIMEOUT_SECONDS = 15.0
 INTERNAL_COMMAND_TIMEOUT_SECONDS = 12.0
+SCAN_COMMAND_TIMEOUT_SECONDS = 18.0
+SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS = 15.0
 MIN_COMMAND_BUDGET_SECONDS = 2.0
 COMMAND_RESPONSE_MARGIN_SECONDS = 0.25
 MOTION_TIMEOUT_SECONDS = 4.0
@@ -140,6 +142,11 @@ class BlastObservationMonitor:
             and not callable(cancel_requested)
         ):
             raise ValueError("unsupported BLAST command")
+        timeout_seconds = (
+            SCAN_COMMAND_TIMEOUT_SECONDS
+            if command == SCAN_COMMAND
+            else COMMAND_TIMEOUT_SECONDS
+        )
         with self._lock:
             if self._snapshot["state"] != "online":
                 raise BlastControllerError(
@@ -166,7 +173,7 @@ class BlastObservationMonitor:
                 self._preempt_stop_request = (
                     self._runtime_generation,
                     result,
-                    time.monotonic() + COMMAND_TIMEOUT_SECONDS,
+                    time.monotonic() + timeout_seconds,
                 )
                 self._command_available.set()
             elif (
@@ -184,7 +191,7 @@ class BlastObservationMonitor:
                     self._runtime_generation,
                     command,
                     result,
-                    time.monotonic() + COMMAND_TIMEOUT_SECONDS,
+                    time.monotonic() + timeout_seconds,
                 )
                 try:
                     self._command_queue.put_nowait(request)
@@ -196,7 +203,7 @@ class BlastObservationMonitor:
                     ) from None
                 self._command_available.set()
         try:
-            return result.result(timeout=COMMAND_TIMEOUT_SECONDS)
+            return result.result(timeout=timeout_seconds)
         except FutureTimeoutError:
             result.cancel()
             raise BlastControllerError(
@@ -370,10 +377,15 @@ class BlastObservationMonitor:
                     ),
                 )
                 return
+            internal_timeout = (
+                SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS
+                if command == SCAN_COMMAND
+                else INTERNAL_COMMAND_TIMEOUT_SECONDS
+            )
             value = await asyncio.wait_for(
                 self._perform_command(runtime, generation, command),
                 timeout=min(
-                    INTERNAL_COMMAND_TIMEOUT_SECONDS,
+                    internal_timeout,
                     remaining - COMMAND_RESPONSE_MARGIN_SECONDS,
                 ),
             )
@@ -425,6 +437,12 @@ class BlastObservationMonitor:
             imu.get("heading_deg") if isinstance(imu, dict) else None
         )
 
+    @staticmethod
+    def _scan_heading_delta(heading, reference):
+        if heading is None or reference is None:
+            return None
+        return (heading - reference + 180.0) % 360.0 - 180.0
+
     @classmethod
     def _scan_ray(
         cls,
@@ -443,10 +461,9 @@ class BlastObservationMonitor:
                 observation.get("distance_mm")
             ),
             "heading_deg": heading,
-            "relative_heading_deg": (
-                heading - start_heading
-                if heading is not None and start_heading is not None
-                else None
+            "relative_heading_deg": cls._scan_heading_delta(
+                heading,
+                start_heading,
             ),
             "observation_settled": observation_settled,
             "observed_at_ms": observed_at_ms,
@@ -495,11 +512,21 @@ class BlastObservationMonitor:
         )
         start_heading = self._scan_heading(center)
 
-        _left_receipt, left, left_settled = await self._scan_turn(
-            runtime,
-            generation,
-            "left",
-            settle=True,
+        _left_near_receipt, left_near, left_near_settled = (
+            await self._scan_turn(
+                runtime,
+                generation,
+                "left",
+                settle=True,
+            )
+        )
+        _left_far_receipt, left_far, left_far_settled = (
+            await self._scan_turn(
+                runtime,
+                generation,
+                "left",
+                settle=True,
+            )
         )
         await self._scan_turn(
             runtime,
@@ -507,11 +534,33 @@ class BlastObservationMonitor:
             "right",
             settle=False,
         )
-        _right_receipt, right, right_settled = await self._scan_turn(
+        await self._scan_turn(
             runtime,
             generation,
             "right",
-            settle=True,
+            settle=False,
+        )
+        _right_near_receipt, right_near, right_near_settled = (
+            await self._scan_turn(
+                runtime,
+                generation,
+                "right",
+                settle=True,
+            )
+        )
+        _right_far_receipt, right_far, right_far_settled = (
+            await self._scan_turn(
+                runtime,
+                generation,
+                "right",
+                settle=True,
+            )
+        )
+        await self._scan_turn(
+            runtime,
+            generation,
+            "left",
+            settle=False,
         )
         _return_receipt, final, final_settled = await self._scan_turn(
             runtime,
@@ -521,10 +570,9 @@ class BlastObservationMonitor:
         )
 
         final_heading = self._scan_heading(final)
-        restoration_error = (
-            final_heading - start_heading
-            if final_heading is not None and start_heading is not None
-            else None
+        restoration_error = self._scan_heading_delta(
+            final_heading,
+            start_heading,
         )
         restoration_verified = (
             restoration_error is not None
@@ -544,8 +592,10 @@ class BlastObservationMonitor:
             "restoration_verified": restoration_verified,
             "all_observations_settled": all((
                 center_settled,
-                left_settled,
-                right_settled,
+                left_near_settled,
+                left_far_settled,
+                right_near_settled,
+                right_far_settled,
                 final_settled,
             )),
             "rays": [
@@ -556,16 +606,28 @@ class BlastObservationMonitor:
                     center_settled,
                 ),
                 self._scan_ray(
-                    "left",
-                    left,
+                    "left_near",
+                    left_near,
                     start_heading,
-                    left_settled,
+                    left_near_settled,
                 ),
                 self._scan_ray(
-                    "right",
-                    right,
+                    "left_far",
+                    left_far,
                     start_heading,
-                    right_settled,
+                    left_far_settled,
+                ),
+                self._scan_ray(
+                    "right_near",
+                    right_near,
+                    start_heading,
+                    right_near_settled,
+                ),
+                self._scan_ray(
+                    "right_far",
+                    right_far,
+                    start_heading,
+                    right_far_settled,
                 ),
             ],
         }
@@ -576,7 +638,7 @@ class BlastObservationMonitor:
             "command": SCAN_COMMAND,
             "accepted": True,
             "completed": True,
-            "receipt": {"turn_count": 4},
+            "receipt": {"turn_count": 8},
             "observation": final,
             "observation_settled": final_settled,
             "scan": scan,

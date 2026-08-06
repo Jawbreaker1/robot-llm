@@ -189,7 +189,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         class ScanningRuntime(FakeRuntime):
             def __init__(self, *, hub_name):
                 super().__init__(hub_name=hub_name)
-                self.heading = 10.0
+                self.heading = 179.0
                 self.distance = 300
                 self.turn_index = 0
 
@@ -201,12 +201,42 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
             async def turn_pulse(self, direction):
                 receipt = await super().turn_pulse(direction)
-                expected = ("left", "right", "right", "left")
+                expected = (
+                    "left",
+                    "left",
+                    "right",
+                    "right",
+                    "right",
+                    "right",
+                    "left",
+                    "left",
+                )
                 self.assert_direction(direction, expected[self.turn_index])
-                self.heading += (-34.0, 34.0, 38.0, -36.0)[
-                    self.turn_index
-                ]
-                self.distance = (720, 300, 1_100, 310)[self.turn_index]
+                delta = (
+                    -22.0,
+                    -23.0,
+                    23.0,
+                    22.0,
+                    24.0,
+                    23.0,
+                    -22.0,
+                    -23.0,
+                )[self.turn_index]
+                self.heading = (
+                    self.heading
+                    + delta
+                    + 180.0
+                ) % 360.0 - 180.0
+                self.distance = (
+                    720,
+                    2_000,
+                    720,
+                    300,
+                    1_100,
+                    2_000,
+                    1_100,
+                    310,
+                )[self.turn_index]
                 self.turn_index += 1
                 return receipt
 
@@ -229,27 +259,37 @@ class BlastObservationMonitorTests(unittest.TestCase):
             [call for call in runtime.calls if call[0] == "turn_pulse"],
             [
                 ("turn_pulse", "left"),
+                ("turn_pulse", "left"),
                 ("turn_pulse", "right"),
                 ("turn_pulse", "right"),
+                ("turn_pulse", "right"),
+                ("turn_pulse", "right"),
+                ("turn_pulse", "left"),
                 ("turn_pulse", "left"),
             ],
         )
         self.assertEqual(result["command"], SCAN_COMMAND)
-        self.assertEqual(result["receipt"], {"turn_count": 4})
-        self.assertEqual(result["observation"]["imu"]["heading_deg"], 12.0)
+        self.assertEqual(result["receipt"], {"turn_count": 8})
+        self.assertEqual(result["observation"]["imu"]["heading_deg"], -179.0)
         scan = result["scan"]
         self.assertEqual(scan["schema"], "blast-scan-front-arc/v1")
         self.assertEqual(
             [ray["side"] for ray in scan["rays"]],
-            ["center", "left", "right"],
+            [
+                "center",
+                "left_near",
+                "left_far",
+                "right_near",
+                "right_far",
+            ],
         )
         self.assertEqual(
             [ray["distance_mm"] for ray in scan["rays"]],
-            [300.0, 720.0, 1_100.0],
+            [300.0, 720.0, 2_000.0, 1_100.0, 2_000.0],
         )
         self.assertEqual(
             [ray["relative_heading_deg"] for ray in scan["rays"]],
-            [0.0, -34.0, 38.0],
+            [0.0, -22.0, -45.0, 24.0, 47.0],
         )
         self.assertEqual(scan["restoration_error_deg"], 2.0)
         self.assertTrue(scan["restoration_verified"])
