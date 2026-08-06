@@ -26,7 +26,7 @@ from wiring import (
 
 PROTOCOL_VERSION = 1
 MAX_INPUT_CHARS = 512
-DRIVE_PULSE_SPEED_DPS = 240
+DRIVE_PULSE_SPEED_DPS = 120
 DRIVE_PULSE_ANGLE_DEG = 90
 TURN_PULSE_SPEED_DPS = 180
 TURN_PULSE_ANGLE_DEG = 45
@@ -99,6 +99,9 @@ def observation():
     imu = {
         "ready": imu_ready,
         "stationary": hub.imu.stationary(),
+        # Static front/back lean is useful even while the calibrated IMU is
+        # not ready. Keep it explicitly separate from calibrated tilt below.
+        "raw_tilt_deg": list(hub.imu.tilt(False)),
     }
     if imu_ready:
         imu["heading_deg"] = hub.imu.heading()
