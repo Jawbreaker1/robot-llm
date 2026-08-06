@@ -120,14 +120,22 @@ class BlastObservationMonitor:
         with self._lock:
             return deepcopy(self._snapshot)
 
-    def command(self, command: str):
-        if command not in COMMANDS:
+    def command(self, command: str, *, cancel_requested=None):
+        if command not in COMMANDS or (
+            cancel_requested is not None
+            and not callable(cancel_requested)
+        ):
             raise ValueError("unsupported BLAST command")
         with self._lock:
             if self._snapshot["state"] != "online":
                 raise BlastControllerError(
                     "controller_unavailable",
                     "BLAST is not connected",
+                )
+            if cancel_requested is not None and cancel_requested():
+                raise BlastControllerError(
+                    "controller_command_interrupted",
+                    "BLAST command was cancelled before motor start",
                 )
             preempts_active_command = (
                 command == "stop"

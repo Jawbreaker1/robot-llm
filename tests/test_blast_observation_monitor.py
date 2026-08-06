@@ -178,6 +178,30 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         monitor.close()
 
+    def test_cancelled_agent_command_never_reaches_motor_queue(self):
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        with self.assertRaises(BlastControllerError) as raised:
+            monitor.command(
+                "drive_forward",
+                cancel_requested=lambda: True,
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "controller_command_interrupted",
+        )
+        self.assertNotIn(
+            ("drive_pulse", "forward"),
+            FakeRuntime.instances[0].calls,
+        )
+        monitor.close()
+
     def test_command_waits_for_an_inflight_observation(self):
         observing = threading.Event()
         release = threading.Event()
