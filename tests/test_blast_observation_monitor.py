@@ -320,6 +320,183 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertFalse(result["observation"]["motion_active"])
         monitor.close()
 
+    def test_stop_preempts_active_command_on_the_owner_runtime(self):
+        pulse_started = threading.Event()
+        moving_observed = threading.Event()
+
+        class LongMotionRuntime(FakeRuntime):
+            async def drive_pulse(self, direction):
+                receipt = await super().drive_pulse(direction)
+                self.motion_observations = 100
+                pulse_started.set()
+                return receipt
+
+            async def observe(self):
+                observation = await super().observe()
+                if observation["motion_active"]:
+                    moving_observed.set()
+                return observation
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=LongMotionRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        command_failures = []
+
+        def drive():
+            try:
+                monitor.command("drive_forward")
+            except BlastControllerError as error:
+                command_failures.append(error.code)
+
+        command_thread = threading.Thread(target=drive)
+        command_thread.start()
+        self.assertTrue(pulse_started.wait(timeout=1.0))
+        self.assertTrue(moving_observed.wait(timeout=1.0))
+
+        stop_result = monitor.command("stop")
+        command_thread.join(timeout=1.0)
+
+        self.assertFalse(command_thread.is_alive())
+        self.assertEqual(
+            command_failures,
+            ["controller_command_interrupted"],
+        )
+        self.assertTrue(stop_result["completed"])
+        self.assertFalse(stop_result["observation"]["motion_active"])
+        self.assertEqual(len(FakeRuntime.instances), 1)
+        runtime = FakeRuntime.instances[0]
+        self.assertIn(("stop",), runtime.calls)
+        self.assertLess(runtime.calls.index(("stop",)), 100)
+        self.assertEqual(monitor.snapshot()["state"], "online")
+        monitor.close()
+
+    def test_stop_cancels_a_queued_command_before_motor_start(self):
+        claim_gap_open = threading.Event()
+        release_claim = threading.Event()
+
+        class ClaimGapMonitor(BlastObservationMonitor):
+            async def _service_preempt_stop(self, runtime, generation):
+                result = await super()._service_preempt_stop(
+                    runtime,
+                    generation,
+                )
+                if not claim_gap_open.is_set():
+                    claim_gap_open.set()
+                    while not release_claim.is_set():
+                        await __import__("asyncio").sleep(0.005)
+                return result
+
+        monitor = ClaimGapMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        self.assertTrue(claim_gap_open.wait(timeout=1.0))
+        failures = []
+        stop_results = []
+
+        def command(name):
+            try:
+                result = monitor.command(name)
+                if name == "stop":
+                    stop_results.append(result)
+            except BlastControllerError as error:
+                failures.append((name, error.code))
+
+        drive_thread = threading.Thread(
+            target=command,
+            args=("drive_forward",),
+        )
+        drive_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._pending_command is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        stop_thread = threading.Thread(target=command, args=("stop",))
+        stop_thread.start()
+        release_claim.set()
+        drive_thread.join(timeout=1.0)
+        stop_thread.join(timeout=1.0)
+
+        self.assertFalse(drive_thread.is_alive())
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(
+            failures,
+            [("drive_forward", "controller_command_interrupted")],
+        )
+        self.assertTrue(stop_results[0]["completed"])
+        runtime = FakeRuntime.instances[0]
+        self.assertNotIn(("drive_pulse", "forward"), runtime.calls)
+        self.assertIn(("stop",), runtime.calls)
+        monitor.close()
+
+    def test_duplicate_preemptive_stop_is_rejected_busy(self):
+        moving_observed = threading.Event()
+        stop_started = threading.Event()
+        release_stop = threading.Event()
+
+        class BlockingStopRuntime(FakeRuntime):
+            async def drive_pulse(self, direction):
+                receipt = await super().drive_pulse(direction)
+                self.motion_observations = 100
+                return receipt
+
+            async def observe(self):
+                observation = await super().observe()
+                if observation["motion_active"]:
+                    moving_observed.set()
+                return observation
+
+            async def stop(self):
+                stop_started.set()
+                while not release_stop.is_set():
+                    await __import__("asyncio").sleep(0.005)
+                return await super().stop()
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=BlockingStopRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        drive_failures = []
+        stop_results = []
+
+        def drive():
+            try:
+                monitor.command("drive_forward")
+            except BlastControllerError as error:
+                drive_failures.append(error.code)
+
+        def stop():
+            stop_results.append(monitor.command("stop"))
+
+        drive_thread = threading.Thread(target=drive)
+        drive_thread.start()
+        self.assertTrue(moving_observed.wait(timeout=1.0))
+        stop_thread = threading.Thread(target=stop)
+        stop_thread.start()
+        self.assertTrue(stop_started.wait(timeout=1.0))
+
+        with self.assertRaises(BlastControllerError) as busy:
+            monitor.command("stop")
+        self.assertEqual(busy.exception.code, "controller_busy")
+
+        release_stop.set()
+        stop_thread.join(timeout=1.0)
+        drive_thread.join(timeout=1.0)
+        self.assertFalse(stop_thread.is_alive())
+        self.assertFalse(drive_thread.is_alive())
+        self.assertTrue(stop_results[0]["completed"])
+        self.assertEqual(
+            drive_failures,
+            ["controller_command_interrupted"],
+        )
+        monitor.close()
+
     def test_rejects_unknown_offline_and_parallel_motion_commands(self):
         monitor = BlastObservationMonitor(runtime_factory=FakeRuntime)
         with self.assertRaises(ValueError):

@@ -50,6 +50,7 @@
       throw new TypeError("Controller panel options are invalid.");
     }
     const pendingControllers = new Set();
+    const pendingStops = new Set();
     let lastRender = null;
 
     function element(tag, className, content) {
@@ -81,10 +82,17 @@
     }
 
     async function sendCommand(controllerId, command) {
-      if (pendingControllers.has(controllerId)) {
+      const isStop = command === "stop";
+      if (
+        (isStop && pendingStops.has(controllerId))
+        || (!isStop && (
+          pendingControllers.has(controllerId)
+          || pendingStops.has(controllerId)
+        ))
+      ) {
         return;
       }
-      pendingControllers.add(controllerId);
+      (isStop ? pendingStops : pendingControllers).add(controllerId);
       rerender();
       try {
         await request(
@@ -98,10 +106,14 @@
         showToast(t("registry.control.completed", {
           command: t(`registry.control.${command}`),
         }));
-      } catch (_error) {
-        showToast(t("registry.control.failed"), true);
+      } catch (error) {
+        if (error && error.code === "controller_command_interrupted") {
+          showToast(t("registry.control.interrupted"));
+        } else {
+          showToast(t("registry.control.failed"), true);
+        }
       } finally {
-        pendingControllers.delete(controllerId);
+        (isStop ? pendingStops : pendingControllers).delete(controllerId);
         await onCommandComplete();
         rerender();
       }
@@ -115,7 +127,8 @@
       const observed = Number.isFinite(runtime.last_observed_at_unix_ms);
       const moving = observation.motion_active === true;
       const pending = pendingControllers.has(controller.controller_id);
-      const enabled = online && observed && !moving && !pending;
+      const stopPending = pendingStops.has(controller.controller_id);
+      const enabled = online && observed && !moving && !pending && !stopPending;
       const controls = element("section", "controller-controls");
       controls.appendChild(element(
         "strong",
@@ -134,7 +147,7 @@
           );
           button.type = "button";
           button.disabled = command === "stop"
-            ? !(online && observed && !pending)
+            ? !(online && observed && !stopPending)
             : !enabled;
           button.addEventListener("click", () => {
             sendCommand(controller.controller_id, command);
@@ -146,7 +159,7 @@
       controls.appendChild(element(
         "small",
         "controller-control-status",
-        pending
+        pending || stopPending
           ? t("registry.control.running")
           : !online
             ? t("registry.control.offline")

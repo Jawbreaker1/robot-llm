@@ -37,6 +37,7 @@ BLAST_COMMANDS = frozenset((
 ))
 CONTROLLER_ERROR_STATUS = {
     "controller_busy": 409,
+    "controller_command_interrupted": 409,
     "stale_controller_command": 409,
     "controller_unavailable": 503,
     "controller_command_failed": 502,

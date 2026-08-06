@@ -640,6 +640,11 @@ process.stdout.write(JSON.stringify({
         self.assertIn('"claw_close"', self.controller_panel)
         self.assertIn('"body_right"', self.controller_panel)
         self.assertIn("pendingControllers", self.controller_panel)
+        self.assertIn("pendingStops", self.controller_panel)
+        self.assertIn(
+            'error.code === "controller_command_interrupted"',
+            self.controller_panel,
+        )
         self.assertIn(
             "Number.isFinite(runtime.last_observed_at_unix_ms)",
             self.controller_panel,

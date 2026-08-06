@@ -84,7 +84,8 @@ class BlastObservationMonitor:
         self._loop = None
         self._task = None
         self._runtime_generation = 0
-        self._command_pending = False
+        self._pending_command = None
+        self._preempt_stop_request = None
         self._command_queue = Queue(maxsize=1)
         self._command_available = threading.Event()
         self._snapshot = {
@@ -128,28 +129,50 @@ class BlastObservationMonitor:
                     "controller_unavailable",
                     "BLAST is not connected",
                 )
-            if self._command_pending:
+            preempts_active_command = (
+                command == "stop"
+                and self._pending_command is not None
+                and self._pending_command != "stop"
+            )
+            if preempts_active_command:
+                if self._preempt_stop_request is not None:
+                    raise BlastControllerError(
+                        "controller_busy",
+                        "BLAST already has a pending stop command",
+                    )
+                result = Future()
+                self._preempt_stop_request = (
+                    self._runtime_generation,
+                    result,
+                    time.monotonic() + COMMAND_TIMEOUT_SECONDS,
+                )
+                self._command_available.set()
+            elif (
+                self._pending_command is not None
+                or self._preempt_stop_request is not None
+            ):
                 raise BlastControllerError(
                     "controller_busy",
                     "BLAST already has a pending command",
                 )
-            self._command_pending = True
-            result = Future()
-            request = (
-                self._runtime_generation,
-                command,
-                result,
-                time.monotonic() + COMMAND_TIMEOUT_SECONDS,
-            )
-            try:
-                self._command_queue.put_nowait(request)
-            except Full:
-                self._command_pending = False
-                raise BlastControllerError(
-                    "controller_busy",
-                    "BLAST command queue is full",
-                ) from None
-            self._command_available.set()
+            else:
+                self._pending_command = command
+                result = Future()
+                request = (
+                    self._runtime_generation,
+                    command,
+                    result,
+                    time.monotonic() + COMMAND_TIMEOUT_SECONDS,
+                )
+                try:
+                    self._command_queue.put_nowait(request)
+                except Full:
+                    self._pending_command = None
+                    raise BlastControllerError(
+                        "controller_busy",
+                        "BLAST command queue is full",
+                    ) from None
+                self._command_available.set()
         try:
             return result.result(timeout=COMMAND_TIMEOUT_SECONDS)
         except FutureTimeoutError:
@@ -242,9 +265,22 @@ class BlastObservationMonitor:
                 generation = self._runtime_generation
             self._set_state("online", None, ready=ready)
             while not self._stop_requested.is_set():
+                preempted = await self._service_preempt_stop(
+                    runtime,
+                    generation,
+                )
                 request = self._next_command()
-                if request is None:
-                    self._publish_observation(await runtime.observe())
+                if preempted and request is not None:
+                    self._finish_command(
+                        request[2],
+                        error=BlastControllerError(
+                            "controller_command_interrupted",
+                            "BLAST command was interrupted by stop",
+                        ),
+                    )
+                elif request is None:
+                    if not preempted:
+                        self._publish_observation(await runtime.observe())
                 else:
                     await self._execute_command(
                         runtime,
@@ -297,8 +333,23 @@ class BlastObservationMonitor:
                     "stale_controller_command",
                     "BLAST reconnected before the command ran",
                 )
+            with self._lock:
+                stop_won_before_start = (
+                    command != "stop"
+                    and self._preempt_stop_request is not None
+                )
+            if stop_won_before_start:
+                await self._service_preempt_stop(runtime, generation)
+                self._finish_command(
+                    result,
+                    error=BlastControllerError(
+                        "controller_command_interrupted",
+                        "BLAST command was interrupted by stop",
+                    ),
+                )
+                return
             value = await asyncio.wait_for(
-                self._perform_command(runtime, command),
+                self._perform_command(runtime, generation, command),
                 timeout=min(
                     INTERNAL_COMMAND_TIMEOUT_SECONDS,
                     remaining - COMMAND_RESPONSE_MARGIN_SECONDS,
@@ -331,9 +382,11 @@ class BlastObservationMonitor:
                 )
             )
             self._finish_command(result, error=failure)
+            if failure.code == "controller_command_interrupted":
+                return
             raise failure
 
-    async def _perform_command(self, runtime, command: str):
+    async def _perform_command(self, runtime, generation, command: str):
         operation, direction = COMMANDS[command]
         method = getattr(runtime, operation)
         receipt = (
@@ -343,6 +396,7 @@ class BlastObservationMonitor:
         )
         observation = await self._observe_until_idle(
             runtime,
+            generation=generation,
             stop_only=command == "stop",
         )
         return {
@@ -356,11 +410,25 @@ class BlastObservationMonitor:
             "observation": observation,
         }
 
-    async def _observe_until_idle(self, runtime, *, stop_only: bool):
+    async def _observe_until_idle(
+        self,
+        runtime,
+        *,
+        generation,
+        stop_only: bool,
+    ):
         deadline = asyncio.get_running_loop().time() + (
             0.0 if stop_only else MOTION_TIMEOUT_SECONDS
         )
         while True:
+            if (
+                not stop_only
+                and await self._service_preempt_stop(runtime, generation)
+            ):
+                raise BlastControllerError(
+                    "controller_command_interrupted",
+                    "BLAST command was interrupted by stop",
+                )
             observation = await runtime.observe()
             self._publish_observation(observation)
             if observation.get("motion_active") is False:
@@ -377,6 +445,61 @@ class BlastObservationMonitor:
                 )
             await asyncio.sleep(MOTION_POLL_INTERVAL_SECONDS)
 
+    async def _service_preempt_stop(self, runtime, generation) -> bool:
+        with self._lock:
+            request = self._preempt_stop_request
+        if request is None:
+            return False
+        requested_generation, result, expires_at = request
+        if result.cancelled() or time.monotonic() >= expires_at:
+            self._finish_preempt_stop(
+                result,
+                error=(
+                    None
+                    if result.cancelled()
+                    else BlastControllerError(
+                        "controller_command_timeout",
+                        "BLAST stop command expired before execution",
+                    )
+                ),
+            )
+            return False
+        try:
+            if requested_generation != generation:
+                raise BlastControllerError(
+                    "stale_controller_command",
+                    "BLAST reconnected before stop ran",
+                )
+            self._finish_preempt_stop(
+                result,
+                value=await self._perform_command(
+                    runtime,
+                    generation,
+                    "stop",
+                ),
+            )
+            return True
+        except asyncio.CancelledError:
+            self._finish_preempt_stop(
+                result,
+                error=BlastControllerError(
+                    "controller_unavailable",
+                    "BLAST controller stopped",
+                ),
+            )
+            raise
+        except Exception as error:
+            failure = (
+                error
+                if isinstance(error, BlastControllerError)
+                else BlastControllerError(
+                    "controller_command_failed",
+                    "BLAST stop command failed",
+                )
+            )
+            self._finish_preempt_stop(result, error=failure)
+            raise failure
+
     def _publish_observation(self, observation) -> None:
         self._set_state(
             "online",
@@ -390,7 +513,18 @@ class BlastObservationMonitor:
 
     def _finish_command(self, result, *, value=None, error=None):
         with self._lock:
-            self._command_pending = False
+            self._pending_command = None
+        if not result.done():
+            if error is None:
+                result.set_result(value)
+            else:
+                result.set_exception(error)
+
+    def _finish_preempt_stop(self, result, *, value=None, error=None):
+        with self._lock:
+            request = self._preempt_stop_request
+            if request is not None and request[1] is result:
+                self._preempt_stop_request = None
         if not result.done():
             if error is None:
                 result.set_result(value)
@@ -398,6 +532,10 @@ class BlastObservationMonitor:
                 result.set_exception(error)
 
     def _reject_commands(self, error) -> None:
+        with self._lock:
+            stop_request = self._preempt_stop_request
+        if stop_request is not None:
+            self._finish_preempt_stop(stop_request[1], error=error)
         while True:
             request = self._next_command()
             if request is None:

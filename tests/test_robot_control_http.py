@@ -346,29 +346,34 @@ class RobotControlHTTPRouterTests(unittest.TestCase):
         self.assertEqual(unknown.exception.code, "controller_route_not_found")
 
     def test_blast_controller_errors_have_bounded_http_statuses(self):
-        class BusyController(FakeControllerService):
-            def command(self, command):
-                error = RuntimeError("details stay private")
-                error.code = "controller_busy"
-                raise error
+        for error_code in (
+            "controller_busy",
+            "controller_command_interrupted",
+        ):
+            with self.subTest(error_code=error_code):
+                class FailingController(FakeControllerService):
+                    def command(self, command):
+                        error = RuntimeError("details stay private")
+                        error.code = error_code
+                        raise error
 
-        router = RobotControlHTTPRouter(
-            self.service,
-            controller_services={
-                "blast-01.hub": BusyController(),
-            },
-        )
+                router = RobotControlHTTPRouter(
+                    self.service,
+                    controller_services={
+                        "blast-01.hub": FailingController(),
+                    },
+                )
 
-        with self.assertRaises(RobotControlHTTPError) as raised:
-            router.handle(
-                "POST",
-                "/api/v1/controllers/blast-01.hub/commands",
-                "",
-                encoded({"command": "turn_left"}),
-            )
+                with self.assertRaises(RobotControlHTTPError) as raised:
+                    router.handle(
+                        "POST",
+                        "/api/v1/controllers/blast-01.hub/commands",
+                        "",
+                        encoded({"command": "turn_left"}),
+                    )
 
-        self.assertEqual(raised.exception.status, 409)
-        self.assertEqual(raised.exception.code, "controller_busy")
+                self.assertEqual(raised.exception.status, 409)
+                self.assertEqual(raised.exception.code, error_code)
 
     def test_settings_errors_preserve_typed_status_and_code(self):
         with self.assertRaises(RobotControlHTTPError) as raised:
