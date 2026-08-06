@@ -13,7 +13,8 @@ Robot LLM Lab connects a local AI agent to physical LEGO robots. EV3RSTORM
 currently carries the complete navigation loop: give it a goal and the agent
 plans, acts, reads sensors and motor feedback, and adapts when reality
 disagrees. Robot Inventor 51515 has now completed its first physical bring-up
-with Pybricks and direct local deployment over Bluetooth.
+with Pybricks, persistent BLE telemetry, and bounded manual control from the
+same dashboard.
 
 The language model chooses semantic intent and expression. The host application
 validates and dispatches typed actions, while the active controller worker
@@ -57,7 +58,7 @@ or language-specific command menus. The model never receives raw motor access.
 | Status | Capabilities |
 |---|---|
 | Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
-| Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, complete port inventory, IMU and battery telemetry, plus verified display, speaker and motor control |
+| Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, complete port inventory, persistent sensor and motor telemetry, verified display and speaker control, bounded manual actions, and a stop that can interrupt active motion |
 | Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, per-run physical navigation memory, multi-controller telemetry, and bounded manual BLAST tests |
 | Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
 | Planned | Repeatable autonomous obstacle navigation, Robot Inventor autonomy in the application, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
@@ -96,8 +97,9 @@ flowchart TD
 The host owns goals, state, navigation memory, model calls, and validation.
 Each controller worker exposes a small set of fixed robot operations and
 processes one request at a time. It contains no planner, personality, or
-independent goal. The EV3 implementation is application-integrated today; the
-Robot Inventor worker is the next controller implementation. Once the model has
+independent goal. EV3 is application-integrated for autonomous execution;
+Robot Inventor is application-integrated for live telemetry and bounded manual
+actions, while agent-issued BLAST plans remain the next step. Once the model has
 authorized a target and detour side, a deterministic route executive may
 serialize several freshly checked pulses before asking the model again. New
 geometry, ambiguous progress, a veto, or a failed movement returns control to
@@ -191,7 +193,8 @@ an ultrasonic sensor, the built-in six-axis IMU and battery telemetry. Display,
 speaker and bounded motor actuation are physically verified. A persistent BLE
 session exposes observations, stop, drive, turn, claw and body pulses. The
 dashboard can keep that session open, show battery, distance, color, IMU and
-motor telemetry, and run those fixed actions manually.
+motor telemetry, and run those fixed actions manually. Stop can interrupt an
+in-flight pulse and is verified against a fresh inactive observation.
 
 ```sh
 python3 -m venv .venv
@@ -228,8 +231,8 @@ not replace physical calibration or live stop tests.
   calibration and acceptance runs.
 - Add color sensing, continuous voice interaction, wireless cameras,
   microphones, vision, and sound-source reasoning.
-- Complete the Robot Inventor hub supervisor and host worker, then add BOOST
-  and coordinate several LEGO controllers.
+- Connect the Robot Inventor worker to the shared goal and planning executive,
+  then add BOOST and coordinate several LEGO controllers.
 - Expand the asynchronous architecture with parallel perception, validation,
   and forward planning while preserving serialized motor ownership.
 
