@@ -26,6 +26,10 @@ MIN_COMMAND_BUDGET_SECONDS = 2.0
 COMMAND_RESPONSE_MARGIN_SECONDS = 0.25
 MOTION_TIMEOUT_SECONDS = 4.0
 MOTION_POLL_INTERVAL_SECONDS = 0.05
+POST_MOTION_SETTLE_TIMEOUT_SECONDS = 1.5
+POST_MOTION_SETTLE_SAMPLE_COUNT = 5
+POST_MOTION_DISTANCE_RANGE_MM = 5.0
+POST_MOTION_TILT_RANGE_DEG = 1.0
 COMMAND_RESULT_SCHEMA = "controller-command-result/v1"
 COMMANDS = {
     "drive_forward": ("drive_pulse", "forward"),
@@ -37,6 +41,12 @@ COMMANDS = {
     "body_left": ("body_pulse", "left"),
     "body_right": ("body_pulse", "right"),
     "stop": ("stop", None),
+}
+NAVIGATION_MOTION_COMMANDS = {
+    "drive_forward",
+    "drive_reverse",
+    "turn_left",
+    "turn_right",
 }
 
 
@@ -407,7 +417,16 @@ class BlastObservationMonitor:
             generation=generation,
             stop_only=command == "stop",
         )
-        return {
+        observation_settled = None
+        if command in NAVIGATION_MOTION_COMMANDS:
+            observation, observation_settled = (
+                await self._observe_until_settled(
+                    runtime,
+                    generation=generation,
+                    initial_observation=observation,
+                )
+            )
+        result = {
             "schema": COMMAND_RESULT_SCHEMA,
             "robot_id": ROBOT_ID,
             "controller_id": CONTROLLER_ID,
@@ -417,6 +436,9 @@ class BlastObservationMonitor:
             "receipt": receipt,
             "observation": observation,
         }
+        if observation_settled is not None:
+            result["observation_settled"] = observation_settled
+        return result
 
     async def _observe_until_idle(
         self,
@@ -452,6 +474,88 @@ class BlastObservationMonitor:
                     "BLAST motion did not stop as expected",
                 )
             await asyncio.sleep(MOTION_POLL_INTERVAL_SECONDS)
+
+    @staticmethod
+    def _settling_sample(observation):
+        distance = observation.get("distance_mm")
+        imu = observation.get("imu")
+        tilt = None
+        if isinstance(imu, dict):
+            for key in ("tilt_deg", "raw_tilt_deg"):
+                candidate = imu.get(key)
+                if isinstance(candidate, (list, tuple)) and len(candidate) == 2:
+                    tilt = candidate
+                    break
+        values = (
+            distance,
+            *(tilt if isinstance(tilt, (list, tuple)) else ()),
+        )
+        if (
+            len(values) != 3
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in values
+            )
+        ):
+            return None
+        return tuple(float(value) for value in values)
+
+    @staticmethod
+    def _settling_window_is_stable(samples) -> bool:
+        if len(samples) < POST_MOTION_SETTLE_SAMPLE_COUNT:
+            return False
+        ranges = tuple(
+            max(sample[index] for sample in samples)
+            - min(sample[index] for sample in samples)
+            for index in range(3)
+        )
+        return (
+            ranges[0] <= POST_MOTION_DISTANCE_RANGE_MM
+            and ranges[1] <= POST_MOTION_TILT_RANGE_DEG
+            and ranges[2] <= POST_MOTION_TILT_RANGE_DEG
+        )
+
+    async def _observe_until_settled(
+        self,
+        runtime,
+        *,
+        generation,
+        initial_observation,
+    ):
+        deadline = (
+            asyncio.get_running_loop().time()
+            + POST_MOTION_SETTLE_TIMEOUT_SECONDS
+        )
+        latest = initial_observation
+        samples = []
+        while True:
+            if await self._service_preempt_stop(runtime, generation):
+                raise BlastControllerError(
+                    "controller_command_interrupted",
+                    "BLAST command was interrupted by stop",
+                )
+            sample = self._settling_sample(latest)
+            if latest.get("motion_active") is False and sample is not None:
+                samples.append(sample)
+                del samples[:-POST_MOTION_SETTLE_SAMPLE_COUNT]
+            else:
+                samples.clear()
+            settled = self._settling_window_is_stable(samples)
+            timed_out = asyncio.get_running_loop().time() >= deadline
+            if settled or timed_out:
+                if await self._service_preempt_stop(runtime, generation):
+                    raise BlastControllerError(
+                        "controller_command_interrupted",
+                        "BLAST command was interrupted by stop",
+                    )
+                # Stabilisation improves evidence quality, but must not turn a
+                # usable bounded movement into a failed robot episode.
+                return latest, settled
+            await asyncio.sleep(MOTION_POLL_INTERVAL_SECONDS)
+            latest = await runtime.observe()
+            self._publish_observation(latest)
 
     async def _service_preempt_stop(self, runtime, generation) -> bool:
         with self._lock:

@@ -64,6 +64,7 @@ class FakeController:
             "command": command,
             "completed": True,
             "observation": observation,
+            "observation_settled": True,
         }
 
 
@@ -123,6 +124,9 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(
             planner.contexts[1].history[0]["action"],
             "ADVANCE",
+        )
+        self.assertTrue(
+            planner.contexts[1].history[0]["observation_settled"]
         )
         self.assertEqual(
             planner.contexts[1].observation["sensors"]["distance_mm"],

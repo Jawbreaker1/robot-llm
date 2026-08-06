@@ -251,6 +251,9 @@ class BlastEpisodeRuntimeAdapter:
                     "action": decision.action,
                     "assessment": decision.assessment,
                     "result_observation": result_observation,
+                    "observation_settled": command_result.get(
+                        "observation_settled"
+                    ),
                 })
                 context.publish({
                     "current_action": decision.action,

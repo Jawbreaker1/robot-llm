@@ -39,7 +39,11 @@ class FakeRuntime:
         return {
             "observed_at_ms": self.observe_calls,
             "battery": {"voltage_mv": 7_800, "current_ma": 120},
-            "imu": {"ready": True, "heading_deg": 12},
+            "imu": {
+                "ready": True,
+                "heading_deg": 12,
+                "raw_tilt_deg": [0.0, 0.0],
+            },
             "motor_angles_deg": {"left_drive": 10},
             "motion_active": moving,
             "color": "Color.WHITE",
@@ -176,6 +180,185 @@ class BlastObservationMonitorTests(unittest.TestCase):
             ("drive_pulse", "forward"),
             FakeRuntime.instances[0].calls,
         )
+        monitor.close()
+
+    def test_navigation_command_returns_latest_settled_observation(self):
+        class RockingRuntime(FakeRuntime):
+            async def drive_pulse(self, direction):
+                receipt = await super().drive_pulse(direction)
+                self.samples = [
+                    (True, 250, 2.0),
+                    (False, 244, 1.4),
+                    (False, 248, 0.9),
+                    (False, 251, 0.3),
+                    (False, 250, 0.2),
+                    (False, 252, 0.1),
+                    (False, 251, 0.1),
+                    (False, 251, 0.1),
+                ]
+                return receipt
+
+            async def observe(self):
+                observation = await super().observe()
+                if getattr(self, "samples", None):
+                    moving, distance, tilt = self.samples.pop(0)
+                    observation["motion_active"] = moving
+                    observation["distance_mm"] = distance
+                    observation["imu"]["raw_tilt_deg"] = [tilt, 0.0]
+                return observation
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=RockingRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        result = monitor.command("drive_forward")
+
+        self.assertEqual(result["observation"]["distance_mm"], 251)
+        self.assertEqual(
+            result["observation"]["imu"]["raw_tilt_deg"],
+            [0.1, 0.0],
+        )
+        self.assertFalse(result["observation"]["motion_active"])
+        self.assertTrue(result["observation_settled"])
+        self.assertGreaterEqual(FakeRuntime.instances[0].observe_calls, 8)
+        monitor.close()
+
+    def test_unsettled_navigation_returns_explicit_quality_flag(self):
+        class RockingRuntime(FakeRuntime):
+            async def drive_pulse(self, direction):
+                receipt = await super().drive_pulse(direction)
+                self.motion_observations = 0
+                self.after_drive = True
+                return receipt
+
+            async def observe(self):
+                observation = await super().observe()
+                if getattr(self, "after_drive", False):
+                    observation["motion_active"] = False
+                    observation["distance_mm"] = 200 + self.observe_calls * 20
+                return observation
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=RockingRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        with mock.patch(
+            "robot_agent.blast_observation_monitor."
+            "POST_MOTION_SETTLE_TIMEOUT_SECONDS",
+            0.06,
+        ):
+            result = monitor.command("drive_forward")
+
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["observation_settled"])
+        self.assertFalse(result["observation"]["motion_active"])
+        monitor.close()
+
+    def test_stop_wins_at_the_final_settled_sample(self):
+        stable_return_reached = threading.Event()
+        allow_final_check = threading.Event()
+
+        class FinalCheckMonitor(BlastObservationMonitor):
+            @staticmethod
+            def _settling_window_is_stable(samples):
+                stable = BlastObservationMonitor._settling_window_is_stable(
+                    samples
+                )
+                if stable:
+                    stable_return_reached.set()
+                    allow_final_check.wait(timeout=1.0)
+                return stable
+
+        monitor = FinalCheckMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        drive_failures = []
+        stop_results = []
+
+        def drive():
+            try:
+                monitor.command("drive_forward")
+            except BlastControllerError as error:
+                drive_failures.append(error.code)
+
+        drive_thread = threading.Thread(target=drive)
+        drive_thread.start()
+        self.assertTrue(stable_return_reached.wait(timeout=1.0))
+        stop_thread = threading.Thread(
+            target=lambda: stop_results.append(monitor.command("stop"))
+        )
+        stop_thread.start()
+        deadline = time.monotonic() + 1.0
+        while (
+            monitor._preempt_stop_request is None
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        allow_final_check.set()
+        drive_thread.join(timeout=1.0)
+        stop_thread.join(timeout=1.0)
+
+        self.assertFalse(drive_thread.is_alive())
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(
+            drive_failures,
+            ["controller_command_interrupted"],
+        )
+        self.assertTrue(stop_results[0]["completed"])
+        monitor.close()
+
+    def test_stop_preempts_navigation_during_post_motion_settling(self):
+        settling_started = threading.Event()
+
+        class UnsettledRuntime(FakeRuntime):
+            async def drive_pulse(self, direction):
+                receipt = await super().drive_pulse(direction)
+                self.motion_observations = 0
+                self.after_drive = True
+                return receipt
+
+            async def observe(self):
+                observation = await super().observe()
+                if getattr(self, "after_drive", False):
+                    observation["motion_active"] = False
+                    observation["distance_mm"] = 300 + self.observe_calls * 10
+                    settling_started.set()
+                return observation
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=UnsettledRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        failures = []
+
+        def drive():
+            try:
+                monitor.command("drive_forward")
+            except BlastControllerError as error:
+                failures.append(error.code)
+
+        drive_thread = threading.Thread(target=drive)
+        drive_thread.start()
+        self.assertTrue(settling_started.wait(timeout=1.0))
+
+        stop_result = monitor.command("stop")
+        drive_thread.join(timeout=1.0)
+
+        self.assertFalse(drive_thread.is_alive())
+        self.assertEqual(failures, ["controller_command_interrupted"])
+        self.assertTrue(stop_result["completed"])
+        self.assertIn(("stop",), FakeRuntime.instances[0].calls)
         monitor.close()
 
     def test_cancelled_agent_command_never_reaches_motor_queue(self):
