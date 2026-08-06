@@ -140,6 +140,14 @@ class BlastEpisodeRuntimeAdapter:
                 return False
         return False
 
+    @classmethod
+    def _completion_allowed(cls, history) -> bool:
+        scan_used = any(
+            item.get("action") == SCAN_FRONT_ARC
+            for item in history
+        )
+        return not scan_used or cls._scan_is_current(history)
+
     def _available_actions(self, observation, history=()) -> tuple[str, ...]:
         available = list(ACTION_COMMANDS)
         distance = observation["sensors"].get("distance_mm")
@@ -236,6 +244,7 @@ class BlastEpisodeRuntimeAdapter:
                     observation,
                     history,
                 )
+                completion_allowed = self._completion_allowed(history)
                 result = planner.decide(ControllerActionContext(
                     goal=context.request.goal,
                     locale=context.request.locale,
@@ -244,6 +253,7 @@ class BlastEpisodeRuntimeAdapter:
                     available_actions=available_actions,
                     observation=observation,
                     history=tuple(history[-12:]),
+                    completion_allowed=completion_allowed,
                 ))
                 if not isinstance(result, ControllerActionPlannerResult):
                     raise BlastEpisodeError(
@@ -253,9 +263,12 @@ class BlastEpisodeRuntimeAdapter:
                 if self._cancelled(context):
                     return self._outcome("stopped", False, "stopped")
                 decision = result.decision
-                if decision.action not in (
-                    available_actions + (COMPLETE, ABORT)
-                ):
+                terminal_actions = (
+                    (COMPLETE, ABORT)
+                    if completion_allowed
+                    else (ABORT,)
+                )
+                if decision.action not in available_actions + terminal_actions:
                     raise BlastEpisodeError(
                         "blast_planner_action_invalid",
                         "BLAST planner selected an unavailable action",

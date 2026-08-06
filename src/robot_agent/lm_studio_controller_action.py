@@ -39,7 +39,10 @@ _SYSTEM_PROMPT = (
     "SCAN_FRONT_ARC, when available, observes both sides of the current heading "
     "with a bounded turn sweep and returns near its starting heading. Pick it "
     "when obstacle boundaries or a clear side are unknown instead of guessing "
-    "through repeated turns. "
+    "through repeated turns. Clear range while facing away from a navigation "
+    "reference identifies an opening, not proof that an obstacle was passed. "
+    "After scan-guided motion, use a fresh scan from the resulting pose before "
+    "claiming passage complete. "
     "Pick "
     "COMPLETE only when the observation and history support that the goal is "
     "satisfied. Pick ABORT only when progress is no longer reasonable. Otherwise "
@@ -158,6 +161,7 @@ class ControllerActionContext:
     available_actions: tuple[str, ...]
     observation: Mapping[str, object]
     history: tuple[Mapping[str, object], ...] = ()
+    completion_allowed: bool = True
 
     def __post_init__(self) -> None:
         _safe_text("Controller goal", self.goal, MAX_GOAL_CHARS)
@@ -176,6 +180,7 @@ class ControllerActionContext:
             not isinstance(self.history, tuple)
             or len(self.history) > MAX_HISTORY_ITEMS
             or any(not isinstance(item, Mapping) for item in self.history)
+            or type(self.completion_allowed) is not bool
         ):
             raise _lm.LMStudioInputError("Controller history is invalid")
         _strict_value(self.observation)
@@ -190,6 +195,7 @@ class ControllerActionContext:
             "available_actions": list(self.available_actions),
             "observation": _strict_value(self.observation),
             "history": _strict_value(self.history),
+            "completion_allowed": self.completion_allowed,
         }
 
 
@@ -244,7 +250,12 @@ class LMStudioControllerActionPlanner:
             raise _lm.LMStudioInputError(
                 "Controller-action request is invalid"
             )
-        choices = list(context.available_actions + TERMINAL_ACTIONS)
+        terminal_actions = (
+            TERMINAL_ACTIONS
+            if context.completion_allowed
+            else (ABORT,)
+        )
+        choices = list(context.available_actions + terminal_actions)
         properties = {
             "action": {"type": "string", "enum": choices},
             "confidence_milli": {
@@ -389,7 +400,11 @@ class LMStudioControllerActionPlanner:
         assessment = value["assessment"]
         plan = value["plan"]
         utterance = value["utterance"]
-        allowed = context.available_actions + TERMINAL_ACTIONS
+        allowed = context.available_actions + (
+            TERMINAL_ACTIONS
+            if context.completion_allowed
+            else (ABORT,)
+        )
         if (
             action not in allowed
             or isinstance(confidence, bool)

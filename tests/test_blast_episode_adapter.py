@@ -69,6 +69,25 @@ class FakeController:
         }
 
 
+class FakeScanController(FakeController):
+    def command(self, command, *, cancel_requested=None):
+        result = super().command(
+            command,
+            cancel_requested=cancel_requested,
+        )
+        if command == "scan_front_arc":
+            result["scan"] = {
+                "schema": "blast-scan-front-arc/v1",
+                "restoration_verified": True,
+                "rays": [
+                    {"side": "center", "distance_mm": 500.0},
+                    {"side": "left_near", "distance_mm": 900.0},
+                    {"side": "right_near", "distance_mm": 1_200.0},
+                ],
+            }
+        return result
+
+
 class Planner:
     def __init__(self, decisions):
         self.decisions = list(decisions)
@@ -267,6 +286,46 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
 
         self.assertIn(SCAN_FRONT_ARC, available)
+
+    def test_scan_guided_motion_requires_a_fresh_scan_before_completion(self):
+        controller = FakeScanController(500)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC, plan=(SCAN_FRONT_ARC,)),
+            decision("TURN_LEFT", plan=("TURN_LEFT",)),
+            decision(COMPLETE, assessment="Unreachable invalid completion."),
+        ])
+        context, _updates = episode_context()
+
+        with self.assertRaises(BlastEpisodeError) as raised:
+            self.adapter(controller, planner).run(context)
+
+        self.assertEqual(raised.exception.code, "blast_planner_action_invalid")
+        self.assertTrue(planner.contexts[0].completion_allowed)
+        self.assertTrue(planner.contexts[1].completion_allowed)
+        self.assertFalse(planner.contexts[2].completion_allowed)
+        self.assertIn(
+            SCAN_FRONT_ARC,
+            planner.contexts[2].available_actions,
+        )
+
+    def test_fresh_scan_allows_completion_after_scan_guided_motion(self):
+        controller = FakeScanController(500)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC, plan=(SCAN_FRONT_ARC,)),
+            decision("TURN_LEFT", plan=("TURN_LEFT",)),
+            decision(SCAN_FRONT_ARC, plan=(SCAN_FRONT_ARC,)),
+            decision(COMPLETE, assessment="Fresh final scan confirms it."),
+        ])
+        context, _updates = episode_context()
+
+        result = self.adapter(controller, planner).run(context)
+
+        self.assertTrue(result.completed)
+        self.assertEqual(
+            controller.commands,
+            ["scan_front_arc", "turn_left", "scan_front_arc"],
+        )
+        self.assertTrue(planner.contexts[3].completion_allowed)
 
     def test_scan_requires_a_structured_controller_result(self):
         controller = FakeController()

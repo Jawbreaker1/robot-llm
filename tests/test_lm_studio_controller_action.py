@@ -102,6 +102,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         supplied = json.loads(request["messages"][1]["content"])
         self.assertEqual(supplied["observation"]["distance_mm"], 480)
         self.assertEqual(supplied["goal"], context().goal)
+        self.assertTrue(supplied["completion_allowed"])
         action_schema = request["response_format"]["json_schema"][
             "schema"
         ]["properties"]["action"]
@@ -152,6 +153,36 @@ class ControllerActionPlannerTests(unittest.TestCase):
         }))
         with self.assertRaises(LMStudioProtocolError):
             invalid.decide(context())
+
+    def test_completion_can_be_withheld_by_the_host(self):
+        planner, transport = self.planner(completion({
+            "action": "TURN_LEFT",
+            "confidence_milli": 800,
+            "assessment": "Jag måste verifiera slutläget först.",
+            "plan": ["TURN_LEFT"],
+            "utterance": None,
+        }))
+
+        planner.decide(context(completion_allowed=False))
+
+        request = json.loads(transport.calls[0][1])
+        supplied = json.loads(request["messages"][1]["content"])
+        action_schema = request["response_format"]["json_schema"][
+            "schema"
+        ]["properties"]["action"]
+        self.assertFalse(supplied["completion_allowed"])
+        self.assertNotIn(COMPLETE, action_schema["enum"])
+        self.assertIn("ABORT", action_schema["enum"])
+
+        invalid, _ = self.planner(completion({
+            "action": COMPLETE,
+            "confidence_milli": 900,
+            "assessment": "Klart.",
+            "plan": [],
+            "utterance": None,
+        }))
+        with self.assertRaises(LMStudioProtocolError):
+            invalid.decide(context(completion_allowed=False))
 
     def test_scan_action_is_described_as_a_returning_two_sided_sweep(self):
         planner, transport = self.planner(completion({
