@@ -12,9 +12,9 @@ speak, and adapt as it goes.**
 Robot LLM Lab connects a local AI agent to physical LEGO robots. EV3RSTORM
 currently carries the complete navigation loop: give it a goal and the agent
 plans, acts, reads sensors and motor feedback, and adapts when reality
-disagrees. Robot Inventor 51515 has now completed its first physical bring-up
-with Pybricks, persistent BLE telemetry, and bounded manual control from the
-same dashboard.
+disagrees. Robot Inventor 51515 now runs the same model-directed
+act → observe → replan loop over Pybricks and persistent BLE telemetry, with
+robot-specific bounded actions and gyro-backed distance scans.
 
 The language model chooses semantic intent and expression. The host application
 validates and dispatches typed actions, while the active controller worker
@@ -58,7 +58,7 @@ or language-specific command menus. The model never receives raw motor access.
 | Status | Capabilities |
 |---|---|
 | Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
-| Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, persistent sensor and motor telemetry, bounded manual actions, interruptible stop, and a model-directed act → observe → replan loop |
+| Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, persistent telemetry, bounded actions, interruptible stop, and a model-directed act → observe → replan loop with two-sided distance scans |
 | Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, per-run physical navigation memory, multi-controller telemetry, and agent-directed BLAST episodes |
 | Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
 | Planned | Repeatable autonomous obstacle navigation, richer Robot Inventor goals, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
@@ -75,8 +75,9 @@ BLAST-01 has its own registered robot identity and can be selected as the
 dashboard's physical agent profile. Gemma chooses one typed action at a time;
 the host executes it through the existing bounded BLE controller, feeds the
 fresh observation back to the model, and repeats until completion or abort.
-The first slice supports drive and turn decisions. Obstacle navigation and
-manipulation goals remain future work for this profile.
+The first slice supports drive, turn, and gyro-measured two-sided scan
+decisions. Multi-step obstacle navigation is experimental; manipulation goals
+remain future work for this profile.
 
 ## Architecture
 
@@ -99,9 +100,10 @@ flowchart TD
 The host owns goals, state, navigation memory, model calls, and validation.
 Each controller worker exposes a small set of fixed robot operations and
 processes one request at a time. It contains no planner, personality, or
-independent goal. EV3 is application-integrated for autonomous execution;
-Robot Inventor is application-integrated for live telemetry and bounded manual
-actions, while agent-issued BLAST plans remain the next step. Once the model has
+independent goal. EV3 and Robot Inventor are both application-integrated for
+autonomous execution. Their profiles translate shared semantic intent into
+robot-specific bounded operations; EV3 currently has the richer map and route
+executive, while BLAST replans after each movement or scan. Once the model has
 authorized a target and detour side, a deterministic route executive may
 serialize several freshly checked pulses before asking the model again. New
 geometry, ambiguous progress, a veto, or a failed movement returns control to
@@ -235,8 +237,8 @@ not replace physical calibration or live stop tests.
   calibration and acceptance runs.
 - Add color sensing, continuous voice interaction, wireless cameras,
   microphones, vision, and sound-source reasoning.
-- Connect the Robot Inventor worker to the shared goal and planning executive,
-  then add BOOST and coordinate several LEGO controllers.
+- Extend Robot Inventor navigation with shared route and map support, then add
+  BOOST and coordinate several LEGO controllers.
 - Expand the asynchronous architecture with parallel perception, validation,
   and forward planning while preserving serialized motor ownership.
 

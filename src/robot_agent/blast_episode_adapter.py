@@ -18,6 +18,7 @@ from .lm_studio_controller_action import (
     ControllerActionContext,
     ControllerActionPlannerResult,
 )
+from .physical_navigation_contract import SCAN_FRONT_ARC
 from .robot_control_service import RobotEpisodeOutcome
 
 
@@ -129,17 +130,65 @@ class BlastEpisodeRuntimeAdapter:
             "sensors": observation,
         }
 
-    def _available_actions(self, observation) -> tuple[str, ...]:
+    @staticmethod
+    def _scan_is_current(history) -> bool:
+        for item in reversed(history):
+            action = item.get("action")
+            if action == SCAN_FRONT_ARC:
+                return True
+            if action in ACTION_COMMANDS:
+                return False
+        return False
+
+    def _available_actions(self, observation, history=()) -> tuple[str, ...]:
         available = list(ACTION_COMMANDS)
         distance = observation["sensors"].get("distance_mm")
-        if (
+        distance_is_finite = (
             isinstance(distance, (int, float))
             and not isinstance(distance, bool)
             and math.isfinite(float(distance))
-            and distance <= self.minimum_forward_clearance_mm
+        )
+        if (
+            self._heading(observation["sensors"]) is not None
+            and distance_is_finite
+            and not self._scan_is_current(history)
         ):
+            available.append(SCAN_FRONT_ARC)
+        if distance_is_finite and distance <= self.minimum_forward_clearance_mm:
             available.remove("ADVANCE")
         return tuple(available)
+
+    @staticmethod
+    def _heading(sensors):
+        imu = sensors.get("imu") if isinstance(sensors, Mapping) else None
+        heading = imu.get("heading_deg") if isinstance(imu, Mapping) else None
+        if (
+            isinstance(heading, bool)
+            or not isinstance(heading, (int, float))
+            or not math.isfinite(float(heading))
+        ):
+            return None
+        return float(heading)
+
+    @staticmethod
+    def _heading_delta(heading, reference):
+        if heading is None or reference is None:
+            return None
+        return (heading - reference + 180.0) % 360.0 - 180.0
+
+    @classmethod
+    def _with_navigation_reference(cls, observation, start_heading):
+        enriched = dict(observation)
+        current_heading = cls._heading(observation["sensors"])
+        enriched["navigation_reference"] = {
+            "episode_start_heading_deg": start_heading,
+            "current_heading_deg": current_heading,
+            "heading_error_deg": cls._heading_delta(
+                current_heading,
+                start_heading,
+            ),
+        }
+        return enriched
 
     @staticmethod
     def _outcome(reason: str, completed: bool, message: str):
@@ -163,6 +212,7 @@ class BlastEpisodeRuntimeAdapter:
             self._active_episode_id = context.episode_id
 
         history = []
+        episode_start_heading = None
         try:
             planner = self.planner_factory(context.settings.model)
             if not callable(getattr(planner, "decide", None)):
@@ -174,7 +224,18 @@ class BlastEpisodeRuntimeAdapter:
                 if self._cancelled(context):
                     return self._outcome("stopped", False, "stopped")
                 observation = self._observation()
-                available_actions = self._available_actions(observation)
+                if _index == 0:
+                    episode_start_heading = self._heading(
+                        observation["sensors"]
+                    )
+                observation = self._with_navigation_reference(
+                    observation,
+                    episode_start_heading,
+                )
+                available_actions = self._available_actions(
+                    observation,
+                    history,
+                )
                 result = planner.decide(ControllerActionContext(
                     goal=context.request.goal,
                     locale=context.request.locale,
@@ -230,10 +291,16 @@ class BlastEpisodeRuntimeAdapter:
                         decision.assessment,
                     )
                 try:
-                    command_result = self.controller.command(
-                        ACTION_COMMANDS[decision.action],
-                        cancel_requested=lambda: self._cancelled(context),
-                    )
+                    if decision.action == SCAN_FRONT_ARC:
+                        command_result = self.controller.command(
+                            "scan_front_arc",
+                            cancel_requested=lambda: self._cancelled(context),
+                        )
+                    else:
+                        command_result = self.controller.command(
+                            ACTION_COMMANDS[decision.action],
+                            cancel_requested=lambda: self._cancelled(context),
+                        )
                 except BlastControllerError as error:
                     if (
                         error.code == "controller_command_interrupted"
@@ -247,15 +314,27 @@ class BlastEpisodeRuntimeAdapter:
                         "BLAST returned an invalid command result",
                     )
                 result_observation = command_result.get("observation")
-                history.append({
+                history_item = {
                     "action": decision.action,
                     "assessment": decision.assessment,
                     "result_observation": result_observation,
                     "observation_settled": command_result.get(
                         "observation_settled"
                     ),
-                })
-                context.publish({
+                }
+                scan = command_result.get("scan")
+                if (
+                    decision.action == SCAN_FRONT_ARC
+                    and not isinstance(scan, Mapping)
+                ):
+                    raise BlastEpisodeError(
+                        "blast_scan_result_invalid",
+                        "BLAST returned an invalid scan result",
+                    )
+                if isinstance(scan, Mapping):
+                    history_item["scan"] = scan
+                history.append(history_item)
+                update = {
                     "current_action": decision.action,
                     "obstacle": {
                         "distance_mm": (
@@ -264,7 +343,10 @@ class BlastEpisodeRuntimeAdapter:
                             else None
                         )
                     },
-                })
+                }
+                if isinstance(scan, Mapping):
+                    update["scan"] = scan
+                context.publish(update)
             return self._outcome(
                 "decision_budget_exhausted",
                 False,

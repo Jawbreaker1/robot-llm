@@ -31,6 +31,9 @@ POST_MOTION_SETTLE_SAMPLE_COUNT = 5
 POST_MOTION_DISTANCE_RANGE_MM = 5.0
 POST_MOTION_TILT_RANGE_DEG = 1.0
 COMMAND_RESULT_SCHEMA = "controller-command-result/v1"
+SCAN_COMMAND = "scan_front_arc"
+SCAN_RESULT_SCHEMA = "blast-scan-front-arc/v1"
+SCAN_RESTORATION_TOLERANCE_DEG = 5.0
 COMMANDS = {
     "drive_forward": ("drive_pulse", "forward"),
     "drive_reverse": ("drive_pulse", "reverse"),
@@ -40,6 +43,7 @@ COMMANDS = {
     "claw_close": ("claw_pulse", "close"),
     "body_left": ("body_pulse", "left"),
     "body_right": ("body_pulse", "right"),
+    SCAN_COMMAND: (None, None),
     "stop": ("stop", None),
 }
 NAVIGATION_MOTION_COMMANDS = {
@@ -404,7 +408,183 @@ class BlastObservationMonitor:
                 return
             raise failure
 
+    @staticmethod
+    def _finite_number(value):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            return None
+        return float(value)
+
+    @classmethod
+    def _scan_heading(cls, observation):
+        imu = observation.get("imu")
+        return cls._finite_number(
+            imu.get("heading_deg") if isinstance(imu, dict) else None
+        )
+
+    @classmethod
+    def _scan_ray(
+        cls,
+        side,
+        observation,
+        start_heading,
+        observation_settled,
+    ):
+        heading = cls._scan_heading(observation)
+        observed_at_ms = observation.get("observed_at_ms")
+        if type(observed_at_ms) is not int:
+            observed_at_ms = None
+        return {
+            "side": side,
+            "distance_mm": cls._finite_number(
+                observation.get("distance_mm")
+            ),
+            "heading_deg": heading,
+            "relative_heading_deg": (
+                heading - start_heading
+                if heading is not None and start_heading is not None
+                else None
+            ),
+            "observation_settled": observation_settled,
+            "observed_at_ms": observed_at_ms,
+        }
+
+    async def _scan_turn(
+        self,
+        runtime,
+        generation,
+        direction,
+        *,
+        settle,
+    ):
+        if await self._service_preempt_stop(runtime, generation):
+            raise BlastControllerError(
+                "controller_command_interrupted",
+                "BLAST scan was interrupted by stop",
+            )
+        receipt = await runtime.turn_pulse(direction)
+        observation = await self._observe_until_idle(
+            runtime,
+            generation=generation,
+            stop_only=False,
+        )
+        observation_settled = None
+        if settle:
+            observation, observation_settled = (
+                await self._observe_until_settled(
+                    runtime,
+                    generation=generation,
+                    initial_observation=observation,
+                )
+            )
+        return receipt, observation, observation_settled
+
+    async def _perform_scan_front_arc(self, runtime, generation):
+        center = await self._observe_until_idle(
+            runtime,
+            generation=generation,
+            stop_only=False,
+        )
+        center, center_settled = await self._observe_until_settled(
+            runtime,
+            generation=generation,
+            initial_observation=center,
+        )
+        start_heading = self._scan_heading(center)
+
+        _left_receipt, left, left_settled = await self._scan_turn(
+            runtime,
+            generation,
+            "left",
+            settle=True,
+        )
+        await self._scan_turn(
+            runtime,
+            generation,
+            "right",
+            settle=False,
+        )
+        _right_receipt, right, right_settled = await self._scan_turn(
+            runtime,
+            generation,
+            "right",
+            settle=True,
+        )
+        _return_receipt, final, final_settled = await self._scan_turn(
+            runtime,
+            generation,
+            "left",
+            settle=True,
+        )
+
+        final_heading = self._scan_heading(final)
+        restoration_error = (
+            final_heading - start_heading
+            if final_heading is not None and start_heading is not None
+            else None
+        )
+        restoration_verified = (
+            restoration_error is not None
+            and abs(restoration_error) <= SCAN_RESTORATION_TOLERANCE_DEG
+        )
+        scan = {
+            "schema": SCAN_RESULT_SCHEMA,
+            "state": "complete",
+            "result": (
+                "restored"
+                if restoration_verified
+                else "restoration_unverified"
+            ),
+            "start_heading_deg": start_heading,
+            "final_heading_deg": final_heading,
+            "restoration_error_deg": restoration_error,
+            "restoration_verified": restoration_verified,
+            "all_observations_settled": all((
+                center_settled,
+                left_settled,
+                right_settled,
+                final_settled,
+            )),
+            "rays": [
+                self._scan_ray(
+                    "center",
+                    center,
+                    start_heading,
+                    center_settled,
+                ),
+                self._scan_ray(
+                    "left",
+                    left,
+                    start_heading,
+                    left_settled,
+                ),
+                self._scan_ray(
+                    "right",
+                    right,
+                    start_heading,
+                    right_settled,
+                ),
+            ],
+        }
+        return {
+            "schema": COMMAND_RESULT_SCHEMA,
+            "robot_id": ROBOT_ID,
+            "controller_id": CONTROLLER_ID,
+            "command": SCAN_COMMAND,
+            "accepted": True,
+            "completed": True,
+            "receipt": {"turn_count": 4},
+            "observation": final,
+            "observation_settled": final_settled,
+            "scan": scan,
+        }
+
     async def _perform_command(self, runtime, generation, command: str):
+        if command == SCAN_COMMAND:
+            return await self._perform_scan_front_arc(runtime, generation)
         operation, direction = COMMANDS[command]
         method = getattr(runtime, operation)
         receipt = (

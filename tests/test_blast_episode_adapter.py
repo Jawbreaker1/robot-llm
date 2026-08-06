@@ -12,6 +12,7 @@ from robot_agent.lm_studio_controller_action import (
     ControllerActionDecision,
     ControllerActionPlannerResult,
 )
+from robot_agent.physical_navigation_contract import SCAN_FRONT_ARC
 
 
 def decision(action, *, plan=(), assessment="ok"):
@@ -133,6 +134,84 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             455,
         )
         self.assertEqual(updates[0]["plan"], ["ADVANCE", COMPLETE])
+        self.assertEqual(
+            planner.contexts[0].observation["navigation_reference"],
+            {
+                "episode_start_heading_deg": 0.0,
+                "current_heading_deg": 0.0,
+                "heading_error_deg": 0.0,
+            },
+        )
+
+    def test_scan_is_one_agent_action_with_stable_heading_reference(self):
+        class ScanController(FakeController):
+            def __init__(self):
+                super().__init__(300)
+                self.snapshot_value["observation"]["imu"][
+                    "heading_deg"
+                ] = 179
+
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                observation = {
+                    **result["observation"],
+                    "imu": {
+                        **result["observation"]["imu"],
+                        "heading_deg": -179,
+                    },
+                }
+                result["observation"] = observation
+                result["scan"] = {
+                    "schema": "blast-scan-front-arc/v1",
+                    "restoration_verified": True,
+                    "rays": [
+                        {"side": "center", "distance_mm": 300.0},
+                        {"side": "left", "distance_mm": 900.0},
+                        {"side": "right", "distance_mm": 1_200.0},
+                    ],
+                }
+                self.snapshot_value = {
+                    **self.snapshot_value,
+                    "observation": observation,
+                }
+                return result
+
+        controller = ScanController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC, plan=(SCAN_FRONT_ARC,)),
+            decision(COMPLETE, assessment="The route is understood."),
+        ])
+        context, updates = episode_context()
+
+        result = self.adapter(controller, planner).run(context)
+
+        self.assertTrue(result.completed)
+        self.assertEqual(controller.commands, ["scan_front_arc"])
+        scan = planner.contexts[1].history[0]["scan"]
+        self.assertTrue(scan["restoration_verified"])
+        self.assertEqual(
+            [update["scan"] for update in updates if "scan" in update],
+            [scan],
+        )
+        self.assertIn(
+            SCAN_FRONT_ARC,
+            planner.contexts[0].available_actions,
+        )
+        self.assertNotIn(
+            SCAN_FRONT_ARC,
+            planner.contexts[1].available_actions,
+        )
+        self.assertEqual(
+            planner.contexts[1].observation["navigation_reference"],
+            {
+                "episode_start_heading_deg": 179.0,
+                "current_heading_deg": -179.0,
+                "heading_error_deg": 2.0,
+            },
+        )
 
     def test_close_obstacle_removes_only_forward_action(self):
         controller = FakeController(100)
@@ -146,6 +225,60 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             planner.contexts[0].available_actions,
         )
         self.assertIn("REVERSE", planner.contexts[0].available_actions)
+        self.assertIn(
+            SCAN_FRONT_ARC,
+            planner.contexts[0].available_actions,
+        )
+
+    def test_scan_is_hidden_without_heading_or_distance(self):
+        for missing in ("heading", "distance"):
+            controller = FakeController()
+            if missing == "heading":
+                controller.snapshot_value["observation"]["imu"].pop(
+                    "heading_deg"
+                )
+            else:
+                controller.snapshot_value["observation"].pop("distance_mm")
+            planner = Planner([decision(COMPLETE)])
+
+            self.adapter(controller, planner).run(episode_context()[0])
+
+            with self.subTest(missing=missing):
+                self.assertNotIn(
+                    SCAN_FRONT_ARC,
+                    planner.contexts[0].available_actions,
+                )
+
+    def test_motion_makes_scan_available_again(self):
+        adapter = self.adapter(FakeController(), Planner([]))
+        observation = {
+            "sensors": {
+                "distance_mm": 300,
+                "imu": {"heading_deg": 0},
+            }
+        }
+
+        available = adapter._available_actions(
+            observation,
+            (
+                {"action": SCAN_FRONT_ARC},
+                {"action": "TURN_LEFT"},
+            ),
+        )
+
+        self.assertIn(SCAN_FRONT_ARC, available)
+
+    def test_scan_requires_a_structured_controller_result(self):
+        controller = FakeController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC, plan=(SCAN_FRONT_ARC,)),
+        ])
+
+        with self.assertRaises(BlastEpisodeError) as raised:
+            self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertEqual(raised.exception.code, "blast_scan_result_invalid")
+        self.assertEqual(controller.commands, ["scan_front_arc"])
 
     def test_stop_wins_after_planning_but_before_motor_start(self):
         controller = FakeController()

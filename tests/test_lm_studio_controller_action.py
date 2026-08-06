@@ -10,6 +10,7 @@ from robot_agent.lm_studio_controller_action import (
     ControllerActionContext,
     LMStudioControllerActionPlanner,
 )
+from robot_agent.physical_navigation_contract import SCAN_FRONT_ARC
 
 
 MODEL = "local/controller-model"
@@ -117,7 +118,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         )
         self.assertEqual(request["reasoning_effort"], "none")
 
-    def test_terminal_decision_requires_an_empty_plan(self):
+    def test_terminal_decision_normalizes_one_redundant_terminal_step(self):
         planner, _ = self.planner(completion({
             "action": COMPLETE,
             "confidence_milli": 900,
@@ -137,8 +138,42 @@ class ControllerActionPlannerTests(unittest.TestCase):
             "plan": [COMPLETE],
             "utterance": None,
         }))
+        self.assertEqual(
+            invalid.decide(context()).decision.plan,
+            (),
+        )
+
+        invalid, _ = self.planner(completion({
+            "action": COMPLETE,
+            "confidence_milli": 900,
+            "assessment": "Målet är uppnått.",
+            "plan": ["TURN_LEFT"],
+            "utterance": None,
+        }))
         with self.assertRaises(LMStudioProtocolError):
             invalid.decide(context())
+
+    def test_scan_action_is_described_as_a_returning_two_sided_sweep(self):
+        planner, transport = self.planner(completion({
+            "action": SCAN_FRONT_ARC,
+            "confidence_milli": 900,
+            "assessment": "Jag behöver se båda sidorna.",
+            "plan": [SCAN_FRONT_ARC],
+            "utterance": None,
+        }))
+
+        result = planner.decide(context(available_actions=(
+            "TURN_LEFT",
+            "TURN_RIGHT",
+            SCAN_FRONT_ARC,
+        )))
+
+        self.assertEqual(result.decision.action, SCAN_FRONT_ARC)
+        request = json.loads(transport.calls[0][1])
+        system_prompt = request["messages"][0]["content"]
+        self.assertIn(SCAN_FRONT_ARC, system_prompt)
+        self.assertIn("both sides", system_prompt)
+        self.assertIn("returns near its starting heading", system_prompt)
 
     def test_nonterminal_plan_must_start_with_selected_action(self):
         planner, _ = self.planner(completion({

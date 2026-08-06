@@ -3,8 +3,11 @@ import time
 import unittest
 from unittest import mock
 
-from robot_agent.blast_observation_monitor import BlastObservationMonitor
-from robot_agent.blast_observation_monitor import BlastControllerError
+from robot_agent.blast_observation_monitor import (
+    SCAN_COMMAND,
+    BlastControllerError,
+    BlastObservationMonitor,
+)
 
 
 class FakeRuntime:
@@ -180,6 +183,77 @@ class BlastObservationMonitorTests(unittest.TestCase):
             ("drive_pulse", "forward"),
             FakeRuntime.instances[0].calls,
         )
+        monitor.close()
+
+    def test_scan_front_arc_is_one_atomic_gyro_measured_command(self):
+        class ScanningRuntime(FakeRuntime):
+            def __init__(self, *, hub_name):
+                super().__init__(hub_name=hub_name)
+                self.heading = 10.0
+                self.distance = 300
+                self.turn_index = 0
+
+            async def observe(self):
+                observation = await super().observe()
+                observation["imu"]["heading_deg"] = self.heading
+                observation["distance_mm"] = self.distance
+                return observation
+
+            async def turn_pulse(self, direction):
+                receipt = await super().turn_pulse(direction)
+                expected = ("left", "right", "right", "left")
+                self.assert_direction(direction, expected[self.turn_index])
+                self.heading += (-34.0, 34.0, 38.0, -36.0)[
+                    self.turn_index
+                ]
+                self.distance = (720, 300, 1_100, 310)[self.turn_index]
+                self.turn_index += 1
+                return receipt
+
+            @staticmethod
+            def assert_direction(actual, expected):
+                if actual != expected:
+                    raise AssertionError("unexpected scan direction")
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=ScanningRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        result = monitor.command(SCAN_COMMAND)
+
+        runtime = FakeRuntime.instances[0]
+        self.assertEqual(
+            [call for call in runtime.calls if call[0] == "turn_pulse"],
+            [
+                ("turn_pulse", "left"),
+                ("turn_pulse", "right"),
+                ("turn_pulse", "right"),
+                ("turn_pulse", "left"),
+            ],
+        )
+        self.assertEqual(result["command"], SCAN_COMMAND)
+        self.assertEqual(result["receipt"], {"turn_count": 4})
+        self.assertEqual(result["observation"]["imu"]["heading_deg"], 12.0)
+        scan = result["scan"]
+        self.assertEqual(scan["schema"], "blast-scan-front-arc/v1")
+        self.assertEqual(
+            [ray["side"] for ray in scan["rays"]],
+            ["center", "left", "right"],
+        )
+        self.assertEqual(
+            [ray["distance_mm"] for ray in scan["rays"]],
+            [300.0, 720.0, 1_100.0],
+        )
+        self.assertEqual(
+            [ray["relative_heading_deg"] for ray in scan["rays"]],
+            [0.0, -34.0, 38.0],
+        )
+        self.assertEqual(scan["restoration_error_deg"], 2.0)
+        self.assertTrue(scan["restoration_verified"])
+        self.assertTrue(scan["all_observations_settled"])
         monitor.close()
 
     def test_navigation_command_returns_latest_settled_observation(self):
@@ -578,6 +652,51 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertIn(("stop",), runtime.calls)
         self.assertLess(runtime.calls.index(("stop",)), 100)
         self.assertEqual(monitor.snapshot()["state"], "online")
+        monitor.close()
+
+    def test_stop_interrupts_scan_before_any_later_turn(self):
+        first_turn_started = threading.Event()
+
+        class InterruptedScanRuntime(FakeRuntime):
+            async def turn_pulse(self, direction):
+                receipt = await super().turn_pulse(direction)
+                self.motion_observations = 100
+                first_turn_started.set()
+                return receipt
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=InterruptedScanRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        scan_failures = []
+
+        def scan():
+            try:
+                monitor.command(SCAN_COMMAND)
+            except BlastControllerError as error:
+                scan_failures.append(error.code)
+
+        scan_thread = threading.Thread(target=scan)
+        scan_thread.start()
+        self.assertTrue(first_turn_started.wait(timeout=1.0))
+
+        stop_result = monitor.command("stop")
+        scan_thread.join(timeout=1.0)
+
+        self.assertFalse(scan_thread.is_alive())
+        self.assertEqual(
+            scan_failures,
+            ["controller_command_interrupted"],
+        )
+        self.assertTrue(stop_result["completed"])
+        runtime = FakeRuntime.instances[0]
+        self.assertEqual(
+            [call for call in runtime.calls if call[0] == "turn_pulse"],
+            [("turn_pulse", "left")],
+        )
+        self.assertIn(("stop",), runtime.calls)
         monitor.close()
 
     def test_stop_cancels_a_queued_command_before_motor_start(self):
