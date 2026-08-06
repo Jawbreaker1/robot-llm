@@ -12,6 +12,7 @@ from robot_agent.dashboard_cli import (
     _parser,
     _run,
 )
+from robot_agent.blast_episode_adapter import BLAST_PROFILE_ID
 from robot_agent.ev3rstorm_profile import EV3RSTORM_PROFILE_ID, EV3SSHBinding
 
 
@@ -82,6 +83,104 @@ class DashboardRobotProfileTests(unittest.TestCase):
                     model="model-a",
                     timeout_seconds=7.5,
                 )
+
+    def test_blast_profile_requires_and_reuses_one_monitor(self):
+        args = _parser().parse_args(
+            ["--robot-profile", BLAST_PROFILE_ID]
+        )
+        with self.assertRaisesRegex(ValueError, "--blast-hub-name"):
+            _configured_robot_runtime_adapter(args)
+
+        args = _parser().parse_args([
+            "--robot-profile",
+            BLAST_PROFILE_ID,
+            "--blast-hub-name",
+            "BLAST-TEST",
+            "--robot-planner-timeout-seconds",
+            "6.5",
+        ])
+        monitor = object()
+        adapter = object()
+        planner = object()
+        with (
+            mock.patch(
+                "robot_agent.dashboard_cli.BlastEpisodeRuntimeAdapter",
+                return_value=adapter,
+            ) as adapter_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.LMStudioControllerActionPlanner",
+                return_value=planner,
+            ) as planner_type,
+        ):
+            result = _configured_robot_runtime_adapter(
+                args,
+                blast_monitor=monitor,
+            )
+            self.assertIs(result, adapter)
+            self.assertIs(
+                adapter_type.call_args.kwargs["controller"],
+                monitor,
+            )
+            planner_factory = adapter_type.call_args.kwargs[
+                "planner_factory"
+            ]
+            planner_type.assert_not_called()
+            self.assertIs(planner_factory("model-b"), planner)
+            planner_type.assert_called_once_with(
+                base_url=args.lm_studio_url,
+                model="model-b",
+                timeout_seconds=6.5,
+            )
+
+    def test_run_binds_blast_profile_to_the_observed_controller(self):
+        monitor = mock.Mock()
+        adapter = mock.Mock()
+        service = mock.Mock()
+        control_service = mock.Mock()
+        server = mock.Mock()
+        router = mock.Mock(session_path="/live/token/")
+        with (
+            mock.patch(
+                "robot_agent.dashboard_cli.BlastObservationMonitor",
+                return_value=monitor,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.BlastEpisodeRuntimeAdapter",
+                return_value=adapter,
+            ) as adapter_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+                return_value=service,
+            ) as service_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.RobotControlService",
+                return_value=control_service,
+            ) as control_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+                return_value=(server, router),
+            ),
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            result = _run([
+                "--robot-profile",
+                BLAST_PROFILE_ID,
+                "--blast-hub-name",
+                "BLAST-TEST",
+            ])
+
+        self.assertEqual(result, 0)
+        monitor.start.assert_called_once_with()
+        monitor.close.assert_called_once_with()
+        self.assertIs(adapter_type.call_args.kwargs["controller"], monitor)
+        self.assertIs(control_type.call_args.args[0], adapter)
+        self.assertEqual(
+            service_type.call_args.kwargs["controller_runtime_providers"],
+            (monitor,),
+        )
+        ready = json.loads(stdout.getvalue())
+        self.assertEqual(ready["robot_profile"], BLAST_PROFILE_ID)
+        self.assertTrue(ready["physical_control_enabled"])
 
     def test_run_injects_selected_profile_without_starting_adapter(self):
         adapter = mock.Mock()

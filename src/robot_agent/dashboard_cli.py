@@ -21,6 +21,10 @@ from .dashboard_http import (
 )
 from .dashboard_service import DashboardService
 from .blast_observation_monitor import BlastObservationMonitor
+from .blast_episode_adapter import (
+    BLAST_PROFILE_ID,
+    BlastEpisodeRuntimeAdapter,
+)
 from .ev3rstorm_profile import (
     DEFAULT_EV3RSTORM_MEMORY_PATH,
     EV3RSTORM_PROFILE_ID,
@@ -29,6 +33,7 @@ from .ev3rstorm_profile import (
 )
 from .lm_studio import DEFAULT_BASE_URL, DEFAULT_MODEL
 from .lm_studio_navigation import LMStudioNavigationPlanner
+from .lm_studio_controller_action import LMStudioControllerActionPlanner
 from .lm_studio_robot_input import (
     LMStudioRobotInputModel,
     REQUEST_TIMEOUT_SECONDS as ROBOT_INPUT_TIMEOUT_SECONDS,
@@ -48,6 +53,7 @@ ROBOT_PROFILE_DISABLED = "disabled"
 ROBOT_PROFILE_CHOICES = (
     ROBOT_PROFILE_DISABLED,
     EV3RSTORM_PROFILE_ID,
+    BLAST_PROFILE_ID,
 )
 
 
@@ -352,7 +358,7 @@ def _parser() -> argparse.ArgumentParser:
         "--blast-hub-name",
         help=(
             "Connect one Robot Inventor hub for telemetry and bounded manual "
-            "tests without adding it to the navigation control service"
+            "tests; required when --robot-profile blast-01 is selected"
         ),
     )
     parser.add_argument(
@@ -450,7 +456,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _configured_robot_runtime_adapter(args):
+def _configured_robot_runtime_adapter(args, *, blast_monitor=None):
     """Compose an opt-in adapter without connecting to physical hardware."""
 
     if args.robot_profile == ROBOT_PROFILE_DISABLED:
@@ -460,6 +466,33 @@ def _configured_robot_runtime_adapter(args):
                 "ev3rstorm-01"
             )
         return None
+    if args.robot_profile == BLAST_PROFILE_ID:
+        if args.robot_target is not None or args.robot_reset_memory:
+            raise ValueError(
+                "EV3 target/reset options cannot be used with "
+                "--robot-profile blast-01"
+            )
+        if blast_monitor is None:
+            raise ValueError(
+                "--blast-hub-name is required with --robot-profile blast-01"
+            )
+        if (
+            not math.isfinite(args.robot_planner_timeout_seconds)
+            or not 0.5 <= args.robot_planner_timeout_seconds <= 60.0
+        ):
+            raise ValueError("physical planner timeout is invalid")
+
+        def planner_factory(model):
+            return LMStudioControllerActionPlanner(
+                base_url=args.lm_studio_url,
+                model=model,
+                timeout_seconds=args.robot_planner_timeout_seconds,
+            )
+
+        return BlastEpisodeRuntimeAdapter(
+            controller=blast_monitor,
+            planner_factory=planner_factory,
+        )
     if args.robot_profile != EV3RSTORM_PROFILE_ID:
         raise ValueError("physical robot profile is unsupported")
     if args.robot_target is None:
@@ -566,7 +599,20 @@ def _run(
                     "physical profile options"
                 )
         else:
-            robot_runtime_adapter = _configured_robot_runtime_adapter(args)
+            if args.robot_profile == BLAST_PROFILE_ID:
+                if not args.blast_hub_name:
+                    raise ValueError(
+                        "--blast-hub-name is required with "
+                        "--robot-profile blast-01"
+                    )
+                blast_monitor = BlastObservationMonitor(
+                    hub_name=args.blast_hub_name,
+                )
+                blast_monitor.start()
+            robot_runtime_adapter = _configured_robot_runtime_adapter(
+                args,
+                blast_monitor=blast_monitor,
+            )
         if args.simulation_map_demo and robot_runtime_adapter is not None:
             raise ValueError(
                 "--simulation-map-demo cannot be combined with a physical "
@@ -633,7 +679,7 @@ def _run(
                 require_opaque_path=True,
             )
             speech_transcriber.probe()
-        if args.blast_hub_name:
+        if args.blast_hub_name and blast_monitor is None:
             blast_monitor = BlastObservationMonitor(
                 hub_name=args.blast_hub_name,
             )
