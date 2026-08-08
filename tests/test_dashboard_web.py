@@ -804,6 +804,12 @@ function ev3Button(status) {
   completeRequest({});
   await new Promise(setImmediate);
   const blastRequests = requests.splice(0);
+  const retry = buttonsFor("connecting")[2];
+  retry.click();
+  retry.click();
+  completeRequest({});
+  await new Promise(setImmediate);
+  const retryRequests = requests.splice(0);
 
   const ev3States = Object.fromEntries(
     ["not_checked", "checking", "passed", "failed"].map((status) => [
@@ -831,6 +837,7 @@ function ev3Button(status) {
     unconfiguredBlastDisabled,
     pendingDisabled,
     blastRequests,
+    retryRequests,
     ev3States,
     checkingDisabled,
     unavailableEV3Disabled,
@@ -860,7 +867,7 @@ function ev3Button(status) {
             self.fail(completed.stderr)
         result = json.loads(completed.stdout)
         self.assertEqual(result["states"]["configured"], [False, True, True])
-        self.assertEqual(result["states"]["connecting"], [True, False, True])
+        self.assertEqual(result["states"]["connecting"], [True, False, False])
         self.assertEqual(result["states"]["online"], [True, False, True])
         self.assertEqual(result["states"]["offline"], [True, False, False])
         self.assertEqual(result["states"]["stopped"], [False, True, True])
@@ -874,6 +881,15 @@ function ev3Button(status) {
         self.assertEqual(
             result["blastRequests"][0]["options"]["body"],
             {"action": "connect"},
+        )
+        self.assertEqual(len(result["retryRequests"]), 1)
+        self.assertEqual(
+            result["retryRequests"][0]["url"],
+            "/api/v1/controllers/blast-01.hub/connection",
+        )
+        self.assertEqual(
+            result["retryRequests"][0]["options"]["body"],
+            {"action": "retry"},
         )
         self.assertEqual(result["ev3States"], {
             "not_checked": "configured",

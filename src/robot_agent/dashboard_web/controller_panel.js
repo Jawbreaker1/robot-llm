@@ -263,7 +263,9 @@
           || state === "connecting"
           || state === "offline"
         ),
-        retry: configured && state === "offline",
+        retry: configured && (
+          state === "connecting" || state === "offline"
+        ),
       };
       const controls = element("section", "controller-controls");
       controls.appendChild(element(
