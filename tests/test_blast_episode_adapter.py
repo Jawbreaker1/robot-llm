@@ -7,12 +7,22 @@ from robot_agent.blast_episode_adapter import (
     BlastEpisodeRuntimeAdapter,
 )
 from robot_agent.blast_observation_monitor import BlastControllerError
+from robot_agent.blast_observation_monitor import (
+    COMMAND_RESULT_SCHEMA,
+    CONTROLLER_ID,
+    ROBOT_ID,
+)
 from robot_agent.lm_studio_controller_action import (
     COMPLETE,
     ControllerActionDecision,
     ControllerActionPlannerResult,
 )
-from robot_agent.physical_navigation_contract import SCAN_FRONT_ARC
+from robot_agent.physical_navigation_contract import (
+    SCAN_FRONT_ARC,
+    TURN_LEFT_90,
+    PhysicalNavigationContractError,
+)
+from robot_agent.robot_control_contract import RobotRuntimeUpdate
 
 
 def decision(action, *, plan=(), assessment="ok"):
@@ -40,6 +50,12 @@ class FakeController:
             "observation": {
                 "distance_mm": distance_mm,
                 "motion_active": False,
+                "motor_angles_deg": {
+                    "left_drive": 0,
+                    "right_drive": 0,
+                    "claw": 0,
+                    "body": 0,
+                },
                 "imu": {"ready": True, "heading_deg": 0},
             },
         }
@@ -54,16 +70,66 @@ class FakeController:
                 "cancelled",
             )
         self.commands.append(command)
-        observation = dict(self.snapshot_value["observation"])
+        previous = self.snapshot_value["observation"]
+        observation = {
+            **previous,
+            "motor_angles_deg": dict(previous["motor_angles_deg"]),
+            "imu": dict(previous.get("imu", {})),
+        }
+        before = {
+            role: observation["motor_angles_deg"][role]
+            for role in ("left_drive", "right_drive")
+        }
+        receipt = {"accepted": True}
         if command == "drive_forward":
             observation["distance_mm"] -= 45
+            deltas = (90, 90)
+            receipt.update({
+                "direction": "forward",
+                "speed_dps": 120,
+                "angle_deg": 90,
+                "before_angles_deg": before,
+            })
+        elif command == "drive_reverse":
+            observation["distance_mm"] += 45
+            deltas = (-90, -90)
+            receipt.update({
+                "direction": "reverse",
+                "speed_dps": 120,
+                "angle_deg": 90,
+                "before_angles_deg": before,
+            })
+        elif command in ("turn_left", "turn_right"):
+            left = command == "turn_left"
+            deltas = (-48, 49) if left else (49, -48)
+            receipt.update({
+                "direction": "left" if left else "right",
+                "speed_dps": 180,
+                "wheel_angle_deg": 45,
+                "before_angles_deg": before,
+            })
+            heading = observation["imu"].get("heading_deg", 0)
+            observation["imu"]["heading_deg"] = heading + (
+                23.765 if left else -23.765
+            )
+        else:
+            deltas = (0, 0)
+            if command == "scan_front_arc":
+                receipt = {"turn_count": 8}
+        for role, delta in zip(("left_drive", "right_drive"), deltas):
+            observation["motor_angles_deg"][role] += delta
         self.snapshot_value = {
             **self.snapshot_value,
             "observation": observation,
         }
         return {
+            "schema": COMMAND_RESULT_SCHEMA,
+            "robot_id": ROBOT_ID,
+            "controller_id": CONTROLLER_ID,
             "command": command,
+            "accepted": True,
             "completed": True,
+            "receipt": receipt,
             "observation": observation,
             "observation_settled": True,
         }
@@ -161,6 +227,49 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 "heading_error_deg": 0.0,
             },
         )
+        self.assertEqual(
+            planner.contexts[1].history[0]["motion"][
+                "left_encoder_delta_degrees"
+            ],
+            90,
+        )
+        self.assertEqual(
+            planner.contexts[1].observation["odometry"]["x_mm"],
+            45,
+        )
+
+    def test_scripted_semantic_actions_use_four_pulse_turn_and_carry_pose(self):
+        controller = FakeController(1_000)
+        planner = Planner([
+            decision("ADVANCE"),
+            decision("ADVANCE"),
+            decision(TURN_LEFT_90),
+            decision("ADVANCE"),
+            decision("ADVANCE"),
+            decision(COMPLETE, assessment="Fixture sequence ended."),
+        ])
+        context, updates = episode_context()
+
+        result = self.adapter(controller, planner).run(context)
+
+        self.assertTrue(result.completed)
+        self.assertEqual(
+            controller.commands,
+            ["drive_forward"] * 2
+            + ["turn_left"] * 4
+            + ["drive_forward"] * 2,
+        )
+        final_pose = planner.contexts[-1].observation["odometry"]
+        self.assertLessEqual(abs(final_pose["x_mm"] - 90), 10)
+        self.assertLessEqual(abs(final_pose["y_mm"] - 90), 10)
+        self.assertEqual(final_pose["verified_motion_count"], 5)
+        self.assertNotIn("pose", updates[-2])
+        runtime_update = None
+        for update in updates:
+            runtime_update = RobotRuntimeUpdate.from_mapping(
+                update,
+                runtime_update,
+            )
 
     def test_scan_is_one_agent_action_with_stable_heading_reference(self):
         class ScanController(FakeController):
@@ -232,6 +341,94 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             },
         )
 
+    def test_restored_scan_residue_reanchors_before_semantic_turn(self):
+        class ResidualScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    observation = {
+                        **result["observation"],
+                        "motor_angles_deg": dict(
+                            result["observation"]["motor_angles_deg"]
+                        ),
+                    }
+                    observation["motor_angles_deg"]["left_drive"] += 8
+                    observation["motor_angles_deg"]["right_drive"] += 8
+                    result["observation"] = observation
+                    self.snapshot_value = {
+                        **self.snapshot_value,
+                        "observation": observation,
+                    }
+                return result
+
+        controller = ResidualScanController(500)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+            decision(SCAN_FRONT_ARC),
+            decision(COMPLETE, assessment="Fixture sequence ended."),
+        ])
+
+        result = self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertTrue(result.completed)
+        self.assertEqual(
+            controller.commands,
+            ["scan_front_arc"]
+            + ["turn_left"] * 4
+            + ["scan_front_arc"],
+        )
+        self.assertTrue(
+            planner.contexts[1].history[0][
+                "odometry_reanchored_after_scan"
+            ]
+        )
+        self.assertEqual(
+            planner.contexts[1].observation["odometry"]["heading_mdeg"],
+            0,
+        )
+        self.assertEqual(
+            planner.contexts[2].observation["odometry"]["heading_mdeg"],
+            95_060,
+        )
+        self.assertEqual(
+            planner.contexts[3].observation["odometry"],
+            planner.contexts[2].observation["odometry"],
+        )
+
+    def test_unrestored_scan_stops_before_another_planner_turn(self):
+        class UnrestoredScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    result["scan"] = {
+                        **result["scan"],
+                        "restoration_verified": False,
+                    }
+                return result
+
+        controller = UnrestoredScanController(500)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision("ADVANCE"),
+        ])
+
+        with self.assertRaises(PhysicalNavigationContractError) as raised:
+            self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertEqual(
+            raised.exception.code,
+            "blast_scan_restoration_unverified",
+        )
+        self.assertEqual(controller.commands, ["scan_front_arc"])
+        self.assertEqual(len(planner.contexts), 1)
+
     def test_close_obstacle_removes_only_forward_action(self):
         controller = FakeController(100)
         planner = Planner([decision(COMPLETE, assessment="Already close")])
@@ -281,7 +478,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             observation,
             (
                 {"action": SCAN_FRONT_ARC},
-                {"action": "TURN_LEFT"},
+                {"action": TURN_LEFT_90},
             ),
         )
 
@@ -291,7 +488,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         controller = FakeScanController(500)
         planner = Planner([
             decision(SCAN_FRONT_ARC, plan=(SCAN_FRONT_ARC,)),
-            decision("TURN_LEFT", plan=("TURN_LEFT",)),
+            decision(TURN_LEFT_90, plan=(TURN_LEFT_90,)),
             decision(COMPLETE, assessment="Unreachable invalid completion."),
         ])
         context, _updates = episode_context()
@@ -312,7 +509,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         controller = FakeScanController(500)
         planner = Planner([
             decision(SCAN_FRONT_ARC, plan=(SCAN_FRONT_ARC,)),
-            decision("TURN_LEFT", plan=("TURN_LEFT",)),
+            decision(TURN_LEFT_90, plan=(TURN_LEFT_90,)),
             decision(SCAN_FRONT_ARC, plan=(SCAN_FRONT_ARC,)),
             decision(COMPLETE, assessment="Fresh final scan confirms it."),
         ])
@@ -323,7 +520,14 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(result.completed)
         self.assertEqual(
             controller.commands,
-            ["scan_front_arc", "turn_left", "scan_front_arc"],
+            [
+                "scan_front_arc",
+                "turn_left",
+                "turn_left",
+                "turn_left",
+                "turn_left",
+                "scan_front_arc",
+            ],
         )
         self.assertTrue(planner.contexts[3].completion_allowed)
 

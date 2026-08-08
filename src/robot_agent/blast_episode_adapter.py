@@ -12,22 +12,30 @@ from .blast_observation_monitor import (
     ROBOT_ID,
     BlastControllerError,
 )
+from .blast_navigation_action_profile import BLAST_NAVIGATION_COMMANDS
+from .blast_navigation_motion_execution import (
+    BlastNavigationMotionExecutor,
+)
 from .lm_studio_controller_action import (
     ABORT,
     COMPLETE,
     ControllerActionContext,
     ControllerActionPlannerResult,
 )
-from .physical_navigation_contract import SCAN_FRONT_ARC
+from .physical_navigation_contract import (
+    ADVANCE,
+    REVERSE,
+    SCAN_FRONT_ARC,
+    TURN_LEFT_90,
+    TURN_RIGHT_90,
+)
 from .robot_control_service import RobotEpisodeOutcome
 
 
 BLAST_PROFILE_ID = ROBOT_ID
 ACTION_COMMANDS = {
-    "ADVANCE": "drive_forward",
-    "REVERSE": "drive_reverse",
-    "TURN_LEFT": "turn_left",
-    "TURN_RIGHT": "turn_right",
+    action: BLAST_NAVIGATION_COMMANDS[action]
+    for action in (ADVANCE, REVERSE, TURN_LEFT_90, TURN_RIGHT_90)
 }
 DEFAULT_MAX_DECISIONS = 16
 DEFAULT_MAX_OBSERVATION_AGE_MS = 3_000
@@ -221,6 +229,7 @@ class BlastEpisodeRuntimeAdapter:
 
         history = []
         episode_start_heading = None
+        motion_executor = None
         try:
             planner = self.planner_factory(context.settings.model)
             if not callable(getattr(planner, "decide", None)):
@@ -236,10 +245,15 @@ class BlastEpisodeRuntimeAdapter:
                     episode_start_heading = self._heading(
                         observation["sensors"]
                     )
+                    motion_executor = BlastNavigationMotionExecutor(
+                        controller=self.controller,
+                        initial_observation=observation["sensors"],
+                    )
                 observation = self._with_navigation_reference(
                     observation,
                     episode_start_heading,
                 )
+                observation["odometry"] = motion_executor.pose.to_dict()
                 available_actions = self._available_actions(
                     observation,
                     history,
@@ -310,10 +324,11 @@ class BlastEpisodeRuntimeAdapter:
                             cancel_requested=lambda: self._cancelled(context),
                         )
                     else:
-                        command_result = self.controller.command(
-                            ACTION_COMMANDS[decision.action],
+                        execution = motion_executor.execute(
+                            decision.action,
                             cancel_requested=lambda: self._cancelled(context),
                         )
+                        command_result = execution.controller_results[-1]
                 except BlastControllerError as error:
                     if (
                         error.code == "controller_command_interrupted"
@@ -335,6 +350,9 @@ class BlastEpisodeRuntimeAdapter:
                         "observation_settled"
                     ),
                 }
+                if decision.action in ACTION_COMMANDS:
+                    history_item["motion"] = execution.motion.to_dict()
+                    history_item["pose"] = execution.pose.to_dict()
                 scan = command_result.get("scan")
                 if (
                     decision.action == SCAN_FRONT_ARC
@@ -345,6 +363,11 @@ class BlastEpisodeRuntimeAdapter:
                         "BLAST returned an invalid scan result",
                     )
                 if isinstance(scan, Mapping):
+                    history_item["odometry_reanchored_after_scan"] = (
+                        motion_executor.reanchor_after_restored_scan(
+                            command_result
+                        )
+                    )
                     history_item["scan"] = scan
                 history.append(history_item)
                 update = {
