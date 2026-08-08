@@ -1051,6 +1051,43 @@ class DashboardServiceTests(unittest.TestCase):
         self.assertFalse(controller["control_exposed"])
         self.assertIn("sensor.imu", controller["capabilities"])
 
+    def test_bootstrap_derives_ev3_status_from_one_controller_snapshot(self):
+        calls = []
+        runtime_snapshot = {
+            "schema": "controller-runtime-observation/v1",
+            "robot_id": "ev3rstorm-01",
+            "controller_id": "ev3rstorm-01.ev3-main",
+            "display_name": "EV3RSTORM",
+            "state": "configured",
+            "reason_code": "reachability_verified",
+            "connection_mode": "episodic_ssh",
+            "reachability": {
+                "status": "passed",
+                "error_code": None,
+            },
+            "last_checked_at_unix_ms": 1_000,
+            "last_verified_at_unix_ms": 1_000,
+            "observation": None,
+        }
+
+        def provider():
+            calls.append(True)
+            return runtime_snapshot
+
+        service = self.make_service(
+            episode_runner=ScriptedRunner(),
+            controller_runtime_providers=(provider,),
+        )
+
+        bootstrap = service.bootstrap()
+
+        self.assertEqual(calls, [True])
+        self.assertEqual(
+            bootstrap["runtime"]["controllers"],
+            [runtime_snapshot],
+        )
+        self.assertEqual(bootstrap["runtime"]["ev3"], runtime_snapshot)
+
     def test_invalid_controller_runtime_does_not_break_bootstrap(self):
         service = self.make_service(
             episode_runner=ScriptedRunner(),

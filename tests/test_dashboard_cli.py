@@ -288,6 +288,9 @@ class DashboardCLITests(unittest.TestCase):
 
     def test_run_injects_robot_adapter_into_separate_control_service(self):
         adapter = mock.Mock()
+        reachability = mock.Mock(spec=("snapshot", "check"))
+        adapter.controller_runtime_provider = reachability
+        adapter.controller_reachability_service = reachability
         dashboard_service = mock.Mock()
         control_service = mock.Mock()
         http_server = mock.Mock()
@@ -298,7 +301,7 @@ class DashboardCLITests(unittest.TestCase):
             mock.patch(
                 "robot_agent.dashboard_cli.DashboardService",
                 return_value=dashboard_service,
-            ),
+            ) as dashboard_type,
             mock.patch(
                 "robot_agent.dashboard_cli.RobotControlService",
                 return_value=control_service,
@@ -330,6 +333,16 @@ class DashboardCLITests(unittest.TestCase):
         self.assertIsInstance(
             server_args.kwargs["robot_input_service"],
             RobotInputService,
+        )
+        self.assertEqual(
+            dashboard_type.call_args.kwargs[
+                "controller_runtime_providers"
+            ],
+            (reachability,),
+        )
+        self.assertEqual(
+            server_args.kwargs["controller_control_services"],
+            {"ev3rstorm-01.ev3-main": reachability},
         )
         control_service.shutdown.assert_called_once_with()
         self.assertTrue(

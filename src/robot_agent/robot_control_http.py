@@ -23,6 +23,10 @@ ROBOT_API_PREFIX = "/api/v1/robot/"
 CONTROLLER_API_PREFIX = "/api/v1/controllers/"
 BLAST_COMMAND_PATH = "/api/v1/controllers/blast-01.hub/commands"
 BLAST_CONNECTION_PATH = "/api/v1/controllers/blast-01.hub/connection"
+EV3_CONTROLLER_ID = "ev3rstorm-01.ev3-main"
+EV3_REACHABILITY_PATH = (
+    "/api/v1/controllers/ev3rstorm-01.ev3-main/reachability"
+)
 MAX_ROBOT_REQUEST_BYTES = 16 * 1024
 MAX_ROBOT_PAGE_LIMIT = 500
 BLAST_COMMANDS = frozenset((
@@ -162,7 +166,19 @@ class RobotControlHTTPRouter:
             not isinstance(services, Mapping)
             or any(
                 not isinstance(controller_id, str)
-                or not callable(getattr(controller, "command", None))
+                or controller is None
+                or (
+                    controller_id == "blast-01.hub"
+                    and not callable(getattr(controller, "command", None))
+                )
+                or (
+                    controller_id == EV3_CONTROLLER_ID
+                    and not callable(getattr(controller, "check", None))
+                )
+                or controller_id not in {
+                    "blast-01.hub",
+                    EV3_CONTROLLER_ID,
+                }
                 for controller_id, controller in services.items()
             )
         ):
@@ -247,6 +263,7 @@ class RobotControlHTTPRouter:
             if method != "POST" or path not in {
                 BLAST_COMMAND_PATH,
                 BLAST_CONNECTION_PATH,
+                EV3_REACHABILITY_PATH,
             }:
                 raise RobotControlHTTPError(
                     404,
@@ -254,17 +271,44 @@ class RobotControlHTTPRouter:
                     "Controller route was not found",
                 )
             endpoint = (
-                "Controller connection endpoint"
-                if path == BLAST_CONNECTION_PATH
-                else "Controller command endpoint"
+                "EV3 reachability endpoint"
+                if path == EV3_REACHABILITY_PATH
+                else (
+                    "Controller connection endpoint"
+                    if path == BLAST_CONNECTION_PATH
+                    else "Controller command endpoint"
+                )
             )
             self._no_query(query, endpoint)
-            controller = self._controller_services.get("blast-01.hub")
+            controller_id = (
+                EV3_CONTROLLER_ID
+                if path == EV3_REACHABILITY_PATH
+                else "blast-01.hub"
+            )
+            controller = self._controller_services.get(controller_id)
             if controller is None:
                 raise RobotControlHTTPError(
                     503,
                     "controller_unavailable",
-                    "BLAST controller is not configured",
+                    "Controller is not configured",
+                )
+            if path == EV3_REACHABILITY_PATH:
+                self._empty_command(body)
+                operation = getattr(controller, "check", None)
+                if not callable(operation):
+                    raise RobotControlHTTPError(
+                        503,
+                        "controller_connection_unavailable",
+                        "EV3 reachability check is not configured",
+                    )
+                value = self._controller_call(
+                    operation,
+                    default_code="controller_connection_failed",
+                    message="EV3 reachability check failed",
+                )
+                return RobotControlHTTPResponse(
+                    200,
+                    {"reachability": value},
                 )
             if path == BLAST_CONNECTION_PATH:
                 request = _exact_object(

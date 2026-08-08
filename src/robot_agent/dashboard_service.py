@@ -691,6 +691,19 @@ class DashboardService:
     def bootstrap(self):
         with self._runtime_lock:
             runtime = dict(self._lm_runtime)
+        controller_runtimes = self._controller_runtimes()
+        ev3_runtime = next(
+            (
+                controller
+                for controller in controller_runtimes
+                if controller.get("controller_id")
+                == "ev3rstorm-01.ev3-main"
+            ),
+            {
+                "state": "unobserved",
+                "reason_code": "physical_probe_not_run",
+            },
+        )
         return {
             "schema": SERVICE_SCHEMA,
             "api_version": "robot-dashboard/v1",
@@ -721,11 +734,8 @@ class DashboardService:
             "runtime": {
                 "lm_studio": runtime,
                 "speech_to_text": self._stt.runtime_view(),
-                "controllers": self._controller_runtimes(),
-                "ev3": {
-                    "state": "unobserved",
-                    "reason_code": "physical_probe_not_run",
-                },
+                "controllers": controller_runtimes,
+                "ev3": ev3_runtime,
             },
         }
 

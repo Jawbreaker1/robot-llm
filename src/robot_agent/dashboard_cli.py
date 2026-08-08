@@ -684,23 +684,32 @@ def _run(
                 hub_name=args.blast_hub_name,
             )
             blast_monitor.start()
+        try:
+            adapter_state = vars(robot_runtime_adapter)
+        except TypeError:
+            adapter_state = {}
+        ev3_runtime_provider = adapter_state.get(
+            "controller_runtime_provider"
+        )
+        ev3_reachability_service = adapter_state.get(
+            "controller_reachability_service"
+        )
+        controller_runtime_providers = tuple(
+            provider
+            for provider in (blast_monitor, ev3_runtime_provider)
+            if provider is not None
+        )
         service = DashboardService(
             base_url=args.lm_studio_url,
             model=args.model,
             spatial_map_provider=map_runtime,
             speech_transcriber=speech_transcriber,
-            controller_runtime_providers=(
-                (blast_monitor,) if blast_monitor is not None else ()
-            ),
+            controller_runtime_providers=controller_runtime_providers,
         )
         robot_control_service = RobotControlService(
             robot_runtime_adapter,
             settings=RobotControlSettings(model=args.model),
         )
-        try:
-            adapter_state = vars(robot_runtime_adapter)
-        except TypeError:
-            adapter_state = {}
         speech_factory = adapter_state.get("speech_runtime_factory")
         speech_locales = adapter_state.get("speech_locales", ())
         if callable(speech_factory) and speech_locales:
@@ -726,14 +735,17 @@ def _run(
                 else None
             ),
         )
+        controller_control_services = {}
+        if blast_monitor is not None:
+            controller_control_services["blast-01.hub"] = blast_monitor
+        if ev3_reachability_service is not None:
+            controller_control_services[
+                "ev3rstorm-01.ev3-main"
+            ] = ev3_reachability_service
         server_options = {
             "robot_control_service": robot_control_service,
             "robot_input_service": robot_input_service,
-            "controller_control_services": (
-                {"blast-01.hub": blast_monitor}
-                if blast_monitor is not None
-                else {}
-            ),
+            "controller_control_services": controller_control_services,
         }
         if args.console_access_key_file:
             server_options["session_token"] = (

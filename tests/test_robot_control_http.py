@@ -403,6 +403,88 @@ class RobotControlHTTPRouterTests(unittest.TestCase):
                     )
                 self.assertEqual(raised.exception.status, 400)
 
+    def test_ev3_reachability_route_accepts_only_an_empty_post(self):
+        class Reachability:
+            def __init__(self):
+                self.calls = 0
+
+            def check(self):
+                self.calls += 1
+                return {
+                    "controller_id": "ev3rstorm-01.ev3-main",
+                    "state": "configured",
+                    "reachability": {"status": "passed"},
+                }
+
+        reachability = Reachability()
+        router = RobotControlHTTPRouter(
+            self.service,
+            controller_services={
+                "ev3rstorm-01.ev3-main": reachability,
+            },
+        )
+
+        response = router.handle(
+            "POST",
+            "/api/v1/controllers/ev3rstorm-01.ev3-main/reachability",
+            "",
+            encoded({}),
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(reachability.calls, 1)
+        self.assertEqual(
+            response.body["reachability"]["reachability"]["status"],
+            "passed",
+        )
+        for method, query, body in (
+            ("GET", "", encoded({})),
+            ("POST", "force=true", encoded({})),
+            ("POST", "", encoded({"action": "connect"})),
+        ):
+            with self.subTest(method=method, query=query, body=body):
+                with self.assertRaises(RobotControlHTTPError):
+                    router.handle(
+                        method,
+                        "/api/v1/controllers/"
+                        "ev3rstorm-01.ev3-main/reachability",
+                        query,
+                        body,
+                    )
+
+    def test_ev3_reachability_route_is_bounded_when_busy_or_unavailable(self):
+        with self.assertRaises(RobotControlHTTPError) as unavailable:
+            self.router.handle(
+                "POST",
+                "/api/v1/controllers/ev3rstorm-01.ev3-main/reachability",
+                "",
+                encoded({}),
+            )
+        self.assertEqual(unavailable.exception.status, 503)
+
+        class BusyReachability:
+            def check(self):
+                error = RuntimeError("private state")
+                error.code = "controller_busy"
+                raise error
+
+        router = RobotControlHTTPRouter(
+            self.service,
+            controller_services={
+                "ev3rstorm-01.ev3-main": BusyReachability(),
+            },
+        )
+        with self.assertRaises(RobotControlHTTPError) as busy:
+            router.handle(
+                "POST",
+                "/api/v1/controllers/ev3rstorm-01.ev3-main/reachability",
+                "",
+                encoded({}),
+            )
+        self.assertEqual(busy.exception.status, 409)
+        self.assertEqual(busy.exception.code, "controller_busy")
+        self.assertNotIn("private", str(busy.exception))
+
     def test_blast_controller_errors_have_bounded_http_statuses(self):
         for error_code in (
             "controller_busy",
