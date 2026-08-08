@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from robot_agent.blast_episode_adapter import (
+    ACTION_COMMANDS,
     BlastEpisodeError,
     BlastEpisodeRuntimeAdapter,
 )
@@ -412,6 +413,130 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(
             planner.contexts[3].observation["odometry"],
             planner.contexts[2].observation["odometry"],
+        )
+
+    def test_scan_guided_turn_persists_one_detour_side(self):
+        for action, side in (
+            (TURN_LEFT_90, "LEFT"),
+            ("TURN_RIGHT_90", "RIGHT"),
+        ):
+            with self.subTest(action=action):
+                opposite = (
+                    "TURN_RIGHT_90"
+                    if action == TURN_LEFT_90
+                    else TURN_LEFT_90
+                )
+                controller = FakeScanController(1_000)
+                planner = Planner([
+                    decision(SCAN_FRONT_ARC),
+                    decision(action),
+                    decision("ADVANCE"),
+                    decision(opposite),
+                    decision("ABORT"),
+                ])
+
+                result = self.adapter(controller, planner).run(
+                    episode_context()[0]
+                )
+
+                self.assertEqual(result.terminal_reason, "planner_aborted")
+                self.assertNotIn(
+                    "navigation_intent",
+                    planner.contexts[1].observation,
+                )
+                expected = {
+                    "selected_detour_side_relative_to_scan": side,
+                }
+                self.assertEqual(
+                    planner.contexts[2].observation["navigation_intent"],
+                    expected,
+                )
+                self.assertEqual(
+                    planner.contexts[3].observation["navigation_intent"],
+                    expected,
+                )
+                self.assertEqual(
+                    planner.contexts[4].observation["navigation_intent"],
+                    expected,
+                )
+                self.assertEqual(
+                    controller.commands,
+                    ["scan_front_arc"]
+                    + list(ACTION_COMMANDS[action])
+                    + ["drive_forward"]
+                    + list(ACTION_COMMANDS[opposite]),
+                )
+
+    def test_turn_without_current_scan_does_not_create_detour_intent(self):
+        controller = FakeController(1_000)
+        planner = Planner([
+            decision(TURN_LEFT_90, plan=(TURN_LEFT_90,)),
+            decision("ABORT"),
+        ])
+
+        self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertNotIn(
+            "navigation_intent",
+            planner.contexts[1].observation,
+        )
+
+    def test_planned_later_turn_does_not_create_detour_intent(self):
+        controller = FakeScanController(1_000)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(
+                "ADVANCE",
+                plan=("ADVANCE", TURN_LEFT_90),
+            ),
+            decision("ABORT"),
+        ])
+
+        self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertNotIn(
+            "navigation_intent",
+            planner.contexts[2].observation,
+        )
+
+    def test_partial_scan_guided_turn_does_not_create_detour_intent(self):
+        controller = FakeScanController(1_000)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+            decision("ABORT"),
+        ])
+        context, _updates = episode_context()
+
+        class OneShotPartialTurn:
+            def __init__(self):
+                self.fired = False
+
+            def is_set(self):
+                if (
+                    not self.fired
+                    and controller.commands.count("turn_left") == 2
+                ):
+                    self.fired = True
+                    return True
+                return False
+
+        context.stop_requested = OneShotPartialTurn()
+
+        self.adapter(controller, planner).run(context)
+
+        self.assertEqual(
+            controller.commands,
+            ["scan_front_arc", "turn_left", "turn_left"],
+        )
+        self.assertFalse(
+            planner.contexts[2].history[1]["motion"][
+                "command_completed"
+            ]
+        )
+        self.assertNotIn(
+            "navigation_intent",
+            planner.contexts[2].observation,
         )
 
     def test_unrestored_scan_stops_before_another_planner_turn(self):

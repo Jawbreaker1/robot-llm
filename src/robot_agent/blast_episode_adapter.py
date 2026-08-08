@@ -230,6 +230,7 @@ class BlastEpisodeRuntimeAdapter:
         history = []
         episode_start_heading = None
         motion_executor = None
+        selected_detour_side = None
         try:
             planner = self.planner_factory(context.settings.model)
             if not callable(getattr(planner, "decide", None)):
@@ -254,6 +255,12 @@ class BlastEpisodeRuntimeAdapter:
                     episode_start_heading,
                 )
                 observation["odometry"] = motion_executor.pose.to_dict()
+                if selected_detour_side is not None:
+                    observation["navigation_intent"] = {
+                        "selected_detour_side_relative_to_scan": (
+                            selected_detour_side
+                        ),
+                    }
                 available_actions = self._available_actions(
                     observation,
                     history,
@@ -277,6 +284,11 @@ class BlastEpisodeRuntimeAdapter:
                 if self._cancelled(context):
                     return self._outcome("stopped", False, "stopped")
                 decision = result.decision
+                selects_detour_side = (
+                    selected_detour_side is None
+                    and self._scan_is_current(history)
+                    and decision.action in (TURN_LEFT_90, TURN_RIGHT_90)
+                )
                 terminal_actions = (
                     (COMPLETE, ABORT)
                     if completion_allowed
@@ -354,6 +366,12 @@ class BlastEpisodeRuntimeAdapter:
                 if decision.action in ACTION_COMMANDS:
                     history_item["motion"] = execution.motion.to_dict()
                     history_item["pose"] = execution.pose.to_dict()
+                    if selects_detour_side and execution.motion.complete:
+                        selected_detour_side = (
+                            "LEFT"
+                            if decision.action == TURN_LEFT_90
+                            else "RIGHT"
+                        )
                 scan = command_result.get("scan")
                 if (
                     decision.action == SCAN_FRONT_ARC
