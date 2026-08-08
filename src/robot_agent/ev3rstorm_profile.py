@@ -29,6 +29,9 @@ from .host_piper_speech import (
 from .navigation_memory_store import NavigationMemoryStore
 from .physical_footprint import RobotFootprint
 from .physical_navigation_adapter import PhysicalNavigationRuntimeAdapter
+from .physical_navigation_execution_contract import (
+    EV3NavigationExecutionContract,
+)
 from .physical_odometry import OdometryCalibration
 from .physical_spatial_map import PhysicalSpatialMapBridge
 from .provisional_hazard_map import HazardMapCalibration
@@ -535,6 +538,7 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             transport_factory=transport_factory,
             planner_factory=planner_factory,
             memory_factory=memory_factory,
+            execution_contract=EV3NavigationExecutionContract(),
             scan_executor_factory=scan_executor_factory,
             speech_runtime_factory=speech_runtime_factory,
             speech_locales=("sv", "en"),

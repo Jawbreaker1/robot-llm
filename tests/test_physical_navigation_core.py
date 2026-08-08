@@ -70,6 +70,9 @@ from robot_agent.physical_navigation_runtime import (
     PhysicalNavigationRuntimeConfig,
     PhysicalNavigationRuntimeError,
 )
+from robot_agent.physical_navigation_execution_contract import (
+    EV3NavigationExecutionContract,
+)
 from robot_agent.physical_navigation_adapter import (
     PhysicalNavigationRuntimeAdapter,
 )
@@ -3680,6 +3683,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             transport_factory=object,
             planner_factory=lambda _model: object(),
             memory_factory=object,
+            execution_contract=EV3NavigationExecutionContract(),
             spatial_map_bridge=bridge,
         )
         context = SimpleNamespace(
@@ -3728,6 +3732,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                         transport_factory=object,
                         planner_factory=lambda _model: object(),
                         memory_factory=object,
+                        execution_contract=EV3NavigationExecutionContract(),
                         spatial_map_bridge=invalid,
                     )
 
@@ -3735,10 +3740,14 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         scan_calibration = ActiveIrScanCalibration(
             alignment_tolerance_mdeg=10_000,
         )
+        execution_contract = mock.Mock(
+            wraps=EV3NavigationExecutionContract(),
+        )
         adapter = PhysicalNavigationRuntimeAdapter(
             transport_factory=object,
             planner_factory=lambda _model: object(),
             memory_factory=object,
+            execution_contract=execution_contract,
             request_timeout_seconds=25.0,
             scan_timeout_seconds=30.0,
             active_scan_calibration=scan_calibration,
@@ -3770,6 +3779,10 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         config = runtime_type.call_args.kwargs["config"]
         self.assertEqual(config.request_timeout_seconds, 25.0)
         self.assertEqual(config.scan_timeout_seconds, 30.0)
+        self.assertIs(
+            runtime_type.call_args.kwargs["execution_contract"],
+            execution_contract,
+        )
         self.assertIs(
             runtime_type.call_args.kwargs["active_scan_calibration"],
             scan_calibration,
@@ -4006,6 +4019,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
 
     def test_runtime_requires_both_worker_interrupt_capabilities(self):
         response = FakeRuntimeTransport().request("describe", {}, 1.0)
+        execution_contract = EV3NavigationExecutionContract()
         for capability in (
             "process_signals_interrupt_active_pulses",
             "channel_close_interrupts_active_pulses",
@@ -4018,7 +4032,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                     else:
                         changed["result"]["safety"][capability] = False
                     with self.assertRaises(PhysicalNavigationRuntimeError):
-                        PhysicalNavigationRuntime._description(changed)
+                        execution_contract.parse_description(changed)
 
     def test_runtime_executes_exact_tail_and_replans_to_finish(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4032,6 +4046,9 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             )
             transport = FakeRuntimeTransport()
             planner = FakeRuntimePlanner()
+            execution_contract = mock.Mock(
+                wraps=EV3NavigationExecutionContract(),
+            )
             runtime = PhysicalNavigationRuntime(
                 episode_id="episode-a",
                 config=PhysicalNavigationRuntimeConfig(
@@ -4042,6 +4059,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                     max_episode_seconds=10,
                 ),
                 transport=transport,
+                execution_contract=execution_contract,
                 planner=planner,
                 memory=memory,
                 monotonic=lambda: 0.0,
@@ -4069,6 +4087,15 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             [item for item in transport.calls if item[0] == "shutdown"],
             [("shutdown", {})],
         )
+        execution_contract.parse_description.assert_called_once()
+        self.assertEqual(
+            [
+                call.args[0]
+                for call in execution_contract.parse_observation.call_args_list
+            ],
+            ["pulse", "pulse"],
+        )
+        execution_contract.shutdown_verified.assert_called_once()
 
     def test_invalid_model_output_gets_bounded_feedback_retry(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4887,6 +4914,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             transport_factory=object,
             planner_factory=lambda _model: object(),
             memory_factory=object,
+            execution_contract=EV3NavigationExecutionContract(),
             speech_runtime_factory=lambda **_kwargs: speech,
         )
         context = SimpleNamespace(
@@ -4996,6 +5024,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 transport_factory=lambda: transport,
                 planner_factory=lambda _model: SpeechRuntimePlanner(),
                 memory_factory=memory_factory,
+                execution_contract=EV3NavigationExecutionContract(),
                 speech_runtime_factory=(
                     lambda *, event_sink: RobotSpeechRuntime(
                         speaker=speaker,
@@ -5056,6 +5085,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 transport_factory=FakeRuntimeTransport,
                 planner_factory=lambda _model: FakeRuntimePlanner(),
                 memory_factory=memory_factory,
+                execution_contract=EV3NavigationExecutionContract(),
                 speech_runtime_factory=speech_runtime_factory,
                 minimum_forward_progress_mm=100,
             )
@@ -5109,6 +5139,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 transport_factory=FakeRuntimeTransport,
                 planner_factory=lambda _model: FakeRuntimePlanner(),
                 memory_factory=memory_factory,
+                execution_contract=EV3NavigationExecutionContract(),
                 speech_runtime_factory=(
                     lambda *, event_sink: UnreapedSpeech()
                 ),
@@ -5163,6 +5194,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 transport_factory=lambda: transport,
                 planner_factory=lambda _model: SpeechRuntimePlanner(),
                 memory_factory=memory_factory,
+                execution_contract=EV3NavigationExecutionContract(),
                 speech_runtime_factory=(
                     lambda *, event_sink: RobotSpeechRuntime(
                         speaker=speaker,
@@ -5928,6 +5960,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                 transport_factory=FakeRuntimeTransport,
                 planner_factory=planner_factory,
                 memory_factory=memory_factory,
+                execution_contract=EV3NavigationExecutionContract(),
                 minimum_forward_progress_mm=100,
             )
             context = SimpleNamespace(

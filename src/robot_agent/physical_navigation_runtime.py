@@ -62,9 +62,6 @@ from .physical_navigation_plan_tail_runtime import (
 )
 from .physical_navigation_contract import (
     ADVANCE,
-    EXPECTED_WORKER_SAFETY,
-    EXPECTED_WORKER_OPERATIONS,
-    EXPECTED_ACTION_SPECS,
     FINISH,
     OBSERVE,
     REVERSE,
@@ -73,10 +70,11 @@ from .physical_navigation_contract import (
     SCAN_TURN_OPERATION,
     NavigationDecision,
     PhysicalNavigationContractError,
-    expected_scan_turn_profile,
-    expected_scan_sample_profile,
     motion_budget_allows,
     validate_observation,
+)
+from .physical_navigation_execution_contract import (
+    EV3NavigationExecutionContract,
 )
 from .physical_navigation_mission import DirectionalMission
 from .physical_navigation_motion_runtime import (
@@ -229,6 +227,7 @@ class PhysicalNavigationRuntime(
         config: PhysicalNavigationRuntimeConfig,
         transport,
         transport_factory: Optional[Callable[[], object]] = None,
+        execution_contract=None,
         planner,
         memory: NavigationMemoryStore,
         active_scan_executor=None,
@@ -257,6 +256,17 @@ class PhysicalNavigationRuntime(
             raise ValueError("navigation transport is invalid")
         if transport_factory is not None and not callable(transport_factory):
             raise ValueError("navigation transport factory is invalid")
+        if execution_contract is None:
+            execution_contract = EV3NavigationExecutionContract()
+        if any(
+            not callable(getattr(execution_contract, name, None))
+            for name in (
+                "parse_description",
+                "parse_observation",
+                "shutdown_verified",
+            )
+        ):
+            raise ValueError("navigation execution contract is invalid")
         if (
             active_scan_executor_factory is not None
             and not callable(active_scan_executor_factory)
@@ -286,6 +296,7 @@ class PhysicalNavigationRuntime(
         self.config = config
         self.transport = transport
         self.transport_factory = transport_factory
+        self.execution_contract = execution_contract
         self.planner = planner
         self.memory = memory
         self.active_scan_executor = active_scan_executor
@@ -533,160 +544,17 @@ class PhysicalNavigationRuntime(
         self._raise_if_cancelled("after_{}_request".format(operation))
         return response
 
-    @staticmethod
-    def _description(
-        response: Mapping[str, object],
-    ) -> Tuple[
-        Mapping[str, object],
-        Mapping[str, Mapping[str, object]],
-        DriveMotorRoles,
-        int,
-    ]:
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise PhysicalNavigationRuntimeError(
-                "invalid_worker_description",
-                "Worker description is missing",
-            )
-        required = {
-            "worker_id",
-            "demo_only",
-            "policy_owner",
-            "controller_id",
-            "request_schema",
-            "response_schema",
-            "operations",
-            "pulse",
-            "scan_turn",
-            "scan_sample",
-            "safety",
-            "process",
-            "observation",
-            "drive_geometry",
-        }
-        if set(result) != required or result["policy_owner"] != "host":
-            raise PhysicalNavigationRuntimeError(
-                "invalid_worker_description",
-                "Worker identity/policy boundary is invalid",
-            )
-        pulse = result["pulse"]
-        safety = result["safety"]
-        process = result["process"]
-        if (
-            not isinstance(process, dict)
-            or set(process) != {"absolute_max_ms", "max_requests"}
-            or isinstance(process["absolute_max_ms"], bool)
-            or not isinstance(process["absolute_max_ms"], int)
-            or not 5_000 <= process["absolute_max_ms"] <= 180_000
-            or isinstance(process["max_requests"], bool)
-            or not isinstance(process["max_requests"], int)
-            or process["max_requests"] <= 0
-        ):
-            raise PhysicalNavigationRuntimeError(
-                "invalid_worker_process_contract",
-                "Worker process lifetime contract is invalid",
-            )
-        geometry = result["drive_geometry"]
-        if (
-            not isinstance(geometry, dict)
-            or set(geometry)
-            != {
-                "left_motor_role",
-                "right_motor_role",
-                "forward_speed_sign",
-            }
-            or not isinstance(geometry["forward_speed_sign"], dict)
-        ):
-            raise PhysicalNavigationRuntimeError(
-                "invalid_worker_drive_geometry",
-                "Worker drive geometry is invalid",
-            )
-        drive_roles = DriveMotorRoles(
-            left=geometry["left_motor_role"],
-            right=geometry["right_motor_role"],
-        )
-        if (
-            set(geometry["forward_speed_sign"])
-            != {drive_roles.left, drive_roles.right}
-            or geometry["forward_speed_sign"][drive_roles.left] != 1
-            or geometry["forward_speed_sign"][drive_roles.right] != 1
-        ):
-            raise PhysicalNavigationRuntimeError(
-                "unsupported_worker_drive_sign",
-                "Semantic action profile requires positive-forward drive roles",
-            )
-        if (
-            not isinstance(pulse, dict)
-            or pulse.get("actions") != EXPECTED_ACTION_SPECS
-            or not isinstance(result["operations"], list)
-            or set(result["operations"]) != EXPECTED_WORKER_OPERATIONS
-            or result["scan_turn"] != expected_scan_turn_profile()
-            or result["scan_sample"] != expected_scan_sample_profile()
-            or safety != EXPECTED_WORKER_SAFETY
-        ):
-            raise PhysicalNavigationRuntimeError(
-                "unsafe_worker_contract",
-                "Worker safety or semantic action contract is invalid",
-            )
-        observation = validate_observation(result["observation"])
-        return (
-            observation,
-            deepcopy(pulse["actions"]),
-            drive_roles,
-            process["absolute_max_ms"],
-        )
-
     def _observation_from_response(
         self,
         operation: str,
         response: Mapping[str, object],
         expected_action: Optional[str] = None,
     ) -> Mapping[str, object]:
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise PhysicalNavigationRuntimeError(
-                "invalid_worker_result",
-                "Worker result is missing",
-            )
-        if operation == "observe":
-            if set(result) != {"observation"}:
-                raise PhysicalNavigationRuntimeError(
-                    "invalid_observe_result",
-                    "Observe result fields are invalid",
-                )
-            observation = validate_observation(result["observation"])
-        elif operation == "pulse":
-            if (
-                set(result) != {"action", "outcome", "observation", "stop"}
-                or result["action"] != expected_action
-                or not isinstance(result["outcome"], dict)
-                or result["outcome"].get("action") != expected_action
-                or result["outcome"].get("stop_confirmed") is not True
-            ):
-                raise PhysicalNavigationRuntimeError(
-                    "invalid_pulse_result",
-                    "Pulse result is not correlated and stopped",
-                )
-            observation = validate_observation(result["observation"])
-            if observation["last_outcome"] != result["outcome"]:
-                raise PhysicalNavigationRuntimeError(
-                    "pulse_outcome_mismatch",
-                    "Pulse observation lacks its correlated outcome",
-                )
-        elif operation in (SCAN_TURN_OPERATION, SCAN_SAMPLE_OPERATION):
-            # EV3NavigationSSHTransport has already validated the complete
-            # operation-specific receipt. Accept only its correlated snapshot.
-            observation = validate_observation(result.get("observation"))
-        else:
-            raise PhysicalNavigationRuntimeError(
-                "invalid_observation_operation",
-                "Operation has no observation contract",
-            )
-        if response.get("state_version") != observation["state_version"]:
-            raise PhysicalNavigationRuntimeError(
-                "worker_state_version_mismatch",
-                "Response and observation state versions differ",
-            )
+        observation = self.execution_contract.parse_observation(
+            operation,
+            response,
+            expected_action,
+        )
         self._remember_observation(observation)
         self._observation_received_monotonic = self.monotonic()
         return observation
@@ -1093,7 +961,7 @@ class PhysicalNavigationRuntime(
             action_specs,
             drive_roles,
             absolute_max_ms,
-        ) = self._description(description)
+        ) = self.execution_contract.parse_description(description)
         self._remember_observation(observation)
         if (
             expected_action_specs is not None
@@ -1146,13 +1014,7 @@ class PhysicalNavigationRuntime(
                     {},
                     min(4.0, self.config.request_timeout_seconds),
                 )
-                result = response.get("result", {})
-                outcome = result.get("outcome", {})
-                clean = (
-                    outcome.get("status") == "completed"
-                    and outcome.get("stop_confirmed") is True
-                    and outcome.get("motor_owner_closed") is True
-                )
+                clean = self.execution_contract.shutdown_verified(response)
             else:
                 clean = True
         except Exception:

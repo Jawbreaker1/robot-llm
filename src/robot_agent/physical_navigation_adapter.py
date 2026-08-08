@@ -31,6 +31,7 @@ class PhysicalNavigationRuntimeAdapter:
         transport_factory: Callable[[], object],
         planner_factory: Callable[[str], object],
         memory_factory: Callable[[], NavigationMemoryStore],
+        execution_contract,
         scan_executor_factory: Optional[Callable[[object], object]] = None,
         speech_runtime_factory: Optional[Callable[..., object]] = None,
         speech_locales=(),
@@ -55,6 +56,15 @@ class PhysicalNavigationRuntimeAdapter:
         ):
             if not callable(dependency):
                 raise ValueError("runtime adapter factory is invalid")
+        if any(
+            not callable(getattr(execution_contract, name, None))
+            for name in (
+                "parse_description",
+                "parse_observation",
+                "shutdown_verified",
+            )
+        ):
+            raise ValueError("navigation execution contract is invalid")
         if scan_executor_factory is not None and not callable(
             scan_executor_factory
         ):
@@ -121,6 +131,7 @@ class PhysicalNavigationRuntimeAdapter:
         self.transport_factory = transport_factory
         self.planner_factory = planner_factory
         self.memory_factory = memory_factory
+        self.execution_contract = execution_contract
         self.scan_executor_factory = scan_executor_factory
         self.speech_runtime_factory = speech_runtime_factory
         self.speech_locales = speech_locales
@@ -344,6 +355,7 @@ class PhysicalNavigationRuntimeAdapter:
                 ),
                 transport=transport,
                 transport_factory=self.transport_factory,
+                execution_contract=self.execution_contract,
                 planner=planner,
                 memory=memory,
                 active_scan_executor=scan_executor,
