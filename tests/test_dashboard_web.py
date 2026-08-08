@@ -645,6 +645,13 @@ process.stdout.write(JSON.stringify({
         self.assertIn('"body_right"', self.controller_panel)
         self.assertIn("pendingControllers", self.controller_panel)
         self.assertIn("pendingStops", self.controller_panel)
+        self.assertIn("pendingConnections", self.controller_panel)
+        self.assertIn(
+            "/connection`",
+            self.controller_panel,
+        )
+        self.assertIn('body: { action }', self.controller_panel)
+        self.assertIn('"connect", "disconnect", "retry"', self.controller_panel)
         self.assertIn(
             'error.code === "controller_command_interrupted"',
             self.controller_panel,
@@ -692,6 +699,123 @@ process.stdout.write(JSON.stringify({
         ):
             with self.subTest(raw_value=raw_value):
                 self.assertIn(">{}<".format(raw_value), self.html)
+
+    def test_blast_connection_controls_follow_runtime_state_and_submit_once(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const context = {};
+vm.runInNewContext(source, context, { filename: process.argv[1] });
+
+class Element {
+  constructor(tag) {
+    this.tag = tag;
+    this.children = [];
+    this.listeners = {};
+    this.disabled = false;
+    this.textContent = "";
+  }
+  appendChild(child) {
+    this.children.push(child);
+    return child;
+  }
+  replaceChildren(...children) {
+    this.children = children;
+  }
+  addEventListener(name, listener) {
+    this.listeners[name] = listener;
+  }
+  click() {
+    if (!this.disabled && this.listeners.click) {
+      return this.listeners.click();
+    }
+    return undefined;
+  }
+}
+
+const document = { createElement: (tag) => new Element(tag) };
+const requests = [];
+let completeRequest;
+const panel = context.RobotControllerPanel.create({
+  document,
+  translate: (key) => key,
+  humanState: (state) => state,
+  setStatus() {},
+  formatDateTime: String,
+  formatNumber: String,
+  request: (url, options) => {
+    requests.push({ url, options });
+    return new Promise((resolve) => { completeRequest = resolve; });
+  },
+  showToast() {},
+  onCommandComplete: async () => {},
+});
+const controller = {
+  node_kind: "controller",
+  controller_id: "blast-01.hub",
+  robot_id: "blast-01",
+  display_name: "BLAST",
+  lifecycle: "configured",
+};
+const container = new Element("main");
+
+function buttonsFor(state) {
+  panel.render(container, [controller], [{
+    controller_id: "blast-01.hub",
+    state,
+    observation: {},
+  }]);
+  const connectionSection = container.children[0].children[2];
+  return connectionSection.children[1].children;
+}
+
+const states = {};
+for (const state of ["configured", "connecting", "online", "offline", "stopped"]) {
+  states[state] = buttonsFor(state).map((button) => button.disabled);
+}
+const connect = buttonsFor("configured")[0];
+connect.click();
+connect.click();
+const pendingDisabled = container.children[0].children[2].children[1].children
+  .map((button) => button.disabled);
+completeRequest({});
+Promise.resolve().then(() => Promise.resolve()).then(() => {
+  process.stdout.write(JSON.stringify({ states, pendingDisabled, requests }));
+});
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(WEB_ROOT / "controller_panel.js"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            self.fail(completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["states"]["configured"], [False, True, True])
+        self.assertEqual(result["states"]["connecting"], [True, False, True])
+        self.assertEqual(result["states"]["online"], [True, False, True])
+        self.assertEqual(result["states"]["offline"], [True, False, False])
+        self.assertEqual(result["states"]["stopped"], [False, True, True])
+        self.assertEqual(result["pendingDisabled"], [True, True, True])
+        self.assertEqual(len(result["requests"]), 1)
+        self.assertEqual(
+            result["requests"][0]["url"],
+            "/api/v1/controllers/blast-01.hub/connection",
+        )
+        self.assertEqual(
+            result["requests"][0]["options"]["body"],
+            {"action": "connect"},
+        )
 
     def test_rejected_session_latches_once_and_stops_dashboard_pollers(self):
         notice = next(

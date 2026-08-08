@@ -51,6 +51,7 @@
     }
     const pendingControllers = new Set();
     const pendingStops = new Set();
+    const pendingConnections = new Set();
     let lastRender = null;
 
     function element(tag, className, content) {
@@ -119,6 +120,76 @@
       }
     }
 
+    async function sendConnectionAction(controllerId, action) {
+      if (pendingConnections.has(controllerId)) {
+        return;
+      }
+      pendingConnections.add(controllerId);
+      rerender();
+      try {
+        await request(
+          `/api/v1/controllers/${encodeURIComponent(controllerId)}/connection`,
+          {
+            method: "POST",
+            body: { action },
+            timeout: 16000,
+          },
+        );
+        showToast(t("registry.connection.completed", {
+          action: t(`registry.connection.${action}`),
+        }));
+      } catch (_error) {
+        showToast(t("registry.connection.failed"), true);
+      } finally {
+        pendingConnections.delete(controllerId);
+        await onCommandComplete();
+        rerender();
+      }
+    }
+
+    function renderConnectionControls(card, controller, runtime) {
+      if (controller.controller_id !== BLAST_CONTROLLER_ID) {
+        return;
+      }
+      const controllerId = controller.controller_id;
+      const state = text(runtime.state, "unobserved");
+      const pending = pendingConnections.has(controllerId);
+      const allowed = {
+        connect: state === "configured" || state === "stopped" || state === "unobserved",
+        disconnect: state === "online" || state === "connecting" || state === "offline",
+        retry: state === "offline",
+      };
+      const controls = element("section", "controller-controls");
+      controls.appendChild(element(
+        "strong",
+        "controller-controls-title",
+        t("registry.connection.title"),
+      ));
+      const group = element("div", "controller-control-group");
+      ["connect", "disconnect", "retry"].forEach((action) => {
+        const button = element(
+          "button",
+          "button button-secondary",
+          t(`registry.connection.${action}`),
+        );
+        button.type = "button";
+        button.disabled = pending || !allowed[action];
+        button.addEventListener("click", () => {
+          sendConnectionAction(controllerId, action);
+        });
+        group.appendChild(button);
+      });
+      controls.appendChild(group);
+      controls.appendChild(element(
+        "small",
+        "controller-control-status",
+        pending
+          ? t("registry.connection.running")
+          : t("registry.connection.state", { state: humanState(state) }),
+      ));
+      card.appendChild(controls);
+    }
+
     function renderControls(card, controller, runtime, observation) {
       if (controller.controller_id !== BLAST_CONTROLLER_ID) {
         return;
@@ -128,7 +199,8 @@
       const moving = observation.motion_active === true;
       const pending = pendingControllers.has(controller.controller_id);
       const stopPending = pendingStops.has(controller.controller_id);
-      const enabled = online && observed && !moving && !pending && !stopPending;
+      const connectionPending = pendingConnections.has(controller.controller_id);
+      const enabled = online && observed && !moving && !pending && !stopPending && !connectionPending;
       const controls = element("section", "controller-controls");
       controls.appendChild(element(
         "strong",
@@ -147,7 +219,7 @@
           );
           button.type = "button";
           button.disabled = command === "stop"
-            ? !(online && observed && !stopPending)
+            ? !(online && observed && !stopPending && !connectionPending)
             : !enabled;
           button.addEventListener("click", () => {
             sendCommand(controller.controller_id, command);
@@ -253,6 +325,7 @@
         ),
       );
       card.appendChild(telemetry);
+      renderConnectionControls(card, controller, runtime);
       renderControls(card, controller, runtime, observation);
       return card;
     }
