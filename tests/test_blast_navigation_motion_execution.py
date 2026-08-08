@@ -210,7 +210,52 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
             ),
             (90, 91),
         )
+        self.assertEqual(executor.expected_start_angles, controller.angles)
         self.assertTrue(executor.localization_valid)
+
+    def test_single_degree_pre_command_settling_is_localizable(self):
+        controller, executor = self.executor()
+        executor.execute(TURN_LEFT_90)
+        controller.angles["right_drive"] += 1
+
+        result = executor.execute(ADVANCE)
+
+        self.assertTrue(result.motion.complete)
+        self.assertEqual(result.motion.observed_slice_count, 2)
+        self.assertEqual(
+            result.motion.segments[0].kind,
+            "inter_action_settling",
+        )
+        self.assertEqual(
+            (
+                result.motion.left_encoder_delta_degrees,
+                result.motion.right_encoder_delta_degrees,
+            ),
+            (90, 91),
+        )
+        self.assertEqual(executor.expected_start_angles, controller.angles)
+        self.assertTrue(executor.localization_valid)
+
+    def test_accumulated_pre_command_and_receipt_gap_latches(self):
+        controller, executor = self.executor()
+        executor.execute(TURN_LEFT_90)
+        controller.angles["right_drive"] += 1
+        controller.next_gap = (0, 1)
+        command_count = len(controller.commands)
+        trusted_pose = executor.pose
+        trusted_anchor = executor.expected_start_angles
+
+        with self.assertRaises(PhysicalNavigationContractError) as raised:
+            executor.execute(ADVANCE)
+
+        self.assertEqual(
+            raised.exception.code,
+            "blast_motion_slice_discontinuous",
+        )
+        self.assertEqual(len(controller.commands), command_count + 1)
+        self.assertEqual(executor.pose, trusted_pose)
+        self.assertEqual(executor.expected_start_angles, trusted_anchor)
+        self.assertFalse(executor.localization_valid)
 
     def test_two_degree_receipt_gap_across_actions_latches_localization(self):
         controller, executor = self.executor()
@@ -270,8 +315,8 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
     def test_cross_action_encoder_gap_fails_closed_without_advancing_pose(self):
         controller, executor = self.executor()
         first = executor.execute(ADVANCE)
-        controller.angles["left_drive"] += 1
-        controller.angles["right_drive"] += 1
+        controller.angles["left_drive"] += 2
+        controller.angles["right_drive"] += 2
         command_count = len(controller.commands)
 
         with self.assertRaises(PhysicalNavigationContractError) as raised:
@@ -280,6 +325,13 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertEqual(
             raised.exception.code,
             "blast_motion_slice_discontinuous",
+        )
+        self.assertEqual(
+            str(raised.exception),
+            (
+                "BLAST encoders changed outside a verified motion action: "
+                "expected=(190, 290) observed=(192, 292) delta=(2, 2)"
+            ),
         )
         self.assertEqual(executor.pose, first.pose)
         self.assertFalse(executor.localization_valid)

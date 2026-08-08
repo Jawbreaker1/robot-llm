@@ -23,6 +23,7 @@ from .physical_odometry import (
 
 
 _DRIVE_ROLES = ("left_drive", "right_drive")
+_MAX_PRE_COMMAND_SETTLING_DEGREES = 1
 MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES = int(round(
     10 / BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
     .linear_mm_per_encoder_degree
@@ -161,10 +162,28 @@ class BlastNavigationMotionExecutor:
             snapshot.get("observation")
             if isinstance(snapshot, Mapping) else None
         )
-        if observed_start != self._expected_start_angles:
+        pre_command_settling = tuple(
+            observed_start[role] - self._expected_start_angles[role]
+            for role in _DRIVE_ROLES
+        )
+        expected_start = tuple(
+            self._expected_start_angles[role] for role in _DRIVE_ROLES
+        )
+        observed_start_tuple = tuple(
+            observed_start[role] for role in _DRIVE_ROLES
+        )
+        if any(
+            abs(delta) > _MAX_PRE_COMMAND_SETTLING_DEGREES
+            for delta in pre_command_settling
+        ):
             self._invalidate(
                 "blast_motion_slice_discontinuous",
-                "BLAST encoders changed outside a verified motion action",
+                (
+                    "BLAST encoders changed outside a verified motion "
+                    f"action: expected={expected_start} "
+                    f"observed={observed_start_tuple} "
+                    f"delta={pre_command_settling}"
+                ),
             )
 
         results = []
