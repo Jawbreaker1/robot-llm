@@ -542,14 +542,23 @@ def apply_verified_motion(
     for segment in segments:
         left = segment.left_encoder_delta_degrees
         right = segment.right_encoder_delta_degrees
-        bounded_uncommanded_drift = (
-            max_uncommanded_drift_degrees > 0
-            and segment.kind == "inter_slice_settling"
-            and segment.command_verified is False
-            and abs(left) <= max_uncommanded_drift_degrees
-            and abs(right) <= max_uncommanded_drift_degrees
-        )
-        if not bounded_uncommanded_drift:
+        uncommanded_settling = segment.kind in {
+            "inter_action_settling",
+            "inter_slice_settling",
+        }
+        if uncommanded_settling:
+            bounded_uncommanded_drift = (
+                max_uncommanded_drift_degrees > 0
+                and segment.command_verified is False
+                and abs(left) <= max_uncommanded_drift_degrees
+                and abs(right) <= max_uncommanded_drift_degrees
+            )
+            if not bounded_uncommanded_drift:
+                raise PhysicalNavigationContractError(
+                    "encoder_direction_mismatch",
+                    "Uncommanded encoder drift exceeds its allowance",
+                )
+        else:
             _validate_direction(motion.action, left, right)
         center_mm = (
             (left + right)

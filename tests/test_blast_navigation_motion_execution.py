@@ -190,6 +190,42 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertEqual(result.pose.heading_mdeg, -93_835)
         self.assertTrue(executor.localization_valid)
 
+    def test_single_degree_receipt_gap_across_actions_is_localizable(self):
+        controller, executor = self.executor()
+        executor.execute(TURN_LEFT_90)
+        controller.next_gap = (0, 1)
+
+        result = executor.execute(ADVANCE)
+
+        self.assertTrue(result.motion.complete)
+        self.assertEqual(result.motion.observed_slice_count, 2)
+        self.assertEqual(
+            result.motion.segments[0].kind,
+            "inter_action_settling",
+        )
+        self.assertEqual(
+            (
+                result.motion.left_encoder_delta_degrees,
+                result.motion.right_encoder_delta_degrees,
+            ),
+            (90, 91),
+        )
+        self.assertTrue(executor.localization_valid)
+
+    def test_two_degree_receipt_gap_across_actions_latches_localization(self):
+        controller, executor = self.executor()
+        executor.execute(TURN_LEFT_90)
+        controller.next_gap = (0, 2)
+
+        with self.assertRaises(PhysicalNavigationContractError) as raised:
+            executor.execute(ADVANCE)
+
+        self.assertEqual(
+            raised.exception.code,
+            "blast_motion_slice_discontinuous",
+        )
+        self.assertFalse(executor.localization_valid)
+
     def test_two_degree_internal_gap_still_latches_localization(self):
         controller, executor = self.executor()
         original_command = controller.command

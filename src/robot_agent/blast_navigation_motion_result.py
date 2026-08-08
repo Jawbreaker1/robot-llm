@@ -174,6 +174,7 @@ def _slice(
     after,
     checks,
     settling_checks,
+    settling_kind,
 ):
     verified = all(checks)
     result = {
@@ -194,16 +195,21 @@ def _slice(
         "stop": deepcopy(_CLEAN_STOP),
     }
     if command_before != before:
+        settling_reason = (
+            "inter_action_encoder_settling_observed"
+            if settling_kind == "inter_action_settling"
+            else "inter_slice_encoder_settling_observed"
+        )
         result["segments"] = [
             _segment(
-                kind="inter_slice_settling",
+                kind=settling_kind,
                 commanded_sides=(),
                 before=before,
                 after=command_before,
                 checks=settling_checks,
                 verified=False,
                 error="uncommanded encoder settling",
-                reason="inter_slice_encoder_settling_observed",
+                reason=settling_reason,
             ),
             _segment(
                 kind="commanded",
@@ -249,6 +255,7 @@ def build_blast_navigation_motion_result(
     *,
     expected_start_angles: Mapping[str, int],
     canonical_observation: Mapping[str, object],
+    allow_initial_settling: bool = False,
 ):
     """Build a result accepted by existing shared encoder odometry."""
 
@@ -280,9 +287,12 @@ def build_blast_navigation_motion_result(
                 current - previous
                 for previous, current in zip(previous_after, before)
             )
-            if index == 1 or any(
-                abs(delta) > _MAX_INTER_SLICE_SETTLING_DEGREES
-                for delta in settling
+            if (
+                (index == 1 and allow_initial_settling is not True)
+                or any(
+                    abs(delta) > _MAX_INTER_SLICE_SETTLING_DEGREES
+                    for delta in settling
+                )
             ):
                 _fail(
                     "blast_motion_slice_discontinuous",
@@ -306,6 +316,11 @@ def build_blast_navigation_motion_result(
             after,
             checks,
             settling_checks,
+            (
+                "inter_action_settling"
+                if index == 1
+                else "inter_slice_settling"
+            ),
         ))
         previous_after = after
 

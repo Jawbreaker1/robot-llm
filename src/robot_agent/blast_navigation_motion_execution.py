@@ -197,6 +197,7 @@ class BlastNavigationMotionExecutor:
                 canonical_observation=_canonical_observation(
                     final_observation
                 ),
+                allow_initial_settling=True,
             )
             motion = verified_motion_from_result(action, canonical)
             pose = apply_verified_motion(

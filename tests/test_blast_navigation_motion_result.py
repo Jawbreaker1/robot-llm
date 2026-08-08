@@ -185,6 +185,7 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
             PhysicalPose(),
             motion,
             BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+            max_uncommanded_drift_degrees=1,
         )
 
         self.assertEqual(
@@ -213,6 +214,66 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
         )
         self.assertEqual(pose.heading_mdeg, 88_445)
 
+    def test_bounded_inter_action_settling_is_preserved_in_odometry(self):
+        for right_gap in (-1, 1):
+            with self.subTest(right_gap=right_gap):
+                results = [command_result(
+                    "drive_forward",
+                    (0, right_gap),
+                    (90, 90),
+                )]
+                raw = build_blast_navigation_motion_result(
+                    ADVANCE,
+                    results,
+                    expected_start_angles={
+                        "left_drive": 0,
+                        "right_drive": 0,
+                    },
+                    canonical_observation=canonical_observation(results),
+                    allow_initial_settling=True,
+                )
+                motion = verified_motion_from_result(ADVANCE, raw)
+                settling = raw["outcome"]["slices"][0]["segments"][0]
+
+                self.assertEqual(
+                    settling["kind"],
+                    "inter_action_settling",
+                )
+                self.assertEqual(
+                    [
+                        motor["position_delta"]
+                        for motor in settling["motors"]
+                    ],
+                    [0, right_gap],
+                )
+                self.assertEqual(
+                    (
+                        motion.left_encoder_delta_degrees,
+                        motion.right_encoder_delta_degrees,
+                    ),
+                    (90, 90 + right_gap),
+                )
+                with self.assertRaises(
+                    PhysicalNavigationContractError
+                ) as caught:
+                    apply_verified_motion(
+                        PhysicalPose(),
+                        motion,
+                        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+                    )
+                self.assertEqual(
+                    caught.exception.code,
+                    "encoder_direction_mismatch",
+                )
+
+                pose = apply_verified_motion(
+                    PhysicalPose(),
+                    motion,
+                    BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+                    max_uncommanded_drift_degrees=1,
+                )
+                self.assertEqual(pose.verified_motion_count, 1)
+
     def test_live_turn_receipts_keep_the_observed_settling_degree(self):
         results = [
             command_result("turn_left", (-158, 84), (-45, 51)),
@@ -227,6 +288,7 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
             PhysicalPose(),
             motion,
             BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+            max_uncommanded_drift_degrees=1,
         )
 
         self.assertTrue(motion.complete)
