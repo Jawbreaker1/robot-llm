@@ -2,6 +2,7 @@
   "use strict";
 
   const BLAST_CONTROLLER_ID = "blast-01.hub";
+  const EV3_CONTROLLER_ID = "ev3rstorm-01.ev3-main";
   const BLAST_COMMAND_GROUPS = Object.freeze([
     ["drive_forward", "drive_reverse"],
     ["turn_left", "turn_right"],
@@ -147,17 +148,122 @@
       }
     }
 
+    async function checkEV3Reachability(controllerId) {
+      if (pendingConnections.has(controllerId)) {
+        return;
+      }
+      pendingConnections.add(controllerId);
+      rerender();
+      try {
+        await request(
+          `/api/v1/controllers/${encodeURIComponent(controllerId)}/reachability`,
+          {
+            method: "POST",
+            body: {},
+            timeout: 70000,
+          },
+        );
+        showToast(t("registry.reachability.completed"));
+      } catch (_error) {
+        showToast(t("registry.reachability.failed"), true);
+      } finally {
+        pendingConnections.delete(controllerId);
+        await onCommandComplete();
+        rerender();
+      }
+    }
+
+    function controllerDisplayState(runtime, fallback = "configured") {
+      const checked = record(runtime);
+      if (checked.controller_id === EV3_CONTROLLER_ID) {
+        const status = text(record(checked.reachability).status, "not_checked");
+        if (status === "passed") {
+          return "verified";
+        }
+        if (status === "checking") {
+          return "connecting";
+        }
+        if (status === "failed") {
+          return "offline";
+        }
+      }
+      return text(checked.state, fallback);
+    }
+
+    function renderEV3ReachabilityControls(card, controller, runtime) {
+      if (controller.controller_id !== EV3_CONTROLLER_ID) {
+        return;
+      }
+      const configured = runtime.controller_id === controller.controller_id;
+      const reachability = record(runtime.reachability);
+      const status = text(reachability.status, "not_checked");
+      const pending = pendingConnections.has(controller.controller_id);
+      const controls = element("section", "controller-controls");
+      controls.appendChild(element(
+        "strong",
+        "controller-controls-title",
+        t("registry.reachability.title"),
+      ));
+      const group = element("div", "controller-control-group");
+      const button = element(
+        "button",
+        "button button-secondary",
+        t("registry.reachability.check"),
+      );
+      button.type = "button";
+      button.disabled = !configured || pending || status === "checking";
+      button.addEventListener("click", () => {
+        checkEV3Reachability(controller.controller_id);
+      });
+      group.appendChild(button);
+      controls.appendChild(group);
+      const verifiedAt = runtime.last_verified_at_unix_ms;
+      const statusKey = !configured
+        ? "registry.reachability.unavailable"
+        : pending || status === "checking"
+          ? "registry.reachability.checking"
+          : status === "passed"
+            ? "registry.reachability.verified"
+            : status === "failed"
+              ? "registry.reachability.failed"
+              : "registry.reachability.not_checked";
+      controls.appendChild(element(
+        "small",
+        "controller-control-status",
+        t(statusKey, {
+          time: Number.isFinite(verifiedAt)
+            ? formatDateTime(verifiedAt)
+            : t("common.missing"),
+        }),
+      ));
+      controls.appendChild(element(
+        "small",
+        "controller-control-status",
+        t("registry.reachability.ephemeral"),
+      ));
+      card.appendChild(controls);
+    }
+
     function renderConnectionControls(card, controller, runtime) {
       if (controller.controller_id !== BLAST_CONTROLLER_ID) {
         return;
       }
       const controllerId = controller.controller_id;
+      const configured = runtime.controller_id === controllerId;
       const state = text(runtime.state, "unobserved");
       const pending = pendingConnections.has(controllerId);
       const allowed = {
-        connect: state === "configured" || state === "stopped" || state === "unobserved",
-        disconnect: state === "online" || state === "connecting" || state === "offline",
-        retry: state === "offline",
+        connect: configured && (
+          state === "configured"
+          || state === "stopped"
+          || state === "unobserved"
+        ),
+        disconnect: configured && (
+          state === "online"
+          || state === "connecting"
+          || state === "offline"
+        ),
+        retry: configured && state === "offline",
       };
       const controls = element("section", "controller-controls");
       controls.appendChild(element(
@@ -185,7 +291,9 @@
         "controller-control-status",
         pending
           ? t("registry.connection.running")
-          : t("registry.connection.state", { state: humanState(state) }),
+          : configured
+            ? t("registry.connection.state", { state: humanState(state) })
+            : t("registry.connection.not_configured"),
       ));
       card.appendChild(controls);
     }
@@ -258,7 +366,10 @@
       ));
       title.appendChild(element("small", "", text(controller.controller_id)));
       header.appendChild(title);
-      const runtimeState = text(runtime.state, controller.lifecycle);
+      const runtimeState = controllerDisplayState(
+        runtime,
+        controller.lifecycle,
+      );
       header.appendChild(element(
         "span",
         `state-chip ${runtimeState === "online" ? "state-ready" : "state-idle"}`,
@@ -326,6 +437,7 @@
       );
       card.appendChild(telemetry);
       renderConnectionControls(card, controller, runtime);
+      renderEV3ReachabilityControls(card, controller, runtime);
       renderControls(card, controller, runtime, observation);
       return card;
     }
@@ -387,7 +499,10 @@
       const runtime = runtimes(runtimeControllers).find(
         (item) => item.robot_id === robot.robot_id,
       );
-      return text(runtime && runtime.state, text(robot.lifecycle, "configured"));
+      return controllerDisplayState(
+        runtime,
+        text(robot.lifecycle, "configured"),
+      );
     }
 
     function nodeWithRuntimeState(node, runtimeByController) {
@@ -396,7 +511,7 @@
     }
 
     function statusTone(state) {
-      return state === "online"
+      return state === "online" || state === "verified"
         ? "online"
         : state === "connecting"
           ? "busy"
@@ -418,6 +533,7 @@
     }
 
     return Object.freeze({
+      controllerDisplayState,
       nodeWithRuntimeState,
       render,
       renderBlastStatus,

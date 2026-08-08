@@ -367,7 +367,7 @@
     byId("setting-lm-model").value = safeText(lmStudio.model, "");
 
     const ev3 = safeObject(runtimeObject.ev3);
-    const ev3State = safeText(ev3.state, "unobserved");
+    const ev3State = controllerPanel.controllerDisplayState(ev3, "unobserved");
     setStatus(
       "status-ev3",
       controllerPanel.statusTone(ev3State),

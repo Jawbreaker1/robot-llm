@@ -700,7 +700,7 @@ process.stdout.write(JSON.stringify({
             with self.subTest(raw_value=raw_value):
                 self.assertIn(">{}<".format(raw_value), self.html)
 
-    def test_blast_connection_controls_follow_runtime_state_and_submit_once(self):
+    def test_controller_connection_controls_render_and_submit_once(self):
         script = r"""
 const fs = require("fs");
 const vm = require("vm");
@@ -751,7 +751,7 @@ const panel = context.RobotControllerPanel.create({
   showToast() {},
   onCommandComplete: async () => {},
 });
-const controller = {
+const blastController = {
   node_kind: "controller",
   controller_id: "blast-01.hub",
   robot_id: "blast-01",
@@ -761,7 +761,7 @@ const controller = {
 const container = new Element("main");
 
 function buttonsFor(state) {
-  panel.render(container, [controller], [{
+  panel.render(container, [blastController], [{
     controller_id: "blast-01.hub",
     state,
     observation: {},
@@ -774,14 +774,72 @@ const states = {};
 for (const state of ["configured", "connecting", "online", "offline", "stopped"]) {
   states[state] = buttonsFor(state).map((button) => button.disabled);
 }
-const connect = buttonsFor("configured")[0];
-connect.click();
-connect.click();
-const pendingDisabled = container.children[0].children[2].children[1].children
-  .map((button) => button.disabled);
-completeRequest({});
-Promise.resolve().then(() => Promise.resolve()).then(() => {
-  process.stdout.write(JSON.stringify({ states, pendingDisabled, requests }));
+panel.render(container, [blastController], []);
+const unconfiguredBlastDisabled = container.children[0].children[2]
+  .children[1].children.map((button) => button.disabled);
+const ev3Controller = {
+  node_kind: "controller",
+  controller_id: "ev3rstorm-01.ev3-main",
+  robot_id: "ev3rstorm-01",
+  display_name: "EV3RSTORM",
+  lifecycle: "configured",
+};
+
+function ev3Button(status) {
+  panel.render(container, [ev3Controller], [{
+    controller_id: "ev3rstorm-01.ev3-main",
+    state: "configured",
+    reachability: { status },
+    observation: {},
+  }]);
+  return container.children[0].children[2].children[1].children[0];
+}
+
+(async () => {
+  const connect = buttonsFor("configured")[0];
+  connect.click();
+  connect.click();
+  const pendingDisabled = container.children[0].children[2].children[1].children
+    .map((button) => button.disabled);
+  completeRequest({});
+  await new Promise(setImmediate);
+  const blastRequests = requests.splice(0);
+
+  const ev3States = Object.fromEntries(
+    ["not_checked", "checking", "passed", "failed"].map((status) => [
+      status,
+      panel.controllerDisplayState({
+        controller_id: "ev3rstorm-01.ev3-main",
+        state: "configured",
+        reachability: { status },
+      }),
+    ]),
+  );
+  const checkingDisabled = ev3Button("checking").disabled;
+  panel.render(container, [ev3Controller], []);
+  const unavailableEV3Disabled = container.children[0].children[2]
+    .children[1].children[0].disabled;
+  const check = ev3Button("not_checked");
+  check.click();
+  check.click();
+  const ev3PendingDisabled = container.children[0].children[2]
+    .children[1].children[0].disabled;
+  completeRequest({});
+  await new Promise(setImmediate);
+  process.stdout.write(JSON.stringify({
+    states,
+    unconfiguredBlastDisabled,
+    pendingDisabled,
+    blastRequests,
+    ev3States,
+    checkingDisabled,
+    unavailableEV3Disabled,
+    ev3PendingDisabled,
+    ev3Requests: requests,
+  }));
+})().catch((error) => {
+  process.stderr.write(String(error));
+  process.exitCode = 1;
 });
 """
         completed = subprocess.run(
@@ -806,16 +864,33 @@ Promise.resolve().then(() => Promise.resolve()).then(() => {
         self.assertEqual(result["states"]["online"], [True, False, True])
         self.assertEqual(result["states"]["offline"], [True, False, False])
         self.assertEqual(result["states"]["stopped"], [False, True, True])
+        self.assertEqual(result["unconfiguredBlastDisabled"], [True, True, True])
         self.assertEqual(result["pendingDisabled"], [True, True, True])
-        self.assertEqual(len(result["requests"]), 1)
+        self.assertEqual(len(result["blastRequests"]), 1)
         self.assertEqual(
-            result["requests"][0]["url"],
+            result["blastRequests"][0]["url"],
             "/api/v1/controllers/blast-01.hub/connection",
         )
         self.assertEqual(
-            result["requests"][0]["options"]["body"],
+            result["blastRequests"][0]["options"]["body"],
             {"action": "connect"},
         )
+        self.assertEqual(result["ev3States"], {
+            "not_checked": "configured",
+            "checking": "connecting",
+            "passed": "verified",
+            "failed": "offline",
+        })
+        self.assertTrue(result["checkingDisabled"])
+        self.assertTrue(result["unavailableEV3Disabled"])
+        self.assertTrue(result["ev3PendingDisabled"])
+        self.assertEqual(len(result["ev3Requests"]), 1)
+        self.assertEqual(
+            result["ev3Requests"][0]["url"],
+            "/api/v1/controllers/ev3rstorm-01.ev3-main/reachability",
+        )
+        self.assertEqual(result["ev3Requests"][0]["options"]["body"], {})
+        self.assertEqual(result["ev3Requests"][0]["options"]["timeout"], 70_000)
 
     def test_rejected_session_latches_once_and_stops_dashboard_pollers(self):
         notice = next(

@@ -221,8 +221,10 @@ blockera dialog, navigation eller den deterministiska säkerhetsloopen.
   EV3 visar i stället encoderbaserad lokal pose och provisoriska, icke-metriska
   IR-sektorer med samma hypotes-ID:n som den fysiska navigationen använder.
 - **Kroppar** visar logiska robotar med controllers och perceptionskällor.
-  EV3RSTORM är deklarerad men inte observerad när ingen fysisk probe har
-  körts.
+  BLAST visar den långlivade BLE-sessionen och kan anslutas, kopplas från
+  eller återanslutas här. EV3 visar i stället resultatet från en explicit,
+  rörelsefri beredskapskontroll; dess korta SSH-session stängs efter kontrollen
+  och öppnas på nytt för varje uppdrag.
 - **Händelser** visar den begränsade, append-only eventströmmen med
   korrelations-ID:n. Rå prompt, rå modelltext och fulla evidence-URL:er
   loggas inte.
@@ -381,6 +383,11 @@ skriver aldrig direkt till motorer, SSH eller TTS: det lämnar ett typat mål
 eller stoppkrav till robotkontrolltjänsten, som i sin tur använder den enda
 serialiserade physical runtime som får äga motortransporten. Utan en injicerad
 adapter är kontrollplanet `DISABLED` och muterande robotanrop nekas.
+
+Anslutningskontrollerna följer samma gräns. BLAST-knapparna styr den
+konfigurerade BLE-livscykeln. EV3-knappen kör en avgränsad preflight utan
+motoranrop och delar ett exklusivt controller-lås med fysiska uppdrag, så en
+kontroll och en navigationsepisod aldrig kan använda bricken samtidigt.
 
 Kartan, komponentregistret och tekniska historikvyer är read-only projektioner.
 Att ett nodkort visar `online` ger därför inte nodkortet egen motorauktoritet,

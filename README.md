@@ -59,7 +59,7 @@ or language-specific command menus. The model never receives raw motor access.
 |---|---|
 | Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
 | Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, persistent telemetry, bounded actions, interruptible stop, and a model-directed act → observe → replan loop with two-sided distance scans |
-| Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, per-run physical navigation memory, multi-controller telemetry, and agent-directed BLAST episodes |
+| Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, simulator mapping, per-run physical navigation memory, multi-controller telemetry and connection controls, and agent-directed BLAST episodes |
 | Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
 | Planned | Repeatable autonomous obstacle navigation, richer Robot Inventor goals, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
 
@@ -132,7 +132,9 @@ The dashboard shows the current live state rather than offering old physical
 runs to resume. It exposes the current goal, plan, action, speech state,
 active detour route and waypoint progress, technical events, and a read-only
 map. Navigation memory is retained during an EV3 episode and reset before the
-next physical run.
+next physical run. The **Bodies** view keeps each controller separate: BLAST
+has Connect, Disconnect, and Retry controls, while EV3 has a motion-free
+readiness check because its SSH worker is opened and closed per task.
 
 The same Map view can display a completed simulator run or qualitative physical
 odometry and obstacle hypotheses:
@@ -186,8 +188,12 @@ ROBOT_LLM_STT_URL='' scripts/start_ev3rstorm_console.sh \
 ```
 
 Omit the STT override when the local speech-recognition service is configured.
-Robot movement begins only after a goal is submitted and explicitly started in
-the dashboard.
+The dashboard may be started before the EV3 is powered on. After the brick has
+booted, choose **Bodies → Check connection** to verify SSH, the deployed worker,
+stationary sensing, stop, and clean shutdown without issuing a motor command.
+The check records when readiness was last verified; it does not claim or keep a
+persistent connection. Robot movement begins only after a goal is submitted
+and explicitly started in the dashboard.
 
 ## Robot Inventor 51515 bring-up
 
@@ -199,7 +205,8 @@ session exposes observations, stop, drive, turn, claw and body pulses. The
 dashboard can keep that session open, show battery, distance, color, IMU and
 motor telemetry, run those fixed actions manually, or bind the same connection
 to a model-directed robot episode. Stop can interrupt an in-flight pulse and is
-verified against a fresh inactive observation.
+verified against a fresh inactive observation. The **Bodies** view exposes the
+same BLE lifecycle as Connect, Disconnect, and Retry controls.
 
 ```sh
 python3 -m venv .venv
