@@ -22,6 +22,7 @@ from .robot_control_service import (
 ROBOT_API_PREFIX = "/api/v1/robot/"
 CONTROLLER_API_PREFIX = "/api/v1/controllers/"
 BLAST_COMMAND_PATH = "/api/v1/controllers/blast-01.hub/commands"
+BLAST_CONNECTION_PATH = "/api/v1/controllers/blast-01.hub/connection"
 MAX_ROBOT_REQUEST_BYTES = 16 * 1024
 MAX_ROBOT_PAGE_LIMIT = 500
 BLAST_COMMANDS = frozenset((
@@ -35,6 +36,11 @@ BLAST_COMMANDS = frozenset((
     "body_right",
     "stop",
 ))
+CONTROLLER_CONNECTION_ACTIONS = frozenset((
+    "connect",
+    "disconnect",
+    "retry",
+))
 CONTROLLER_ERROR_STATUS = {
     "controller_busy": 409,
     "controller_command_interrupted": 409,
@@ -43,6 +49,7 @@ CONTROLLER_ERROR_STATUS = {
     "controller_command_failed": 502,
     "controller_motion_not_stopped": 503,
     "controller_command_timeout": 504,
+    "controller_connection_failed": 502,
 }
 
 
@@ -189,19 +196,24 @@ class RobotControlHTTPRouter:
             ) from None
 
     @staticmethod
-    def _controller_call(operation):
+    def _controller_call(
+        operation,
+        *,
+        default_code="controller_command_failed",
+        message="Controller command failed",
+    ):
         try:
             return operation()
         except RobotControlHTTPError:
             raise
         except Exception as error:
-            code = getattr(error, "code", "controller_command_failed")
+            code = getattr(error, "code", default_code)
             if code not in CONTROLLER_ERROR_STATUS:
-                code = "controller_command_failed"
+                code = default_code
             raise RobotControlHTTPError(
                 CONTROLLER_ERROR_STATUS[code],
                 code,
-                "Controller command failed",
+                message,
             ) from None
 
     @staticmethod
@@ -232,13 +244,59 @@ class RobotControlHTTPRouter:
             )
 
         if path.startswith(CONTROLLER_API_PREFIX):
-            if method != "POST" or path != BLAST_COMMAND_PATH:
+            if method != "POST" or path not in {
+                BLAST_COMMAND_PATH,
+                BLAST_CONNECTION_PATH,
+            }:
                 raise RobotControlHTTPError(
                     404,
                     "controller_route_not_found",
                     "Controller route was not found",
                 )
-            self._no_query(query, "Controller command endpoint")
+            endpoint = (
+                "Controller connection endpoint"
+                if path == BLAST_CONNECTION_PATH
+                else "Controller command endpoint"
+            )
+            self._no_query(query, endpoint)
+            controller = self._controller_services.get("blast-01.hub")
+            if controller is None:
+                raise RobotControlHTTPError(
+                    503,
+                    "controller_unavailable",
+                    "BLAST controller is not configured",
+                )
+            if path == BLAST_CONNECTION_PATH:
+                request = _exact_object(
+                    _body_object(body),
+                    ("action",),
+                )
+                action = request["action"]
+                if (
+                    not isinstance(action, str)
+                    or action not in CONTROLLER_CONNECTION_ACTIONS
+                ):
+                    raise RobotControlHTTPError(
+                        400,
+                        "invalid_controller_connection_action",
+                        "Controller connection action is invalid",
+                    )
+                operation = getattr(controller, action, None)
+                if not callable(operation):
+                    raise RobotControlHTTPError(
+                        503,
+                        "controller_connection_unavailable",
+                        "Controller connection lifecycle is not configured",
+                    )
+                value = self._controller_call(
+                    operation,
+                    default_code="controller_connection_failed",
+                    message="Controller connection action failed",
+                )
+                return RobotControlHTTPResponse(
+                    200,
+                    {"connection": value},
+                )
             request = _exact_object(
                 _body_object(body),
                 ("command",),
@@ -249,13 +307,6 @@ class RobotControlHTTPRouter:
                     400,
                     "invalid_controller_command",
                     "Controller command is invalid",
-                )
-            controller = self._controller_services.get("blast-01.hub")
-            if controller is None:
-                raise RobotControlHTTPError(
-                    503,
-                    "controller_unavailable",
-                    "BLAST controller is not configured",
                 )
             value = self._controller_call(
                 lambda: controller.command(command)

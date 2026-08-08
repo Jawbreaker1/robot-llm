@@ -117,6 +117,7 @@ class FakeRobotInputService:
 class FakeControllerService:
     def __init__(self):
         self.commands = []
+        self.connection_actions = []
 
     def command(self, command):
         self.commands.append(command)
@@ -127,6 +128,24 @@ class FakeControllerService:
             "accepted": True,
             "completed": True,
         }
+
+    def _connection(self, action):
+        self.connection_actions.append(action)
+        return {
+            "schema": "controller-runtime-observation/v1",
+            "robot_id": "blast-01",
+            "controller_id": "blast-01.hub",
+            "state": "stopped" if action == "disconnect" else "connecting",
+        }
+
+    def connect(self):
+        return self._connection("connect")
+
+    def disconnect(self):
+        return self._connection("disconnect")
+
+    def retry(self):
+        return self._connection("retry")
 
 
 def encoded(value):
@@ -344,6 +363,45 @@ class RobotControlHTTPRouterTests(unittest.TestCase):
                 encoded({"command": "stop"}),
             )
         self.assertEqual(unknown.exception.code, "controller_route_not_found")
+
+    def test_blast_connection_route_accepts_only_fixed_actions(self):
+        controller = FakeControllerService()
+        router = RobotControlHTTPRouter(
+            self.service,
+            controller_services={"blast-01.hub": controller},
+        )
+
+        for action in ("connect", "disconnect", "retry"):
+            response = router.handle(
+                "POST",
+                "/api/v1/controllers/blast-01.hub/connection",
+                "",
+                encoded({"action": action}),
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                response.body["connection"]["controller_id"],
+                "blast-01.hub",
+            )
+
+        self.assertEqual(
+            controller.connection_actions,
+            ["connect", "disconnect", "retry"],
+        )
+        for body in (
+            {"action": "restart"},
+            {"action": []},
+            {"action": "connect", "force": True},
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(RobotControlHTTPError) as raised:
+                    router.handle(
+                        "POST",
+                        "/api/v1/controllers/blast-01.hub/connection",
+                        "",
+                        encoded(body),
+                    )
+                self.assertEqual(raised.exception.status, 400)
 
     def test_blast_controller_errors_have_bounded_http_statuses(self):
         for error_code in (
