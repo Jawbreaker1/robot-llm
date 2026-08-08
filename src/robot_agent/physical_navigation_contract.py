@@ -10,6 +10,10 @@ from dataclasses import dataclass
 import json
 from typing import Mapping, Optional, Tuple
 
+from .physical_navigation_sensor_evidence import (
+    sensor_evidence_from_validated_ev3_observation,
+)
+
 
 DECISION_SCHEMA = "robot-physical-navigation-decision/v1"
 REQUEST_SCHEMA = "ev3-agent-worker-request/v1"
@@ -589,9 +593,11 @@ def observation_safety_signature(
     observation: Mapping[str, object],
 ) -> Tuple[bool, bool, bool]:
     checked = validate_observation(observation)
+    sensors = sensor_evidence_from_validated_ev3_observation(checked)
+    assert sensors.contact is not None
     return (
-        checked["touch"]["pressed"],
-        checked["infrared"]["blocked"],
+        sensors.contact.pressed,
+        sensors.clearance.blocked,
         checked["budgets"]["motion_fault_latched"],
     )
 

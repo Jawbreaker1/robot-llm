@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Mapping, Optional, Tuple
 
 from .physical_navigation_contract import validate_observation
+from .physical_navigation_sensor_evidence import (
+    sensor_evidence_from_validated_ev3_observation,
+)
 from .physical_odometry import PhysicalPose
 
 
@@ -29,14 +32,12 @@ def observation_progress_signature(
     relevant_roles = (
         None if motor_roles is None else frozenset(motor_roles)
     )
-    infrared = checked["infrared"]
+    sensors = sensor_evidence_from_validated_ev3_observation(checked)
+    assert sensors.contact is not None
     facts = {
-        "infrared_available": (
-            infrared["raw"] is not None
-            or infrared["filtered"] is not None
-        ),
-        "infrared_blocked": infrared["blocked"],
-        "touch_pressed": checked["touch"]["pressed"],
+        "infrared_available": sensors.clearance.sample_available,
+        "infrared_blocked": sensors.clearance.blocked,
+        "touch_pressed": sensors.contact.pressed,
         "motion_fault_latched": checked["budgets"][
             "motion_fault_latched"
         ],

@@ -80,6 +80,9 @@ from .physical_navigation_mission import DirectionalMission
 from .physical_navigation_motion_runtime import (
     PhysicalNavigationMotionRuntimeMixin,
 )
+from .physical_navigation_sensor_evidence import (
+    sensor_evidence_from_validated_ev3_observation,
+)
 from .physical_odometry import (
     DriveMotorRoles,
 )
@@ -565,6 +568,8 @@ class PhysicalNavigationRuntime(
         observation: Mapping[str, object],
         action_specs: Mapping[str, Mapping[str, object]],
     ) -> Tuple[Mapping[str, object], Mapping[str, object]]:
+        sensors = sensor_evidence_from_validated_ev3_observation(observation)
+        assert sensors.contact is not None
         geometry = self.memory.hazard_map.goal_geometry(
             pose=self.memory.pose,
             goal_heading_mdeg=mission.reference_heading_mdeg,
@@ -578,7 +583,7 @@ class PhysicalNavigationRuntime(
             goal_corridor_clear=facts[FACT_GOAL_CORRIDOR_CLEAR],
             all_known_hazards_passed=all(target_values.values()),
             localization_valid=self.memory.localization_valid,
-            touch_pressed=observation["touch"]["pressed"],
+            touch_pressed=sensors.contact.pressed,
             calibration=self.memory.odometry_calibration,
         )
         mission_value = dict(mission_value)
