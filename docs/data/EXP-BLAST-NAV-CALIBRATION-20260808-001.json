@@ -53,15 +53,36 @@
     "observation": "Robot remained physically in front of the obstacle and did not begin a successful pass"
   },
   "geometry": {
-    "robot_footprint": "unknown-unmeasured-current-build",
-    "range_sensor_extrinsics": "unknown-unmeasured-current-build",
-    "mount_note": "Ultrasonic sensor is mounted beneath the movable left arm"
+    "reference_frame": "differential-drive origin; forward +X, left +Y",
+    "measurement_method": "operator folding-rule measurement; approximate",
+    "robot_footprint": {
+      "status": "measured-approximate-current-build",
+      "extents_mm": {
+        "front": 110,
+        "rear": 60,
+        "left": 105,
+        "right": 100
+      },
+      "clearance_margin_mm": 10,
+      "pose": "ultrasonic arm in navigation pose; gripper closed and neutral"
+    },
+    "range_sensor_extrinsics": {
+      "status": "measured-approximate-navigation-pose",
+      "planar_pose": {
+        "forward_offset_mm": 110,
+        "left_offset_mm": 80,
+        "yaw_mdeg": 0
+      },
+      "centre_height_mm_approx": 205,
+      "vertical_pitch": "not measured",
+      "mount_note": "Ultrasonic sensor is mounted beneath the movable left arm"
+    }
   },
   "limitations": [
     "Linear scale is provisional evidence from one stationary target and one floor surface",
     "Turn scale is provisional IMU evidence from six scans and 24 bounded turn samples",
-    "Robot footprint must be measured before shared route execution is enabled",
-    "Range-sensor forward, lateral and yaw offsets must be measured in navigation scan pose",
+    "Footprint and range-sensor extrinsics are approximate folding-rule measurements",
+    "Ultrasonic vertical pitch remains unmeasured and body pitch varies with the support wheels",
     "This evidence record is not consumed by the runtime"
   ]
 }

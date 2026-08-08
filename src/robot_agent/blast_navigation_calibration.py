@@ -123,20 +123,31 @@ BLAST_PROVISIONAL_NAVIGATION_CALIBRATION = BlastNavigationCalibration(
         "24 opposed 45-degree scan-turn samples averaged 23.477908 body "
         "degrees"
     ),
-    robot_footprint=None,
-    footprint_status="unknown-unmeasured-current-build",
+    robot_footprint=RobotFootprint(
+        front_extent_mm=110,
+        rear_extent_mm=60,
+        left_extent_mm=105,
+        right_extent_mm=100,
+        clearance_margin_mm=10,
+        calibration_status="measured-approximate-current-build",
+        calibration_evidence=(
+            "Operator folding-rule measurement from the differential-drive "
+            "origin; 10 mm margin is separate from the measured extents"
+        ),
+    ),
+    footprint_status="measured-approximate-current-build",
     footprint_evidence=(
-        "Current assembled body extents relative to the differential-drive "
-        "origin have not been measured"
+        "Operator measured front 110, rear 60, left 105 and right 100 mm "
+        "from the differential-drive origin with a folding rule"
     ),
     range_sensor_extrinsics=BlastRangeSensorExtrinsics(
-        forward_offset_mm=None,
-        left_offset_mm=None,
-        yaw_mdeg=None,
-        calibration_status="unknown-unmeasured-current-build",
+        forward_offset_mm=110,
+        left_offset_mm=80,
+        yaw_mdeg=0,
+        calibration_status="measured-approximate-navigation-pose",
         calibration_evidence=(
-            "The ultrasonic sensor is mounted on the movable left arm; its "
-            "planar scan-pose offset has not been measured"
+            "Operator folding-rule measurement to the ultrasonic face "
+            "centre with the left arm in navigation pose"
         ),
     ),
     evidence_id=BLAST_NAVIGATION_EVIDENCE_ID,

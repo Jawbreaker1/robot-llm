@@ -21,7 +21,7 @@ EVIDENCE_PATH = (
 
 
 class BlastNavigationCalibrationTests(unittest.TestCase):
-    def test_live_motion_scale_is_typed_but_geometry_is_incomplete(self):
+    def test_live_motion_scale_and_measured_geometry_are_typed(self):
         calibration = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
 
         self.assertEqual(
@@ -32,11 +32,26 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
             calibration.odometry.turn_mdeg_per_opposed_encoder_degree,
             522,
         )
-        self.assertIsNone(calibration.robot_footprint)
-        self.assertFalse(calibration.range_sensor_extrinsics.complete)
-        self.assertFalse(calibration.complete)
-        with self.assertRaisesRegex(ValueError, "geometry is incomplete"):
-            calibration.require_complete()
+        footprint, sensor = calibration.require_complete()
+        self.assertEqual(
+            (
+                footprint.front_extent_mm,
+                footprint.rear_extent_mm,
+                footprint.left_extent_mm,
+                footprint.right_extent_mm,
+                footprint.clearance_margin_mm,
+            ),
+            (110, 60, 105, 100, 10),
+        )
+        self.assertEqual(
+            (
+                sensor.forward_offset_mm,
+                sensor.left_offset_mm,
+                sensor.yaw_mdeg,
+            ),
+            (110, 80, 0),
+        )
+        self.assertTrue(calibration.complete)
 
     def test_partial_range_sensor_measurement_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "extrinsics are partial"):
@@ -82,25 +97,18 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
 
     def test_both_geometry_parts_are_required_for_activation(self):
         source = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-        footprint = RobotFootprint(
-            front_extent_mm=100,
-            rear_extent_mm=80,
-            left_extent_mm=90,
-            right_extent_mm=90,
-            calibration_status="test",
-            calibration_evidence="complete fixture",
-        )
-        sensor = BlastRangeSensorExtrinsics(
-            forward_offset_mm=80,
-            left_offset_mm=60,
-            yaw_mdeg=0,
-            calibration_status="test",
-            calibration_evidence="complete fixture",
+        assert source.robot_footprint is not None
+        incomplete_sensor = BlastRangeSensorExtrinsics(
+            forward_offset_mm=None,
+            left_offset_mm=None,
+            yaw_mdeg=None,
+            calibration_status="unknown",
+            calibration_evidence="incomplete fixture",
         )
 
         for calibration in (
-            replace(source, robot_footprint=footprint),
-            replace(source, range_sensor_extrinsics=sensor),
+            replace(source, robot_footprint=None),
+            replace(source, range_sensor_extrinsics=incomplete_sensor),
         ):
             with self.subTest(calibration=calibration):
                 self.assertFalse(calibration.complete)
@@ -154,12 +162,53 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            evidence["geometry"]["robot_footprint"],
-            calibration.footprint_status,
+            evidence["geometry"]["robot_footprint"]["status"],
+            calibration.robot_footprint.calibration_status,
         )
         self.assertEqual(
-            evidence["geometry"]["range_sensor_extrinsics"],
+            evidence["geometry"]["range_sensor_extrinsics"]["status"],
             calibration.range_sensor_extrinsics.calibration_status,
+        )
+        self.assertEqual(
+            evidence["geometry"]["robot_footprint"]["extents_mm"],
+            {
+                "front": calibration.robot_footprint.front_extent_mm,
+                "rear": calibration.robot_footprint.rear_extent_mm,
+                "left": calibration.robot_footprint.left_extent_mm,
+                "right": calibration.robot_footprint.right_extent_mm,
+            },
+        )
+        self.assertEqual(
+            evidence["geometry"]["robot_footprint"][
+                "clearance_margin_mm"
+            ],
+            calibration.robot_footprint.clearance_margin_mm,
+        )
+        self.assertEqual(
+            evidence["geometry"]["range_sensor_extrinsics"][
+                "planar_pose"
+            ],
+            {
+                "forward_offset_mm": (
+                    calibration.range_sensor_extrinsics.forward_offset_mm
+                ),
+                "left_offset_mm": (
+                    calibration.range_sensor_extrinsics.left_offset_mm
+                ),
+                "yaw_mdeg": calibration.range_sensor_extrinsics.yaw_mdeg,
+            },
+        )
+        self.assertEqual(
+            evidence["geometry"]["range_sensor_extrinsics"][
+                "centre_height_mm_approx"
+            ],
+            205,
+        )
+        self.assertEqual(
+            evidence["geometry"]["range_sensor_extrinsics"][
+                "vertical_pitch"
+            ],
+            "not measured",
         )
 
 
