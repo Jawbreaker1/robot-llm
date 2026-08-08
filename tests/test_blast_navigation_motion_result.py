@@ -361,6 +361,14 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
         with self.assertRaises(PhysicalNavigationContractError) as caught:
             build(TURN_LEFT_90, turns)
         self.assertEqual(caught.exception.code, "blast_motion_slice_discontinuous")
+        self.assertEqual(
+            str(caught.exception),
+            (
+                "BLAST motion has an unobserved encoder gap: "
+                "action=TURN_LEFT_90 slice=2 previous=(55, 245) "
+                "before=(53, 245) delta=(-2, 0)"
+            ),
+        )
 
         turns = turn_results("turn_left")
         turns[1]["receipt"]["before_angles_deg"]["left_drive"] += 1

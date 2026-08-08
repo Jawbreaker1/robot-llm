@@ -290,7 +290,12 @@ def build_blast_navigation_motion_result(
             ):
                 _fail(
                     "blast_motion_slice_discontinuous",
-                    "BLAST motion has an unobserved encoder gap",
+                    (
+                        "BLAST motion has an unobserved encoder gap: "
+                        f"action={action} slice={index} "
+                        f"previous={previous_after} before={before} "
+                        f"delta={settling}"
+                    ),
                 )
             settling_checks = tuple(
                 delta == 0 or delta * sign > 0
