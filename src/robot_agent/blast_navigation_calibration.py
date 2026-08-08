@@ -1,0 +1,151 @@
+"""Typed BLAST navigation facts, deliberately not wired into runtime yet."""
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+from .physical_footprint import RobotFootprint
+from .physical_odometry import OdometryCalibration
+
+
+BLAST_NAVIGATION_EVIDENCE_ID = (
+    "EXP-BLAST-NAV-CALIBRATION-20260808-001"
+)
+
+
+def _text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value == value.strip()
+        and 0 < len(value) <= 512
+        and all(ord(character) >= 32 for character in value)
+    )
+
+
+@dataclass(frozen=True)
+class BlastRangeSensorExtrinsics:
+    """Planar ultrasonic pose relative to the differential-drive origin."""
+
+    forward_offset_mm: Optional[int]
+    left_offset_mm: Optional[int]
+    yaw_mdeg: Optional[int]
+    calibration_status: str
+    calibration_evidence: str
+
+    def __post_init__(self) -> None:
+        values = (
+            self.forward_offset_mm,
+            self.left_offset_mm,
+            self.yaw_mdeg,
+        )
+        measured = tuple(value is not None for value in values)
+        if any(measured) and not all(measured):
+            raise ValueError("BLAST range-sensor extrinsics are partial")
+        if all(measured):
+            forward, left, yaw = values
+            if (
+                any(type(value) is not int for value in values)
+                or not -1_000 <= forward <= 1_000
+                or not -1_000 <= left <= 1_000
+                or not -180_000 <= yaw <= 179_999
+            ):
+                raise ValueError("BLAST range-sensor extrinsics are invalid")
+        if not _text(self.calibration_status) or not _text(
+            self.calibration_evidence
+        ):
+            raise ValueError("BLAST range-sensor provenance is invalid")
+
+    @property
+    def complete(self) -> bool:
+        return self.forward_offset_mm is not None
+
+
+@dataclass(frozen=True)
+class BlastNavigationCalibration:
+    """Known motion scale plus geometry required before route activation."""
+
+    odometry: OdometryCalibration
+    odometry_status: str
+    odometry_evidence: str
+    robot_footprint: Optional[RobotFootprint]
+    footprint_status: str
+    footprint_evidence: str
+    range_sensor_extrinsics: BlastRangeSensorExtrinsics
+    evidence_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.odometry, OdometryCalibration)
+            or (
+                self.robot_footprint is not None
+                and not isinstance(self.robot_footprint, RobotFootprint)
+            )
+            or not isinstance(
+                self.range_sensor_extrinsics,
+                BlastRangeSensorExtrinsics,
+            )
+            or any(
+                not _text(value)
+                for value in (
+                    self.odometry_status,
+                    self.odometry_evidence,
+                    self.footprint_status,
+                    self.footprint_evidence,
+                    self.evidence_id,
+                )
+            )
+        ):
+            raise ValueError("BLAST navigation calibration is invalid")
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self.robot_footprint is not None
+            and self.range_sensor_extrinsics.complete
+        )
+
+    def require_complete(
+        self,
+    ) -> Tuple[RobotFootprint, BlastRangeSensorExtrinsics]:
+        if not self.complete:
+            raise ValueError("BLAST navigation geometry is incomplete")
+        assert self.robot_footprint is not None
+        return self.robot_footprint, self.range_sensor_extrinsics
+
+
+BLAST_PROVISIONAL_NAVIGATION_CALIBRATION = BlastNavigationCalibration(
+    odometry=OdometryCalibration(
+        linear_mm_per_encoder_degree=0.5,
+        turn_mdeg_per_opposed_encoder_degree=522,
+    ),
+    odometry_status="provisional-live-range-and-imu-derived",
+    odometry_evidence=(
+        "Two 90-degree drive pulses changed range 358->313->268 mm; "
+        "24 opposed 45-degree scan-turn samples averaged 23.477908 body "
+        "degrees"
+    ),
+    robot_footprint=None,
+    footprint_status="unknown-unmeasured-current-build",
+    footprint_evidence=(
+        "Current assembled body extents relative to the differential-drive "
+        "origin have not been measured"
+    ),
+    range_sensor_extrinsics=BlastRangeSensorExtrinsics(
+        forward_offset_mm=None,
+        left_offset_mm=None,
+        yaw_mdeg=None,
+        calibration_status="unknown-unmeasured-current-build",
+        calibration_evidence=(
+            "The ultrasonic sensor is mounted on the movable left arm; its "
+            "planar scan-pose offset has not been measured"
+        ),
+    ),
+    evidence_id=BLAST_NAVIGATION_EVIDENCE_ID,
+)
+
+
+__all__ = (
+    "BLAST_NAVIGATION_EVIDENCE_ID",
+    "BLAST_PROVISIONAL_NAVIGATION_CALIBRATION",
+    "BlastNavigationCalibration",
+    "BlastRangeSensorExtrinsics",
+)

@@ -1,0 +1,67 @@
+{
+  "schema": "blast-navigation-calibration-evidence/v1",
+  "experiment_id": "EXP-BLAST-NAV-CALIBRATION-20260808-001",
+  "source_commit": "23bddf0c5a2bc50c92f1306e047778cd56e54d83",
+  "episode_id": "episode-7b8bfe68b9f55c8495042a58",
+  "robot_id": "blast-01",
+  "controller_id": "blast-01.hub",
+  "model": "google/gemma-4-26b-a4b",
+  "drive": {
+    "commanded_encoder_degrees_per_wheel": 90,
+    "range_observations_mm": [358, 313, 268],
+    "derived_linear_mm_per_encoder_degree": 0.5
+  },
+  "turn": {
+    "commanded_opposed_encoder_degrees_per_wheel": 45,
+    "imu_sample_count": 24,
+    "body_turn_samples_degrees": [
+      22.869614439999992,
+      24.042602000000016,
+      23.640423559999988,
+      23.49059600000001,
+      22.14063200000001,
+      22.808223999999996,
+      25.951056800000003,
+      24.2265472,
+      23.776656000000003,
+      21.743431199999975,
+      23.08201600000001,
+      22.86228940000001,
+      23.044814000000002,
+      22.953749999999985,
+      23.8543928,
+      23.80234520000002,
+      22.59555900000001,
+      23.161102,
+      24.59533300000001,
+      24.57877799999997,
+      22.249854999999997,
+      21.953330000000022,
+      26.758320999999995,
+      23.288133999999985
+    ],
+    "sample_derivation": "Per scan: abs(left_near), abs(left_far-left_near), abs(right_near), abs(right_far-right_near), using relative IMU headings",
+    "mean_body_turn_degrees": 23.477908441666667,
+    "minimum_body_turn_degrees": 21.743431199999975,
+    "maximum_body_turn_degrees": 26.758320999999995,
+    "derived_turn_mdeg_per_opposed_encoder_degree": 522
+  },
+  "physical_outcome": {
+    "operator_start_distance_approx_mm": 400,
+    "operator_end_distance_approx_mm": 100,
+    "terminal_reason": "decision_budget_exhausted",
+    "observation": "Robot remained physically in front of the obstacle and did not begin a successful pass"
+  },
+  "geometry": {
+    "robot_footprint": "unknown-unmeasured-current-build",
+    "range_sensor_extrinsics": "unknown-unmeasured-current-build",
+    "mount_note": "Ultrasonic sensor is mounted beneath the movable left arm"
+  },
+  "limitations": [
+    "Linear scale is provisional evidence from one stationary target and one floor surface",
+    "Turn scale is provisional IMU evidence from six scans and 24 bounded turn samples",
+    "Robot footprint must be measured before shared route execution is enabled",
+    "Range-sensor forward, lateral and yaw offsets must be measured in navigation scan pose",
+    "This evidence record is not consumed by the runtime"
+  ]
+}

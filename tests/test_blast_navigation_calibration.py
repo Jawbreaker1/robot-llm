@@ -1,0 +1,167 @@
+import json
+from dataclasses import replace
+from pathlib import Path
+import unittest
+
+from robot_agent.blast_navigation_calibration import (
+    BLAST_NAVIGATION_EVIDENCE_ID,
+    BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
+    BlastNavigationCalibration,
+    BlastRangeSensorExtrinsics,
+)
+from robot_agent.physical_footprint import RobotFootprint
+
+
+EVIDENCE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "docs"
+    / "data"
+    / "EXP-BLAST-NAV-CALIBRATION-20260808-001.json"
+)
+
+
+class BlastNavigationCalibrationTests(unittest.TestCase):
+    def test_live_motion_scale_is_typed_but_geometry_is_incomplete(self):
+        calibration = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+
+        self.assertEqual(
+            calibration.odometry.linear_mm_per_encoder_degree,
+            0.5,
+        )
+        self.assertEqual(
+            calibration.odometry.turn_mdeg_per_opposed_encoder_degree,
+            522,
+        )
+        self.assertIsNone(calibration.robot_footprint)
+        self.assertFalse(calibration.range_sensor_extrinsics.complete)
+        self.assertFalse(calibration.complete)
+        with self.assertRaisesRegex(ValueError, "geometry is incomplete"):
+            calibration.require_complete()
+
+    def test_partial_range_sensor_measurement_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "extrinsics are partial"):
+            BlastRangeSensorExtrinsics(
+                forward_offset_mm=100,
+                left_offset_mm=None,
+                yaw_mdeg=0,
+                calibration_status="test",
+                calibration_evidence="partial fixture",
+            )
+
+    def test_complete_fixture_can_cross_the_activation_gate(self):
+        footprint = RobotFootprint(
+            front_extent_mm=100,
+            rear_extent_mm=80,
+            left_extent_mm=90,
+            right_extent_mm=90,
+            clearance_margin_mm=10,
+            calibration_status="test",
+            calibration_evidence="complete fixture",
+        )
+        sensor = BlastRangeSensorExtrinsics(
+            forward_offset_mm=80,
+            left_offset_mm=60,
+            yaw_mdeg=0,
+            calibration_status="test",
+            calibration_evidence="complete fixture",
+        )
+        source = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+        calibration = BlastNavigationCalibration(
+            odometry=source.odometry,
+            odometry_status=source.odometry_status,
+            odometry_evidence=source.odometry_evidence,
+            robot_footprint=footprint,
+            footprint_status="test",
+            footprint_evidence="complete fixture",
+            range_sensor_extrinsics=sensor,
+            evidence_id="test-evidence",
+        )
+
+        self.assertTrue(calibration.complete)
+        self.assertEqual(calibration.require_complete(), (footprint, sensor))
+
+    def test_both_geometry_parts_are_required_for_activation(self):
+        source = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+        footprint = RobotFootprint(
+            front_extent_mm=100,
+            rear_extent_mm=80,
+            left_extent_mm=90,
+            right_extent_mm=90,
+            calibration_status="test",
+            calibration_evidence="complete fixture",
+        )
+        sensor = BlastRangeSensorExtrinsics(
+            forward_offset_mm=80,
+            left_offset_mm=60,
+            yaw_mdeg=0,
+            calibration_status="test",
+            calibration_evidence="complete fixture",
+        )
+
+        for calibration in (
+            replace(source, robot_footprint=footprint),
+            replace(source, range_sensor_extrinsics=sensor),
+        ):
+            with self.subTest(calibration=calibration):
+                self.assertFalse(calibration.complete)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "geometry is incomplete",
+                ):
+                    calibration.require_complete()
+
+    def test_evidence_record_matches_the_typed_values(self):
+        evidence = json.loads(EVIDENCE_PATH.read_text(encoding="utf-8"))
+        calibration = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+
+        self.assertEqual(evidence["experiment_id"], BLAST_NAVIGATION_EVIDENCE_ID)
+        self.assertEqual(
+            evidence["drive"]["derived_linear_mm_per_encoder_degree"],
+            calibration.odometry.linear_mm_per_encoder_degree,
+        )
+        self.assertEqual(
+            evidence["turn"][
+                "derived_turn_mdeg_per_opposed_encoder_degree"
+            ],
+            calibration.odometry.turn_mdeg_per_opposed_encoder_degree,
+        )
+        samples = evidence["turn"]["body_turn_samples_degrees"]
+        sample_mean = sum(samples) / len(samples)
+        self.assertEqual(len(samples), evidence["turn"]["imu_sample_count"])
+        self.assertAlmostEqual(
+            sample_mean,
+            evidence["turn"]["mean_body_turn_degrees"],
+            places=12,
+        )
+        self.assertEqual(
+            min(samples),
+            evidence["turn"]["minimum_body_turn_degrees"],
+        )
+        self.assertEqual(
+            max(samples),
+            evidence["turn"]["maximum_body_turn_degrees"],
+        )
+        self.assertEqual(
+            round(
+                sample_mean
+                / evidence["turn"][
+                    "commanded_opposed_encoder_degrees_per_wheel"
+                ]
+                * 1_000
+            ),
+            evidence["turn"][
+                "derived_turn_mdeg_per_opposed_encoder_degree"
+            ],
+        )
+        self.assertEqual(
+            evidence["geometry"]["robot_footprint"],
+            calibration.footprint_status,
+        )
+        self.assertEqual(
+            evidence["geometry"]["range_sensor_extrinsics"],
+            calibration.range_sensor_extrinsics.calibration_status,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
