@@ -987,6 +987,37 @@ class BlastObservationMonitorTests(unittest.TestCase):
         release.set()
         monitor.close()
 
+    def test_connection_lifecycle_reuses_and_restarts_the_single_owner(self):
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+
+        accepted = monitor.connect()
+        self.assertIn(accepted["state"], {"connecting", "online"})
+        self.wait_for(monitor, "online")
+        self.assertEqual(monitor.connect()["state"], "online")
+        self.assertEqual(len(FakeRuntime.instances), 1)
+
+        disconnected = monitor.disconnect()
+        self.assertEqual(disconnected["state"], "stopped")
+        self.assertTrue(FakeRuntime.instances[0].closed)
+
+        retried = monitor.retry()
+        self.assertIn(retried["state"], {"connecting", "online"})
+        self.wait_for(monitor, "online")
+        self.assertEqual(len(FakeRuntime.instances), 2)
+        monitor.close()
+
+    def test_disconnect_before_connect_is_truthfully_stopped(self):
+        monitor = BlastObservationMonitor(runtime_factory=FakeRuntime)
+
+        snapshot = monitor.disconnect()
+
+        self.assertEqual(snapshot["state"], "stopped")
+        self.assertEqual(snapshot["reason_code"], "observer_stopped")
+        self.assertEqual(FakeRuntime.instances, [])
+
     def test_reconnects_after_hub_becomes_available(self):
         factory = RecoveringFactory()
         monitor = BlastObservationMonitor(

@@ -94,6 +94,7 @@ class BlastObservationMonitor:
         self._poll_interval_seconds = float(poll_interval_seconds)
         self._reconnect_interval_seconds = float(reconnect_interval_seconds)
         self._runtime_factory = runtime_factory
+        self._lifecycle_lock = threading.RLock()
         self._lock = threading.RLock()
         self._stop_requested = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -119,18 +120,40 @@ class BlastObservationMonitor:
         }
 
     def start(self) -> None:
-        with self._lock:
-            if self._thread is not None:
-                raise RuntimeError("BLAST observation monitor already started")
-            self._stop_requested.clear()
-            self._command_available.clear()
-            self._set_state("connecting", "connecting")
-            self._thread = threading.Thread(
-                target=self._run,
-                name="robot-llm-blast-observer",
-                daemon=True,
-            )
-            self._thread.start()
+        with self._lifecycle_lock:
+            with self._lock:
+                if self._thread is not None:
+                    raise RuntimeError(
+                        "BLAST observation monitor already started"
+                    )
+                self._stop_requested.clear()
+                self._command_available.clear()
+                self._set_state("connecting", "connecting")
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="robot-llm-blast-observer",
+                    daemon=True,
+                )
+                self._thread.start()
+
+    def connect(self):
+        with self._lifecycle_lock:
+            with self._lock:
+                running = self._thread is not None
+            if not running:
+                self.start()
+            return self.snapshot()
+
+    def disconnect(self):
+        with self._lifecycle_lock:
+            self.close()
+            return self.snapshot()
+
+    def retry(self):
+        with self._lifecycle_lock:
+            self.close()
+            self.start()
+            return self.snapshot()
 
     def snapshot(self):
         with self._lock:
@@ -212,25 +235,27 @@ class BlastObservationMonitor:
             ) from None
 
     def close(self) -> None:
-        with self._lock:
-            thread = self._thread
-        if thread is None:
-            return
-        self._stop_requested.set()
-        self._command_available.set()
-        with self._lock:
-            loop = self._loop
-            task = self._task
-        if loop is not None and task is not None:
-            try:
-                loop.call_soon_threadsafe(task.cancel)
-            except RuntimeError:
-                pass
-        thread.join(timeout=12.0)
-        if thread.is_alive():
-            raise RuntimeError("BLAST observation monitor did not stop")
-        with self._lock:
-            self._thread = None
+        with self._lifecycle_lock:
+            with self._lock:
+                thread = self._thread
+            if thread is None:
+                self._set_state("stopped", "observer_stopped")
+                return
+            self._stop_requested.set()
+            self._command_available.set()
+            with self._lock:
+                loop = self._loop
+                task = self._task
+            if loop is not None and task is not None:
+                try:
+                    loop.call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    pass
+            thread.join(timeout=12.0)
+            if thread.is_alive():
+                raise RuntimeError("BLAST observation monitor did not stop")
+            with self._lock:
+                self._thread = None
 
     def _set_state(self, state: str, reason_code: Optional[str], **changes) -> None:
         with self._lock:
