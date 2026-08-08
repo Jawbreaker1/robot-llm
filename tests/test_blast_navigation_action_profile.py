@@ -5,6 +5,7 @@ from robot_agent.blast_navigation_action_profile import (
     DRIVE_ENCODER_DEGREES,
     TURN_ENCODER_DEGREES_PER_PULSE,
     TURN_ENCODER_DEGREES_PER_QUARTER_TURN,
+    TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN,
     TURN_PULSES_PER_QUARTER_TURN,
     blast_navigation_action_specs,
 )
@@ -45,12 +46,24 @@ class BlastNavigationActionProfileTests(unittest.TestCase):
         )
         self.assertEqual(
             specs[TURN_LEFT_90]["target_mean_abs_encoder_degrees"],
-            TURN_ENCODER_DEGREES_PER_QUARTER_TURN,
+            TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN,
         )
         self.assertEqual(
             TURN_ENCODER_DEGREES_PER_QUARTER_TURN,
             TURN_ENCODER_DEGREES_PER_PULSE
             * TURN_PULSES_PER_QUARTER_TURN,
+        )
+        self.assertEqual(
+            TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN,
+            193,
+        )
+        self.assertEqual(
+            specs[TURN_LEFT_90]["estimated_body_turn_degrees"],
+            94.57,
+        )
+        self.assertEqual(
+            specs[TURN_RIGHT_90]["estimated_body_turn_degrees"],
+            -94.57,
         )
         for action, commands in BLAST_NAVIGATION_COMMANDS.items():
             with self.subTest(action=action):
@@ -73,8 +86,8 @@ class BlastNavigationActionProfileTests(unittest.TestCase):
 
         self.assertEqual((advance.x_mm, advance.y_mm), (45, 0))
         self.assertEqual((reverse.x_mm, reverse.y_mm), (-45, 0))
-        self.assertEqual(left.heading_mdeg, 93_960)
-        self.assertEqual(right.heading_mdeg, -93_960)
+        self.assertEqual(left.heading_mdeg, 94_570)
+        self.assertEqual(right.heading_mdeg, -94_570)
 
     def test_callers_cannot_mutate_the_checked_in_profile(self):
         changed = blast_navigation_action_specs()

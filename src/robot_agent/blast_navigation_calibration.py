@@ -115,13 +115,14 @@ class BlastNavigationCalibration:
 BLAST_PROVISIONAL_NAVIGATION_CALIBRATION = BlastNavigationCalibration(
     odometry=OdometryCalibration(
         linear_mm_per_encoder_degree=0.5,
-        turn_mdeg_per_opposed_encoder_degree=522,
+        turn_mdeg_per_opposed_encoder_degree=490,
     ),
-    odometry_status="provisional-live-range-and-imu-derived",
+    odometry_status="provisional-live-encoder-and-reference-derived",
     odometry_evidence=(
         "Two 90-degree drive pulses changed range 358->313->268 mm; "
-        "24 opposed 45-degree scan-turn samples averaged 23.477908 body "
-        "degrees"
+        "one four-pulse left turn used 194 actual opposed encoder degrees "
+        "for approximately 95 body degrees and the mirrored right turn "
+        "returned to the physical start pose"
     ),
     robot_footprint=RobotFootprint(
         front_extent_mm=110,

@@ -136,11 +136,11 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
                 )
                 self.assertEqual(pose.x_mm, expected_x)
 
-    def test_four_turn_receipts_produce_calibrated_quarter_turns(self):
+    def test_four_exact_command_receipts_apply_actual_encoder_scale(self):
         calibration = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
         cases = (
-            (TURN_LEFT_90, "turn_left", (-180, 180), 93_960),
-            (TURN_RIGHT_90, "turn_right", (180, -180), -93_960),
+            (TURN_LEFT_90, "turn_left", (-180, 180), 88_200),
+            (TURN_RIGHT_90, "turn_right", (180, -180), -88_200),
         )
         for action, command, totals, expected_heading in cases:
             with self.subTest(action=action):
@@ -211,7 +211,7 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
             ),
             (-181, 180),
         )
-        self.assertEqual(pose.heading_mdeg, 94_221)
+        self.assertEqual(pose.heading_mdeg, 88_445)
 
     def test_live_turn_receipts_keep_the_observed_settling_degree(self):
         results = [
@@ -223,6 +223,11 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
 
         raw = build(TURN_LEFT_90, results)
         motion = verified_motion_from_result(TURN_LEFT_90, raw)
+        pose = apply_verified_motion(
+            PhysicalPose(),
+            motion,
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+        )
 
         self.assertTrue(motion.complete)
         self.assertEqual(motion.observed_slice_count, 5)
@@ -245,6 +250,7 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
             ],
             [(-298, -299), (233, 233)],
         )
+        self.assertEqual(pose.heading_mdeg, 94_815)
 
     def test_settling_and_failed_command_keep_distinct_evidence(self):
         results = turn_results("turn_left")

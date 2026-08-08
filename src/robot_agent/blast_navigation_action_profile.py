@@ -28,15 +28,20 @@ TURN_PULSES_PER_QUARTER_TURN = 4
 TURN_ENCODER_DEGREES_PER_QUARTER_TURN = (
     TURN_ENCODER_DEGREES_PER_PULSE * TURN_PULSES_PER_QUARTER_TURN
 )
+# Live four-pulse turns delivered 194 and 191.5 mean absolute encoder
+# degrees.  The action target describes expected physical encoder evidence,
+# while the fixed command sequence above remains exactly 4 x 45 degrees.
+TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN = 193
 _ODOMETRY = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
 _NOMINAL_ADVANCE_MM = int(round(
     DRIVE_ENCODER_DEGREES * _ODOMETRY.linear_mm_per_encoder_degree
 ))
-_NOMINAL_QUARTER_TURN_DEGREES = int(round(
-    TURN_ENCODER_DEGREES_PER_QUARTER_TURN
+_NOMINAL_QUARTER_TURN_DEGREES = round(
+    TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN
     * _ODOMETRY.turn_mdeg_per_opposed_encoder_degree
-    / 1_000
-))
+    / 1_000,
+    2,
+)
 
 BLAST_NAVIGATION_COMMANDS = {
     ADVANCE: ("drive_forward",),
@@ -79,6 +84,12 @@ _TURN_EVIDENCE = {
     "commanded_encoder_degrees_per_pulse": (
         TURN_ENCODER_DEGREES_PER_PULSE
     ),
+    "commanded_encoder_degrees_total": (
+        TURN_ENCODER_DEGREES_PER_QUARTER_TURN
+    ),
+    "observed_mean_abs_encoder_degrees": (
+        TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN
+    ),
     "pulse_count": TURN_PULSES_PER_QUARTER_TURN,
     "estimated_body_turn_degrees": _NOMINAL_QUARTER_TURN_DEGREES,
 }
@@ -109,9 +120,9 @@ BLAST_NAVIGATION_ACTION_SPECS = {
         * TURN_PULSES_PER_QUARTER_TURN,
         estimated_body_turn_degrees=_NOMINAL_QUARTER_TURN_DEGREES,
         target_encoder_degrees=(
-            TURN_ENCODER_DEGREES_PER_QUARTER_TURN
+            TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN
         ),
-        calibration="provisional-live-imu-derived",
+        calibration="provisional-live-encoder-and-reference-derived",
         calibration_evidence=_TURN_EVIDENCE,
     ),
     TURN_RIGHT_90: _action_spec(
@@ -121,9 +132,9 @@ BLAST_NAVIGATION_ACTION_SPECS = {
         * TURN_PULSES_PER_QUARTER_TURN,
         estimated_body_turn_degrees=-_NOMINAL_QUARTER_TURN_DEGREES,
         target_encoder_degrees=(
-            TURN_ENCODER_DEGREES_PER_QUARTER_TURN
+            TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN
         ),
-        calibration="provisional-live-imu-derived",
+        calibration="provisional-live-encoder-and-reference-derived",
         calibration_evidence=_TURN_EVIDENCE,
     ),
 }
@@ -141,6 +152,7 @@ __all__ = (
     "DRIVE_ENCODER_DEGREES",
     "TURN_ENCODER_DEGREES_PER_PULSE",
     "TURN_ENCODER_DEGREES_PER_QUARTER_TURN",
+    "TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN",
     "TURN_PULSES_PER_QUARTER_TURN",
     "blast_navigation_action_specs",
 )

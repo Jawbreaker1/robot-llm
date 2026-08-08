@@ -44,7 +44,51 @@
     "mean_body_turn_degrees": 23.477908441666667,
     "minimum_body_turn_degrees": 21.743431199999975,
     "maximum_body_turn_degrees": 26.758320999999995,
-    "derived_turn_mdeg_per_opposed_encoder_degree": 522
+    "commanded_angle_ratio_mdeg_per_degree": 522,
+    "quarter_turn_validation": {
+      "observed_at_local_date": "2026-08-08",
+      "source": "Operator-observed manual dashboard command sequence",
+      "command_sequence": "turn_left x4 followed by turn_right x4",
+      "left": {
+        "before_encoder_degrees": {
+          "left_drive": -161,
+          "right_drive": 468
+        },
+        "after_encoder_degrees": {
+          "left_drive": -349,
+          "right_drive": 668
+        },
+        "encoder_deltas_degrees": {
+          "left_drive": -188,
+          "right_drive": 200
+        },
+        "actual_opposed_encoder_degrees": 194.0,
+        "operator_body_turn_degrees_approx": 95,
+        "operator_observation": "Very close to 90 degrees with slight over-rotation"
+      },
+      "right_return": {
+        "before_encoder_degrees": {
+          "left_drive": -349,
+          "right_drive": 668
+        },
+        "after_encoder_degrees": {
+          "left_drive": -154,
+          "right_drive": 480
+        },
+        "encoder_deltas_degrees": {
+          "left_drive": 195,
+          "right_drive": -188
+        },
+        "actual_opposed_encoder_degrees": 191.5,
+        "operator_observation": "Returned to the same physical position and heading"
+      },
+      "observed_mean_abs_encoder_degrees_per_action": 192.75,
+      "rounded_expected_encoder_degrees_per_action": 193,
+      "selected_provisional_turn_mdeg_per_actual_opposed_encoder_degree": 490,
+      "selection_basis": "Selected from the approximate 95 degree left reference turn over 194 actual opposed encoder degrees; right return validates symmetry but the physical angle remains approximate",
+      "imu_authority": "Not used for this selection because the IMU reported nonstationary or not ready and previously drifted 7.413 degrees without encoder motion"
+    },
+    "selected_turn_mdeg_per_actual_opposed_encoder_degree": 490
   },
   "physical_outcome": {
     "operator_start_distance_approx_mm": 400,
@@ -80,7 +124,8 @@
   },
   "limitations": [
     "Linear scale is provisional evidence from one stationary target and one floor surface",
-    "Turn scale is provisional IMU evidence from six scans and 24 bounded turn samples",
+    "Legacy scan ratio uses commanded angles and nonstationary IMU evidence and is not the selected actual-encoder odometry scale",
+    "Actual-encoder turn scale is provisional evidence from one physical left/right reference pair",
     "Footprint and range-sensor extrinsics are approximate folding-rule measurements",
     "Ultrasonic vertical pitch remains unmeasured and body pitch varies with the support wheels",
     "This evidence record is not consumed by the runtime"

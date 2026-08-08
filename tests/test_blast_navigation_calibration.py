@@ -30,7 +30,7 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
         )
         self.assertEqual(
             calibration.odometry.turn_mdeg_per_opposed_encoder_degree,
-            522,
+            490,
         )
         footprint, sensor = calibration.require_complete()
         self.assertEqual(
@@ -129,7 +129,7 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
         )
         self.assertEqual(
             evidence["turn"][
-                "derived_turn_mdeg_per_opposed_encoder_degree"
+                "selected_turn_mdeg_per_actual_opposed_encoder_degree"
             ],
             calibration.odometry.turn_mdeg_per_opposed_encoder_degree,
         )
@@ -157,9 +157,28 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
                 ]
                 * 1_000
             ),
-            evidence["turn"][
-                "derived_turn_mdeg_per_opposed_encoder_degree"
+            evidence["turn"]["commanded_angle_ratio_mdeg_per_degree"],
+        )
+        validation = evidence["turn"]["quarter_turn_validation"]
+        self.assertEqual(
+            validation[
+                "selected_provisional_turn_mdeg_per_actual_opposed_encoder_degree"
             ],
+            calibration.odometry.turn_mdeg_per_opposed_encoder_degree,
+        )
+        self.assertEqual(
+            validation["rounded_expected_encoder_degrees_per_action"],
+            193,
+        )
+        self.assertEqual(
+            validation["left"]["actual_opposed_encoder_degrees"],
+            194.0,
+        )
+        self.assertEqual(
+            validation["right_return"][
+                "actual_opposed_encoder_degrees"
+            ],
+            191.5,
         )
         self.assertEqual(
             evidence["geometry"]["robot_footprint"]["status"],
