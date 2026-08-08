@@ -48,6 +48,7 @@ class PhysicalNavigationRuntimeAdapter:
         event_mapper: Optional[
             Callable[[Mapping[str, object]], Optional[Mapping[str, object]]]
         ] = None,
+        controller_lease=None,
     ):
         for dependency in (
             transport_factory,
@@ -128,6 +129,11 @@ class PhysicalNavigationRuntimeAdapter:
             ActiveIrScanCalibration,
         ):
             raise ValueError("active scan calibration is invalid")
+        if controller_lease is not None and any(
+            not callable(getattr(controller_lease, name, None))
+            for name in ("acquire", "release")
+        ):
+            raise ValueError("controller lease is invalid")
         self.transport_factory = transport_factory
         self.planner_factory = planner_factory
         self.memory_factory = memory_factory
@@ -148,6 +154,7 @@ class PhysicalNavigationRuntimeAdapter:
         self.plan_tail_max_age_seconds = float(plan_tail_max_age_seconds)
         self.active_scan_calibration = active_scan_calibration
         self.event_mapper = event_mapper or self._dashboard_update
+        self.controller_lease = controller_lease
         self._lock = threading.Lock()
         self._active = None
 
@@ -254,6 +261,22 @@ class PhysicalNavigationRuntimeAdapter:
             return False
 
     def run(self, context) -> RobotEpisodeOutcome:
+        lease = self.controller_lease
+        if lease is not None and not lease.acquire(blocking=False):
+            raise PhysicalNavigationRuntimeError(
+                "controller_busy",
+                "The physical controller is already in use",
+            )
+        try:
+            return self._run_owned(context)
+        finally:
+            if lease is not None:
+                with self._lock:
+                    release_lease = self._active is None
+                if release_lease:
+                    lease.release()
+
+    def _run_owned(self, context) -> RobotEpisodeOutcome:
         reservation = object()
         with self._lock:
             if self._active is not None:

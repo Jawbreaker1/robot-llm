@@ -229,6 +229,20 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                     adapter.spatial_map_provider.snapshot()["status"],
                     "unavailable",
                 )
+                self.assertIs(
+                    adapter.controller_runtime_provider,
+                    adapter.controller_reachability_service,
+                )
+                self.assertIs(
+                    adapter.controller_lease,
+                    adapter.controller_reachability_service._lease,
+                )
+                self.assertEqual(
+                    adapter.controller_runtime_provider.snapshot()[
+                        "reachability"
+                    ]["status"],
+                    "not_checked",
+                )
 
                 self.assertIs(adapter.transport_factory(), transport_value)
                 transport_factory.assert_called_once_with(
@@ -307,6 +321,42 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                     speech_runtime_factory.call_args.kwargs["speaker"]
                 ))
                 planner_factory.assert_not_called()
+
+    def test_reachability_uses_the_bound_motion_free_preflight(self):
+        report = {
+            "status": "passed",
+            "effects": "motion_free",
+            "contract_checks": {
+                "motor_commands_issued": 0,
+                "shutdown_confirmed": True,
+                "motor_owner_closed": True,
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            binding = EV3SSHBinding(
+                profile_id=EV3RSTORM_PROFILE_ID,
+                target="robot@ev3dev.local",
+                memory_path=Path(directory) / "memory.json",
+            )
+            with mock.patch(
+                "robot_agent.ev3rstorm_profile."
+                "run_ev3_navigation_preflight",
+                return_value=report,
+            ) as preflight:
+                adapter = self.profile.build_adapter(
+                    binding,
+                    planner_factory=mock.Mock(),
+                )
+                preflight.assert_not_called()
+                result = adapter.controller_reachability_service.check()
+
+        self.assertEqual(result["reachability"]["status"], "passed")
+        preflight.assert_called_once_with(
+            "robot@ev3dev.local",
+            controller_id="ev3rstorm-01.ev3-main",
+            remote_worker_path=EV3RSTORM_REMOTE_WORKER_PATH,
+            connect_timeout_seconds=5,
+        )
 
     def test_default_speech_profile_is_swedish_nst_deep_only(self):
         self.assertEqual(

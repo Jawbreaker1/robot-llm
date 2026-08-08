@@ -19,6 +19,8 @@ from .controller_runtime_profile import (
 from .ev3_active_ir_scan_rig import build_ev3_active_ir_scan_executor
 from .ev3_audio_transport import EV3WAVSSHSession
 from .ev3_navigation_transport import EV3NavigationSSHTransport
+from .ev3_navigation_preflight_cli import run_ev3_navigation_preflight
+from .ev3_reachability import EV3ReachabilityProbe
 from .host_piper_speech import (
     HostPiperEV3Speaker,
     LocaleSpeechSynthesizer,
@@ -534,7 +536,24 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             controller_instance_id=self.descriptor.controller_id,
         )
 
-        return PhysicalNavigationRuntimeAdapter(
+        controller_lease = threading.Lock()
+
+        def check_reachability():
+            return run_ev3_navigation_preflight(
+                binding.target,
+                controller_id=self.descriptor.controller_id,
+                remote_worker_path=binding.remote_worker_path,
+                connect_timeout_seconds=binding.connect_timeout_seconds,
+            )
+
+        reachability = EV3ReachabilityProbe(
+            robot_id=self.descriptor.robot_id,
+            controller_id=self.descriptor.controller_id,
+            display_name=self.descriptor.display_name,
+            controller_lease=controller_lease,
+            preflight=check_reachability,
+        )
+        adapter = PhysicalNavigationRuntimeAdapter(
             transport_factory=transport_factory,
             planner_factory=planner_factory,
             memory_factory=memory_factory,
@@ -555,7 +574,13 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             active_scan_calibration=(
                 EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION
             ),
+            controller_lease=controller_lease,
         )
+        # Dashboard composition discovers these explicit, read-only seams
+        # without changing the existing profile return type.
+        adapter.controller_runtime_provider = reachability
+        adapter.controller_reachability_service = reachability
+        return adapter
 
 
 __all__ = (

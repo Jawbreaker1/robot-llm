@@ -3670,6 +3670,57 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
             ),
         })
 
+    def test_adapter_controller_lease_is_nonblocking_and_released(self):
+        lease = threading.Lock()
+        adapter = PhysicalNavigationRuntimeAdapter(
+            transport_factory=object,
+            planner_factory=lambda _model: object(),
+            memory_factory=object,
+            execution_contract=EV3NavigationExecutionContract(),
+            controller_lease=lease,
+        )
+        context = object()
+        adapter._run_owned = mock.Mock(return_value="completed")
+
+        lease.acquire()
+        try:
+            with self.assertRaises(PhysicalNavigationRuntimeError) as raised:
+                adapter.run(context)
+        finally:
+            lease.release()
+        self.assertEqual(raised.exception.code, "controller_busy")
+        adapter._run_owned.assert_not_called()
+
+        self.assertEqual(adapter.run(context), "completed")
+        self.assertTrue(lease.acquire(blocking=False))
+        lease.release()
+
+        adapter._run_owned.side_effect = RuntimeError("failed startup")
+        with self.assertRaisesRegex(RuntimeError, "failed startup"):
+            adapter.run(context)
+        self.assertTrue(lease.acquire(blocking=False))
+        lease.release()
+
+    def test_adapter_retains_controller_lease_for_unreaped_runtime(self):
+        lease = threading.Lock()
+        adapter = PhysicalNavigationRuntimeAdapter(
+            transport_factory=object,
+            planner_factory=lambda _model: object(),
+            memory_factory=object,
+            execution_contract=EV3NavigationExecutionContract(),
+            controller_lease=lease,
+        )
+
+        def leave_active(_context):
+            adapter._active = (object(), object(), "unreaped")
+            return "completed"
+
+        adapter._run_owned = leave_active
+        self.assertEqual(adapter.run(object()), "completed")
+        self.assertFalse(lease.acquire(blocking=False))
+        adapter._active = None
+        lease.release()
+
     def test_adapter_exposes_bridge_and_passes_only_its_offer_to_runtime(self):
         class Bridge:
             def offer(self, **_kwargs):
