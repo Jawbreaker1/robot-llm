@@ -165,6 +165,119 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
                 )
                 self.assertEqual(pose.heading_mdeg, expected_heading)
 
+    def test_bounded_inter_slice_settling_is_preserved_in_odometry(self):
+        results = turn_results("turn_left")
+        third_after = results[2]["observation"]["motor_angles_deg"]
+        fourth_before = (
+            third_after["left_drive"] - 1,
+            third_after["right_drive"],
+        )
+        results[3] = command_result(
+            "turn_left",
+            fourth_before,
+            (-45, 45),
+        )
+
+        raw = build(TURN_LEFT_90, results)
+        fourth = raw["outcome"]["slices"][3]
+        motion = verified_motion_from_result(TURN_LEFT_90, raw)
+        pose = apply_verified_motion(
+            PhysicalPose(),
+            motion,
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+        )
+
+        self.assertEqual(
+            [segment["kind"] for segment in fourth["segments"]],
+            ["inter_slice_settling", "commanded"],
+        )
+        self.assertEqual(
+            [
+                motor["position_delta"]
+                for motor in fourth["segments"][0]["motors"]
+            ],
+            [-1, 0],
+        )
+        self.assertFalse(
+            fourth["segments"][0]["encoder_verification"]["passed"]
+        )
+        self.assertTrue(motion.complete)
+        self.assertEqual(motion.observed_slice_count, 5)
+        self.assertEqual(motion.verified_slice_count, 4)
+        self.assertEqual(
+            (
+                motion.left_encoder_delta_degrees,
+                motion.right_encoder_delta_degrees,
+            ),
+            (-181, 180),
+        )
+        self.assertEqual(pose.heading_mdeg, 94_221)
+
+    def test_live_turn_receipts_keep_the_observed_settling_degree(self):
+        results = [
+            command_result("turn_left", (-158, 84), (-45, 51)),
+            command_result("turn_left", (-203, 135), (-46, 50)),
+            command_result("turn_left", (-249, 185), (-49, 48)),
+            command_result("turn_left", (-299, 233), (-47, 50)),
+        ]
+
+        raw = build(TURN_LEFT_90, results)
+        motion = verified_motion_from_result(TURN_LEFT_90, raw)
+
+        self.assertTrue(motion.complete)
+        self.assertEqual(motion.observed_slice_count, 5)
+        self.assertEqual(motion.verified_slice_count, 4)
+        self.assertEqual(
+            (
+                motion.left_encoder_delta_degrees,
+                motion.right_encoder_delta_degrees,
+            ),
+            (-188, 199),
+        )
+        settling = raw["outcome"]["slices"][3]["segments"][0]
+        self.assertEqual(
+            [
+                (
+                    motor["position_before"],
+                    motor["position_after"],
+                )
+                for motor in settling["motors"]
+            ],
+            [(-298, -299), (233, 233)],
+        )
+
+    def test_settling_and_failed_command_keep_distinct_evidence(self):
+        results = turn_results("turn_left")
+        third_after = results[2]["observation"]["motor_angles_deg"]
+        results[3] = command_result(
+            "turn_left",
+            (
+                third_after["left_drive"] - 1,
+                third_after["right_drive"],
+            ),
+            (0, 45),
+        )
+
+        raw = build(TURN_LEFT_90, results)
+        settling, commanded = raw["outcome"]["slices"][3]["segments"]
+
+        self.assertEqual(
+            settling["encoder_verification"],
+            {
+                "passed": False,
+                "error": "uncommanded encoder settling",
+                "checks": [
+                    {"side": "left", "passed": True},
+                    {"side": "right", "passed": True},
+                ],
+            },
+        )
+        self.assertEqual(
+            commanded["encoder_verification"]["error"],
+            "encoder direction missing",
+        )
+        self.assertEqual(raw["outcome"]["status"], "verification_failed")
+
     def test_actual_unequal_travel_is_not_replaced_by_nominal(self):
         results = [command_result("drive_forward", (0, 0), (71, 83))]
         motion = verified_motion_from_result(ADVANCE, build(ADVANCE, results))
@@ -232,9 +345,15 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
             build_blast_navigation_motion_result(
                 ADVANCE,
                 drive,
-                expected_start_angles={"left_drive": 1, "right_drive": 0},
+                expected_start_angles={"left_drive": -1, "right_drive": 0},
                 canonical_observation=canonical_observation(drive),
             )
+        self.assertEqual(caught.exception.code, "blast_motion_slice_discontinuous")
+
+        turns = turn_results("turn_left")
+        turns[1]["receipt"]["before_angles_deg"]["left_drive"] -= 2
+        with self.assertRaises(PhysicalNavigationContractError) as caught:
+            build(TURN_LEFT_90, turns)
         self.assertEqual(caught.exception.code, "blast_motion_slice_discontinuous")
 
         turns = turn_results("turn_left")

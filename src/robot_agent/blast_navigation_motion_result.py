@@ -31,6 +31,7 @@ _RESULT_FIELDS = frozenset((
     "schema", "robot_id", "controller_id", "command", "accepted",
     "completed", "receipt", "observation", "observation_settled",
 ))
+_MAX_INTER_SLICE_SETTLING_DEGREES = 1
 
 
 def _fail(code, message):
@@ -121,25 +122,67 @@ def _decode_result(command, result):
     return before, after, deltas, checks
 
 
-def _slice(index, count, duration_ms, before, after, checks):
-    verified = all(checks)
+def _motors(before, after):
+    return [
+        {
+            "side": side,
+            "role": role,
+            "position_before": start,
+            "position_after": end,
+            "position_delta": end - start,
+            "state": "",
+        }
+        for side, role, start, end in zip(_SIDES, _ROLES, before, after)
+    ]
+
+
+def _segment(
+    *,
+    kind,
+    commanded_sides,
+    before,
+    after,
+    checks,
+    verified,
+    error,
+    reason,
+):
     return {
+        "kind": kind,
+        "commanded_sides": list(commanded_sides),
+        "status": "completed",
+        "reason": reason,
+        "motors": _motors(before, after),
+        "encoder_verification": {
+            "passed": verified,
+            "error": error,
+            "checks": [
+                {"side": side, "passed": passed}
+                for side, passed in zip(_SIDES, checks)
+            ],
+        },
+        "stop": deepcopy(_CLEAN_STOP),
+    }
+
+
+def _slice(
+    index,
+    count,
+    duration_ms,
+    before,
+    command_before,
+    after,
+    checks,
+    settling_checks,
+):
+    verified = all(checks)
+    result = {
         "slice_index": index,
         "slice_count": count,
         "duration_ms": duration_ms,
         "status": "completed",
         "reason": "angle_command_completed",
-        "motors": [
-            {
-                "side": side,
-                "role": role,
-                "position_before": start,
-                "position_after": end,
-                "position_delta": end - start,
-                "state": "",
-            }
-            for side, role, start, end in zip(_SIDES, _ROLES, before, after)
-        ],
+        "motors": _motors(before, after),
         "encoder_verification": {
             "passed": verified,
             "error": None if verified else "encoder direction missing",
@@ -150,6 +193,30 @@ def _slice(index, count, duration_ms, before, after, checks):
         },
         "stop": deepcopy(_CLEAN_STOP),
     }
+    if command_before != before:
+        result["segments"] = [
+            _segment(
+                kind="inter_slice_settling",
+                commanded_sides=(),
+                before=before,
+                after=command_before,
+                checks=settling_checks,
+                verified=False,
+                error="uncommanded encoder settling",
+                reason="inter_slice_encoder_settling_observed",
+            ),
+            _segment(
+                kind="commanded",
+                commanded_sides=_SIDES,
+                before=command_before,
+                after=after,
+                checks=checks,
+                verified=verified,
+                error=None if verified else "encoder direction missing",
+                reason="angle_command_completed",
+            ),
+        ]
+    return result
 
 
 def _correlated_observation(value, final_angles, outcome):
@@ -207,13 +274,37 @@ def build_blast_navigation_motion_result(
     slices = []
     for index, (command, result) in enumerate(zip(commands, command_results), 1):
         before, after, _deltas, checks = _decode_result(command, result)
+        settling_checks = None
         if before != previous_after:
-            _fail(
-                "blast_motion_slice_discontinuous",
-                "BLAST motion has an unobserved encoder gap",
+            _direction, _speed, _field, _angle, signs = _command_profile(
+                command
+            )
+            settling = tuple(
+                current - previous
+                for previous, current in zip(previous_after, before)
+            )
+            if index == 1 or any(
+                abs(delta) > _MAX_INTER_SLICE_SETTLING_DEGREES
+                or (delta != 0 and delta * sign < 0)
+                for delta, sign in zip(settling, signs)
+            ):
+                _fail(
+                    "blast_motion_slice_discontinuous",
+                    "BLAST motion has an unobserved encoder gap",
+                )
+            settling_checks = tuple(
+                delta == 0 or delta * sign > 0
+                for delta, sign in zip(settling, signs)
             )
         slices.append(_slice(
-            index, len(commands), durations[index - 1], before, after, checks,
+            index,
+            len(commands),
+            durations[index - 1],
+            previous_after,
+            before,
+            after,
+            checks,
+            settling_checks,
         ))
         previous_after = after
 
