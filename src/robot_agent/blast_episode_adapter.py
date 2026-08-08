@@ -345,6 +345,7 @@ class BlastEpisodeRuntimeAdapter:
                 history_item = {
                     "action": decision.action,
                     "assessment": decision.assessment,
+                    "plan": list(decision.plan),
                     "result_observation": result_observation,
                     "observation_settled": command_result.get(
                         "observation_settled"

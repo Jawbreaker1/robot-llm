@@ -191,7 +191,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         planner = Planner([
             decision(
                 "ADVANCE",
-                plan=("ADVANCE", COMPLETE),
+                plan=("ADVANCE", TURN_LEFT_90, COMPLETE),
                 assessment="Move one bounded pulse.",
             ),
             decision(
@@ -211,6 +211,18 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             planner.contexts[1].history[0]["action"],
             "ADVANCE",
         )
+        self.assertEqual(
+            planner.contexts[1].history[0]["plan"],
+            ["ADVANCE", TURN_LEFT_90, COMPLETE],
+        )
+        self.assertIsInstance(
+            planner.contexts[1].history[0]["plan"],
+            list,
+        )
+        self.assertIsNot(
+            planner.contexts[1].history[0]["plan"],
+            updates[0]["plan"],
+        )
         self.assertTrue(
             planner.contexts[1].history[0]["observation_settled"]
         )
@@ -218,7 +230,10 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             planner.contexts[1].observation["sensors"]["distance_mm"],
             455,
         )
-        self.assertEqual(updates[0]["plan"], ["ADVANCE", COMPLETE])
+        self.assertEqual(
+            updates[0]["plan"],
+            ["ADVANCE", TURN_LEFT_90, COMPLETE],
+        )
         self.assertEqual(
             planner.contexts[0].observation["navigation_reference"],
             {
