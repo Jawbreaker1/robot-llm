@@ -276,17 +276,13 @@ def build_blast_navigation_motion_result(
         before, after, _deltas, checks = _decode_result(command, result)
         settling_checks = None
         if before != previous_after:
-            _direction, _speed, _field, _angle, signs = _command_profile(
-                command
-            )
             settling = tuple(
                 current - previous
                 for previous, current in zip(previous_after, before)
             )
             if index == 1 or any(
                 abs(delta) > _MAX_INTER_SLICE_SETTLING_DEGREES
-                or (delta != 0 and delta * sign < 0)
-                for delta, sign in zip(settling, signs)
+                for delta in settling
             ):
                 _fail(
                     "blast_motion_slice_discontinuous",
@@ -298,8 +294,8 @@ def build_blast_navigation_motion_result(
                     ),
                 )
             settling_checks = tuple(
-                delta == 0 or delta * sign > 0
-                for delta, sign in zip(settling, signs)
+                abs(delta) <= _MAX_INTER_SLICE_SETTLING_DEGREES
+                for delta in settling
             )
         slices.append(_slice(
             index,

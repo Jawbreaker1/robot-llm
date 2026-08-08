@@ -13,6 +13,7 @@ from robot_agent.blast_observation_monitor import (
 from robot_agent.physical_navigation_contract import (
     ADVANCE,
     TURN_LEFT_90,
+    TURN_RIGHT_90,
     PhysicalNavigationContractError,
 )
 
@@ -163,6 +164,56 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertEqual(result.motion.verified_slice_count, 4)
         self.assertEqual(result.motion.observed_slice_count, 5)
         self.assertEqual(result.pose.heading_mdeg, 94_815)
+
+    def test_opposite_single_degree_backlash_remains_localizable(self):
+        controller, executor = self.executor()
+        original_command = controller.command
+        calls = 0
+
+        def command(name, *, cancel_requested=None):
+            nonlocal calls
+            if calls == 2:
+                controller.next_gap = (-1, 0)
+            calls += 1
+            return original_command(
+                name,
+                cancel_requested=cancel_requested,
+            )
+
+        controller.command = command
+
+        result = executor.execute(TURN_RIGHT_90)
+
+        self.assertTrue(result.motion.complete)
+        self.assertEqual(result.motion.observed_slice_count, 5)
+        self.assertEqual(result.pose.heading_mdeg, -93_835)
+        self.assertTrue(executor.localization_valid)
+
+    def test_two_degree_internal_gap_still_latches_localization(self):
+        controller, executor = self.executor()
+        original_command = controller.command
+        calls = 0
+
+        def command(name, *, cancel_requested=None):
+            nonlocal calls
+            if calls == 2:
+                controller.next_gap = (-2, 0)
+            calls += 1
+            return original_command(
+                name,
+                cancel_requested=cancel_requested,
+            )
+
+        controller.command = command
+
+        with self.assertRaises(PhysicalNavigationContractError) as raised:
+            executor.execute(TURN_RIGHT_90)
+
+        self.assertEqual(
+            raised.exception.code,
+            "blast_motion_slice_discontinuous",
+        )
+        self.assertFalse(executor.localization_valid)
 
     def test_cancelled_turn_retains_only_observed_prefix(self):
         controller, executor = self.executor()

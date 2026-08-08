@@ -370,11 +370,81 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
             ),
         )
 
-        turns = turn_results("turn_left")
-        turns[1]["receipt"]["before_angles_deg"]["left_drive"] += 1
+    def test_opposite_single_degree_settling_is_explicit_blast_odometry(self):
+        results = turn_results("turn_right", count=2)
+        second_after = results[-1]["observation"]["motor_angles_deg"]
+        results.append(command_result(
+            "turn_right",
+            (second_after["left_drive"] - 1, second_after["right_drive"]),
+            (45, -45),
+        ))
+        third_after = results[-1]["observation"]["motor_angles_deg"]
+        results.append(command_result(
+            "turn_right",
+            (third_after["left_drive"], third_after["right_drive"]),
+            (45, -45),
+        ))
+
+        raw = build(TURN_RIGHT_90, results)
+        motion = verified_motion_from_result(TURN_RIGHT_90, raw)
+        settling = raw["outcome"]["slices"][2]["segments"][0]
+
+        self.assertEqual(settling["kind"], "inter_slice_settling")
+        self.assertEqual(
+            [motor["position_delta"] for motor in settling["motors"]],
+            [-1, 0],
+        )
+        self.assertEqual(
+            (
+                motion.left_encoder_delta_degrees,
+                motion.right_encoder_delta_degrees,
+            ),
+            (179, -180),
+        )
         with self.assertRaises(PhysicalNavigationContractError) as caught:
-            build(TURN_LEFT_90, turns)
-        self.assertEqual(caught.exception.code, "blast_motion_slice_discontinuous")
+            apply_verified_motion(
+                PhysicalPose(),
+                motion,
+                BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+            )
+        self.assertEqual(caught.exception.code, "encoder_direction_mismatch")
+
+        pose = apply_verified_motion(
+            PhysicalPose(),
+            motion,
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+            max_uncommanded_drift_degrees=1,
+        )
+        self.assertEqual(pose.heading_mdeg, -87_955)
+
+        with self.assertRaises(PhysicalNavigationContractError) as invalid:
+            apply_verified_motion(
+                PhysicalPose(),
+                motion,
+                max_uncommanded_drift_degrees=2,
+            )
+        self.assertEqual(
+            invalid.exception.code,
+            "invalid_uncommanded_drift_limit",
+        )
+
+        commanded_wrong_way = verified_motion_from_result(
+            TURN_RIGHT_90,
+            build(
+                TURN_RIGHT_90,
+                [command_result("turn_right", (0, 0), (-1, 0))],
+            ),
+        )
+        with self.assertRaises(PhysicalNavigationContractError) as commanded:
+            apply_verified_motion(
+                PhysicalPose(),
+                commanded_wrong_way,
+                max_uncommanded_drift_degrees=1,
+            )
+        self.assertEqual(
+            commanded.exception.code,
+            "encoder_direction_mismatch",
+        )
 
     def test_wrong_direction_is_retained_and_odometry_fails_closed(self):
         cases = (
@@ -394,6 +464,7 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
                         PhysicalPose(),
                         motion,
                         BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+                        max_uncommanded_drift_degrees=1,
                     )
                 self.assertEqual(caught.exception.code, "encoder_direction_mismatch")
 

@@ -157,6 +157,7 @@ class EncoderMotionSegment:
     right_encoder_delta_degrees: int
     command_verified: bool
     status: str
+    kind: str = "commanded"
 
 
 @dataclass(frozen=True)
@@ -412,6 +413,7 @@ def verified_motion_from_result(
                         segment_verification.get("passed") is True
                     ),
                     status=segment.get("status"),
+                    kind=segment.get("kind", "commanded"),
                 )
             )
         added = segments[segment_start:]
@@ -495,8 +497,19 @@ def apply_verified_motion(
     pose: PhysicalPose,
     motion: VerifiedMotion,
     calibration: OdometryCalibration = OdometryCalibration(),
+    *,
+    max_uncommanded_drift_degrees: int = 0,
 ) -> PhysicalPose:
     """Apply clean, direction-consistent encoder evidence to local odometry."""
+
+    if (
+        type(max_uncommanded_drift_degrees) is not int
+        or not 0 <= max_uncommanded_drift_degrees <= 1
+    ):
+        raise PhysicalNavigationContractError(
+            "invalid_uncommanded_drift_limit",
+            "Uncommanded encoder drift limit is invalid",
+        )
 
     segments = motion.segments
     if not segments and motion.verified_slice_count:
@@ -510,6 +523,7 @@ def apply_verified_motion(
                 ),
                 command_verified=motion.complete,
                 status=motion.status,
+                kind="commanded",
             ),
         )
     if not segments:
@@ -528,7 +542,15 @@ def apply_verified_motion(
     for segment in segments:
         left = segment.left_encoder_delta_degrees
         right = segment.right_encoder_delta_degrees
-        _validate_direction(motion.action, left, right)
+        bounded_uncommanded_drift = (
+            max_uncommanded_drift_degrees > 0
+            and segment.kind == "inter_slice_settling"
+            and segment.command_verified is False
+            and abs(left) <= max_uncommanded_drift_degrees
+            and abs(right) <= max_uncommanded_drift_degrees
+        )
+        if not bounded_uncommanded_drift:
+            _validate_direction(motion.action, left, right)
         center_mm = (
             (left + right)
             / 2.0

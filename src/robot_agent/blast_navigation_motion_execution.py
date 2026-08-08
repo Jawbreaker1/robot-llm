@@ -194,6 +194,7 @@ class BlastNavigationMotionExecutor:
                 self._pose,
                 motion,
                 BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+                max_uncommanded_drift_degrees=1,
             )
         except Exception:
             if command_attempted:
