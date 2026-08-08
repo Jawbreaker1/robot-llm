@@ -377,7 +377,6 @@
     }
 
     function renderGlobalStatus() {
-      const robotStatus = byId("status-ev3");
       const motionStatus = byId("status-motion");
       const stateStatus = control.state === "FAULTED"
         ? "fault"
@@ -386,13 +385,6 @@
           : control.state === "IDLE"
             ? "ready"
             : "offline";
-      if (robotStatus) {
-        robotStatus.dataset.status = stateStatus;
-        const value = robotStatus.querySelector(".status-value");
-        if (value) {
-          value.textContent = stateTranslation(control.state);
-        }
-      }
       if (motionStatus) {
         motionStatus.dataset.status = stateStatus;
         const value = motionStatus.querySelector(".status-value");

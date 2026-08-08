@@ -748,6 +748,13 @@ class DashboardServiceTests(unittest.TestCase):
             all(not node["control_exposed"] for node in registry["nodes"])
         )
         self.assertEqual(bootstrap["runtime"]["controllers"], [])
+        self.assertEqual(
+            bootstrap["runtime"]["ev3"],
+            {
+                "state": "unobserved",
+                "reason_code": "physical_probe_not_run",
+            },
+        )
         self.assertFalse(bootstrap["capabilities"]["ssh"])
         self.assertEqual(
             bootstrap["capabilities"]["spatial_map"],
@@ -1025,6 +1032,10 @@ class DashboardServiceTests(unittest.TestCase):
         self.assertEqual(
             bootstrap["runtime"]["controllers"],
             [runtime_snapshot],
+        )
+        self.assertEqual(
+            bootstrap["runtime"]["ev3"]["state"],
+            "unobserved",
         )
         blast = next(
             robot

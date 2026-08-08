@@ -620,6 +620,7 @@ process.stdout.write(JSON.stringify({
             "event-table-body",
             "settings-form",
             "status-motion",
+            "status-ev3",
             "status-blast",
             "controller-details",
         }
@@ -630,6 +631,9 @@ process.stdout.write(JSON.stringify({
         self.assertIn('controller.controller_id === "blast-01.hub"', self.controller_panel)
         self.assertIn('"status-blast"', self.controller_panel)
         self.assertIn("runtimeObject.controllers", self.javascript)
+        self.assertIn("controllerPanel.statusTone(ev3State)", self.javascript)
+        self.assertIn('state === "connecting"', self.controller_panel)
+        self.assertIn('state === "offline" || state === "stopped"', self.controller_panel)
         self.assertIn("observation.distance_mm", self.controller_panel)
         self.assertIn("observation.motor_angles_deg", self.controller_panel)
         self.assertIn(
@@ -2273,6 +2277,14 @@ process.stdout.write(JSON.stringify({
         )
         self.assertIn(
             "if (!shouldApplySnapshot(control, next))",
+            self.robot_control,
+        )
+        self.assertNotIn(
+            'byId("status-ev3")',
+            self.robot_control,
+        )
+        self.assertIn(
+            'const motionStatus = byId("status-motion");',
             self.robot_control,
         )
         self.assertEqual(

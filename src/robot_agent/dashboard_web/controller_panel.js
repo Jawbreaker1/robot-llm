@@ -322,6 +322,16 @@
       return runtime ? { ...node, lifecycle: runtime.state } : node;
     }
 
+    function statusTone(state) {
+      return state === "online"
+        ? "online"
+        : state === "connecting"
+          ? "busy"
+          : state === "offline" || state === "stopped"
+            ? "offline"
+            : "idle";
+    }
+
     function renderBlastStatus(runtimeControllers) {
       const blast = runtimes(runtimeControllers).find(
         (controller) => controller.controller_id === "blast-01.hub",
@@ -329,13 +339,7 @@
       const state = text(blast.state, "unobserved");
       setStatus(
         "status-blast",
-        state === "online"
-          ? "online"
-          : state === "connecting"
-            ? "busy"
-            : state === "offline"
-              ? "offline"
-              : "idle",
+        statusTone(state),
         humanState(state),
       );
     }
@@ -347,6 +351,7 @@
       runtimeIndex,
       runtimes,
       stateForRobot,
+      statusTone,
       visibleRobots,
     });
   }

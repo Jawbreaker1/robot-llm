@@ -370,7 +370,7 @@
     const ev3State = safeText(ev3.state, "unobserved");
     setStatus(
       "status-ev3",
-      ev3State === "online" ? "online" : ev3State === "offline" ? "idle" : "idle",
+      controllerPanel.statusTone(ev3State),
       humanState(ev3State),
     );
 
