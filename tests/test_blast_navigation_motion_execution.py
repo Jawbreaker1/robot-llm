@@ -1,7 +1,8 @@
 import unittest
 
 from robot_agent.blast_navigation_motion_execution import (
-    MAX_RESTORED_SCAN_ENCODER_RESIDUE_DEGREES,
+    MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES,
+    MAX_RESTORED_SCAN_OPPOSED_RESIDUE_DEGREES,
     BlastNavigationMotionExecutor,
 )
 from robot_agent.blast_observation_monitor import (
@@ -300,6 +301,20 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertEqual(pose_after_scan.y_mm, 0)
         self.assertEqual(result.pose.heading_mdeg, 94_570)
 
+    def test_live_scan_common_mode_residue_reanchors_without_false_pose(self):
+        controller, executor = self.executor()
+        controller.angles["left_drive"] += 16
+        controller.angles["right_drive"] += 10
+
+        reanchored = executor.reanchor_after_restored_scan(
+            scan_result(controller, restored=True)
+        )
+
+        self.assertTrue(reanchored)
+        self.assertEqual(executor.pose.x_mm, 0)
+        self.assertEqual(executor.pose.y_mm, 0)
+        self.assertTrue(executor.localization_valid)
+
     def test_unrestored_scan_residue_blocks_motion_before_command(self):
         controller, executor = self.executor()
         controller.angles["left_drive"] += 8
@@ -317,11 +332,28 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertFalse(executor.localization_valid)
         self.assertEqual(controller.commands, [])
 
-    def test_excessive_restored_scan_residue_is_not_discarded(self):
+    def test_excessive_common_mode_scan_residue_is_not_discarded(self):
         controller, executor = self.executor()
-        controller.angles["left_drive"] += (
-            MAX_RESTORED_SCAN_ENCODER_RESIDUE_DEGREES + 1
+        excessive = MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES + 1
+        controller.angles["left_drive"] += excessive
+        controller.angles["right_drive"] += excessive
+
+        with self.assertRaises(PhysicalNavigationContractError) as raised:
+            executor.reanchor_after_restored_scan(
+                scan_result(controller, restored=True)
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "blast_scan_encoder_residue_excessive",
         )
+        self.assertFalse(executor.localization_valid)
+
+    def test_excessive_opposed_scan_residue_is_not_discarded(self):
+        controller, executor = self.executor()
+        excessive = MAX_RESTORED_SCAN_OPPOSED_RESIDUE_DEGREES + 1
+        controller.angles["left_drive"] += excessive
+        controller.angles["right_drive"] -= excessive
 
         with self.assertRaises(PhysicalNavigationContractError) as raised:
             executor.reanchor_after_restored_scan(

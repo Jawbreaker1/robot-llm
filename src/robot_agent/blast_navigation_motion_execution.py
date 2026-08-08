@@ -23,7 +23,11 @@ from .physical_odometry import (
 
 
 _DRIVE_ROLES = ("left_drive", "right_drive")
-MAX_RESTORED_SCAN_ENCODER_RESIDUE_DEGREES = int(round(
+MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES = int(round(
+    10 / BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
+    .linear_mm_per_encoder_degree
+))
+MAX_RESTORED_SCAN_OPPOSED_RESIDUE_DEGREES = int(round(
     SCAN_RESTORATION_TOLERANCE_DEG * 1_000 /
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
     .turn_mdeg_per_opposed_encoder_degree
@@ -128,10 +132,15 @@ class BlastNavigationMotionExecutor:
         except Exception:
             self._localization_valid = False
             raise
-        if any(
-            abs(angles[role] - self._expected_start_angles[role])
-            > MAX_RESTORED_SCAN_ENCODER_RESIDUE_DEGREES
+        residue = tuple(
+            angles[role] - self._expected_start_angles[role]
             for role in _DRIVE_ROLES
+        )
+        if (
+            abs(sum(residue))
+            > 2 * MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES
+            or abs(residue[1] - residue[0])
+            > 2 * MAX_RESTORED_SCAN_OPPOSED_RESIDUE_DEGREES
         ):
             self._invalidate("blast_scan_encoder_residue_excessive",
                              "BLAST scan left excessive encoder residue")
@@ -209,5 +218,6 @@ class BlastNavigationMotionExecutor:
             motion=motion,
             pose=pose,
         )
-__all__ = ("MAX_RESTORED_SCAN_ENCODER_RESIDUE_DEGREES",
+__all__ = ("MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES",
+           "MAX_RESTORED_SCAN_OPPOSED_RESIDUE_DEGREES",
            "BlastNavigationMotionExecution", "BlastNavigationMotionExecutor")
