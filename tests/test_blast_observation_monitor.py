@@ -1018,6 +1018,38 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(snapshot["reason_code"], "observer_stopped")
         self.assertEqual(FakeRuntime.instances, [])
 
+    def test_disconnect_closes_command_admission_before_runtime_cleanup(self):
+        cleanup_started = threading.Event()
+        release_cleanup = threading.Event()
+
+        class SlowCloseRuntime(FakeRuntime):
+            async def close(self):
+                cleanup_started.set()
+                await __import__("asyncio").to_thread(
+                    release_cleanup.wait,
+                    2.0,
+                )
+                await super().close()
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=SlowCloseRuntime,
+        )
+        monitor.connect()
+        self.wait_for(monitor, "online")
+        disconnect_thread = threading.Thread(target=monitor.disconnect)
+        disconnect_thread.start()
+        self.assertTrue(cleanup_started.wait(timeout=1.0))
+
+        with self.assertRaises(BlastControllerError) as rejected:
+            monitor.command("claw_open")
+
+        self.assertEqual(rejected.exception.code, "controller_unavailable")
+        release_cleanup.set()
+        disconnect_thread.join(timeout=1.0)
+        self.assertFalse(disconnect_thread.is_alive())
+        self.assertEqual(monitor.snapshot()["state"], "stopped")
+
     def test_reconnects_after_hub_becomes_available(self):
         factory = RecoveringFactory()
         monitor = BlastObservationMonitor(

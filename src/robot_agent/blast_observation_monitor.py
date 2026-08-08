@@ -134,7 +134,12 @@ class BlastObservationMonitor:
                     name="robot-llm-blast-observer",
                     daemon=True,
                 )
-                self._thread.start()
+                try:
+                    self._thread.start()
+                except Exception:
+                    self._thread = None
+                    self._set_state("offline", "observer_start_failed")
+                    raise
 
     def connect(self):
         with self._lifecycle_lock:
@@ -241,6 +246,7 @@ class BlastObservationMonitor:
             if thread is None:
                 self._set_state("stopped", "observer_stopped")
                 return
+            self._set_state("offline", "disconnecting")
             self._stop_requested.set()
             self._command_available.set()
             with self._lock:
@@ -254,6 +260,12 @@ class BlastObservationMonitor:
             thread.join(timeout=12.0)
             if thread.is_alive():
                 raise RuntimeError("BLAST observation monitor did not stop")
+            self._reject_commands(
+                BlastControllerError(
+                    "controller_unavailable",
+                    "BLAST connection ended",
+                )
+            )
             with self._lock:
                 self._thread = None
 
