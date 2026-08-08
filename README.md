@@ -167,6 +167,35 @@ ROBOT_LLM_STT_URL='' scripts/start_lab_console.sh \
 The empty STT URL starts without speech recognition. Follow the
 [dashboard guide](docs/DASHBOARD.md) to add the local whisper.cpp service.
 
+## Start the robot console
+
+The normal two-controller lab starts with one command:
+
+```sh
+scripts/start_robot_console.sh
+```
+
+This assumes the default local speech-recognition service is running. To start
+without voice input, use `ROBOT_LLM_STT_URL='' scripts/start_robot_console.sh`.
+
+This configures EV3RSTORM and BLAST without contacting either robot. Power them
+on afterwards, then use **Bodies → Check connection** for EV3 and
+**Bodies → Connect** for BLAST. The defaults are `robot@ev3dev.local` and
+`BLAST-01`; different names can be supplied without editing the scripts:
+
+```sh
+ROBOT_LLM_EV3_TARGET='robot@192.168.1.50' \
+ROBOT_LLM_BLAST_HUB_NAME='MY-BLAST' \
+  scripts/start_robot_console.sh
+```
+
+The combined profile currently uses EV3 as the active goal executor while
+BLAST, once connected, remains available for telemetry and bounded controller
+actions. Use
+`scripts/start_ev3rstorm_console.sh` or `scripts/start_blast_console.sh` when
+only one robot should be configured. All launchers reuse the same application
+entry point and prefer the repository's `.venv` when it exists.
+
 ## Running with a physical EV3
 
 The physical path requires an EV3 running ev3dev, a network connection to the
@@ -179,13 +208,15 @@ motion-free deployment checks in:
 - [EV3 Wi-Fi setup](docs/EV3_WIFI.md)
 - [EV3 runtime deployment](docs/EV3_RUNTIME_DEPLOYMENT.md)
 
-Then start the explicit EV3 profile:
+Then start the explicit EV3 profile. Its default target is
+`robot@ev3dev.local`:
 
 ```sh
 ROBOT_LLM_STT_URL='' scripts/start_ev3rstorm_console.sh \
-  --robot-target 'robot@<EV3-host>' \
   --model 'EXACT-MODEL-ID-FROM-LM-STUDIO'
 ```
+
+Set `ROBOT_LLM_EV3_TARGET` when the brick uses another hostname or address.
 
 Omit the STT override when the local speech-recognition service is configured.
 The dashboard may be started before the EV3 is powered on. After the brick has
@@ -220,8 +251,8 @@ To run BLAST as the dashboard's active physical agent:
 
 ```sh
 ROBOT_LLM_PYTHON=.venv/bin/python ROBOT_LLM_STT_URL='' \
-  scripts/start_lab_console.sh --blast-hub-name BLAST-01 \
-  --robot-profile blast-01 --model 'EXACT-MODEL-ID-FROM-LM-STUDIO'
+  scripts/start_blast_console.sh \
+  --model 'EXACT-MODEL-ID-FROM-LM-STUDIO'
 ```
 
 This optional toolchain requires Python 3.10 or newer. Disconnect Pybricks Code

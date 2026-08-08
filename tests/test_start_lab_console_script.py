@@ -8,10 +8,18 @@ import unittest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 START_SCRIPT = PROJECT_ROOT / "scripts" / "start_lab_console.sh"
+EV3_START_SCRIPT = PROJECT_ROOT / "scripts" / "start_ev3rstorm_console.sh"
+BLAST_START_SCRIPT = PROJECT_ROOT / "scripts" / "start_blast_console.sh"
+ROBOT_START_SCRIPT = PROJECT_ROOT / "scripts" / "start_robot_console.sh"
 
 
 class StartLabConsoleScriptTests(unittest.TestCase):
-    def _captured_launch(self, extra_environment=None, *arguments):
+    def _captured_launch(
+        self,
+        extra_environment=None,
+        *arguments,
+        start_script=START_SCRIPT,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             fake_python = Path(directory) / "fake-python"
             fake_python.write_text(
@@ -36,7 +44,7 @@ class StartLabConsoleScriptTests(unittest.TestCase):
                 environment.update(extra_environment)
 
             completed = subprocess.run(
-                [str(START_SCRIPT), *arguments],
+                [str(start_script), *arguments],
                 cwd=directory,
                 env=environment,
                 check=False,
@@ -144,6 +152,76 @@ class StartLabConsoleScriptTests(unittest.TestCase):
                 "robot_agent.dashboard_cli",
                 "--console-access-key-file",
                 "/tmp/test-console-key",
+            ],
+        )
+
+    def test_ev3_wrapper_has_a_useful_default_target(self):
+        _python_path, arguments = self._captured_launch(
+            {"ROBOT_LLM_STT_URL": ""},
+            start_script=EV3_START_SCRIPT,
+        )
+
+        self.assertEqual(
+            arguments,
+            [
+                "-m",
+                "robot_agent.dashboard_cli",
+                "--console-access-key-file",
+                "~/.robot-llm/dashboard-access-key",
+                "--robot-profile",
+                "ev3rstorm-01",
+                "--robot-target",
+                "robot@ev3dev.local",
+            ],
+        )
+
+    def test_blast_wrapper_defers_connection_to_the_dashboard(self):
+        _python_path, arguments = self._captured_launch(
+            {"ROBOT_LLM_STT_URL": ""},
+            start_script=BLAST_START_SCRIPT,
+        )
+
+        self.assertEqual(
+            arguments,
+            [
+                "-m",
+                "robot_agent.dashboard_cli",
+                "--console-access-key-file",
+                "~/.robot-llm/dashboard-access-key",
+                "--robot-profile",
+                "blast-01",
+                "--blast-hub-name",
+                "BLAST-01",
+            ],
+        )
+
+    def test_combined_wrapper_configures_both_known_controllers(self):
+        _python_path, arguments = self._captured_launch(
+            {
+                "ROBOT_LLM_STT_URL": "",
+                "ROBOT_LLM_EV3_TARGET": "robot@ev3-test.local",
+                "ROBOT_LLM_BLAST_HUB_NAME": "BLAST TEST",
+            },
+            "--port",
+            "8877",
+            start_script=ROBOT_START_SCRIPT,
+        )
+
+        self.assertEqual(
+            arguments,
+            [
+                "-m",
+                "robot_agent.dashboard_cli",
+                "--console-access-key-file",
+                "~/.robot-llm/dashboard-access-key",
+                "--robot-profile",
+                "ev3rstorm-01",
+                "--robot-target",
+                "robot@ev3-test.local",
+                "--blast-hub-name",
+                "BLAST TEST",
+                "--port",
+                "8877",
             ],
         )
 

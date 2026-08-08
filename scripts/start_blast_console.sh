@@ -2,9 +2,9 @@
 set -eu
 
 project_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-ev3_target="${ROBOT_LLM_EV3_TARGET-robot@ev3dev.local}"
+blast_hub_name="${ROBOT_LLM_BLAST_HUB_NAME-BLAST-01}"
 
 exec "$project_root/scripts/start_lab_console.sh" \
-    --robot-profile ev3rstorm-01 \
-    --robot-target "$ev3_target" \
+    --robot-profile blast-01 \
+    --blast-hub-name "$blast_hub_name" \
     "$@"

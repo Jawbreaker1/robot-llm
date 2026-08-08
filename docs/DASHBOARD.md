@@ -15,6 +15,35 @@ från Gemma.
 scripts/start_lab_console.sh
 ```
 
+För den normala fysiska labbkonfigurationen med både EV3RSTORM och BLAST:
+
+```sh
+scripts/start_robot_console.sh
+```
+
+Kommandot förutsätter att den normala lokala taligenkänningstjänsten är igång.
+Starta utan röstinmatning med
+`ROBOT_LLM_STT_URL='' scripts/start_robot_console.sh`.
+
+Starten konfigurerar båda controllrarna men kontaktar ingen robot.
+Slå på robotarna efteråt och använd **Kroppar → Kontrollera anslutning** för
+EV3 respektive **Kroppar → Anslut** för BLAST. EV3 är den aktiva målroboten i
+den kombinerade profilen; BLAST kan samtidigt observeras och använda sina
+begränsade controller-kommandon. Separata starter finns som
+`scripts/start_ev3rstorm_console.sh` och `scripts/start_blast_console.sh`.
+
+Standardnamnen är `robot@ev3dev.local` och `BLAST-01`. De kan ändras utan att
+redigera repot:
+
+```sh
+ROBOT_LLM_EV3_TARGET='robot@192.168.1.50' \
+ROBOT_LLM_BLAST_HUB_NAME='MY-BLAST' \
+  scripts/start_robot_console.sh
+```
+
+Startskripten väljer `ROBOT_LLM_PYTHON` om den är satt, därefter repots
+`.venv/bin/python` om den finns, annars `python3`.
+
 Öppna `http://127.0.0.1:8765`; den lokala roten skickar webbläsaren vidare
 till den aktuella liveadressen i formen
 `http://127.0.0.1:8765/live/<access-key>/`. Åtkomstnyckeln i länken är en

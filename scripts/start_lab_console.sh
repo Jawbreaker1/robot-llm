@@ -2,7 +2,13 @@
 set -eu
 
 project_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-python_command="${ROBOT_LLM_PYTHON-python3}"
+if [ -n "${ROBOT_LLM_PYTHON-}" ]; then
+    python_command="$ROBOT_LLM_PYTHON"
+elif [ -x "$project_root/.venv/bin/python" ]; then
+    python_command="$project_root/.venv/bin/python"
+else
+    python_command="python3"
+fi
 stt_url="${ROBOT_LLM_STT_URL-http://127.0.0.1:8178/v1}"
 stt_inference_path="${ROBOT_LLM_STT_INFERENCE_PATH-/audio/transcriptions}"
 stt_model_id="${ROBOT_LLM_STT_MODEL_ID-ggml-large-v3-turbo-q5_0}"

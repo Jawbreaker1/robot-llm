@@ -170,7 +170,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
             ])
 
         self.assertEqual(result, 0)
-        monitor.start.assert_called_once_with()
+        monitor.start.assert_not_called()
         monitor.close.assert_called_once_with()
         self.assertIs(adapter_type.call_args.kwargs["controller"], monitor)
         self.assertIs(control_type.call_args.args[0], adapter)
@@ -224,6 +224,65 @@ class DashboardRobotProfileTests(unittest.TestCase):
         ready = json.loads(stdout.getvalue())
         self.assertTrue(ready["physical_control_enabled"])
         self.assertEqual(ready["robot_profile"], EV3RSTORM_PROFILE_ID)
+
+    def test_run_configures_ev3_and_dormant_blast_together(self):
+        adapter = mock.Mock()
+        reachability = mock.Mock(spec=("snapshot", "check"))
+        adapter.controller_runtime_provider = reachability
+        adapter.controller_reachability_service = reachability
+        monitor = mock.Mock()
+        dashboard_service = mock.Mock()
+        control_service = mock.Mock()
+        server = mock.Mock()
+        router = mock.Mock(session_path="/live/token/")
+        with (
+            mock.patch(
+                "robot_agent.dashboard_cli.BlastObservationMonitor",
+                return_value=monitor,
+            ) as monitor_type,
+            mock.patch(
+                "robot_agent.dashboard_cli."
+                "_configured_robot_runtime_adapter",
+                return_value=adapter,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+                return_value=dashboard_service,
+            ) as service_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.RobotControlService",
+                return_value=control_service,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+                return_value=(server, router),
+            ) as server_type,
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            result = _run([
+                "--robot-profile",
+                EV3RSTORM_PROFILE_ID,
+                "--robot-target",
+                "robot@ev3dev.local",
+                "--blast-hub-name",
+                "BLAST-TEST",
+            ])
+
+        self.assertEqual(result, 0)
+        monitor_type.assert_called_once_with(hub_name="BLAST-TEST")
+        monitor.start.assert_not_called()
+        adapter.run.assert_not_called()
+        self.assertEqual(
+            service_type.call_args.kwargs["controller_runtime_providers"],
+            (monitor, reachability),
+        )
+        self.assertEqual(
+            server_type.call_args.kwargs["controller_control_services"],
+            {
+                "blast-01.hub": monitor,
+                "ev3rstorm-01.ev3-main": reachability,
+            },
+        )
 
     def test_run_wires_explicit_physical_map_provider(self):
         adapter = mock.Mock()

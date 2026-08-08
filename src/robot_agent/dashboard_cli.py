@@ -608,7 +608,6 @@ def _run(
                 blast_monitor = BlastObservationMonitor(
                     hub_name=args.blast_hub_name,
                 )
-                blast_monitor.start()
             robot_runtime_adapter = _configured_robot_runtime_adapter(
                 args,
                 blast_monitor=blast_monitor,
@@ -683,7 +682,6 @@ def _run(
             blast_monitor = BlastObservationMonitor(
                 hub_name=args.blast_hub_name,
             )
-            blast_monitor.start()
         try:
             adapter_state = vars(robot_runtime_adapter)
         except TypeError:

@@ -269,7 +269,7 @@ class DashboardCLITests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         monitor_type.assert_called_once_with(hub_name="BLAST-TEST")
-        monitor.start.assert_called_once_with()
+        monitor.start.assert_not_called()
         self.assertEqual(
             dashboard_type.call_args.kwargs[
                 "controller_runtime_providers"
