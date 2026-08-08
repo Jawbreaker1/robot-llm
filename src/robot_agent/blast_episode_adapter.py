@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import math
 import threading
 import time
@@ -16,9 +15,6 @@ from .blast_observation_monitor import (
 from .blast_navigation_action_profile import BLAST_NAVIGATION_COMMANDS
 from .blast_navigation_motion_execution import (
     BlastNavigationMotionExecutor,
-)
-from .blast_scan_route_candidates import (
-    build_blast_scan_route_candidates,
 )
 from .lm_studio_controller_action import (
     ABORT,
@@ -234,8 +230,6 @@ class BlastEpisodeRuntimeAdapter:
         history = []
         episode_start_heading = None
         motion_executor = None
-        route_candidates = None
-        scan_version = 0
         try:
             planner = self.planner_factory(context.settings.model)
             if not callable(getattr(planner, "decide", None)):
@@ -260,10 +254,6 @@ class BlastEpisodeRuntimeAdapter:
                     episode_start_heading,
                 )
                 observation["odometry"] = motion_executor.pose.to_dict()
-                if route_candidates is not None:
-                    observation[
-                        "provisional_local_detour_candidates"
-                    ] = deepcopy(route_candidates)
                 available_actions = self._available_actions(
                     observation,
                     history,
@@ -279,7 +269,6 @@ class BlastEpisodeRuntimeAdapter:
                     history=tuple(history[-12:]),
                     completion_allowed=completion_allowed,
                 ))
-                route_candidates = None
                 if not isinstance(result, ControllerActionPlannerResult):
                     raise BlastEpisodeError(
                         "blast_planner_result_invalid",
@@ -379,14 +368,6 @@ class BlastEpisodeRuntimeAdapter:
                         motion_executor.reanchor_after_restored_scan(
                             command_result
                         )
-                    )
-                    scan_version += 1
-                    route_candidates = build_blast_scan_route_candidates(
-                        scan,
-                        scan_pose=motion_executor.pose,
-                        frame_id="blast-local-odometry",
-                        map_generation_id=context.episode_id,
-                        map_version=scan_version,
                     )
                     history_item["scan"] = scan
                 history.append(history_item)

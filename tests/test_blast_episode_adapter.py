@@ -144,28 +144,11 @@ class FakeScanController(FakeController):
         if command == "scan_front_arc":
             result["scan"] = {
                 "schema": "blast-scan-front-arc/v1",
-                "state": "complete",
-                "result": "restored",
                 "restoration_verified": True,
-                "all_observations_settled": True,
                 "rays": [
-                    {
-                        "side": side,
-                        "distance_mm": distance,
-                        "relative_heading_deg": heading,
-                        "observation_settled": True,
-                    }
-                    for side, distance, heading in zip(
-                        (
-                            "center",
-                            "left_near",
-                            "left_far",
-                            "right_near",
-                            "right_far",
-                        ),
-                        (300, 900, 2_000, 900, 2_000),
-                        (0, -30, -60, 30, 60),
-                    )
+                    {"side": "center", "distance_mm": 500.0},
+                    {"side": "left_near", "distance_mm": 900.0},
+                    {"side": "right_near", "distance_mm": 1_200.0},
                 ],
             }
         return result
@@ -431,40 +414,6 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             planner.contexts[2].observation["odometry"],
         )
 
-    def test_restored_scan_adds_context_only_route_candidates(self):
-        controller = FakeScanController(500)
-        planner = Planner([
-            decision(SCAN_FRONT_ARC, plan=(SCAN_FRONT_ARC,)),
-            decision(COMPLETE, assessment="Candidate facts are enough."),
-        ])
-
-        result = self.adapter(controller, planner).run(
-            episode_context()[0]
-        )
-
-        self.assertTrue(result.completed)
-        self.assertEqual(controller.commands, ["scan_front_arc"])
-        self.assertNotIn(
-            "provisional_local_detour_candidates",
-            planner.contexts[0].observation,
-        )
-        facts = planner.contexts[1].observation[
-            "provisional_local_detour_candidates"
-        ]
-        serialized_facts = planner.contexts[1].to_dict()["observation"][
-            "provisional_local_detour_candidates"
-        ]
-        self.assertEqual(serialized_facts, facts)
-        self.assertFalse(facts["route_execution_authorized"])
-        self.assertEqual(
-            [item["detour_side"] for item in facts["candidates"]],
-            ["LEFT_OF_GOAL", "RIGHT_OF_GOAL"],
-        )
-        self.assertEqual(
-            planner.contexts[1].available_actions,
-            ("ADVANCE", "REVERSE", TURN_LEFT_90, "TURN_RIGHT_90"),
-        )
-
     def test_unrestored_scan_stops_before_another_planner_turn(self):
         class UnrestoredScanController(FakeScanController):
             def command(self, command, *, cancel_requested=None):
@@ -567,14 +516,6 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(planner.contexts[1].completion_allowed)
         self.assertFalse(planner.contexts[2].completion_allowed)
         self.assertIn(
-            "provisional_local_detour_candidates",
-            planner.contexts[1].observation,
-        )
-        self.assertNotIn(
-            "provisional_local_detour_candidates",
-            planner.contexts[2].observation,
-        )
-        self.assertIn(
             SCAN_FRONT_ARC,
             planner.contexts[2].available_actions,
         )
@@ -583,7 +524,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         controller = FakeScanController(500)
         planner = Planner([
             decision(SCAN_FRONT_ARC, plan=(SCAN_FRONT_ARC,)),
-            decision("ADVANCE", plan=("ADVANCE",)),
+            decision(TURN_LEFT_90, plan=(TURN_LEFT_90,)),
             decision(SCAN_FRONT_ARC, plan=(SCAN_FRONT_ARC,)),
             decision(COMPLETE, assessment="Fresh final scan confirms it."),
         ])
@@ -596,25 +537,14 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             controller.commands,
             [
                 "scan_front_arc",
-                "drive_forward",
+                "turn_left",
+                "turn_left",
+                "turn_left",
+                "turn_left",
                 "scan_front_arc",
             ],
         )
         self.assertTrue(planner.contexts[3].completion_allowed)
-        first = planner.contexts[1].observation[
-            "provisional_local_detour_candidates"
-        ]
-        second = planner.contexts[3].observation[
-            "provisional_local_detour_candidates"
-        ]
-        self.assertEqual(
-            first["target"]["hypothesis_id"],
-            "blast-scan-target-1",
-        )
-        self.assertEqual(
-            second["target"]["hypothesis_id"],
-            "blast-scan-target-2",
-        )
 
     def test_scan_requires_a_structured_controller_result(self):
         controller = FakeController()
