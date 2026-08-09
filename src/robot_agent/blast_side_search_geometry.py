@@ -36,6 +36,16 @@ def _nominal_pose(pose: PhysicalPose, action: str) -> PhysicalPose:
     )[0]
 
 
+def _moves_toward_origin_front(
+    heading_mdeg: int,
+    origin_heading_mdeg: int,
+) -> bool:
+    difference = math.radians(
+        normalize_heading_mdeg(heading_mdeg - origin_heading_mdeg) / 1_000.0
+    )
+    return math.cos(difference) > 1e-9
+
+
 def side_search_distance(pose: PhysicalPose, waypoint) -> int:
     return int(round(math.hypot(
         waypoint["target_x_mm"] - pose.x_mm,
@@ -136,7 +146,6 @@ def side_search_waypoint(
         travel_origin = outbound_pose
         target_heading = outbound_pose.heading_mdeg
         origin_heading = math.radians(pose.heading_mdeg / 1_000.0)
-        origin_forward = (math.cos(origin_heading), math.sin(origin_heading))
         left = (-math.sin(origin_heading), math.cos(origin_heading))
         delta = (
             outbound_pose.x_mm - pose.x_mm,
@@ -148,12 +157,10 @@ def side_search_waypoint(
             math.cos(travel_heading),
             math.sin(travel_heading),
         )
-        if sum(
-            component * origin_component
-            for component, origin_component in zip(
-                travel_forward, origin_forward
-            )
-        ) > 1e-9:
+        if _moves_toward_origin_front(
+            target_heading,
+            pose.heading_mdeg,
+        ):
             raise ValueError("BLAST side-search outbound pose is invalid")
         lateral_per_mm = (
             travel_forward[0] * left[0]
@@ -235,6 +242,10 @@ def side_search_progress(
         phase = "OUTBOUND"
         if (
             abs(heading_error) <= HEADING_TOLERANCE_MDEG
+            and not _moves_toward_origin_front(
+                pose.heading_mdeg,
+                origin_heading,
+            )
             and side_search_distance(
                 _nominal_pose(pose, ADVANCE), waypoint
             ) < distance
