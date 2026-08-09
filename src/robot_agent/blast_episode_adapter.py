@@ -203,15 +203,10 @@ def _navigation_body_matched(sensors) -> bool:
 
 
 def _minimum_rotation_clearance_mm() -> int:
-    footprint, sensor = (
-        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    return (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+        .minimum_rotation_clearance_mm()
     )
-    assert sensor.forward_offset_mm is not None
-    return max(0, math.ceil(
-        footprint.maximum_corner_radius_mm
-        + footprint.clearance_margin_mm
-        - sensor.forward_offset_mm
-    ))
 
 
 class BlastEpisodeError(RuntimeError):
@@ -346,6 +341,23 @@ class BlastEpisodeRuntimeAdapter:
             return False
         return float(distance) > _minimum_rotation_clearance_mm()
 
+    def _current_observation_allows_action(self, action, observation) -> bool:
+        sensors = observation["sensors"]
+        if not _navigation_body_matched(sensors):
+            return False
+        distance = sensors.get("distance_mm")
+        if action == ADVANCE:
+            return (
+                blast_range_state(distance) == RANGE_STATE_MEASURED
+                and float(distance) > self.minimum_forward_clearance_mm
+            )
+        if action in (TURN_LEFT_90, TURN_RIGHT_90, SCAN_FRONT_ARC):
+            return (
+                self._heading(sensors) is not None
+                and self._current_range_allows_rotation(observation)
+            )
+        return False
+
     @classmethod
     def _completion_allowed(cls, history) -> bool:
         scan_used = any(
@@ -355,21 +367,20 @@ class BlastEpisodeRuntimeAdapter:
         return not scan_used or cls._scan_is_current(history)
 
     def _available_actions(self, observation, history=()) -> tuple[str, ...]:
-        available = list(ACTION_COMMANDS)
-        distance = observation["sensors"].get("distance_mm")
-        distance_is_finite = (
-            isinstance(distance, (int, float))
-            and not isinstance(distance, bool)
-            and math.isfinite(float(distance))
-        )
+        # BLAST has no rear-facing clearance source yet. Keep reverse in the
+        # executor contract, but never offer it as a planner action.
+        available = [
+            action
+            for action in (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90)
+            if self._current_observation_allows_action(action, observation)
+        ]
         if (
-            self._heading(observation["sensors"]) is not None
-            and distance_is_finite
+            self._current_observation_allows_action(
+                SCAN_FRONT_ARC, observation
+            )
             and not self._scan_is_current(history)
         ):
             available.append(SCAN_FRONT_ARC)
-        if distance_is_finite and distance <= self.minimum_forward_clearance_mm:
-            available.remove("ADVANCE")
         return tuple(available)
 
     @staticmethod
@@ -415,6 +426,46 @@ class BlastEpisodeRuntimeAdapter:
                 "message": message,
             },
         )
+
+    def _fresh_planner_action_observation(
+        self,
+        *,
+        action,
+        selects_detour_side,
+        episode_start_heading,
+        motion_executor,
+    ):
+        observation = self._with_navigation_reference(
+            self._observation(),
+            episode_start_heading,
+        )
+        observation["odometry"] = motion_executor.pose.to_dict()
+        if not self._current_observation_allows_action(action, observation):
+            if selects_detour_side:
+                code = "blast_side_search_blocked"
+                message = (
+                    "BLAST side selection lost current motion safety evidence"
+                )
+            elif action == SCAN_FRONT_ARC:
+                code = "blast_scan_start_unverified"
+                message = "BLAST scan lost current rotation clearance"
+            else:
+                code = "blast_action_start_unverified"
+                message = "BLAST action lost current motion safety evidence"
+            raise BlastEpisodeError(code, message)
+        if selects_detour_side and not (
+            _side_search_heading_correlated(
+                observation,
+                motion_executor.pose,
+            )
+            and _navigation_body_matched(observation["sensors"])
+            and self._current_range_allows_rotation(observation)
+        ):
+            raise BlastEpisodeError(
+                "blast_side_search_blocked",
+                "BLAST side selection lost current motion safety evidence",
+            )
+        return observation
 
     def run(self, context) -> RobotEpisodeOutcome:
         with self._lock:
@@ -529,6 +580,12 @@ class BlastEpisodeRuntimeAdapter:
                     observation["navigation_intent"][
                         "side_search_progress"
                     ] = dict(side_search_progress)
+                if side_search_progress is None and not available_actions:
+                    return self._outcome(
+                        "no_safe_blast_action",
+                        False,
+                        "BLAST has no currently observed safe motion or scan",
+                    )
                 completion_allowed = self._completion_allowed(history)
                 selects_detour_side = False
                 detour_origin_pose = None
@@ -573,32 +630,15 @@ class BlastEpisodeRuntimeAdapter:
                             "blast_planner_action_invalid",
                             "BLAST planner selected an unavailable action",
                         )
-                    if selects_detour_side:
-                        fresh_observation = self._with_navigation_reference(
-                            self._observation(),
-                            episode_start_heading,
+                    if action in ACTION_COMMANDS or action == SCAN_FRONT_ARC:
+                        observation = (
+                            self._fresh_planner_action_observation(
+                                action=action,
+                                selects_detour_side=selects_detour_side,
+                                episode_start_heading=episode_start_heading,
+                                motion_executor=motion_executor,
+                            )
                         )
-                        fresh_observation["odometry"] = (
-                            motion_executor.pose.to_dict()
-                        )
-                        if not (
-                            _side_search_heading_correlated(
-                                fresh_observation,
-                                motion_executor.pose,
-                            )
-                            and _navigation_body_matched(
-                                fresh_observation["sensors"]
-                            )
-                            and self._current_range_allows_rotation(
-                                fresh_observation
-                            )
-                        ):
-                            raise BlastEpisodeError(
-                                "blast_side_search_blocked",
-                                "BLAST side selection lost current motion "
-                                "safety evidence",
-                            )
-                        observation = fresh_observation
                     context.publish({
                         "current_action": (
                             None if action in (COMPLETE, ABORT) else action

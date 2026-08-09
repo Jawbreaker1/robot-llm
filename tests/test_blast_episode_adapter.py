@@ -1055,7 +1055,20 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
     def test_side_search_does_not_treat_close_or_no_valid_range_as_clear(self):
         for distance in (100, 2_000):
             with self.subTest(distance=distance):
-                controller = FakeScanController(distance)
+                class RangeChangesAfterTurnController(FakeScanController):
+                    def command(self, command, *, cancel_requested=None):
+                        result = super().command(
+                            command,
+                            cancel_requested=cancel_requested,
+                        )
+                        if self.commands.count("turn_left") == 4:
+                            result["observation"]["distance_mm"] = distance
+                            self.snapshot_value["observation"][
+                                "distance_mm"
+                            ] = distance
+                        return result
+
+                controller = RangeChangesAfterTurnController(500)
                 planner = Planner([
                     decision(SCAN_FRONT_ARC),
                     decision(TURN_LEFT_90),
@@ -1111,7 +1124,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                         ray["range_state"] = RANGE_STATE_NO_VALID_DISTANCE
                 return result
 
-        controller = NoMeasuredCenterController(2_000)
+        controller = NoMeasuredCenterController(500)
         planner = Planner([
             decision(SCAN_FRONT_ARC),
             decision(TURN_LEFT_90),
@@ -1141,7 +1154,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                             )
                         return result
 
-                controller = CloseScanController(distance)
+                controller = CloseScanController(500)
                 planner = Planner([
                     decision(SCAN_FRONT_ARC),
                     decision(TURN_LEFT_90),
@@ -1301,7 +1314,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(controller.commands, ["scan_front_arc"])
         self.assertEqual(len(planner.contexts), 1)
 
-    def test_close_obstacle_removes_only_forward_action(self):
+    def test_close_obstacle_removes_forward_and_blind_reverse(self):
         controller = FakeController(100)
         planner = Planner([decision(COMPLETE, assessment="Already close")])
         context, _updates = episode_context()
@@ -1312,7 +1325,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             "ADVANCE",
             planner.contexts[0].available_actions,
         )
-        self.assertIn("REVERSE", planner.contexts[0].available_actions)
+        self.assertNotIn("REVERSE", planner.contexts[0].available_actions)
         self.assertIn(
             SCAN_FRONT_ARC,
             planner.contexts[0].available_actions,
@@ -1329,13 +1342,22 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 controller.snapshot_value["observation"].pop("distance_mm")
             planner = Planner([decision(COMPLETE)])
 
-            self.adapter(controller, planner).run(episode_context()[0])
+            result = self.adapter(controller, planner).run(
+                episode_context()[0]
+            )
 
             with self.subTest(missing=missing):
-                self.assertNotIn(
-                    SCAN_FRONT_ARC,
-                    planner.contexts[0].available_actions,
-                )
+                if missing == "heading":
+                    self.assertNotIn(
+                        SCAN_FRONT_ARC,
+                        planner.contexts[0].available_actions,
+                    )
+                else:
+                    self.assertEqual(
+                        result.terminal_reason,
+                        "no_safe_blast_action",
+                    )
+                    self.assertEqual(planner.contexts, [])
 
     def test_motion_makes_scan_available_again(self):
         adapter = self.adapter(FakeController(), Planner([]))
@@ -1343,6 +1365,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             "sensors": {
                 "distance_mm": 300,
                 "imu": {"heading_deg": 0},
+                "motor_angles_deg": {"body": 158},
             }
         }
 
@@ -1355,6 +1378,68 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
 
         self.assertIn(SCAN_FRONT_ARC, available)
+
+    def test_unobserved_or_too_close_state_authorizes_no_action(self):
+        for distance, body in ((2_000, 158), (53, 158), (500, 157)):
+            with self.subTest(distance=distance, body=body):
+                controller = FakeController(distance)
+                controller.snapshot_value["observation"][
+                    "motor_angles_deg"
+                ]["body"] = body
+                planner = Planner([decision("ADVANCE")])
+
+                result = self.adapter(controller, planner).run(
+                    episode_context()[0]
+                )
+
+                self.assertFalse(result.completed)
+                self.assertEqual(
+                    result.terminal_reason,
+                    "no_safe_blast_action",
+                )
+                self.assertEqual(controller.commands, [])
+                self.assertEqual(planner.contexts, [])
+
+    def test_action_safety_is_rechecked_after_model_latency(self):
+        for action, change, code in (
+            ("ADVANCE", ("distance_mm", 40), "blast_action_start_unverified"),
+            (
+                TURN_LEFT_90,
+                ("body", 157),
+                "blast_action_start_unverified",
+            ),
+            (
+                SCAN_FRONT_ARC,
+                ("distance_mm", 40),
+                "blast_scan_start_unverified",
+            ),
+        ):
+            with self.subTest(action=action):
+                controller = FakeScanController(500)
+
+                class SafetyChangesPlanner(Planner):
+                    def decide(self, context):
+                        result = super().decide(context)
+                        field, value = change
+                        if field == "body":
+                            controller.snapshot_value["observation"][
+                                "motor_angles_deg"
+                            ]["body"] = value
+                        else:
+                            controller.snapshot_value["observation"][
+                                field
+                            ] = value
+                        return result
+
+                planner = SafetyChangesPlanner([decision(action)])
+
+                with self.assertRaises(BlastEpisodeError) as raised:
+                    self.adapter(controller, planner).run(
+                        episode_context()[0]
+                    )
+
+                self.assertEqual(raised.exception.code, code)
+                self.assertEqual(controller.commands, [])
 
     def test_scan_guided_motion_does_not_reuse_a_planned_completion(self):
         controller = FakeScanController(500)

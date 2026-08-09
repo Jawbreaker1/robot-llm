@@ -325,6 +325,50 @@ class BlastObservationMonitorTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(blast_range_state(value), RANGE_STATE_INVALID)
 
+    def test_scan_checks_settled_center_before_first_turn(self):
+        for distance, body in (
+            (40, 158),
+            (53, 158),
+            (2_000, 158),
+            (300, 157),
+        ):
+            with self.subTest(distance=distance, body=body):
+                class UnsafeScanRuntime(FakeRuntime):
+                    async def observe(self):
+                        observation = await super().observe()
+                        observation["distance_mm"] = distance
+                        observation["motor_angles_deg"]["body"] = body
+                        return observation
+
+                monitor = BlastObservationMonitor(
+                    poll_interval_seconds=0.05,
+                    runtime_factory=UnsafeScanRuntime,
+                )
+                monitor.start()
+                self.wait_for(monitor, "online")
+
+                with self.assertRaises(BlastControllerError) as raised:
+                    monitor.command(SCAN_COMMAND)
+
+                self.assertEqual(
+                    raised.exception.code,
+                    "scan_start_clearance_unverified",
+                )
+                runtime = FakeRuntime.instances[-1]
+                runtime_count = len(FakeRuntime.instances)
+                self.assertEqual(
+                    [
+                        call for call in runtime.calls
+                        if call[0] == "turn_pulse"
+                    ],
+                    [],
+                )
+                self.assertEqual(monitor.snapshot()["state"], "online")
+                self.assertTrue(monitor.command("drive_forward")["completed"])
+                self.assertEqual(len(FakeRuntime.instances), runtime_count)
+                self.assertIs(FakeRuntime.instances[-1], runtime)
+                monitor.close()
+
     def test_navigation_command_returns_latest_settled_observation(self):
         class RockingRuntime(FakeRuntime):
             async def drive_pulse(self, direction):

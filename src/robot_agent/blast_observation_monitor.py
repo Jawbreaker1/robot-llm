@@ -12,6 +12,9 @@ import time
 from typing import Callable, Mapping, Optional
 
 from .blast_ble_runtime import BlastBLERuntime, DEFAULT_HUB_NAME
+from .blast_navigation_calibration import (
+    BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
+)
 
 
 SNAPSHOT_SCHEMA = "controller-runtime-observation/v1"
@@ -528,7 +531,10 @@ class BlastObservationMonitor:
                 )
             )
             self._finish_command(result, error=failure)
-            if failure.code == "controller_command_interrupted":
+            if failure.code in (
+                "controller_command_interrupted",
+                "scan_start_clearance_unverified",
+            ):
                 return
             raise failure
 
@@ -624,6 +630,28 @@ class BlastObservationMonitor:
             initial_observation=center,
         )
         start_heading = self._scan_heading(center)
+        sensor = (
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+            .range_sensor_extrinsics
+        )
+        center_distance = center.get("distance_mm")
+        if not (
+            center_settled
+            and start_heading is not None
+            and sensor.matches_navigation_body_angle(
+                _body_motor_angle(center)
+            )
+            and blast_range_state(center_distance) == RANGE_STATE_MEASURED
+            and float(center_distance) > (
+                BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+                .minimum_rotation_clearance_mm()
+            )
+        ):
+            raise BlastControllerError(
+                "scan_start_clearance_unverified",
+                "BLAST scan cannot rotate without a settled measured "
+                "front clearance and navigation sensor pose",
+            )
 
         _left_near_receipt, left_near, left_near_settled = (
             await self._scan_turn(

@@ -1,6 +1,7 @@
 """Typed BLAST navigation facts, deliberately not wired into runtime yet."""
 
 from dataclasses import dataclass
+import math
 from typing import Optional, Tuple
 
 from .physical_footprint import RobotFootprint
@@ -130,6 +131,17 @@ class BlastNavigationCalibration:
             raise ValueError("BLAST navigation geometry is incomplete")
         assert self.robot_footprint is not None
         return self.robot_footprint, self.range_sensor_extrinsics
+
+    def minimum_rotation_clearance_mm(self) -> int:
+        """Return the provisional front-range margin for body rotation."""
+
+        footprint, sensor = self.require_complete()
+        assert sensor.forward_offset_mm is not None
+        return max(0, math.ceil(
+            footprint.maximum_corner_radius_mm
+            + footprint.clearance_margin_mm
+            - sensor.forward_offset_mm
+        ))
 
 
 BLAST_PROVISIONAL_NAVIGATION_CALIBRATION = BlastNavigationCalibration(

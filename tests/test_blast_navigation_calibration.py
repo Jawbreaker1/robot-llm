@@ -53,6 +53,7 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
             (110, 80, 0, 158),
         )
         self.assertTrue(sensor.matches_navigation_body_angle(158))
+        self.assertEqual(calibration.minimum_rotation_clearance_mm(), 53)
         for value in (157, 159, None, True):
             with self.subTest(value=value):
                 self.assertFalse(sensor.matches_navigation_body_angle(value))
