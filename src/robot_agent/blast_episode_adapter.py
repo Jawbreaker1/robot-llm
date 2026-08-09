@@ -440,15 +440,20 @@ class BlastEpisodeRuntimeAdapter:
             episode_start_heading,
         )
         observation["odometry"] = motion_executor.pose.to_dict()
-        if not self._current_observation_allows_action(action, observation):
+        # The scan monitor settles five fresh samples and performs the final
+        # range, heading, and sensor-pose gate before its first wheel pulse.
+        # Do not let one unsmoothed adapter snapshot preempt that authority.
+        if (
+            action != SCAN_FRONT_ARC
+            and not self._current_observation_allows_action(
+                action, observation
+            )
+        ):
             if selects_detour_side:
                 code = "blast_side_search_blocked"
                 message = (
                     "BLAST side selection lost current motion safety evidence"
                 )
-            elif action == SCAN_FRONT_ARC:
-                code = "blast_scan_start_unverified"
-                message = "BLAST scan lost current rotation clearance"
             else:
                 code = "blast_action_start_unverified"
                 message = "BLAST action lost current motion safety evidence"
@@ -735,6 +740,23 @@ class BlastEpisodeRuntimeAdapter:
                         and self._cancelled(context)
                     ):
                         return self._outcome("stopped", False, "stopped")
+                    if error.code == "scan_start_clearance_unverified":
+                        if self._cancelled(context):
+                            return self._outcome(
+                                "stopped", False, "stopped"
+                            )
+                        if is_side_search_rescan:
+                            return self._outcome(
+                                "side_search_observation_unavailable",
+                                False,
+                                "Side observation scan could not start safely",
+                            )
+                        return self._outcome(
+                            "no_safe_blast_action",
+                            False,
+                            "BLAST scan could not start from settled safety "
+                            "evidence",
+                        )
                     raise
                 if not isinstance(command_result, Mapping):
                     raise BlastEpisodeError(

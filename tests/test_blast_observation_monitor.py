@@ -369,6 +369,44 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 self.assertIs(FakeRuntime.instances[-1], runtime)
                 monitor.close()
 
+    def test_scan_settling_recovers_after_one_no_valid_center_sample(self):
+        class TransientCenterRuntime(FakeRuntime):
+            center_samples = None
+
+            async def observe(self):
+                observation = await super().observe()
+                if self.center_samples:
+                    observation["distance_mm"] = self.center_samples.pop(0)
+                self.calls.append(("distance", observation["distance_mm"]))
+                return observation
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=TransientCenterRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        runtime = FakeRuntime.instances[0]
+        runtime.calls.clear()
+        runtime.center_samples = [2_000] + [500] * 5
+
+        result = monitor.command(SCAN_COMMAND)
+
+        first_turn = next(
+            index
+            for index, call in enumerate(runtime.calls)
+            if call[0] == "turn_pulse"
+        )
+        pre_turn_distances = [
+            call[1]
+            for call in runtime.calls[:first_turn]
+            if call[0] == "distance"
+        ]
+        self.assertIn(2_000, pre_turn_distances)
+        self.assertEqual(pre_turn_distances[-5:], [500] * 5)
+        self.assertEqual(result["scan"]["rays"][0]["distance_mm"], 500)
+        monitor.close()
+
     def test_navigation_command_returns_latest_settled_observation(self):
         class RockingRuntime(FakeRuntime):
             async def drive_pulse(self, direction):

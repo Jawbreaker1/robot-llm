@@ -1408,11 +1408,6 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 ("body", 157),
                 "blast_action_start_unverified",
             ),
-            (
-                SCAN_FRONT_ARC,
-                ("distance_mm", 40),
-                "blast_scan_start_unverified",
-            ),
         ):
             with self.subTest(action=action):
                 controller = FakeScanController(500)
@@ -1440,6 +1435,116 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
                 self.assertEqual(raised.exception.code, code)
                 self.assertEqual(controller.commands, [])
+
+    def test_scan_monitor_settling_can_recover_a_transient_snapshot(self):
+        class TransientRangePlanner(Planner):
+            def decide(self, context):
+                result = super().decide(context)
+                if result.decision.action == SCAN_FRONT_ARC:
+                    controller.snapshot_value["observation"][
+                        "distance_mm"
+                    ] = 2_000
+                return result
+
+        class SettlingScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    result["observation"]["distance_mm"] = 500
+                    self.snapshot_value["observation"]["distance_mm"] = 500
+                return result
+
+        controller = SettlingScanController(500)
+        planner = TransientRangePlanner([
+            decision(SCAN_FRONT_ARC),
+            decision(COMPLETE, assessment="Scan collected."),
+        ])
+
+        result = self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertTrue(result.completed)
+        self.assertEqual(controller.commands, ["scan_front_arc"])
+        self.assertEqual(len(planner.contexts), 2)
+
+    def test_settled_scan_refusal_is_safe_noncomplete(self):
+        for cancelled, terminal_reason in (
+            (False, "no_safe_blast_action"),
+            (True, "stopped"),
+        ):
+            with self.subTest(cancelled=cancelled):
+                context, _updates = episode_context()
+
+                class RefusingScanController(FakeScanController):
+                    def command(self, command, *, cancel_requested=None):
+                        if command == "scan_front_arc":
+                            if cancelled:
+                                context.stop_requested.set()
+                            raise BlastControllerError(
+                                "scan_start_clearance_unverified",
+                                "settled scan start was unsafe",
+                            )
+                        return super().command(
+                            command,
+                            cancel_requested=cancel_requested,
+                        )
+
+                controller = RefusingScanController(500)
+                planner = Planner([decision(SCAN_FRONT_ARC)])
+
+                result = self.adapter(controller, planner).run(context)
+
+                self.assertFalse(result.completed)
+                self.assertEqual(result.terminal_reason, terminal_reason)
+                self.assertEqual(controller.commands, [])
+                self.assertEqual(len(planner.contexts), 1)
+
+    def test_side_rescan_refusal_does_not_publish_multi_view(self):
+        for cancelled, terminal_reason in (
+            (False, "side_search_observation_unavailable"),
+            (True, "stopped"),
+        ):
+            with self.subTest(cancelled=cancelled):
+                context, updates = episode_context()
+
+                class RefusingSecondScanController(FakeScanController):
+                    def __init__(self):
+                        super().__init__(500)
+                        self.scan_attempts = 0
+
+                    def command(self, command, *, cancel_requested=None):
+                        if command == "scan_front_arc":
+                            self.scan_attempts += 1
+                            if self.scan_attempts == 2:
+                                if cancelled:
+                                    context.stop_requested.set()
+                                raise BlastControllerError(
+                                    "scan_start_clearance_unverified",
+                                    "settled side scan start was unsafe",
+                                )
+                        return super().command(
+                            command,
+                            cancel_requested=cancel_requested,
+                        )
+
+                controller = RefusingSecondScanController()
+                planner = Planner([
+                    decision(SCAN_FRONT_ARC),
+                    decision(TURN_LEFT_90),
+                ])
+
+                result = self.adapter(controller, planner).run(context)
+
+                self.assertFalse(result.completed)
+                self.assertEqual(result.terminal_reason, terminal_reason)
+                self.assertEqual(controller.scan_attempts, 2)
+                self.assertEqual(len(planner.contexts), 2)
+                self.assertFalse(any(
+                    "multi_view_observations" in update.get("scan", {})
+                    for update in updates
+                ))
 
     def test_scan_guided_motion_does_not_reuse_a_planned_completion(self):
         controller = FakeScanController(500)
