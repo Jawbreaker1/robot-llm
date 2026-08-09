@@ -769,15 +769,48 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         planner = Planner([
             decision(SCAN_FRONT_ARC),
             decision(TURN_LEFT_90),
-            decision("ABORT"),
         ])
 
-        self.adapter(controller, planner).run(episode_context()[0])
+        with self.assertRaises(BlastEpisodeError) as raised:
+            self.adapter(controller, planner).run(episode_context()[0])
 
-        self.assertNotIn(
-            "navigation_intent",
-            planner.contexts[2].observation,
+        self.assertEqual(
+            raised.exception.code,
+            "blast_planner_action_invalid",
         )
+        self.assertEqual(controller.commands, ["scan_front_arc"])
+
+    def test_close_center_scan_blocks_turn_before_motor_command(self):
+        for distance in (0.0, 40.0):
+            with self.subTest(distance=distance):
+                class CloseScanController(FakeScanController):
+                    def command(self, command, *, cancel_requested=None):
+                        result = super().command(
+                            command,
+                            cancel_requested=cancel_requested,
+                        )
+                        if command == "scan_front_arc":
+                            result["scan"] = scan_result(
+                                center_distance_mm=distance
+                            )
+                        return result
+
+                controller = CloseScanController(distance)
+                planner = Planner([
+                    decision(SCAN_FRONT_ARC),
+                    decision(TURN_LEFT_90),
+                ])
+
+                with self.assertRaises(BlastEpisodeError) as raised:
+                    self.adapter(controller, planner).run(
+                        episode_context()[0]
+                    )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    "blast_planner_action_invalid",
+                )
+                self.assertEqual(controller.commands, ["scan_front_arc"])
 
     def test_side_search_requires_imu_and_body_reference_correlation(self):
         for fault in ("imu", "body"):

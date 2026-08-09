@@ -273,18 +273,29 @@ class BlastEpisodeRuntimeAdapter:
         return False
 
     @staticmethod
-    def _current_scan_has_measured_center(history) -> bool:
+    def _current_scan_allows_quarter_turn(history) -> bool:
         if not history or history[-1].get("action") != SCAN_FRONT_ARC:
             return False
         scan = history[-1].get("scan")
         rays = scan.get("rays") if isinstance(scan, Mapping) else None
-        return bool(
+        if not (
             isinstance(rays, list)
             and rays
             and isinstance(rays[0], Mapping)
             and rays[0].get("side") == "center"
             and rays[0].get("range_state") == RANGE_STATE_MEASURED
+        ):
+            return False
+        footprint, sensor = (
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
         )
+        assert sensor.forward_offset_mm is not None
+        minimum = math.ceil(
+            footprint.maximum_corner_radius_mm
+            + footprint.clearance_margin_mm
+            - sensor.forward_offset_mm
+        )
+        return float(rays[0]["distance_mm"]) > max(0, minimum)
 
     @classmethod
     def _completion_allowed(cls, history) -> bool:
@@ -427,6 +438,14 @@ class BlastEpisodeRuntimeAdapter:
                     observation,
                     history,
                 )
+                scan_allows_turn = self._current_scan_allows_quarter_turn(
+                    history
+                )
+                if self._scan_is_current(history) and not scan_allows_turn:
+                    available_actions = tuple(
+                        action for action in available_actions
+                        if action not in (TURN_LEFT_90, TURN_RIGHT_90)
+                    )
                 if side_search_progress is not None:
                     required_action = side_search_progress["required_action"]
                     if not evidence_correlated:
@@ -471,7 +490,7 @@ class BlastEpisodeRuntimeAdapter:
                 selects_detour_side = (
                     selected_detour_side is None
                     and self._scan_is_current(history)
-                    and self._current_scan_has_measured_center(history)
+                    and scan_allows_turn
                     and decision.action in (TURN_LEFT_90, TURN_RIGHT_90)
                 )
                 detour_origin_pose = (
