@@ -119,6 +119,7 @@ class FakeController:
             raise BlastControllerError(
                 "controller_command_interrupted",
                 "cancelled",
+                motion_started=False,
             )
         self.commands.append(command)
         previous = self.snapshot_value["observation"]
@@ -273,10 +274,11 @@ def episode_context():
 
 class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
     def adapter(self, controller, planner, **changes):
+        monotonic_ms = changes.pop("monotonic_ms", lambda: 1_000)
         return BlastEpisodeRuntimeAdapter(
             controller=controller,
             planner_factory=lambda _model: planner,
-            monotonic_ms=lambda: 1_000,
+            monotonic_ms=monotonic_ms,
             **changes,
         )
 
@@ -1152,6 +1154,84 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             ["turn_right"],
         )
         self.assertEqual(len(planner.contexts), 2)
+
+    def test_no_valid_range_stops_side_turn_after_one_pulse(self):
+        class NoReturnDuringSideTurnController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "turn_left":
+                    result["observation"]["distance_mm"] = 2_000
+                    self.snapshot_value["observation"][
+                        "distance_mm"
+                    ] = 2_000
+                return result
+
+        controller = NoReturnDuringSideTurnController(500)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+
+        result = self.adapter(controller, planner).run(
+            episode_context()[0]
+        )
+
+        self.assertFalse(result.completed)
+        self.assertEqual(
+            result.terminal_reason, "side_search_motion_incomplete"
+        )
+        self.assertEqual(
+            controller.commands, ["scan_front_arc", "turn_left"]
+        )
+        self.assertEqual(len(planner.contexts), 2)
+
+    def test_control_wins_during_final_detour_verification(self):
+        for control, terminal_reason in (
+            ("deadline", "episode_deadline_elapsed"),
+            ("stop", "stopped"),
+        ):
+            with self.subTest(control=control):
+                clock = [1_000]
+                context, updates = episode_context()
+                context.settings.max_episode_ms = 60_000
+                controller = FullDetourController()
+                planner = Planner([
+                    decision(SCAN_FRONT_ARC),
+                    decision(TURN_LEFT_90),
+                ])
+                adapter = self.adapter(
+                    controller,
+                    planner,
+                    monotonic_ms=lambda: clock[0],
+                    max_decisions=51,
+                    execute_provisional_detour=True,
+                )
+                original = adapter._detour_scan_verified
+
+                def verifying_with_control(**values):
+                    verified = original(**values)
+                    if values["role"] == "FINAL":
+                        if control == "deadline":
+                            clock[0] = 61_000
+                        else:
+                            context.stop_requested.set()
+                    return verified
+
+                adapter._detour_scan_verified = verifying_with_control
+
+                result = adapter.run(context)
+
+                self.assertFalse(result.completed)
+                self.assertEqual(result.terminal_reason, terminal_reason)
+                self.assertEqual(controller.scan_count, 4)
+                self.assertEqual(controller.commands[-1], "scan_front_arc")
+                self.assertEqual(len(planner.contexts), 2)
+                self.assertTrue(any(
+                    update.get("scan", {}).get("state") == "complete"
+                    for update in updates
+                ))
 
     def test_full_host_detour_is_symmetric_to_the_right(self):
         controller = FullDetourController()
@@ -2371,6 +2451,131 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(result.terminal_reason, "stopped")
         self.assertFalse(result.completed)
         self.assertEqual(controller.commands, [])
+
+    def test_deadline_discards_late_planner_output_before_dispatch(self):
+        for final_clock, terminal_reason in (
+            (1_999, "episode_deadline_headroom_insufficient"),
+            (2_000, "episode_deadline_elapsed"),
+        ):
+            with self.subTest(final_clock=final_clock):
+                clock = [1_000]
+                context, _updates = episode_context()
+                context.settings.max_episode_ms = 1_000
+                controller = FakeController()
+
+                class LatePlanner(Planner):
+                    def decide(self, planner_context):
+                        result = super().decide(planner_context)
+                        clock[0] = final_clock
+                        return result
+
+                planner = LatePlanner([decision("ADVANCE")])
+
+                result = self.adapter(
+                    controller, planner, monotonic_ms=lambda: clock[0],
+                ).run(context)
+
+                self.assertFalse(result.completed)
+                self.assertEqual(result.terminal_reason, terminal_reason)
+                self.assertEqual(controller.commands, [])
+                self.assertEqual(len(planner.contexts), 1)
+
+    def test_control_before_planner_skips_the_model_call(self):
+        for control, terminal_reason in (
+            ("deadline", "episode_deadline_elapsed"),
+            ("stop", "stopped"),
+        ):
+            with self.subTest(control=control):
+                clock = [1_000]
+                context, _updates = episode_context()
+                context.settings.max_episode_ms = 1_000
+
+                class ControlDuringSnapshotController(FakeController):
+                    def snapshot(self):
+                        snapshot = super().snapshot()
+                        if control == "deadline":
+                            clock[0] = 2_000
+                        else:
+                            context.stop_requested.set()
+                        return snapshot
+
+                controller = ControlDuringSnapshotController()
+                planner = Planner([decision("ADVANCE")])
+
+                result = self.adapter(
+                    controller, planner, monotonic_ms=lambda: clock[0],
+                ).run(context)
+
+                self.assertFalse(result.completed)
+                self.assertEqual(result.terminal_reason, terminal_reason)
+                self.assertEqual(planner.contexts, [])
+                self.assertEqual(controller.commands, [])
+
+    def test_deadline_between_turn_pulses_keeps_partial_map_pose(self):
+        clock = [1_000]
+        context, _updates = episode_context()
+        context.settings.max_episode_ms = 5_000
+
+        class DeadlineAfterFirstPulseController(FakeController):
+            def __init__(self):
+                super().__init__()
+                self.invocations = 0
+
+            def command(self, command, *, cancel_requested=None):
+                if command == "turn_left":
+                    self.invocations += 1
+                if command == "turn_left" and self.invocations == 2:
+                    clock[0] = 6_000
+                return super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+
+        controller = DeadlineAfterFirstPulseController()
+        planner = Planner([decision(TURN_LEFT_90)])
+        adapter = self.adapter(
+            controller, planner, monotonic_ms=lambda: clock[0],
+        )
+
+        result = adapter.run(context)
+
+        self.assertFalse(result.completed)
+        self.assertEqual(
+            result.terminal_reason, "episode_deadline_elapsed"
+        )
+        self.assertEqual(controller.commands, ["turn_left"])
+        self.assertEqual(controller.invocations, 2)
+        history = adapter.spatial_map_provider.snapshot()["pose_history"]
+        self.assertEqual(len(history), 2)
+        self.assertGreater(abs(history[-1]["heading_mdeg"]), 0)
+        self.assertLess(abs(history[-1]["heading_mdeg"]), 90_000)
+
+    def test_deadline_or_stop_wins_when_late_planner_raises(self):
+        for stop, terminal_reason in (
+            (False, "episode_deadline_elapsed"),
+            (True, "stopped"),
+        ):
+            with self.subTest(stop=stop):
+                clock = [1_000]
+                context, _updates = episode_context()
+                context.settings.max_episode_ms = 1_000
+                controller = FakeController()
+
+                class RaisingPlanner:
+                    def decide(self, _planner_context):
+                        clock[0] = 2_000
+                        if stop:
+                            context.stop_requested.set()
+                        raise RuntimeError("late planner failure")
+
+                result = self.adapter(
+                    controller,
+                    RaisingPlanner(),
+                    monotonic_ms=lambda: clock[0],
+                ).run(context)
+
+                self.assertFalse(result.completed)
+                self.assertEqual(result.terminal_reason, terminal_reason)
+                self.assertEqual(controller.commands, [])
 
     def test_request_stop_uses_same_controller_owner(self):
         controller = FakeController()

@@ -312,6 +312,35 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertEqual(result.motion.requested_slice_count, 4)
         self.assertEqual(result.pose.heading_mdeg, 47_040)
 
+    def test_prestart_interruption_of_next_slice_retains_verified_prefix(self):
+        controller, executor = self.executor()
+        original_command = controller.command
+        invocations = 0
+
+        def interrupt_second(name, *, cancel_requested=None):
+            nonlocal invocations
+            invocations += 1
+            if invocations == 2:
+                raise BlastControllerError(
+                    "controller_command_interrupted",
+                    "cancelled before motor start",
+                    motion_started=False,
+                )
+            return original_command(
+                name, cancel_requested=cancel_requested,
+            )
+
+        controller.command = interrupt_second
+
+        result = executor.execute(TURN_LEFT_90)
+
+        self.assertEqual(invocations, 2)
+        self.assertEqual(controller.commands, ["turn_left"])
+        self.assertFalse(result.motion.complete)
+        self.assertEqual(result.motion.verified_slice_count, 1)
+        self.assertEqual(result.pose.heading_mdeg, 23_520)
+        self.assertTrue(executor.localization_valid)
+
     def test_turn_continuation_gate_stops_after_close_slice(self):
         controller, executor = self.executor()
         original_command = controller.command

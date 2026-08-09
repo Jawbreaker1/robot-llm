@@ -245,6 +245,20 @@ class BlastNavigationMotionExecutor:
             final_angles, motion, pose = self._validated_result(
                 action, results,
             )
+        except BlastControllerError as error:
+            interrupted_before_start = (
+                error.code == "controller_command_interrupted"
+                and error.motion_started is False
+            )
+            if not interrupted_before_start:
+                if command_attempted:
+                    self._localization_valid = False
+                raise
+            if not results:
+                raise
+            final_angles, motion, pose = self._validated_result(
+                action, results,
+            )
         except Exception:
             if command_attempted:
                 self._localization_valid = False

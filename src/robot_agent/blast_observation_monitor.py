@@ -76,8 +76,11 @@ NAVIGATION_MOTION_COMMANDS = {
 class BlastControllerError(RuntimeError):
     """A bounded BLAST command could not be accepted or verified."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self, code: str, message: str, *, motion_started=None,
+    ) -> None:
         self.code = code
+        self.motion_started = motion_started
         super().__init__(message)
 
 
@@ -266,6 +269,7 @@ class BlastObservationMonitor:
                 raise BlastControllerError(
                     "controller_command_interrupted",
                     "BLAST command was cancelled before motor start",
+                    motion_started=False,
                 )
             preempts_active_command = (
                 command == "stop"
@@ -423,6 +427,7 @@ class BlastObservationMonitor:
                         error=BlastControllerError(
                             "controller_command_interrupted",
                             "BLAST command was interrupted by stop",
+                            motion_started=False,
                         ),
                     )
                 elif request is None:
@@ -492,6 +497,7 @@ class BlastObservationMonitor:
                     error=BlastControllerError(
                         "controller_command_interrupted",
                         "BLAST command was interrupted by stop",
+                        motion_started=False,
                     ),
                 )
                 return
@@ -603,6 +609,7 @@ class BlastObservationMonitor:
             raise BlastControllerError(
                 "controller_command_interrupted",
                 "BLAST scan was interrupted by stop",
+                motion_started=False,
             )
         receipt = await runtime.turn_pulse(direction)
         observation = await self._observe_until_idle(

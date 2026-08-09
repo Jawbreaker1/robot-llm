@@ -19,6 +19,9 @@ from .blast_detour_route import (
     blast_detour_required_slots,
     blast_detour_scan_allows_progress,
 )
+from .blast_episode_deadline import (
+    SETTLED_OBSERVATION_HEADROOM_MS, BlastEpisodeDeadline,
+    blast_action_deadline_headroom_ms)
 from .blast_observation_monitor import (
     CONTROLLER_ID,
     RANGE_STATE_MEASURED,
@@ -72,7 +75,6 @@ from .physical_odometry import (
 from .physical_navigation_mission import DirectionalMission
 from .robot_control_service import RobotEpisodeOutcome
 
-
 BLAST_PROFILE_ID = ROBOT_ID
 ACTION_COMMANDS = {
     action: BLAST_NAVIGATION_COMMANDS[action]
@@ -86,11 +88,9 @@ _SIDE_SEARCH_IMU_ODOMETRY_TOLERANCE_MDEG = 30_000
 _PLANNER_ACTION_SOURCE = "PLANNER_ACTION"
 _HOST_SIDE_SEARCH_ACTION_SOURCE = "HOST_SIDE_SEARCH_ACTION"
 _HOST_LOCAL_DETOUR_ACTION_SOURCE = "HOST_LOCAL_DETOUR_ACTION"
-_SCAN_REFUSAL_CODES = frozenset((
-    "scan_start_clearance_unverified",
-    "scan_sweep_clearance_lost",
-    "scan_sweep_observation_unverified",
-))
+_SCAN_REFUSAL_CODES = frozenset(("scan_start_clearance_unverified",
+                                 "scan_sweep_clearance_lost",
+                                 "scan_sweep_observation_unverified"))
 
 
 def _map_pose(pose: PhysicalPose):
@@ -512,13 +512,9 @@ class BlastEpisodeRuntimeAdapter:
         ):
             return False
         distance = sensors.get("distance_mm")
-        state = blast_range_state(distance)
         return (
-            state == RANGE_STATE_NO_VALID_DISTANCE
-            or (
-                state == RANGE_STATE_MEASURED
-                and float(distance) > _minimum_rotation_clearance_mm()
-            )
+            blast_range_state(distance) == RANGE_STATE_MEASURED
+            and float(distance) > _minimum_rotation_clearance_mm()
         )
 
     def _current_observation_allows_action(self, action, observation) -> bool:
@@ -606,6 +602,33 @@ class BlastEpisodeRuntimeAdapter:
                 "message": message,
             },
         )
+
+    def _control_outcome(self, context, deadline, headroom_ms=0):
+        value = deadline.outcome(
+            cancelled=self._cancelled(context),
+            headroom_ms=headroom_ms,
+        )
+        if value is None:
+            return None
+        return self._outcome(value[0], False, value[1])
+
+    def _dispatch_action(self, action, motion_executor, control_requested):
+        if action == SCAN_FRONT_ARC:
+            result = self.controller.command(
+                "scan_front_arc",
+                cancel_requested=control_requested,
+            )
+            return result, None
+        execution = motion_executor.execute(
+            action,
+            cancel_requested=control_requested,
+            continue_requested=(
+                self._turn_slice_allows_continuation
+                if action in (TURN_LEFT_90, TURN_RIGHT_90)
+                else None
+            ),
+        )
+        return execution.controller_results[-1], execution
 
     def _scan_failure_outcome(
         self, code, *, side_search_rescan, detour_verification,
@@ -743,23 +766,31 @@ class BlastEpisodeRuntimeAdapter:
 
     def _fresh_planner_observation_or_stop(
         self, action, selects_detour_side, episode_start_heading,
-        motion_executor, context,
+        motion_executor, context, deadline_ms,
     ):
+        control_requested = lambda: (
+            self._control_outcome(
+                context, deadline_ms, SETTLED_OBSERVATION_HEADROOM_MS,
+            ) is not None
+        )
         try:
-            return self._fresh_planner_action_observation(
+            observation = self._fresh_planner_action_observation(
                 action=action,
                 selects_detour_side=selects_detour_side,
                 episode_start_heading=episode_start_heading,
                 motion_executor=motion_executor,
-                cancel_requested=lambda: self._cancelled(context),
-            ), None
+                cancel_requested=control_requested,
+            )
         except BlastControllerError as error:
-            if (
-                error.code == "controller_command_interrupted"
-                and self._cancelled(context)
-            ):
-                return None, self._outcome("stopped", False, "stopped")
+            outcome = self._control_outcome(
+                context, deadline_ms, SETTLED_OBSERVATION_HEADROOM_MS,
+            )
+            if error.code == "controller_command_interrupted" and outcome:
+                return None, outcome
             raise
+        return observation, self._control_outcome(
+            context, deadline_ms, blast_action_deadline_headroom_ms(action),
+        )
 
     def _complete_side_search(
         self,
@@ -944,19 +975,29 @@ class BlastEpisodeRuntimeAdapter:
         motion_executor,
         episode_start_heading,
         remaining_slots,
+        deadline_ms,
     ):
-        result = planner.decide(ControllerActionContext(
-            goal=context.request.goal,
-            locale=context.request.locale,
-            robot_id=ROBOT_ID,
-            controller_id=CONTROLLER_ID,
-            available_actions=available_actions,
-            observation=observation,
-            history=tuple(history[-12:]),
-            completion_allowed=completion_allowed,
-        ))
-        if self._cancelled(context):
-            return None, self._outcome("stopped", False, "stopped")
+        outcome = self._control_outcome(context, deadline_ms)
+        if outcome is not None: return None, outcome
+        try:
+            result = planner.decide(ControllerActionContext(
+                goal=context.request.goal,
+                locale=context.request.locale,
+                robot_id=ROBOT_ID,
+                controller_id=CONTROLLER_ID,
+                available_actions=available_actions,
+                observation=observation,
+                history=tuple(history[-12:]),
+                completion_allowed=completion_allowed,
+            ))
+        except Exception:
+            outcome = self._control_outcome(context, deadline_ms)
+            if outcome is not None:
+                return None, outcome
+            raise
+        outcome = self._control_outcome(context, deadline_ms)
+        if outcome is not None:
+            return None, outcome
         if not isinstance(result, ControllerActionPlannerResult):
             raise BlastEpisodeError(
                 "blast_planner_result_invalid",
@@ -991,7 +1032,7 @@ class BlastEpisodeRuntimeAdapter:
         if action in ACTION_COMMANDS or action == SCAN_FRONT_ARC:
             observation, stopped = self._fresh_planner_observation_or_stop(
                 action, selects_side, episode_start_heading,
-                motion_executor, context,
+                motion_executor, context, deadline_ms,
             )
             if stopped is not None:
                 return None, stopped
@@ -1008,6 +1049,9 @@ class BlastEpisodeRuntimeAdapter:
                 ],
             },
         })
+        outcome = self._control_outcome(context, deadline_ms)
+        if outcome is not None:
+            return None, outcome
         if action == COMPLETE:
             return None, self._outcome("completed", True, assessment)
         if action == ABORT:
@@ -1270,6 +1314,8 @@ class BlastEpisodeRuntimeAdapter:
         detour_pass_scan_complete = False
         detour_final_scan_complete = False
         try:
+            deadline_ms = BlastEpisodeDeadline.begin(
+                context.settings, self.monotonic_ms)
             planner = self.planner_factory(context.settings.model)
             if not callable(getattr(planner, "decide", None)):
                 raise BlastEpisodeError(
@@ -1279,8 +1325,9 @@ class BlastEpisodeRuntimeAdapter:
             # Preserve the existing hard episode bound: host-owned waypoint
             # actions consume the same semantic action slots as model actions.
             for _index in range(self.max_decisions):
-                if self._cancelled(context):
-                    return self._outcome("stopped", False, "stopped")
+                outcome = self._control_outcome(context, deadline_ms)
+                if outcome is not None:
+                    return outcome
                 observation = self._observation()
                 if _index == 0:
                     episode_start_heading = self._heading(
@@ -1389,10 +1436,11 @@ class BlastEpisodeRuntimeAdapter:
                         mission=map_trace.mission,
                     )
                     if detour_complete:
-                        if self._cancelled(context):
-                            return self._outcome(
-                                "stopped", False, "stopped"
-                            )
+                        outcome = self._control_outcome(
+                            context, deadline_ms,
+                        )
+                        if outcome is not None:
+                            return outcome
                         map_trace.record(
                             pose=motion_executor.pose,
                             observation=observation["sensors"],
@@ -1440,6 +1488,7 @@ class BlastEpisodeRuntimeAdapter:
                         motion_executor=motion_executor,
                         episode_start_heading=episode_start_heading,
                         remaining_slots=self.max_decisions - _index,
+                        deadline_ms=deadline_ms,
                     )
                     if outcome is not None:
                         return outcome
@@ -1491,32 +1540,29 @@ class BlastEpisodeRuntimeAdapter:
                 )
                 if is_side_search_reorientation:
                     reorientation_attempted = True
+                outcome = self._control_outcome(
+                    context, deadline_ms,
+                    blast_action_deadline_headroom_ms(action),
+                )
+                if outcome is not None:
+                    return outcome
+                control_requested = lambda: (
+                    self._control_outcome(context, deadline_ms) is not None
+                )
                 try:
-                    if action == SCAN_FRONT_ARC:
-                        command_result = self.controller.command(
-                            "scan_front_arc",
-                            cancel_requested=lambda: self._cancelled(context),
-                        )
-                    else:
-                        execution = motion_executor.execute(
-                            action,
-                            cancel_requested=lambda: self._cancelled(context),
-                            continue_requested=(
-                                self._turn_slice_allows_continuation
-                                if action in (TURN_LEFT_90, TURN_RIGHT_90)
-                                else None
-                            ),
-                        )
-                        command_result = execution.controller_results[-1]
+                    command_result, execution = self._dispatch_action(
+                        action, motion_executor, control_requested,
+                    )
                 except BlastControllerError as error:
+                    outcome = self._control_outcome(context, deadline_ms)
                     if (
                         error.code in (
                             {"controller_command_interrupted"}
                             | _SCAN_REFUSAL_CODES
                         )
-                        and self._cancelled(context)
+                        and outcome is not None
                     ):
-                        return self._outcome("stopped", False, "stopped")
+                        return outcome
                     scan_outcome = self._scan_failure_outcome(
                         error.code,
                         side_search_rescan=is_side_search_rescan,
@@ -1641,11 +1687,12 @@ class BlastEpisodeRuntimeAdapter:
                     context, action, result_observation, scan,
                     planar_projection,
                 )
-                if self._cancelled(context):
-                    return self._outcome("stopped", False, "stopped")
+                outcome = self._control_outcome(context, deadline_ms)
+                if outcome is not None:
+                    return outcome
                 if is_detour_pass_scan or is_detour_final_scan:
                     scan_role = "PASS" if is_detour_pass_scan else "FINAL"
-                    if not self._detour_scan_verified(
+                    detour_scan_verified = self._detour_scan_verified(
                         scan_view=latest_scan_view,
                         role=scan_role,
                         selected_side=selected_detour_side,
@@ -1653,7 +1700,11 @@ class BlastEpisodeRuntimeAdapter:
                         episode_start_heading=episode_start_heading,
                         pose=motion_executor.pose,
                         route=local_detour_route,
-                    ):
+                    )
+                    outcome = self._control_outcome(context, deadline_ms)
+                    if outcome is not None:
+                        return outcome
+                    if not detour_scan_verified:
                         return self._outcome(
                             "detour_verification_unavailable",
                             False,
@@ -1746,9 +1797,4 @@ class BlastEpisodeRuntimeAdapter:
         self.controller.command("stop")
 
 
-__all__ = (
-    "ACTION_COMMANDS",
-    "BLAST_PROFILE_ID",
-    "BlastEpisodeError",
-    "BlastEpisodeRuntimeAdapter",
-)
+__all__ = ("ACTION_COMMANDS", "BLAST_PROFILE_ID", "BlastEpisodeError", "BlastEpisodeRuntimeAdapter")
