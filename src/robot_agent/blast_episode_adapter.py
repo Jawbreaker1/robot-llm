@@ -24,6 +24,7 @@ from .blast_observation_monitor import (
 from .blast_scan_planar_projection import (
     project_blast_scan_planar_surfaces,
 )
+from .blast_spatial_map import BlastSpatialMapBridge
 from .blast_navigation_action_profile import (
     BLAST_NAVIGATION_COMMANDS,
 )
@@ -55,6 +56,7 @@ from .physical_odometry import (
     PhysicalPose,
     normalize_heading_mdeg,
 )
+from .physical_navigation_mission import DirectionalMission
 from .robot_control_service import RobotEpisodeOutcome
 
 
@@ -66,9 +68,175 @@ ACTION_COMMANDS = {
 DEFAULT_MAX_DECISIONS = 16
 DEFAULT_MAX_OBSERVATION_AGE_MS = 3_000
 DEFAULT_MIN_FORWARD_CLEARANCE_MM = 120
+DEFAULT_MINIMUM_FORWARD_PROGRESS_MM = 420
 _SIDE_SEARCH_IMU_ODOMETRY_TOLERANCE_MDEG = 30_000
 _PLANNER_ACTION_SOURCE = "PLANNER_ACTION"
 _HOST_SIDE_SEARCH_ACTION_SOURCE = "HOST_SIDE_SEARCH_ACTION"
+
+
+def _map_pose(pose: PhysicalPose):
+    return {
+        "x_mm": pose.x_mm,
+        "y_mm": pose.y_mm,
+        "heading_mdeg": pose.heading_mdeg,
+    }
+
+
+class _BlastEpisodeMapTrace:
+    """Fail-open projection of one episode into the diagnostic map sink."""
+
+    def __init__(
+        self,
+        *,
+        bridge,
+        episode_id,
+        pose,
+        observation,
+        observed_at_unix_ms,
+        episode_start_heading,
+        minimum_forward_progress_mm,
+    ):
+        self.bridge = bridge
+        self.episode_id = episode_id
+        self.episode_start_heading = episode_start_heading
+        self.mission = DirectionalMission.begin(
+            episode_id=episode_id,
+            minimum_forward_progress_mm=minimum_forward_progress_mm,
+            pose=pose,
+        )
+        self.planned_leg = None
+        self.planar_scan_views = []
+        self._offer(
+            "begin_episode",
+            episode_id=episode_id,
+            pose=pose,
+            observation=observation,
+        )
+        self._offer_trace(pose, observation, observed_at_unix_ms)
+
+    def _offer(self, method, **values):
+        try:
+            return getattr(self.bridge, method)(**values)
+        except Exception:
+            return False
+
+    def _final_goal(self, pose):
+        heading = math.radians(
+            self.mission.reference_heading_mdeg / 1_000.0
+        )
+        distance = self.mission.minimum_forward_progress_mm
+        current = self.mission.longitudinal_progress_mm(pose)
+        return {
+            "kind": "DIRECTIONAL_HEADING",
+            "navigation_enforced": False,
+            "origin_x_mm": self.mission.origin_x_mm,
+            "origin_y_mm": self.mission.origin_y_mm,
+            "target_x_mm": int(round(
+                self.mission.origin_x_mm + distance * math.cos(heading)
+            )),
+            "target_y_mm": int(round(
+                self.mission.origin_y_mm + distance * math.sin(heading)
+            )),
+            "desired_heading_mdeg": self.mission.reference_heading_mdeg,
+            "minimum_forward_progress_mm": distance,
+            "heading_tolerance_mdeg": self.mission.heading_tolerance_mdeg,
+            "current_forward_progress_mm": current,
+            "remaining_forward_progress_mm": max(0, distance - current),
+        }
+
+    def _imu_heading(self, observation, observed_at_unix_ms):
+        imu = observation.get("imu") if isinstance(observation, Mapping) else None
+        heading = imu.get("heading_deg") if isinstance(imu, Mapping) else None
+        if (
+            isinstance(heading, bool)
+            or not isinstance(heading, (int, float))
+            or not math.isfinite(float(heading))
+            or isinstance(self.episode_start_heading, bool)
+            or not isinstance(self.episode_start_heading, (int, float))
+            or not math.isfinite(float(self.episode_start_heading))
+            or type(observed_at_unix_ms) is not int
+        ):
+            return None
+        relative = (
+            float(heading) - float(self.episode_start_heading) + 180.0
+        ) % 360.0 - 180.0
+        return {
+            "heading_mdeg": normalize_heading_mdeg(
+                -round(relative * 1_000)
+            ),
+            "reference": "EPISODE_START",
+            "observed_at_unix_ms": observed_at_unix_ms,
+        }
+
+    def _offer_trace(self, pose, observation, observed_at_unix_ms):
+        self._offer(
+            "offer_trace",
+            episode_id=self.episode_id,
+            final_goal=self._final_goal(pose),
+            planned_leg=self.planned_leg,
+            imu_heading=self._imu_heading(
+                observation, observed_at_unix_ms
+            ),
+            planar_scan_views=tuple(self.planar_scan_views),
+        )
+
+    def record(
+        self,
+        *,
+        pose,
+        observation,
+        pose_observed,
+        selected_side,
+        waypoint,
+        bind_pose,
+        scan_view,
+    ):
+        if not isinstance(observation, Mapping):
+            return
+        observed_at_unix_ms = time.time_ns() // 1_000_000
+        if pose_observed:
+            self._offer(
+                "offer_pose",
+                episode_id=self.episode_id,
+                pose=pose,
+                observation=observation,
+            )
+        if (
+            self.planned_leg is None
+            and selected_side in ("LEFT", "RIGHT")
+            and isinstance(waypoint, Mapping)
+            and isinstance(bind_pose, PhysicalPose)
+        ):
+            self.planned_leg = {
+                "kind": "SIDE_SEARCH",
+                "scope": "SEARCH_POSITION_ONLY",
+                "clearance_proven": False,
+                "passage_proven": False,
+                "route_eligible": False,
+                "selected_side": selected_side,
+                "bind_pose": _map_pose(bind_pose),
+                "waypoint": {
+                    "x_mm": waypoint["target_x_mm"],
+                    "y_mm": waypoint["target_y_mm"],
+                    "heading_mdeg": waypoint["target_heading_mdeg"],
+                },
+            }
+        if isinstance(scan_view, Mapping):
+            self.planar_scan_views.append({
+                "scan_id": "{}-scan-{}".format(
+                    self.episode_id,
+                    len(self.planar_scan_views) + 1,
+                ),
+                "observed_at_unix_ms": observed_at_unix_ms,
+                "scan_pose": {
+                    key: scan_view["scan_pose"][key]
+                    for key in ("x_mm", "y_mm", "heading_mdeg")
+                },
+                "projection": copy.deepcopy(
+                    scan_view["planar_projection"]
+                ),
+            })
+        self._offer_trace(pose, observation, observed_at_unix_ms)
 
 
 def _scan_refusal(reason_is_side_search: bool):
@@ -143,6 +311,10 @@ class BlastEpisodeRuntimeAdapter:
         minimum_forward_clearance_mm: int = (
             DEFAULT_MIN_FORWARD_CLEARANCE_MM
         ),
+        minimum_forward_progress_mm: int = (
+            DEFAULT_MINIMUM_FORWARD_PROGRESS_MM
+        ),
+        spatial_map_bridge=None,
         monotonic_ms: Callable[[], int] = (
             lambda: time.monotonic_ns() // 1_000_000
         ),
@@ -161,13 +333,34 @@ class BlastEpisodeRuntimeAdapter:
             or isinstance(minimum_forward_clearance_mm, bool)
             or not isinstance(minimum_forward_clearance_mm, int)
             or not 1 <= minimum_forward_clearance_mm <= 2_000
+            or isinstance(minimum_forward_progress_mm, bool)
+            or not isinstance(minimum_forward_progress_mm, int)
+            or not 1 <= minimum_forward_progress_mm <= 2_000
         ):
             raise ValueError("BLAST episode adapter configuration is invalid")
+        if spatial_map_bridge is None:
+            spatial_map_bridge = BlastSpatialMapBridge(
+                robot_id=ROBOT_ID,
+                controller_instance_id=CONTROLLER_ID,
+            )
+        if any(
+            not callable(getattr(spatial_map_bridge, name, None))
+            for name in (
+                "begin_episode",
+                "offer_pose",
+                "offer_trace",
+                "snapshot",
+                "close",
+            )
+        ):
+            raise ValueError("BLAST spatial map bridge is invalid")
         self.controller = controller
         self.planner_factory = planner_factory
         self.max_decisions = max_decisions
         self.max_observation_age_ms = max_observation_age_ms
         self.minimum_forward_clearance_mm = minimum_forward_clearance_mm
+        self.minimum_forward_progress_mm = minimum_forward_progress_mm
+        self.spatial_map_provider = spatial_map_bridge
         self.monotonic_ms = monotonic_ms
         self._lock = threading.Lock()
         self._active_episode_id = None
@@ -504,6 +697,56 @@ class BlastEpisodeRuntimeAdapter:
             )
         return side, waypoint, None
 
+    def _begin_map_trace(
+        self, context, pose, observation, episode_start_heading,
+    ):
+        return _BlastEpisodeMapTrace(
+            bridge=self.spatial_map_provider,
+            episode_id=context.episode_id,
+            pose=pose,
+            observation=observation["sensors"],
+            observed_at_unix_ms=observation["observed_at_unix_ms"],
+            episode_start_heading=episode_start_heading,
+            minimum_forward_progress_mm=self.minimum_forward_progress_mm,
+        )
+
+    @staticmethod
+    def _record_map_result(
+        trace, action, pose, observation, selected_side, waypoint, scan_view,
+    ):
+        trace.record(
+            pose=pose,
+            observation=observation,
+            pose_observed=action in ACTION_COMMANDS,
+            selected_side=selected_side,
+            waypoint=waypoint,
+            bind_pose=pose,
+            scan_view=(scan_view if action == SCAN_FRONT_ARC else None),
+        )
+
+    @staticmethod
+    def _publish_action_result(
+        context, action, result_observation, scan, planar_projection,
+    ):
+        update = {
+            "current_action": action,
+            "obstacle": {
+                "distance_mm": (
+                    result_observation.get("distance_mm")
+                    if isinstance(result_observation, Mapping)
+                    else None
+                )
+            },
+        }
+        diagnostic_scan = None
+        if isinstance(scan, Mapping):
+            diagnostic_scan = dict(scan)
+            if planar_projection is not None:
+                diagnostic_scan["planar_projection"] = planar_projection
+            update["scan"] = diagnostic_scan
+        context.publish(update)
+        return diagnostic_scan
+
     def run(self, context) -> RobotEpisodeOutcome:
         with self._lock:
             if self._active_episode_id is not None:
@@ -543,6 +786,10 @@ class BlastEpisodeRuntimeAdapter:
                     motion_executor = BlastNavigationMotionExecutor(
                         controller=self.controller,
                         initial_observation=observation["sensors"],
+                    )
+                    map_trace = self._begin_map_trace(
+                        context, motion_executor.pose, observation,
+                        episode_start_heading,
                     )
                 observation = self._with_navigation_reference(
                     observation,
@@ -896,25 +1143,16 @@ class BlastEpisodeRuntimeAdapter:
                                 planar_projection
                             ),
                         }
+                self._record_map_result(
+                    map_trace, action, motion_executor.pose,
+                    result_observation, selected_detour_side,
+                    side_search_waypoint, latest_scan_view,
+                )
                 history.append(history_item)
-                update = {
-                    "current_action": action,
-                    "obstacle": {
-                        "distance_mm": (
-                            result_observation.get("distance_mm")
-                            if isinstance(result_observation, Mapping)
-                            else None
-                        )
-                    },
-                }
-                if isinstance(scan, Mapping):
-                    diagnostic_scan = dict(scan)
-                    if planar_projection is not None:
-                        diagnostic_scan["planar_projection"] = (
-                            planar_projection
-                        )
-                    update["scan"] = diagnostic_scan
-                context.publish(update)
+                diagnostic_scan = self._publish_action_result(
+                    context, action, result_observation, scan,
+                    planar_projection,
+                )
                 if self._cancelled(context):
                     return self._outcome("stopped", False, "stopped")
                 if (

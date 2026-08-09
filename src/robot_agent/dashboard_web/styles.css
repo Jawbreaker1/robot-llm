@@ -2217,6 +2217,94 @@ textarea:focus-visible,
   stroke-width: 3;
 }
 
+#map-local-odometry-layer[data-geometry="mixed-local-odometry"]
+  > .map-path {
+  stroke: var(--ready);
+  stroke-dasharray: none;
+}
+
+.map-final-goal-line {
+  stroke: var(--warning);
+  stroke-dasharray: 3 7;
+  stroke-linecap: round;
+  stroke-width: 3;
+}
+
+.map-final-goal-target {
+  fill: rgb(242 184 75 / 20%);
+  stroke: var(--warning);
+  stroke-width: 4;
+}
+
+.map-final-goal-heading {
+  fill: none;
+  stroke: var(--warning);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 4;
+}
+
+.map-planned-leg-line {
+  fill: none;
+  stroke: var(--model);
+  stroke-dasharray: 11 7;
+  stroke-linecap: round;
+  stroke-width: 5;
+}
+
+.map-planned-leg-bind,
+.map-planned-waypoint {
+  fill: var(--panel-deep);
+  stroke: var(--model);
+  stroke-width: 3;
+}
+
+.map-planned-waypoint-heading {
+  fill: none;
+  stroke: var(--model);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 3;
+}
+
+.map-blast-scan-ray-line {
+  stroke: rgb(116 167 255 / 62%);
+  stroke-linecap: round;
+  stroke-width: 3;
+}
+
+.map-blast-scan-origin {
+  fill: var(--evidence);
+}
+
+.map-blast-scan-echo {
+  fill: rgb(255 107 98 / 46%);
+  stroke: var(--danger);
+  stroke-width: 3;
+}
+
+.map-navigation-trace-label {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.05em;
+  paint-order: stroke;
+  stroke: var(--panel-deep);
+  stroke-width: 5px;
+}
+
+.map-final-goal-label {
+  fill: var(--warning);
+}
+
+.map-planned-waypoint-label {
+  fill: var(--model);
+}
+
+.map-blast-scan-label {
+  fill: var(--evidence);
+}
+
 .map-local-layer-label,
 .map-local-layer-note,
 .map-local-ir-label {
@@ -2376,6 +2464,14 @@ textarea:focus-visible,
   stroke-width: 5;
 }
 
+.map-local-imu-heading {
+  fill: none;
+  stroke: var(--evidence);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 3;
+}
+
 .map-local-robot-body {
   fill: rgb(110 214 196 / 72%);
   stroke: var(--panel-deep);
@@ -2424,7 +2520,8 @@ textarea:focus-visible,
 
 .legend-swatch,
 .legend-robot,
-.legend-provisional-local {
+.legend-provisional-local,
+.legend-navigation-echo {
   display: inline-block;
   width: 12px;
   height: 12px;
@@ -2469,6 +2566,32 @@ textarea:focus-visible,
   border-color: var(--warning);
   border-style: dashed;
   clip-path: polygon(0 50%, 100% 0, 100% 100%);
+}
+
+.legend-odometry,
+.legend-planned-leg,
+.legend-imu-heading {
+  display: inline-block;
+  width: 17px;
+  height: 3px;
+}
+
+.legend-odometry {
+  border-top: 3px solid var(--ready);
+}
+
+.legend-planned-leg {
+  border-top: 3px dashed var(--model);
+}
+
+.legend-imu-heading {
+  border-top: 3px solid var(--evidence);
+}
+
+.legend-navigation-echo {
+  background: rgb(255 107 98 / 46%);
+  border-color: var(--danger);
+  border-radius: 50%;
 }
 
 .map-detail-column {

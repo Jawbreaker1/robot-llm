@@ -296,6 +296,61 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             45,
         )
 
+    def test_existing_map_shows_goal_and_encoder_odometry_without_authority(self):
+        controller = FakeController(500)
+        planner = Planner([decision("ADVANCE"), decision(COMPLETE)])
+        adapter = self.adapter(controller, planner)
+
+        result = adapter.run(episode_context()[0])
+
+        self.assertTrue(result.completed)
+        spatial_map = adapter.spatial_map_provider.snapshot()
+        self.assertEqual(spatial_map["schema"], "robot-spatial-map/v1")
+        self.assertEqual(spatial_map["status"], "pose_only")
+        self.assertEqual(
+            [pose["x_mm"] for pose in spatial_map["pose_history"]],
+            [0, 45],
+        )
+        trace = spatial_map["navigation_trace"]
+        self.assertEqual(trace["final_goal"]["target_x_mm"], 420)
+        self.assertEqual(
+            trace["final_goal"]["current_forward_progress_mm"], 45
+        )
+        self.assertEqual(
+            trace["final_goal"]["remaining_forward_progress_mm"], 375
+        )
+        self.assertIsNone(trace["planned_leg"])
+        self.assertEqual(trace["imu_heading"]["heading_mdeg"], 0)
+        self.assertEqual(spatial_map["cells"], [])
+        self.assertEqual(spatial_map["object_hypotheses"], [])
+
+    def test_map_sink_failure_does_not_change_actions_or_outcome(self):
+        class BrokenMap:
+            def begin_episode(self, **_values):
+                raise RuntimeError("map unavailable")
+
+            offer_pose = begin_episode
+            offer_trace = begin_episode
+
+            def snapshot(self):
+                raise RuntimeError("map unavailable")
+
+            def close(self, **_values):
+                return True
+
+        controller = FakeController(500)
+        planner = Planner([decision("ADVANCE"), decision(COMPLETE)])
+
+        result = self.adapter(
+            controller,
+            planner,
+            spatial_map_bridge=BrokenMap(),
+        ).run(episode_context()[0])
+
+        self.assertTrue(result.completed)
+        self.assertEqual(controller.commands, ["drive_forward"])
+        self.assertEqual(len(planner.contexts), 2)
+
     def test_scripted_semantic_actions_use_four_pulse_turn_and_carry_pose(self):
         controller = FakeController(1_000)
         planner = Planner([
@@ -649,13 +704,12 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 ])
                 context, updates = episode_context()
 
-                result = self.adapter(
+                adapter = self.adapter(
                     controller,
                     planner,
                     max_decisions=9,
-                ).run(
-                    context
                 )
+                result = adapter.run(context)
 
                 self.assertFalse(result.completed)
                 self.assertEqual(
@@ -686,6 +740,25 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 self.assertFalse(multi_view["clearance_proven"])
                 self.assertFalse(multi_view["passage_proven"])
                 self.assertFalse(multi_view["route_eligible"])
+                spatial_map = adapter.spatial_map_provider.snapshot()
+                trace = spatial_map["navigation_trace"]
+                self.assertEqual(
+                    trace["planned_leg"]["selected_side"], side
+                )
+                self.assertEqual(
+                    trace["planned_leg"]["scope"],
+                    "SEARCH_POSITION_ONLY",
+                )
+                self.assertFalse(
+                    trace["planned_leg"]["clearance_proven"]
+                )
+                self.assertEqual(len(trace["planar_scan_views"]), 2)
+                self.assertGreaterEqual(
+                    len(spatial_map["pose_history"]), 8
+                )
+                self.assertEqual(
+                    trace["final_goal"]["target_x_mm"], 420
+                )
                 self.assertEqual(
                     multi_view["strategy_source"],
                     "PLANNER_ACTION",

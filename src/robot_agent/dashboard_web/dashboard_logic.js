@@ -19,6 +19,14 @@
   const MAX_POSE_HISTORY = 2048;
   const MAX_SCAN_EVIDENCE = 64;
   const MAX_SCAN_RAYS_PER_EVIDENCE = 16;
+  const NAVIGATION_TRACE_SCHEMA = "robot-navigation-trace/v1";
+  const BLAST_SCAN_PROJECTION_SCHEMA = (
+    "blast-planar-scan-projection/v1"
+  );
+  const MAX_NAVIGATION_SCAN_VIEWS = 16;
+  const MAX_NAVIGATION_SCAN_POINTS = 5;
+  const MAX_LOCAL_COORDINATE_MM = 1_000_000;
+  const MAX_MEASURED_RANGE_MM = 10_000;
   const SESSION_REJECTED_CODE = "session_token_rejected";
   const BODY_RELATIVE_BEARING_CONVENTION = (
     "POSITIVE_LEFT_NEGATIVE_RIGHT"
@@ -73,6 +81,308 @@
       return explicitAge;
     }
     return null;
+  }
+
+  function localCoordinate(value) {
+    const coordinate = finite(value);
+    return (
+      coordinate !== null
+      && Math.abs(coordinate) <= MAX_LOCAL_COORDINATE_MM
+    ) ? coordinate : null;
+  }
+
+  function localHeading(value) {
+    const heading = finite(value);
+    return (
+      heading !== null
+      && heading >= -180000
+      && heading <= 179999
+    ) ? heading : null;
+  }
+
+  function normalizeTracePose(value) {
+    const pose = record(value);
+    const xMm = localCoordinate(pose.x_mm);
+    const yMm = localCoordinate(pose.y_mm);
+    const headingMdeg = localHeading(pose.heading_mdeg);
+    if (xMm === null || yMm === null || headingMdeg === null) {
+      return null;
+    }
+    return Object.freeze({ xMm, yMm, headingMdeg });
+  }
+
+  function normalizeFinalGoal(value) {
+    const goal = record(value);
+    const originX = localCoordinate(goal.origin_x_mm);
+    const originY = localCoordinate(goal.origin_y_mm);
+    const targetX = localCoordinate(goal.target_x_mm);
+    const targetY = localCoordinate(goal.target_y_mm);
+    const desiredHeadingMdeg = localHeading(
+      goal.desired_heading_mdeg,
+    );
+    const minimumForwardProgressMm = positive(
+      goal.minimum_forward_progress_mm,
+    );
+    const headingToleranceMdeg = positive(
+      goal.heading_tolerance_mdeg,
+    );
+    const currentForwardProgressMm = finite(
+      goal.current_forward_progress_mm,
+    );
+    const remainingForwardProgressMm = finite(
+      goal.remaining_forward_progress_mm,
+    );
+    if (
+      goal.kind !== "DIRECTIONAL_HEADING"
+      || goal.navigation_enforced !== false
+      || originX === null
+      || originY === null
+      || targetX === null
+      || targetY === null
+      || desiredHeadingMdeg === null
+      || minimumForwardProgressMm === null
+      || minimumForwardProgressMm > MAX_LOCAL_COORDINATE_MM
+      || headingToleranceMdeg === null
+      || headingToleranceMdeg > 180000
+      || currentForwardProgressMm === null
+      || Math.abs(currentForwardProgressMm) > MAX_LOCAL_COORDINATE_MM
+      || remainingForwardProgressMm === null
+      || remainingForwardProgressMm < 0
+      || remainingForwardProgressMm > MAX_LOCAL_COORDINATE_MM
+    ) {
+      return null;
+    }
+    const headingRadians = desiredHeadingMdeg / 1000 * Math.PI / 180;
+    const expectedTargetX = originX
+      + minimumForwardProgressMm * Math.cos(headingRadians);
+    const expectedTargetY = originY
+      + minimumForwardProgressMm * Math.sin(headingRadians);
+    const expectedRemaining = Math.max(
+      0,
+      minimumForwardProgressMm - currentForwardProgressMm,
+    );
+    if (
+      Math.abs(targetX - expectedTargetX) > 1.5
+      || Math.abs(targetY - expectedTargetY) > 1.5
+      || Math.abs(remainingForwardProgressMm - expectedRemaining) > 1
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      kind: "DIRECTIONAL_HEADING",
+      navigationEnforced: false,
+      originX,
+      originY,
+      targetX,
+      targetY,
+      desiredHeadingMdeg,
+      minimumForwardProgressMm,
+      headingToleranceMdeg,
+      currentForwardProgressMm,
+      remainingForwardProgressMm,
+    });
+  }
+
+  function normalizeImuHeading(value, nowUnixMs) {
+    if (value === null) {
+      return null;
+    }
+    const heading = record(value);
+    const headingMdeg = localHeading(heading.heading_mdeg);
+    const observedAtUnixMs = finite(heading.observed_at_unix_ms);
+    if (
+      heading.reference !== "EPISODE_START"
+      || headingMdeg === null
+      || observedAtUnixMs === null
+      || observedAtUnixMs < 0
+      || observedAtUnixMs > nowUnixMs
+    ) {
+      return undefined;
+    }
+    return Object.freeze({
+      headingMdeg,
+      reference: "EPISODE_START",
+      observedAtUnixMs,
+      ageMs: nowUnixMs - observedAtUnixMs,
+    });
+  }
+
+  function normalizePlannedLeg(value) {
+    if (value === null) {
+      return null;
+    }
+    const leg = record(value);
+    const bindPose = normalizeTracePose(leg.bind_pose);
+    const waypoint = normalizeTracePose(leg.waypoint);
+    if (
+      leg.kind !== "SIDE_SEARCH"
+      || leg.scope !== "SEARCH_POSITION_ONLY"
+      || leg.clearance_proven !== false
+      || leg.passage_proven !== false
+      || leg.route_eligible !== false
+      || !["LEFT", "RIGHT"].includes(leg.selected_side)
+      || bindPose === null
+      || waypoint === null
+    ) {
+      return undefined;
+    }
+    return Object.freeze({
+      kind: "SIDE_SEARCH",
+      scope: "SEARCH_POSITION_ONLY",
+      clearanceProven: false,
+      passageProven: false,
+      routeEligible: false,
+      selectedSide: leg.selected_side,
+      bindPose,
+      waypoint,
+    });
+  }
+
+  function normalizePlanarScanPoint(value) {
+    const point = record(value);
+    const measuredRangeMm = positive(point.measured_range_mm);
+    const relativeBearingMdeg = finite(point.relative_bearing_mdeg);
+    const sensorOriginX = localCoordinate(point.sensor_origin_x_mm);
+    const sensorOriginY = localCoordinate(point.sensor_origin_y_mm);
+    const beamHeadingMdeg = localHeading(point.beam_heading_mdeg);
+    const nominalEchoX = localCoordinate(point.nominal_echo_x_mm);
+    const nominalEchoY = localCoordinate(point.nominal_echo_y_mm);
+    const allowedSides = new Set([
+      "center",
+      "left_near",
+      "left_far",
+      "right_near",
+      "right_far",
+    ]);
+    if (
+      !allowedSides.has(point.side)
+      || measuredRangeMm === null
+      || measuredRangeMm > MAX_MEASURED_RANGE_MM
+      || relativeBearingMdeg === null
+      || relativeBearingMdeg < -90000
+      || relativeBearingMdeg > 90000
+      || sensorOriginX === null
+      || sensorOriginY === null
+      || beamHeadingMdeg === null
+      || nominalEchoX === null
+      || nominalEchoY === null
+      || (point.side === "center" && relativeBearingMdeg !== 0)
+      || (point.side.startsWith("left_") && relativeBearingMdeg <= 0)
+      || (point.side.startsWith("right_") && relativeBearingMdeg >= 0)
+    ) {
+      return null;
+    }
+    const headingRadians = beamHeadingMdeg / 1000 * Math.PI / 180;
+    const expectedEchoX = sensorOriginX
+      + measuredRangeMm * Math.cos(headingRadians);
+    const expectedEchoY = sensorOriginY
+      + measuredRangeMm * Math.sin(headingRadians);
+    if (
+      Math.abs(nominalEchoX - expectedEchoX) > 1.5
+      || Math.abs(nominalEchoY - expectedEchoY) > 1.5
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      side: point.side,
+      measuredRangeMm,
+      relativeBearingMdeg,
+      sensorOriginX,
+      sensorOriginY,
+      beamHeadingMdeg,
+      nominalEchoX,
+      nominalEchoY,
+    });
+  }
+
+  function normalizePlanarScanView(value, nowUnixMs) {
+    const view = record(value);
+    const projection = record(view.projection);
+    const scanPose = normalizeTracePose(view.scan_pose);
+    const scanId = text(view.scan_id);
+    const observedAtUnixMs = finite(view.observed_at_unix_ms);
+    if (
+      scanId === null
+      || scanId.length > 128
+      || observedAtUnixMs === null
+      || observedAtUnixMs < 0
+      || observedAtUnixMs > nowUnixMs
+      || scanPose === null
+      || projection.schema !== BLAST_SCAN_PROJECTION_SCHEMA
+      || projection.frame !== "EPISODE_LOCAL_ODOMETRY"
+      || projection.quality !== "PROVISIONAL_YAW_ONLY"
+      || projection.vertical_pitch_compensated !== false
+      || projection.ultrasonic_beam_width_modeled !== false
+      || projection.scan_turn_translation_compensated !== false
+      || !Array.isArray(projection.points)
+      || projection.points.length > MAX_NAVIGATION_SCAN_POINTS
+    ) {
+      return null;
+    }
+    const points = projection.points.map(normalizePlanarScanPoint);
+    if (
+      points.some((point) => point === null)
+      || new Set(points.map((point) => point.side)).size !== points.length
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      scanId,
+      observedAtUnixMs,
+      ageMs: nowUnixMs - observedAtUnixMs,
+      scanPose,
+      quality: "PROVISIONAL_YAW_ONLY",
+      verticalPitchCompensated: false,
+      ultrasonicBeamWidthModeled: false,
+      scanTurnTranslationCompensated: false,
+      points: Object.freeze(points),
+    });
+  }
+
+  function normalizeNavigationTrace(value, frameId, nowUnixMs) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    const trace = record(value);
+    const finalGoal = normalizeFinalGoal(trace.final_goal);
+    const imuHeading = normalizeImuHeading(trace.imu_heading, nowUnixMs);
+    const plannedLeg = normalizePlannedLeg(trace.planned_leg);
+    if (
+      trace.schema !== NAVIGATION_TRACE_SCHEMA
+      || trace.read_only !== true
+      || text(trace.frame_id) === null
+      || frameId === null
+      || trace.frame_id !== frameId
+      || trace.provenance
+        !== "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY"
+      || finalGoal === null
+      || imuHeading === undefined
+      || plannedLeg === undefined
+      || !Array.isArray(trace.planar_scan_views)
+      || trace.planar_scan_views.length > MAX_NAVIGATION_SCAN_VIEWS
+    ) {
+      return null;
+    }
+    const planarScanViews = trace.planar_scan_views.map((scan) => (
+      normalizePlanarScanView(scan, nowUnixMs)
+    ));
+    if (
+      planarScanViews.some((scan) => scan === null)
+      || new Set(planarScanViews.map((scan) => scan.scanId)).size
+        !== planarScanViews.length
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      schema: NAVIGATION_TRACE_SCHEMA,
+      readOnly: true,
+      frameId,
+      provenance: trace.provenance,
+      finalGoal,
+      imuHeading,
+      plannedLeg,
+      planarScanViews: Object.freeze(planarScanViews),
+    });
   }
 
   function normalizeBounds(value) {
@@ -675,6 +985,13 @@
       );
       return evidence === null ? [] : [evidence];
     });
+    const navigationTrace = contractValid
+      ? normalizeNavigationTrace(
+        map.navigation_trace,
+        text(map.frame_id),
+        now,
+      )
+      : null;
     return Object.freeze({
       schema: contractValid ? SPATIAL_MAP_SCHEMA : null,
       contractValid,
@@ -734,6 +1051,7 @@
           ? map.scan_evidence_history_evicted
           : 0
       ),
+      navigationTrace,
     });
   }
 

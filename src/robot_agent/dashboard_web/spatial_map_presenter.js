@@ -176,6 +176,28 @@
       map.poseHistory.forEach((pose) => {
         addPoint(pose.xMm, pose.yMm);
       });
+      const trace = map.navigationTrace;
+      if (trace) {
+        addPoint(trace.finalGoal.originX, trace.finalGoal.originY);
+        addPoint(trace.finalGoal.targetX, trace.finalGoal.targetY);
+        if (trace.plannedLeg) {
+          addPoint(
+            trace.plannedLeg.bindPose.xMm,
+            trace.plannedLeg.bindPose.yMm,
+          );
+          addPoint(
+            trace.plannedLeg.waypoint.xMm,
+            trace.plannedLeg.waypoint.yMm,
+          );
+        }
+        trace.planarScanViews.forEach((view) => {
+          addPoint(view.scanPose.xMm, view.scanPose.yMm);
+          view.points.forEach((point) => {
+            addPoint(point.sensorOriginX, point.sensorOriginY);
+            addPoint(point.nominalEchoX, point.nominalEchoY);
+          });
+        });
+      }
       map.objectHypotheses.forEach((hypothesis) => {
         if (
           hypothesis.provisional
@@ -317,6 +339,237 @@
       return result;
     }
 
+    function headingArrowPath(origin, headingRadians, length) {
+      const end = screenPoint(origin, headingRadians, length);
+      const left = screenPoint(
+        end,
+        headingRadians + Math.PI - 0.55,
+        12,
+      );
+      const right = screenPoint(
+        end,
+        headingRadians + Math.PI + 0.55,
+        12,
+      );
+      return [
+        `M ${origin.x} ${origin.y}`,
+        `L ${end.x} ${end.y}`,
+        `M ${left.x} ${left.y}`,
+        `L ${end.x} ${end.y}`,
+        `L ${right.x} ${right.y}`,
+      ].join(" ");
+    }
+
+    function renderNavigationTrace(layer, map, projection) {
+      const trace = map.navigationTrace;
+      if (!trace) {
+        return;
+      }
+
+      const goal = trace.finalGoal;
+      const goalOrigin = projection.point(goal.originX, goal.originY);
+      const goalTarget = projection.point(goal.targetX, goal.targetY);
+      const goalHeading = goal.desiredHeadingMdeg / 1000 * Math.PI / 180;
+      const goalGroup = createSvgElement("g", {
+        class: "map-final-goal",
+        "data-kind": goal.kind,
+        "data-navigation-enforced": "false",
+        "data-minimum-forward-progress-mm": (
+          goal.minimumForwardProgressMm
+        ),
+        "data-current-forward-progress-mm": (
+          goal.currentForwardProgressMm
+        ),
+        "data-remaining-forward-progress-mm": (
+          goal.remainingForwardProgressMm
+        ),
+        "data-desired-heading-mdeg": goal.desiredHeadingMdeg,
+        "data-heading-tolerance-mdeg": goal.headingToleranceMdeg,
+      });
+      appendSvgTitle(goalGroup, [
+        t("map.navigation_trace.final_goal_title"),
+        t("map.navigation_trace.goal_progress", {
+          current: formatNumber(goal.currentForwardProgressMm),
+          target: formatNumber(goal.minimumForwardProgressMm),
+          remaining: formatNumber(goal.remainingForwardProgressMm),
+        }),
+        t("map.navigation_trace.goal_heading", {
+          heading: formatNumber(goal.desiredHeadingMdeg / 1000, {
+            maximumFractionDigits: 1,
+          }),
+          tolerance: formatNumber(goal.headingToleranceMdeg / 1000, {
+            maximumFractionDigits: 1,
+          }),
+        }),
+      ]);
+      goalGroup.appendChild(createSvgElement("line", {
+        x1: goalOrigin.x,
+        y1: goalOrigin.y,
+        x2: goalTarget.x,
+        y2: goalTarget.y,
+        class: "map-final-goal-line",
+      }));
+      goalGroup.appendChild(createSvgElement("circle", {
+        cx: goalTarget.x,
+        cy: goalTarget.y,
+        r: 11,
+        class: "map-final-goal-target",
+      }));
+      goalGroup.appendChild(createSvgElement("path", {
+        d: headingArrowPath(goalTarget, goalHeading, 48),
+        class: "map-final-goal-heading",
+      }));
+      const goalLabel = createSvgElement("text", {
+        x: goalTarget.x + 15,
+        y: goalTarget.y - 15,
+        class: "map-navigation-trace-label map-final-goal-label",
+      });
+      goalLabel.textContent = t("map.navigation_trace.final_goal_label", {
+        heading: formatNumber(goal.desiredHeadingMdeg / 1000, {
+          maximumFractionDigits: 1,
+        }),
+      });
+      goalGroup.appendChild(goalLabel);
+      layer.appendChild(goalGroup);
+
+      const leg = trace.plannedLeg;
+      if (leg) {
+        const bind = projection.point(
+          leg.bindPose.xMm,
+          leg.bindPose.yMm,
+        );
+        const waypoint = projection.point(
+          leg.waypoint.xMm,
+          leg.waypoint.yMm,
+        );
+        const waypointHeading = (
+          leg.waypoint.headingMdeg / 1000 * Math.PI / 180
+        );
+        const group = createSvgElement("g", {
+          class: "map-planned-leg",
+          "data-kind": leg.kind,
+          "data-scope": leg.scope,
+          "data-selected-side": leg.selectedSide,
+          "data-clearance-proven": "false",
+          "data-passage-proven": "false",
+          "data-route-eligible": "false",
+        });
+        appendSvgTitle(group, [
+          t("map.navigation_trace.planned_leg_title", {
+            side: leg.selectedSide,
+          }),
+          t("map.navigation_trace.search_position_only"),
+        ]);
+        group.appendChild(createSvgElement("path", {
+          d: `M ${bind.x} ${bind.y} L ${waypoint.x} ${waypoint.y}`,
+          class: "map-planned-leg-line",
+        }));
+        group.appendChild(createSvgElement("circle", {
+          cx: bind.x,
+          cy: bind.y,
+          r: 5,
+          class: "map-planned-leg-bind",
+        }));
+        group.appendChild(createSvgElement("circle", {
+          cx: waypoint.x,
+          cy: waypoint.y,
+          r: 9,
+          class: "map-planned-waypoint",
+        }));
+        group.appendChild(createSvgElement("path", {
+          d: headingArrowPath(waypoint, waypointHeading, 36),
+          class: "map-planned-waypoint-heading",
+        }));
+        const label = createSvgElement("text", {
+          x: waypoint.x + 13,
+          y: waypoint.y + 20,
+          class: "map-navigation-trace-label map-planned-waypoint-label",
+        });
+        label.textContent = t(
+          "map.navigation_trace.planned_waypoint_label",
+        );
+        group.appendChild(label);
+        layer.appendChild(group);
+      }
+
+      trace.planarScanViews.forEach((view, viewIndex) => {
+        const group = createSvgElement("g", {
+          class: "map-blast-scan-view",
+          "data-scan-id": view.scanId,
+          "data-quality": view.quality,
+          "data-vertical-pitch-compensated": "false",
+          "data-ultrasonic-beam-width-modeled": "false",
+          "data-scan-turn-translation-compensated": "false",
+        });
+        appendSvgTitle(group, [
+          t("map.navigation_trace.scan_title", {
+            count: formatNumber(viewIndex + 1),
+          }),
+          t("map.navigation_trace.scan_limitations"),
+          t("map.tooltip.age", { age: formatMapAge(view.ageMs) }),
+        ]);
+        view.points.forEach((point) => {
+          const origin = projection.point(
+            point.sensorOriginX,
+            point.sensorOriginY,
+          );
+          const echo = projection.point(
+            point.nominalEchoX,
+            point.nominalEchoY,
+          );
+          const rayGroup = createSvgElement("g", {
+            class: "map-blast-scan-ray",
+            "data-side": point.side,
+            "data-measured-range-mm": point.measuredRangeMm,
+            "data-relative-bearing-mdeg": point.relativeBearingMdeg,
+            "data-beam-heading-mdeg": point.beamHeadingMdeg,
+            "data-quality": "PROVISIONAL_YAW_ONLY",
+          });
+          appendSvgTitle(rayGroup, [
+            t("map.navigation_trace.scan_ray_title", {
+              side: point.side,
+              range: formatNumber(point.measuredRangeMm),
+            }),
+            t("map.navigation_trace.scan_limitations"),
+          ]);
+          rayGroup.appendChild(createSvgElement("line", {
+            x1: origin.x,
+            y1: origin.y,
+            x2: echo.x,
+            y2: echo.y,
+            class: "map-blast-scan-ray-line",
+          }));
+          rayGroup.appendChild(createSvgElement("circle", {
+            cx: origin.x,
+            cy: origin.y,
+            r: 3,
+            class: "map-blast-scan-origin",
+          }));
+          rayGroup.appendChild(createSvgElement("circle", {
+            cx: echo.x,
+            cy: echo.y,
+            r: 6,
+            class: "map-blast-scan-echo",
+          }));
+          group.appendChild(rayGroup);
+        });
+        const scanPose = projection.point(
+          view.scanPose.xMm,
+          view.scanPose.yMm,
+        );
+        const label = createSvgElement("text", {
+          x: scanPose.x + 10,
+          y: scanPose.y - 12,
+          class: "map-navigation-trace-label map-blast-scan-label",
+        });
+        label.textContent = t("map.navigation_trace.scan_label", {
+          count: formatNumber(viewIndex + 1),
+        });
+        group.appendChild(label);
+        layer.appendChild(group);
+      });
+    }
+
     function renderLocalOdometryMap(map, scene, drawable) {
       const layer = byId("map-local-odometry-layer");
       layer.replaceChildren();
@@ -325,6 +578,9 @@
       }
       layer.setAttribute("data-provisional", "true");
       layer.setAttribute("data-geometry", "screen-space-nonmetric");
+      if (map.navigationTrace) {
+        layer.setAttribute("data-geometry", "mixed-local-odometry");
+      }
       const projection = localOdometryProjection(scene.points);
 
       const layerLabel = createSvgElement("text", {
@@ -332,17 +588,33 @@
         y: 42,
         class: "map-local-layer-label",
       });
-      layerLabel.textContent = t("map.local_odometry.layer_label");
+      layerLabel.textContent = t(
+        map.navigationTrace
+          ? "map.navigation_trace.layer_label"
+          : "map.local_odometry.layer_label",
+      );
       layer.appendChild(layerLabel);
       const layerNote = createSvgElement("text", {
         x: 32,
         y: 65,
         class: "map-local-layer-note",
       });
-      layerNote.textContent = t("map.local_odometry.layer_note");
+      layerNote.textContent = t(
+        map.navigationTrace
+          ? "map.navigation_trace.layer_note"
+          : "map.local_odometry.layer_note",
+      );
       layer.appendChild(layerNote);
 
-      renderPath(layer, map.poseHistory, projection);
+      renderPath(
+        layer,
+        map.poseHistory,
+        projection,
+        map.navigationTrace
+          ? "map.navigation_trace.odometry_title"
+          : "map.path.title",
+      );
+      renderNavigationTrace(layer, map, projection);
 
       scene.cues.forEach(({ anchorPose, evidence }) => {
         const anchor = projection.point(
@@ -630,6 +902,30 @@
           y2: headingEnd.y,
           class: "map-local-robot-heading",
         }));
+        const imuHeading = map.navigationTrace?.imuHeading;
+        if (imuHeading) {
+          const imuRadians = (
+            imuHeading.headingMdeg / 1000 * Math.PI / 180
+          );
+          const imuLine = createSvgElement("path", {
+            d: headingArrowPath(robot, imuRadians, 48),
+            class: "map-local-imu-heading",
+            "data-heading-mdeg": imuHeading.headingMdeg,
+            "data-reference": imuHeading.reference,
+          });
+          appendSvgTitle(imuLine, [
+            t("map.navigation_trace.imu_title", {
+              heading: formatNumber(imuHeading.headingMdeg / 1000, {
+                maximumFractionDigits: 1,
+              }),
+            }),
+            t("map.navigation_trace.imu_reference"),
+            t("map.tooltip.age", {
+              age: formatMapAge(imuHeading.ageMs),
+            }),
+          ]);
+          group.appendChild(imuLine);
+        }
         group.appendChild(createSvgElement("circle", {
           cx: robot.x,
           cy: robot.y,
@@ -663,7 +959,12 @@
       return "map-cell map-cell-unknown";
     }
 
-    function renderPath(layer, poses, projection) {
+    function renderPath(
+      layer,
+      poses,
+      projection,
+      titleKey = "map.path.title",
+    ) {
       if (!Array.isArray(poses) || poses.length < 2) {
         return;
       }
@@ -678,7 +979,7 @@
         class: "map-path",
       });
       appendSvgTitle(path, [
-        t("map.path.title"),
+        t(titleKey),
         ...mapTooltipParts(poses[poses.length - 1]),
       ]);
       layer.appendChild(path);

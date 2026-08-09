@@ -890,6 +890,266 @@ process.stdout.write(JSON.stringify({
         self.assertIn("Path points2", metric["metadataText"])
         self.assertTrue(result["invalidDependenciesRejected"])
 
+    def test_blast_navigation_trace_is_strict_and_uses_the_existing_map(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+class FakeNode {
+  constructor(tag, id = null) {
+    this.tag = tag;
+    this.id = id;
+    this.className = "";
+    this.hidden = false;
+    this.attributes = {};
+    this.children = [];
+    this._text = "";
+  }
+  set textContent(value) { this._text = String(value); this.children = []; }
+  get textContent() {
+    return this._text + this.children.map((child) => child.textContent).join("");
+  }
+  appendChild(child) { this.children.push(child); return child; }
+  replaceChildren(...children) { this._text = ""; this.children = children; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+}
+const ids = [
+  "map-connection-status", "map-frame-label", "map-empty-state",
+  "map-empty-title", "map-empty-body", "map-metadata",
+  "map-qualitative-list", "map-qualitative-count", "map-object-list",
+  "map-object-count", "map-local-odometry-layer", "map-cell-layer",
+  "map-path-layer", "map-ray-layer", "map-object-layer", "map-robot-layer",
+];
+const nodes = Object.fromEntries(ids.map((id) => [id, new FakeNode("div", id)]));
+const document = {
+  getElementById(id) { return nodes[id]; },
+  createElement(tag) { return new FakeNode(tag); },
+  createElementNS(_namespace, tag) { return new FakeNode(tag); },
+};
+const context = {};
+for (const filename of process.argv.slice(1)) {
+  vm.runInNewContext(fs.readFileSync(filename, "utf8"), context, { filename });
+}
+const translations = {
+  "common.missing": "—",
+  "map.navigation_trace.final_goal_title": "FINAL GOAL",
+  "map.navigation_trace.goal_progress": ({ current, target, remaining }) => (
+    `${current}/${target}/${remaining}`
+  ),
+  "map.navigation_trace.goal_heading": ({ heading }) => `GOAL ${heading}`,
+  "map.navigation_trace.final_goal_label": ({ heading }) => `FINAL ${heading}`,
+  "map.navigation_trace.planned_leg_title": ({ side }) => `PLAN ${side}`,
+  "map.navigation_trace.search_position_only": "SEARCH POSITION ONLY",
+  "map.navigation_trace.planned_waypoint_label": "WAYPOINT",
+  "map.navigation_trace.scan_title": ({ count }) => `SCAN ${count}`,
+  "map.navigation_trace.scan_limitations": "PROVISIONAL_YAW_ONLY",
+  "map.navigation_trace.scan_ray_title": ({ range }) => `RANGE ${range}`,
+  "map.navigation_trace.scan_label": ({ count }) => `VIEW ${count}`,
+  "map.navigation_trace.imu_title": ({ heading }) => `IMU ${heading}`,
+  "map.navigation_trace.imu_reference": "EPISODE RELATIVE",
+  "map.navigation_trace.layer_label": "BLAST TRACE",
+  "map.navigation_trace.layer_note": "PLAN / ENCODER / IMU / ECHO",
+  "map.navigation_trace.odometry_title": "PROVISIONAL_ENCODER_ODOMETRY",
+};
+function translate(key, args = {}) {
+  const value = translations[key];
+  return typeof value === "function" ? value(args) : (value || key);
+}
+const logic = context.RobotDashboardLogic;
+const presenter = context.RobotSpatialMapPresenter.create({
+  document,
+  normalizeSpatialMap: logic.normalizeSpatialMap,
+  translate,
+  formatNumber: (value) => String(value),
+});
+const point = {
+  side: "center",
+  measured_range_mm: 400,
+  relative_bearing_mdeg: 0,
+  sensor_origin_x_mm: 11,
+  sensor_origin_y_mm: 0,
+  beam_heading_mdeg: 0,
+  nominal_echo_x_mm: 411,
+  nominal_echo_y_mm: 0,
+};
+const scan = {
+  scan_id: "origin-scan",
+  observed_at_unix_ms: 1900,
+  scan_pose: { x_mm: 0, y_mm: 0, heading_mdeg: 0 },
+  projection: {
+    schema: "blast-planar-scan-projection/v1",
+    frame: "EPISODE_LOCAL_ODOMETRY",
+    quality: "PROVISIONAL_YAW_ONLY",
+    vertical_pitch_compensated: false,
+    ultrasonic_beam_width_modeled: false,
+    scan_turn_translation_compensated: false,
+    points: [point],
+  },
+};
+const trace = {
+  schema: "robot-navigation-trace/v1",
+  read_only: true,
+  frame_id: "blast-episode-1",
+  provenance: "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY",
+  final_goal: {
+    kind: "DIRECTIONAL_HEADING",
+    navigation_enforced: false,
+    origin_x_mm: 0,
+    origin_y_mm: 0,
+    target_x_mm: 600,
+    target_y_mm: 0,
+    desired_heading_mdeg: 0,
+    minimum_forward_progress_mm: 600,
+    heading_tolerance_mdeg: 5000,
+    current_forward_progress_mm: 20,
+    remaining_forward_progress_mm: 580,
+  },
+  imu_heading: {
+    heading_mdeg: 95000,
+    reference: "EPISODE_START",
+    observed_at_unix_ms: 1950,
+  },
+  planned_leg: {
+    kind: "SIDE_SEARCH",
+    scope: "SEARCH_POSITION_ONLY",
+    clearance_proven: false,
+    passage_proven: false,
+    route_eligible: false,
+    selected_side: "LEFT",
+    bind_pose: { x_mm: 0, y_mm: 0, heading_mdeg: 90000 },
+    waypoint: { x_mm: 0, y_mm: 225, heading_mdeg: 90000 },
+  },
+  planar_scan_views: [scan],
+};
+const rawMap = {
+  schema: "robot-spatial-map/v1",
+  read_only: true,
+  status: "pose_only",
+  robot_id: "blast-01",
+  frame_id: "blast-episode-1",
+  frame_kind: "LOCAL_ODOMETRY",
+  bounds: null,
+  robot_pose: { x_mm: 20, y_mm: 210, heading_mdeg: 0 },
+  pose_history: [
+    { x_mm: 0, y_mm: 0, heading_mdeg: 0 },
+    { x_mm: 20, y_mm: 210, heading_mdeg: 0 },
+  ],
+  navigation_trace: trace,
+};
+const renderedMap = presenter.render(rawMap, "connected", 2000);
+function descendants(root) {
+  return [root, ...root.children.flatMap(descendants)];
+}
+const rendered = descendants(nodes["map-local-odometry-layer"]);
+const byClass = (name) => rendered.find((node) => node.attributes.class === name);
+const lineLength = (line) => Math.hypot(
+  Number(line.attributes.x2) - Number(line.attributes.x1),
+  Number(line.attributes.y2) - Number(line.attributes.y1),
+);
+const goalLine = byClass("map-final-goal-line");
+const rayLine = byClass("map-blast-scan-ray-line");
+const invalidFrame = logic.normalizeSpatialMap({
+  ...rawMap,
+  navigation_trace: { ...trace, frame_id: "another-episode" },
+}, 2000);
+const invalidEcho = logic.normalizeSpatialMap({
+  ...rawMap,
+  navigation_trace: {
+    ...trace,
+    planar_scan_views: [{
+      ...scan,
+      projection: {
+        ...scan.projection,
+        points: [{ ...point, nominal_echo_x_mm: 900 }],
+      },
+    }],
+  },
+}, 2000);
+const overCapacity = logic.normalizeSpatialMap({
+  ...rawMap,
+  navigation_trace: {
+    ...trace,
+    planar_scan_views: Array.from({ length: 17 }, (_unused, index) => ({
+      ...scan,
+      scan_id: `scan-${index}`,
+    })),
+  },
+}, 2000);
+process.stdout.write(JSON.stringify({
+  trace: renderedMap.navigationTrace,
+  traceFrozen: Object.isFrozen(renderedMap.navigationTrace)
+    && Object.isFrozen(renderedMap.navigationTrace.planarScanViews),
+  layerAttributes: nodes["map-local-odometry-layer"].attributes,
+  goalAttributes: byClass("map-final-goal").attributes,
+  legAttributes: byClass("map-planned-leg").attributes,
+  imuAttributes: byClass("map-local-imu-heading").attributes,
+  rayAttributes: byClass("map-blast-scan-ray").attributes,
+  hasEcho: Boolean(byClass("map-blast-scan-echo")),
+  distanceRatio: lineLength(rayLine) / lineLength(goalLine),
+  localText: nodes["map-local-odometry-layer"].textContent,
+  invalidFrame: invalidFrame.navigationTrace,
+  invalidEcho: invalidEcho.navigationTrace,
+  overCapacity: overCapacity.navigationTrace,
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(WEB_ROOT / "dashboard_logic.js"),
+                str(WEB_ROOT / "spatial_map_presenter.js"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertTrue(result["traceFrozen"])
+        self.assertEqual(result["trace"]["finalGoal"]["targetX"], 600)
+        self.assertFalse(
+            result["trace"]["finalGoal"]["navigationEnforced"]
+        )
+        self.assertEqual(
+            result["layerAttributes"]["data-geometry"],
+            "mixed-local-odometry",
+        )
+        self.assertEqual(
+            result["goalAttributes"]["data-remaining-forward-progress-mm"],
+            "580",
+        )
+        self.assertEqual(
+            result["goalAttributes"]["data-navigation-enforced"],
+            "false",
+        )
+        self.assertEqual(
+            result["legAttributes"]["data-scope"],
+            "SEARCH_POSITION_ONLY",
+        )
+        self.assertEqual(
+            result["legAttributes"]["data-clearance-proven"],
+            "false",
+        )
+        self.assertEqual(result["imuAttributes"]["data-heading-mdeg"], "95000")
+        self.assertEqual(
+            result["rayAttributes"]["data-quality"],
+            "PROVISIONAL_YAW_ONLY",
+        )
+        self.assertEqual(
+            result["rayAttributes"]["data-measured-range-mm"],
+            "400",
+        )
+        self.assertTrue(result["hasEcho"])
+        self.assertAlmostEqual(result["distanceRatio"], 2 / 3)
+        self.assertIn("PROVISIONAL_ENCODER_ODOMETRY", result["localText"])
+        self.assertIn("SEARCH POSITION ONLY", result["localText"])
+        self.assertIsNone(result["invalidFrame"])
+        self.assertIsNone(result["invalidEcho"])
+        self.assertIsNone(result["overCapacity"])
+
 
 if __name__ == "__main__":
     unittest.main()
