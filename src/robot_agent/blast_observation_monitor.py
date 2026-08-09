@@ -25,13 +25,14 @@ DEFAULT_RECONNECT_INTERVAL_SECONDS = 3.0
 DISCONNECT_TIMEOUT_SECONDS = 3.0
 COMMAND_TIMEOUT_SECONDS = 15.0
 INTERNAL_COMMAND_TIMEOUT_SECONDS = 12.0
-SCAN_COMMAND_TIMEOUT_SECONDS = 18.0
-SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS = 15.0
+SCAN_COMMAND_TIMEOUT_SECONDS = 27.0
+SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS = 24.0
 MIN_COMMAND_BUDGET_SECONDS = 2.0
 COMMAND_RESPONSE_MARGIN_SECONDS = 0.25
 MOTION_TIMEOUT_SECONDS = 4.0
 MOTION_POLL_INTERVAL_SECONDS = 0.05
 POST_MOTION_SETTLE_TIMEOUT_SECONDS = 1.5
+SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS = 3.0
 POST_MOTION_SETTLE_SAMPLE_COUNT = 5
 POST_MOTION_DISTANCE_RANGE_MM = 5.0
 POST_MOTION_TILT_RANGE_DEG = 1.0
@@ -614,6 +615,9 @@ class BlastObservationMonitor:
                     runtime,
                     generation=generation,
                     initial_observation=observation,
+                    timeout_seconds=(
+                        SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS
+                    ),
                 )
             )
         return receipt, observation, observation_settled
@@ -628,6 +632,7 @@ class BlastObservationMonitor:
             runtime,
             generation=generation,
             initial_observation=center,
+            timeout_seconds=SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
         )
         start_heading = self._scan_heading(center)
         sensor = (
@@ -906,10 +911,16 @@ class BlastObservationMonitor:
         *,
         generation,
         initial_observation,
+        timeout_seconds=None,
     ):
+        settle_timeout = (
+            POST_MOTION_SETTLE_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         deadline = (
             asyncio.get_running_loop().time()
-            + POST_MOTION_SETTLE_TIMEOUT_SECONDS
+            + settle_timeout
         )
         latest = initial_observation
         samples = []

@@ -8,6 +8,9 @@ from robot_agent.blast_observation_monitor import (
     RANGE_STATE_MEASURED,
     RANGE_STATE_NO_VALID_DISTANCE,
     SCAN_COMMAND,
+    SCAN_COMMAND_TIMEOUT_SECONDS,
+    SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
+    SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
     SCAN_RESULT_SCHEMA,
     BlastControllerError,
     BlastObservationMonitor,
@@ -313,6 +316,53 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(scan["restoration_error_deg"], 2.0)
         self.assertTrue(scan["restoration_verified"])
         self.assertTrue(scan["all_observations_settled"])
+        monitor.close()
+
+    def test_scan_uses_a_longer_settle_window_than_navigation(self):
+        class RecordingMonitor(BlastObservationMonitor):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.settle_timeouts = []
+
+            async def _observe_until_settled(
+                self,
+                runtime,
+                *,
+                generation,
+                initial_observation,
+                timeout_seconds=None,
+            ):
+                self.settle_timeouts.append(timeout_seconds)
+                return await super()._observe_until_settled(
+                    runtime,
+                    generation=generation,
+                    initial_observation=initial_observation,
+                    timeout_seconds=timeout_seconds,
+                )
+
+        monitor = RecordingMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        monitor.command(SCAN_COMMAND)
+        monitor.command("drive_forward")
+
+        self.assertEqual(
+            monitor.settle_timeouts[:6],
+            [SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS] * 6,
+        )
+        self.assertIsNone(monitor.settle_timeouts[-1])
+        self.assertGreaterEqual(
+            SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
+            6 * SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS + 6,
+        )
+        self.assertGreaterEqual(
+            SCAN_COMMAND_TIMEOUT_SECONDS,
+            SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS + 3,
+        )
         monitor.close()
 
     def test_scan_range_state_distinguishes_no_return_from_invalid(self):
