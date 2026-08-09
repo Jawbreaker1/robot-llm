@@ -66,6 +66,7 @@ def _empty_snapshot(robot_id: str, controller_instance_id: str):
         "robot_id": robot_id,
         "controller_instance_id": controller_instance_id,
         "frame_id": None,
+        "local_generation_id": None,
         "frame_kind": LOCAL_ODOMETRY,
         "map_quality": MAP_EMPTY,
         "map_version": None,
@@ -439,6 +440,7 @@ class PhysicalSpatialMapBridge:
                 "robot_id": self.robot_id,
                 "controller_instance_id": self.controller_instance_id,
                 "frame_id": memory.frame_id,
+                "local_generation_id": memory.generation_id,
                 "frame_kind": LOCAL_ODOMETRY,
                 "map_quality": (
                     MAP_PROVISIONAL_IR

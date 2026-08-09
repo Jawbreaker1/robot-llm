@@ -77,6 +77,7 @@ def _empty_snapshot(robot_id: str, controller_instance_id: str):
         "robot_id": robot_id,
         "controller_instance_id": controller_instance_id,
         "frame_id": None,
+        "local_generation_id": None,
         "frame_kind": LOCAL_ODOMETRY,
         "map_quality": MAP_EMPTY,
         "map_version": 0,
@@ -411,6 +412,7 @@ class BlastSpatialMapBridge:
 
     def _refresh_snapshot(self, pose) -> None:
         assert self._frame_id is not None
+        assert self._episode_id is not None
         assert self._last_unix_ms is not None
         self._snapshot = {
             "schema": DASHBOARD_SPATIAL_MAP_SCHEMA,
@@ -421,6 +423,7 @@ class BlastSpatialMapBridge:
             "robot_id": self.robot_id,
             "controller_instance_id": self.controller_instance_id,
             "frame_id": self._frame_id,
+            "local_generation_id": self._episode_id,
             "frame_kind": LOCAL_ODOMETRY,
             "map_quality": MAP_EMPTY,
             "map_version": self._map_version,

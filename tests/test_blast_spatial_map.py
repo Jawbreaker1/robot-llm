@@ -85,6 +85,7 @@ class BlastSpatialMapBridgeTests(TestCase):
         self.assertEqual(value["schema"], "robot-spatial-map/v1")
         self.assertEqual(value["status"], "pose_only")
         self.assertEqual(value["frame_kind"], "LOCAL_ODOMETRY")
+        self.assertEqual(value["local_generation_id"], "episode-a")
         self.assertIsNone(value["resolution_mm"])
         self.assertEqual(value["robot_pose"]["x_mm"], 0)
         self.assertEqual(
@@ -122,6 +123,7 @@ class BlastSpatialMapBridgeTests(TestCase):
         self.assertEqual(bridge.snapshot()["pose_history"][0]["x_mm"], 0)
 
         old_frame = bridge.snapshot()["frame_id"]
+        self.assertEqual(first["local_generation_id"], "episode-a")
         bridge.begin_episode(
             episode_id="episode-b",
             pose=PhysicalPose(),
@@ -129,6 +131,7 @@ class BlastSpatialMapBridgeTests(TestCase):
         )
         second = bridge.snapshot()
         self.assertNotEqual(second["frame_id"], old_frame)
+        self.assertEqual(second["local_generation_id"], "episode-b")
         self.assertEqual(len(second["pose_history"]), 1)
         self.assertFalse(bridge.offer_pose(
             episode_id="episode-a",

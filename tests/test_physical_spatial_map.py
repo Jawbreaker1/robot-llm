@@ -128,6 +128,9 @@ class PhysicalSpatialMapBridgeTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "qualitative_only")
         self.assertEqual(snapshot["frame_kind"], "LOCAL_ODOMETRY")
         self.assertEqual(
+            snapshot["local_generation_id"], memory.generation_id
+        )
+        self.assertEqual(
             snapshot["robot_pose"],
             {
                 "x_mm": 25,
@@ -392,6 +395,7 @@ class PhysicalSpatialMapBridgeTests(unittest.TestCase):
         self.assertEqual(renewed["based_on_world_model_version"], 1)
         self.assertEqual(reset["based_on_world_model_version"], 2)
         self.assertEqual(reset["frame_id"], "ev3-local-2")
+        self.assertEqual(reset["local_generation_id"], "generation-2")
         self.assertEqual(reset["object_hypotheses"], [])
         self.assertEqual(len(reset["pose_history"]), 1)
         self.assertEqual(
