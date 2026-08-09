@@ -4,9 +4,14 @@ import unittest
 from unittest import mock
 
 from robot_agent.blast_observation_monitor import (
+    RANGE_STATE_INVALID,
+    RANGE_STATE_MEASURED,
+    RANGE_STATE_NO_VALID_DISTANCE,
     SCAN_COMMAND,
+    SCAN_RESULT_SCHEMA,
     BlastControllerError,
     BlastObservationMonitor,
+    blast_range_state,
 )
 
 
@@ -272,7 +277,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(result["receipt"], {"turn_count": 8})
         self.assertEqual(result["observation"]["imu"]["heading_deg"], -179.0)
         scan = result["scan"]
-        self.assertEqual(scan["schema"], "blast-scan-front-arc/v1")
+        self.assertEqual(scan["schema"], SCAN_RESULT_SCHEMA)
         self.assertEqual(
             [ray["side"] for ray in scan["rays"]],
             [
@@ -288,6 +293,16 @@ class BlastObservationMonitorTests(unittest.TestCase):
             [300.0, 720.0, 2_000.0, 1_100.0, 2_000.0],
         )
         self.assertEqual(
+            [ray["range_state"] for ray in scan["rays"]],
+            [
+                RANGE_STATE_MEASURED,
+                RANGE_STATE_MEASURED,
+                RANGE_STATE_NO_VALID_DISTANCE,
+                RANGE_STATE_MEASURED,
+                RANGE_STATE_NO_VALID_DISTANCE,
+            ],
+        )
+        self.assertEqual(
             [ray["relative_heading_deg"] for ray in scan["rays"]],
             [0.0, -22.0, -45.0, 24.0, 47.0],
         )
@@ -295,6 +310,16 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertTrue(scan["restoration_verified"])
         self.assertTrue(scan["all_observations_settled"])
         monitor.close()
+
+    def test_scan_range_state_distinguishes_no_return_from_invalid(self):
+        self.assertEqual(blast_range_state(1_999), RANGE_STATE_MEASURED)
+        self.assertEqual(
+            blast_range_state(2_000),
+            RANGE_STATE_NO_VALID_DISTANCE,
+        )
+        for value in (None, True, -1, 2_001, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                self.assertEqual(blast_range_state(value), RANGE_STATE_INVALID)
 
     def test_navigation_command_returns_latest_settled_observation(self):
         class RockingRuntime(FakeRuntime):

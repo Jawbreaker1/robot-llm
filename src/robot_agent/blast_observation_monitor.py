@@ -9,7 +9,7 @@ import math
 from queue import Empty, Full, Queue
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 from .blast_ble_runtime import BlastBLERuntime, DEFAULT_HUB_NAME
 
@@ -34,8 +34,19 @@ POST_MOTION_DISTANCE_RANGE_MM = 5.0
 POST_MOTION_TILT_RANGE_DEG = 1.0
 COMMAND_RESULT_SCHEMA = "controller-command-result/v1"
 SCAN_COMMAND = "scan_front_arc"
-SCAN_RESULT_SCHEMA = "blast-scan-front-arc/v1"
+SCAN_RESULT_SCHEMA = "blast-scan-front-arc/v2"
 SCAN_RESTORATION_TOLERANCE_DEG = 5.0
+PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM = 2_000
+RANGE_STATE_MEASURED = "MEASURED"
+RANGE_STATE_NO_VALID_DISTANCE = "NO_VALID_DISTANCE"
+RANGE_STATE_INVALID = "INVALID"
+SCAN_RAY_SIDES = (
+    "center",
+    "left_near",
+    "left_far",
+    "right_near",
+    "right_far",
+)
 COMMANDS = {
     "drive_forward": ("drive_pulse", "forward"),
     "drive_reverse": ("drive_pulse", "reverse"),
@@ -62,6 +73,49 @@ class BlastControllerError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         self.code = code
         super().__init__(message)
+
+
+def blast_range_state(distance_mm):
+    """Classify Pybricks ultrasonic output without inventing clearance."""
+
+    if (
+        isinstance(distance_mm, bool)
+        or not isinstance(distance_mm, (int, float))
+        or not math.isfinite(float(distance_mm))
+        or not 0 <= float(distance_mm) <= (
+            PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM
+        )
+    ):
+        return RANGE_STATE_INVALID
+    if float(distance_mm) == PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM:
+        return RANGE_STATE_NO_VALID_DISTANCE
+    return RANGE_STATE_MEASURED
+
+
+def validate_blast_scan_range_contract(scan):
+    """Validate only the ray order and explicit range-state contract."""
+
+    if not isinstance(scan, Mapping) or scan.get("schema") != (
+        SCAN_RESULT_SCHEMA
+    ):
+        raise ValueError("BLAST scan result is invalid")
+    rays = scan.get("rays")
+    if (
+        not isinstance(rays, list)
+        or tuple(
+            ray.get("side") if isinstance(ray, Mapping) else None
+            for ray in rays
+        )
+        != SCAN_RAY_SIDES
+        or any(
+            ray.get("range_state") != blast_range_state(
+                ray.get("distance_mm")
+            )
+            for ray in rays
+        )
+    ):
+        raise ValueError("BLAST scan result is invalid")
+    return deepcopy(scan)
 
 
 class BlastObservationMonitor:
@@ -492,11 +546,11 @@ class BlastObservationMonitor:
         observed_at_ms = observation.get("observed_at_ms")
         if type(observed_at_ms) is not int:
             observed_at_ms = None
+        distance_mm = cls._finite_number(observation.get("distance_mm"))
         return {
             "side": side,
-            "distance_mm": cls._finite_number(
-                observation.get("distance_mm")
-            ),
+            "distance_mm": distance_mm,
+            "range_state": blast_range_state(distance_mm),
             "heading_deg": heading,
             "relative_heading_deg": cls._scan_heading_delta(
                 heading,

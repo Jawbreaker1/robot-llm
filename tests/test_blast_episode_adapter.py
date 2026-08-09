@@ -12,7 +12,10 @@ from robot_agent.blast_observation_monitor import BlastControllerError
 from robot_agent.blast_observation_monitor import (
     COMMAND_RESULT_SCHEMA,
     CONTROLLER_ID,
+    RANGE_STATE_MEASURED,
+    RANGE_STATE_NO_VALID_DISTANCE,
     ROBOT_ID,
+    SCAN_RESULT_SCHEMA,
 )
 from robot_agent.lm_studio_controller_action import (
     COMPLETE,
@@ -39,6 +42,32 @@ def decision(action, *, plan=(), assessment="ok"):
         ),
         latency_ms=12,
     )
+
+
+def scan_result(*, center_distance_mm=500.0):
+    distances = (
+        ("center", center_distance_mm),
+        ("left_near", 900.0),
+        ("left_far", 2_000.0),
+        ("right_near", 1_200.0),
+        ("right_far", 2_000.0),
+    )
+    return {
+        "schema": SCAN_RESULT_SCHEMA,
+        "restoration_verified": True,
+        "rays": [
+            {
+                "side": side,
+                "distance_mm": distance_mm,
+                "range_state": (
+                    RANGE_STATE_NO_VALID_DISTANCE
+                    if distance_mm == 2_000
+                    else RANGE_STATE_MEASURED
+                ),
+            }
+            for side, distance_mm in distances
+        ],
+    }
 
 
 class FakeController:
@@ -145,15 +174,7 @@ class FakeScanController(FakeController):
             cancel_requested=cancel_requested,
         )
         if command == "scan_front_arc":
-            result["scan"] = {
-                "schema": "blast-scan-front-arc/v1",
-                "restoration_verified": True,
-                "rays": [
-                    {"side": "center", "distance_mm": 500.0},
-                    {"side": "left_near", "distance_mm": 900.0},
-                    {"side": "right_near", "distance_mm": 1_200.0},
-                ],
-            }
+            result["scan"] = scan_result()
         return result
 
 
@@ -310,15 +331,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     },
                 }
                 result["observation"] = observation
-                result["scan"] = {
-                    "schema": "blast-scan-front-arc/v1",
-                    "restoration_verified": True,
-                    "rays": [
-                        {"side": "center", "distance_mm": 300.0},
-                        {"side": "left", "distance_mm": 900.0},
-                        {"side": "right", "distance_mm": 1_200.0},
-                    ],
-                }
+                result["scan"] = scan_result(center_distance_mm=300.0)
                 self.snapshot_value = {
                     **self.snapshot_value,
                     "observation": observation,
@@ -339,6 +352,16 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         scan = planner.contexts[1].history[0]["scan"]
         self.assertTrue(scan["restoration_verified"])
         self.assertEqual(
+            [ray["range_state"] for ray in scan["rays"]],
+            [
+                RANGE_STATE_MEASURED,
+                RANGE_STATE_MEASURED,
+                RANGE_STATE_NO_VALID_DISTANCE,
+                RANGE_STATE_MEASURED,
+                RANGE_STATE_NO_VALID_DISTANCE,
+            ],
+        )
+        self.assertEqual(
             [update["scan"] for update in updates if "scan" in update],
             [scan],
         )
@@ -358,6 +381,74 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 "heading_error_deg": 2.0,
             },
         )
+
+    def test_legacy_scan_schema_is_rejected_before_replanning(self):
+        class LegacyScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    result["scan"]["schema"] = (
+                        "blast-scan-front-arc/v1"
+                    )
+                return result
+
+        planner = Planner([decision(SCAN_FRONT_ARC)])
+
+        with self.assertRaises(BlastEpisodeError) as rejected:
+            self.adapter(LegacyScanController(), planner).run(
+                episode_context()[0]
+            )
+
+        self.assertEqual(rejected.exception.code, "blast_scan_result_invalid")
+        self.assertEqual(len(planner.contexts), 1)
+
+    def test_inconsistent_scan_range_state_is_rejected(self):
+        class InconsistentScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    result["scan"]["rays"][2]["range_state"] = (
+                        RANGE_STATE_MEASURED
+                    )
+                return result
+
+        planner = Planner([decision(SCAN_FRONT_ARC)])
+
+        with self.assertRaises(BlastEpisodeError) as rejected:
+            self.adapter(InconsistentScanController(), planner).run(
+                episode_context()[0]
+            )
+
+        self.assertEqual(rejected.exception.code, "blast_scan_result_invalid")
+        self.assertEqual(len(planner.contexts), 1)
+
+    def test_scan_with_wrong_ray_order_is_rejected(self):
+        class MisorderedScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    rays = result["scan"]["rays"]
+                    rays[1], rays[2] = rays[2], rays[1]
+                return result
+
+        planner = Planner([decision(SCAN_FRONT_ARC)])
+
+        with self.assertRaises(BlastEpisodeError) as rejected:
+            controller = MisorderedScanController()
+            self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertEqual(rejected.exception.code, "blast_scan_result_invalid")
+        self.assertEqual(controller.commands, ["scan_front_arc"])
+        self.assertEqual(len(planner.contexts), 1)
 
     def test_restored_scan_residue_reanchors_before_semantic_turn(self):
         class ResidualScanController(FakeScanController):

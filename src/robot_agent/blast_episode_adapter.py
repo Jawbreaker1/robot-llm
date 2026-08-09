@@ -14,6 +14,7 @@ from .blast_observation_monitor import (
     CONTROLLER_ID,
     ROBOT_ID,
     BlastControllerError,
+    validate_blast_scan_range_contract,
 )
 from .blast_navigation_action_profile import BLAST_NAVIGATION_COMMANDS
 from .blast_navigation_motion_execution import (
@@ -428,6 +429,13 @@ class BlastEpisodeRuntimeAdapter:
                         "BLAST returned an invalid scan result",
                     )
                 if isinstance(scan, Mapping):
+                    try:
+                        scan = validate_blast_scan_range_contract(scan)
+                    except ValueError:
+                        raise BlastEpisodeError(
+                            "blast_scan_result_invalid",
+                            "BLAST returned an invalid scan result",
+                        ) from None
                     history_item["odometry_reanchored_after_scan"] = (
                         motion_executor.reanchor_after_restored_scan(
                             command_result
