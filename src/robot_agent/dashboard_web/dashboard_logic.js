@@ -12,6 +12,10 @@
     maxDelayMs: 5000,
   });
   const SPATIAL_MAP_SCHEMA = "robot-spatial-map/v1";
+  const SHARED_SPATIAL_MAP_SCHEMA = "robot-spatial-map/v2";
+  const SHARED_FIXED_START = "SHARED_FIXED_START";
+  const SHARED_SNAPSHOT_SEMANTICS = "LATEST_AVAILABLE_NOT_ATOMIC";
+  const MAX_SHARED_ROBOTS = 16;
   const MAX_SPATIAL_CELLS = 10000;
   const MAX_SENSOR_RAYS = 256;
   const MAX_OBJECT_HYPOTHESES = 256;
@@ -56,6 +60,24 @@
 
   function text(value) {
     return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
+  function identifier(value) {
+    return strictText(value, 128);
+  }
+
+  function strictText(value, maximumLength) {
+    return (
+      typeof value === "string"
+      && value.length > 0
+      && value.length <= maximumLength
+      && value === value.trim()
+      && !/[\x00-\x1f]/.test(value)
+    ) ? value : null;
+  }
+
+  function nonnegativeInteger(value) {
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
   }
 
   function provenance(value) {
@@ -660,7 +682,385 @@
     });
   }
 
+  function normalizeSharedFrameTransform(value, identity) {
+    const transform = record(value);
+    const transformProvenance = Array.isArray(transform.provenance)
+      ? transform.provenance
+      : [];
+    const provenanceValid = (
+      transformProvenance.length > 0
+      && transformProvenance.length <= 32
+      && transformProvenance.every((item) => identifier(item) !== null)
+      && new Set(transformProvenance).size === transformProvenance.length
+    );
+    const txMm = localCoordinate(transform.tx_mm);
+    const tyMm = localCoordinate(transform.ty_mm);
+    const yawMdeg = localHeading(transform.yaw_mdeg);
+    const positionUncertaintyMm = nonnegativeInteger(
+      transform.position_uncertainty_mm,
+    );
+    const yawUncertaintyMdeg = nonnegativeInteger(
+      transform.yaw_uncertainty_mdeg,
+    );
+    if (
+      transform.source_robot_id !== identity.robotId
+      || transform.source_controller_id !== identity.controllerInstanceId
+      || transform.source_frame_id !== identity.localFrameId
+      || transform.source_generation_id !== identity.localGenerationId
+      || transform.world_frame_id !== identity.worldFrameId
+      || transform.world_generation_id !== identity.worldGenerationId
+      || !Number.isSafeInteger(txMm)
+      || !Number.isSafeInteger(tyMm)
+      || !Number.isSafeInteger(yawMdeg)
+      || positionUncertaintyMm === null
+      || positionUncertaintyMm > MAX_LOCAL_COORDINATE_MM
+      || yawUncertaintyMdeg === null
+      || yawUncertaintyMdeg > 180000
+      || !provenanceValid
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      sourceRobotId: identity.robotId,
+      sourceControllerId: identity.controllerInstanceId,
+      sourceFrameId: identity.localFrameId,
+      sourceGenerationId: identity.localGenerationId,
+      worldFrameId: identity.worldFrameId,
+      worldGenerationId: identity.worldGenerationId,
+      txMm,
+      tyMm,
+      yawMdeg,
+      positionUncertaintyMm,
+      yawUncertaintyMdeg,
+      provenance: Object.freeze([...transformProvenance]),
+    });
+  }
+
+  function normalizeSharedPose(value, identity) {
+    const pose = record(value);
+    const xMm = localCoordinate(pose.x_mm);
+    const yMm = localCoordinate(pose.y_mm);
+    const headingMdeg = localHeading(pose.heading_mdeg);
+    const stateVersion = nonnegativeInteger(pose.state_version);
+    const observedAtUnixMs = nonnegativeInteger(
+      pose.observed_at_unix_ms,
+    );
+    const ageMs = nonnegativeInteger(pose.age_ms);
+    const sourceId = identifier(pose.source_id);
+    const poseProvenance = strictText(pose.provenance, 512);
+    if (
+      pose.frame_id !== identity.worldFrameId
+      || pose.local_frame_id !== identity.localFrameId
+      || !Number.isSafeInteger(xMm)
+      || !Number.isSafeInteger(yMm)
+      || !Number.isSafeInteger(headingMdeg)
+      || stateVersion === null
+      || observedAtUnixMs === null
+      || ageMs === null
+      || sourceId === null
+      || poseProvenance === null
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      xMm,
+      yMm,
+      headingMdeg,
+      frameId: identity.worldFrameId,
+      localFrameId: identity.localFrameId,
+      stateVersion,
+      observedAtUnixMs,
+      ageMs,
+      sourceId,
+      provenance: poseProvenance,
+    });
+  }
+
+  function sharedRobotWithoutPose(
+    identity,
+    reasonCode,
+    transform = null,
+    contractValid = false,
+  ) {
+    return Object.freeze({
+      contractValid,
+      readOnly: true,
+      status: "unavailable",
+      reasonCode,
+      robotId: identity.robotId,
+      controllerInstanceId: identity.controllerInstanceId,
+      localFrameId: identity.localFrameId,
+      localGenerationId: identity.localGenerationId,
+      worldFrameId: identity.worldFrameId,
+      worldGenerationId: identity.worldGenerationId,
+      robotPose: null,
+      poseHistory: Object.freeze([]),
+      poseHistoryEvicted: 0,
+      collisionGeometry: null,
+      frameTransform: transform,
+      sourceMapId: null,
+      sourceMapVersion: null,
+      sourceStatus: null,
+      capturedAtUnixMs: null,
+      sourceAgeMs: null,
+    });
+  }
+
+  function normalizeSharedRobot(value, worldIdentity) {
+    const robot = record(value);
+    const identity = Object.freeze({
+      robotId: identifier(robot.robot_id),
+      controllerInstanceId: identifier(robot.controller_instance_id),
+      localFrameId: identifier(robot.local_frame_id),
+      localGenerationId: identifier(robot.local_generation_id),
+      worldFrameId: worldIdentity.worldFrameId,
+      worldGenerationId: worldIdentity.worldGenerationId,
+    });
+    const identityValid = (
+      identity.robotId !== null
+      && identity.controllerInstanceId !== null
+      && identity.localFrameId !== null
+      && identity.localGenerationId !== null
+    );
+    const transform = identityValid
+      ? normalizeSharedFrameTransform(robot.frame_transform, identity)
+      : null;
+    const unavailableShapeValid = (
+      robot.status === "unavailable"
+      && robot.robot_pose === null
+      && Array.isArray(robot.pose_history)
+      && robot.pose_history.length === 0
+      && robot.collision_geometry === null
+      && robot.source_map_id === null
+      && robot.source_map_version === null
+      && robot.source_status === null
+      && robot.captured_at_unix_ms === null
+      && robot.source_age_ms === null
+    );
+    if (
+      robot.read_only === true
+      && identityValid
+      && transform !== null
+      && unavailableShapeValid
+    ) {
+      return sharedRobotWithoutPose(
+        identity,
+        identifier(robot.reason_code) || "source_unavailable",
+        transform,
+        true,
+      );
+    }
+    if (
+      robot.read_only !== true
+      || !identityValid
+      || transform === null
+      || robot.status !== "available"
+    ) {
+      return sharedRobotWithoutPose(
+        identity,
+        "source_identity_mismatch",
+        transform,
+      );
+    }
+    const robotPose = normalizeSharedPose(robot.robot_pose, identity);
+    const history = Array.isArray(robot.pose_history)
+      ? robot.pose_history
+      : null;
+    const retained = history === null
+      ? []
+      : history.slice(-MAX_POSE_HISTORY);
+    const poseHistory = retained.map((pose) => (
+      normalizeSharedPose(pose, identity)
+    ));
+    const sourceEvicted = nonnegativeInteger(
+      robot.pose_history_evicted,
+    );
+    const sourceMapVersion = nonnegativeInteger(robot.source_map_version);
+    const capturedAtUnixMs = nonnegativeInteger(
+      robot.captured_at_unix_ms,
+    );
+    const sourceAgeMs = nonnegativeInteger(robot.source_age_ms);
+    const sourceMapId = identifier(robot.source_map_id);
+    const collisionGeometry = normalizeCollisionGeometry(
+      robot.collision_geometry,
+    );
+    const sourceStatusValid = [
+      "available", "pose_only", "qualitative_only",
+    ].includes(robot.source_status);
+    const latestPose = poseHistory[poseHistory.length - 1];
+    const currentMatchesHistory = (
+      robotPose !== null
+      && latestPose !== undefined
+      && ["xMm", "yMm", "headingMdeg"].every((field) => (
+        robotPose[field] === latestPose[field]
+      ))
+    );
+    const locallyEvicted = Math.max(0, history?.length - retained.length);
+    const poseHistoryEvicted = sourceEvicted === null
+      ? null
+      : sourceEvicted + locallyEvicted;
+    if (
+      history === null
+      || poseHistory.some((pose) => pose === null)
+      || !currentMatchesHistory
+      || sourceEvicted === null
+      || !Number.isSafeInteger(poseHistoryEvicted)
+      || sourceMapVersion === null
+      || capturedAtUnixMs === null
+      || sourceAgeMs === null
+      || sourceMapId === null
+      || !sourceStatusValid
+      || robotPose.observedAtUnixMs > capturedAtUnixMs
+      || (
+        robot.collision_geometry !== null
+        && collisionGeometry === null
+      )
+    ) {
+      return sharedRobotWithoutPose(
+        identity,
+        "source_pose_invalid",
+        transform,
+      );
+    }
+    return Object.freeze({
+      contractValid: true,
+      readOnly: true,
+      status: "available",
+      reasonCode: identifier(robot.reason_code) || "pose_transformed",
+      ...identity,
+      robotPose,
+      poseHistory: Object.freeze(poseHistory),
+      poseHistoryEvicted,
+      collisionGeometry,
+      frameTransform: transform,
+      sourceMapId,
+      sourceMapVersion,
+      sourceStatus: robot.source_status,
+      capturedAtUnixMs,
+      sourceAgeMs,
+    });
+  }
+
+  function normalizeSharedSpatialMap(value, nowUnixMs = Date.now()) {
+    const map = record(value);
+    const now = Number.isFinite(nowUnixMs) && nowUnixMs >= 0
+      ? nowUnixMs
+      : Date.now();
+    const worldIdentity = Object.freeze({
+      worldFrameId: identifier(map.frame_id),
+      worldGenerationId: identifier(map.world_generation_id),
+    });
+    const emptyEvidence = [
+      map.cells,
+      map.sensor_rays,
+      map.qualitative_observations,
+      map.scan_evidence_history,
+      map.object_hypotheses,
+    ].every((items) => Array.isArray(items) && items.length === 0);
+    const topValid = (
+      map.schema === SHARED_SPATIAL_MAP_SCHEMA
+      && map.read_only === true
+      && map.frame_kind === SHARED_FIXED_START
+      && map.snapshot_semantics === SHARED_SNAPSHOT_SEMANTICS
+      && worldIdentity.worldFrameId !== null
+      && worldIdentity.worldGenerationId !== null
+      && strictText(map.map_id, 384) !== null
+      && identifier(map.source_id) !== null
+      && strictText(map.provenance, 512) !== null
+      && Array.isArray(map.robots)
+      && map.robots.length <= MAX_SHARED_ROBOTS
+      && ["available", "degraded", "unavailable"].includes(map.status)
+      && map.bounds === null
+      && map.navigation_authority === null
+      && emptyEvidence
+    );
+    const seen = new Set();
+    const robots = topValid ? map.robots.map((rawRobot) => {
+      const normalized = normalizeSharedRobot(rawRobot, worldIdentity);
+      const key = `${normalized.robotId}\u0000${
+        normalized.controllerInstanceId
+      }`;
+      if (
+        normalized.robotId === null
+        || normalized.controllerInstanceId === null
+        || seen.has(key)
+      ) {
+        return sharedRobotWithoutPose(
+          normalized,
+          "source_identity_duplicate",
+          normalized.frameTransform,
+        );
+      }
+      seen.add(key);
+      return normalized;
+    }) : [];
+    const availableCount = robots.filter((robot) => (
+      robot.status === "available"
+    )).length;
+    const detectedStatus = !topValid || availableCount === 0
+      ? "unavailable"
+      : availableCount === robots.length
+        ? "available"
+        : "degraded";
+    const status = (
+      !topValid
+      || map.status === "unavailable"
+      || detectedStatus === "unavailable"
+    )
+      ? "unavailable"
+      : map.status === "degraded" || detectedStatus === "degraded"
+        ? "degraded"
+        : "available";
+    const capturedAtUnixMs = nonnegativeInteger(
+      map.captured_at_unix_ms,
+    );
+    const mapAgeMs = ageAt(capturedAtUnixMs, now);
+    return Object.freeze({
+      schema: topValid ? SHARED_SPATIAL_MAP_SCHEMA : null,
+      contractValid: topValid,
+      status,
+      reasonCode: topValid
+        ? (identifier(map.reason_code) || "shared_pose_snapshot")
+        : "shared_contract_invalid",
+      mapId: topValid ? map.map_id : null,
+      robotId: null,
+      frameId: topValid ? worldIdentity.worldFrameId : null,
+      frameKind: topValid ? SHARED_FIXED_START : null,
+      worldGenerationId: topValid
+        ? worldIdentity.worldGenerationId
+        : null,
+      snapshotSemantics: topValid ? SHARED_SNAPSHOT_SEMANTICS : null,
+      mapVersion: null,
+      basedOnStateVersion: null,
+      basedOnWorldModelVersion: null,
+      capturedAtUnixMs,
+      ageMs: mapAgeMs,
+      sourceId: topValid ? map.source_id : null,
+      provenance: topValid ? map.provenance : null,
+      bounds: null,
+      resolutionMm: null,
+      collisionGeometry: null,
+      hazardRetention: null,
+      scanAttemptRetention: null,
+      robotPose: null,
+      poseHistory: Object.freeze([]),
+      poseHistoryEvicted: 0,
+      cells: Object.freeze([]),
+      sensorRays: Object.freeze([]),
+      objectHypotheses: Object.freeze([]),
+      qualitativeObservations: Object.freeze([]),
+      qualitativeObservationsEvicted: 0,
+      scanEvidenceHistory: Object.freeze([]),
+      scanEvidenceHistoryEvicted: 0,
+      navigationTrace: null,
+      robots: Object.freeze(robots),
+    });
+  }
+
   function normalizeSpatialMap(value, nowUnixMs = Date.now()) {
+    if (record(value).schema === SHARED_SPATIAL_MAP_SCHEMA) {
+      return normalizeSharedSpatialMap(value, nowUnixMs);
+    }
     const map = record(value);
     const now = Number.isFinite(nowUnixMs) && nowUnixMs >= 0
       ? nowUnixMs
@@ -1090,6 +1490,12 @@
     return normalized;
   }
 
+  function selectSpatialMapEndpoint(capabilities) {
+    return record(capabilities).shared_spatial_map === "read_only"
+      ? "/api/v1/shared-map"
+      : "/api/v1/map";
+  }
+
   function isTerminalSessionError(value) {
     return Boolean(
       value
@@ -1314,16 +1720,20 @@
   }
 
   global.RobotDashboardLogic = Object.freeze({
+    MAX_SHARED_ROBOTS,
     MAX_POSE_HISTORY,
     MAX_QUALITATIVE_OBSERVATIONS,
     MAX_SCAN_EVIDENCE,
+    SHARED_SPATIAL_MAP_SCHEMA,
     SPATIAL_MAP_SCHEMA,
     TURN_POLL_POLICY,
     createDashboardRequest,
     createSessionGuard,
     isTerminalSessionError,
+    normalizeSharedSpatialMap,
     normalizeSpatialMap,
     replaceRenderedItems,
+    selectSpatialMapEndpoint,
     transitionTurnPoll,
   });
 })(typeof window === "undefined" ? globalThis : window);

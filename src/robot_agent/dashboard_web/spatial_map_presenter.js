@@ -3,6 +3,7 @@
 
   const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
   const LOCAL_ODOMETRY = "LOCAL_ODOMETRY";
+  const SHARED_SPATIAL_MAP_SCHEMA = "robot-spatial-map/v2";
   const QUALITATIVE_FORWARD_ENVELOPE = (
     "QUALITATIVE_FORWARD_ENVELOPE"
   );
@@ -236,7 +237,7 @@
       };
     }
 
-    function localOdometryProjection(points) {
+    function fittedMetricProjection(points) {
       const minX = Math.min(...points.map((point) => point.xMm));
       const maxX = Math.max(...points.map((point) => point.xMm));
       const minY = Math.min(...points.map((point) => point.yMm));
@@ -312,6 +313,53 @@
           geometry.leftExtentMm + margin,
         ),
       ];
+    }
+
+    function sharedWorldScene(map) {
+      const points = [];
+      function addPoint(point) {
+        if (
+          point
+          && Number.isFinite(point.xMm)
+          && Number.isFinite(point.yMm)
+        ) {
+          points.push(point);
+        }
+      }
+      map.robots.forEach((robot) => {
+        if (robot.status !== "available" || !robot.robotPose) {
+          return;
+        }
+        robot.poseHistory.forEach(addPoint);
+        addPoint(robot.robotPose);
+        footprintCorners(
+          robot.robotPose,
+          robot.collisionGeometry,
+          true,
+        ).forEach(addPoint);
+        if (
+          robot.collisionGeometry?.geometry === "SYMMETRIC_CIRCLE"
+        ) {
+          const radius = robot.collisionGeometry.radiusMm;
+          addPoint({
+            xMm: robot.robotPose.xMm + radius,
+            yMm: robot.robotPose.yMm,
+          });
+          addPoint({
+            xMm: robot.robotPose.xMm - radius,
+            yMm: robot.robotPose.yMm,
+          });
+          addPoint({
+            xMm: robot.robotPose.xMm,
+            yMm: robot.robotPose.yMm + radius,
+          });
+          addPoint({
+            xMm: robot.robotPose.xMm,
+            yMm: robot.robotPose.yMm - radius,
+          });
+        }
+      });
+      return Object.freeze({ points: Object.freeze(points) });
     }
 
     function scanBearingLabel(bearingMdeg) {
@@ -607,7 +655,7 @@
       if (map.navigationTrace) {
         layer.setAttribute("data-geometry", "mixed-local-odometry");
       }
-      const projection = localOdometryProjection(scene.points);
+      const projection = fittedMetricProjection(scene.points);
 
       const layerLabel = createSvgElement("text", {
         x: 32,
@@ -1504,10 +1552,138 @@
       }
     }
 
+    function renderSharedWorldMap(map, scene, drawable) {
+      const cellLayer = byId("map-cell-layer");
+      const pathLayer = byId("map-path-layer");
+      const rayLayer = byId("map-ray-layer");
+      const objectLayer = byId("map-object-layer");
+      const robotLayer = byId("map-robot-layer");
+      cellLayer.replaceChildren();
+      pathLayer.replaceChildren();
+      rayLayer.replaceChildren();
+      objectLayer.replaceChildren();
+      robotLayer.replaceChildren();
+      if (!drawable) {
+        return;
+      }
+      const projection = fittedMetricProjection(scene.points);
+      map.robots.forEach((robot, index) => {
+        if (robot.status !== "available" || !robot.robotPose) {
+          return;
+        }
+        const robotClass = `map-shared-robot-${index % 8}`;
+        const pathGroup = createSvgElement("g", {
+          class: `map-shared-robot-path ${robotClass}`,
+          "data-robot-id": robot.robotId,
+          "data-controller-instance-id": robot.controllerInstanceId,
+        });
+        renderPath(pathGroup, robot.poseHistory, projection);
+        pathLayer.appendChild(pathGroup);
+
+        const pose = robot.robotPose;
+        const robotPoint = projection.point(pose.xMm, pose.yMm);
+        const headingRadians = pose.headingMdeg / 1000 * Math.PI / 180;
+        const headingEnd = screenPoint(robotPoint, headingRadians, 54);
+        const group = createSvgElement("g", {
+          class: `map-shared-robot ${robotClass}`,
+          "data-robot-id": robot.robotId,
+          "data-controller-instance-id": robot.controllerInstanceId,
+          "data-local-frame-id": robot.localFrameId,
+          "data-local-generation-id": robot.localGenerationId,
+          "data-world-frame-id": robot.worldFrameId,
+          "data-world-generation-id": robot.worldGenerationId,
+        });
+        appendSvgTitle(group, [
+          robot.robotId,
+          robot.controllerInstanceId,
+          ...mapTooltipParts(pose),
+        ]);
+        if (
+          robot.collisionGeometry?.geometry === "ASYMMETRIC_RECTANGLE"
+        ) {
+          const corners = footprintCorners(
+            pose,
+            robot.collisionGeometry,
+          ).map((point) => projection.point(point.xMm, point.yMm));
+          group.appendChild(createSvgElement("polygon", {
+            points: corners.map((point) => (
+              `${point.x},${point.y}`
+            )).join(" "),
+            class: `map-local-robot-footprint map-shared-footprint ${
+              robotClass
+            }`,
+            "data-front-extent-mm": (
+              robot.collisionGeometry.frontExtentMm
+            ),
+            "data-rear-extent-mm": (
+              robot.collisionGeometry.rearExtentMm
+            ),
+            "data-left-extent-mm": (
+              robot.collisionGeometry.leftExtentMm
+            ),
+            "data-right-extent-mm": (
+              robot.collisionGeometry.rightExtentMm
+            ),
+          }));
+        } else if (
+          robot.collisionGeometry?.geometry === "SYMMETRIC_CIRCLE"
+        ) {
+          const radiusPoint = projection.point(
+            pose.xMm + robot.collisionGeometry.radiusMm,
+            pose.yMm,
+          );
+          group.appendChild(createSvgElement("circle", {
+            cx: robotPoint.x,
+            cy: robotPoint.y,
+            r: Math.abs(radiusPoint.x - robotPoint.x),
+            class: `map-local-robot-boundary map-shared-footprint ${
+              robotClass
+            }`,
+            "data-radius-mm": robot.collisionGeometry.radiusMm,
+          }));
+        }
+        group.appendChild(createSvgElement("line", {
+          x1: robotPoint.x,
+          y1: robotPoint.y,
+          x2: headingEnd.x,
+          y2: headingEnd.y,
+          class: `map-robot-heading map-shared-heading ${robotClass}`,
+          "data-heading-mdeg": pose.headingMdeg,
+        }));
+        group.appendChild(createSvgElement("circle", {
+          cx: robotPoint.x,
+          cy: robotPoint.y,
+          r: 17,
+          class: `map-robot-body map-shared-body ${robotClass}`,
+        }));
+        const label = createSvgElement("text", {
+          x: robotPoint.x,
+          y: robotPoint.y - 25,
+          class: `map-object-label map-shared-robot-label ${robotClass}`,
+          "text-anchor": "middle",
+        });
+        label.textContent = robot.robotId;
+        group.appendChild(label);
+        robotLayer.appendChild(group);
+      });
+    }
+
     function render(spatialMap, connection = "connected", nowUnixMs) {
       const map = normalizeSpatialMap(spatialMap, nowUnixMs);
       const status = byId("map-connection-status");
-      const localOdometrySceneValue = localOdometryScene(map);
+      const sharedMap = map.schema === SHARED_SPATIAL_MAP_SCHEMA;
+      const sharedScene = sharedMap
+        ? sharedWorldScene(map)
+        : Object.freeze({ points: Object.freeze([]) });
+      const sharedDrawable = (
+        sharedMap
+        && map.contractValid
+        && (map.status === "available" || map.status === "degraded")
+        && sharedScene.points.length > 0
+      );
+      const localOdometrySceneValue = sharedMap
+        ? { points: [], cues: [], latestScans: [] }
+        : localOdometryScene(map);
       const localOdometryDrawable = (
         map.contractValid
         && map.frameKind === LOCAL_ODOMETRY
@@ -1539,7 +1715,7 @@
       } else if (map.status === "degraded") {
         status.className = "state-chip state-locked";
         status.textContent = t("map.status.degraded");
-      } else if (mapDrawable) {
+      } else if (mapDrawable || sharedDrawable) {
         status.className = "state-chip state-ready";
         status.textContent = t("map.status.live");
       } else if (map.status === "qualitative_only") {
@@ -1557,13 +1733,17 @@
         t("map.frame.unavailable"),
       );
       byId("map-empty-state").hidden = (
-        mapDrawable || localOdometryDrawable
+        mapDrawable || localOdometryDrawable || sharedDrawable
       );
       renderEmptyState(map);
       renderMapMetadata(map);
       renderQualitativeObservations(map);
       renderMapObjects(map);
-      renderMetricMap(map, mapDrawable);
+      if (sharedMap) {
+        renderSharedWorldMap(map, sharedScene, sharedDrawable);
+      } else {
+        renderMetricMap(map, mapDrawable);
+      }
       renderLocalOdometryMap(
         map,
         localOdometrySceneValue,

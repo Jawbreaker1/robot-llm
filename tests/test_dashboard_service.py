@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import struct
 import subprocess
@@ -943,6 +944,151 @@ class DashboardServiceTests(unittest.TestCase):
             mismatch.exception.code,
             "spatial_map_unavailable",
         )
+
+    def test_shared_spatial_map_is_opt_in_detached_and_read_only(self):
+        supplied = {
+            "schema": "robot-spatial-map/v2",
+            "read_only": True,
+            "frame_id": "lab-world",
+            "robots": [
+                {
+                    "robot_id": "blast-01",
+                    "robot_pose": {"x_mm": 100, "y_mm": 200},
+                }
+            ],
+        }
+        service = self.make_service(
+            episode_runner=ScriptedRunner(),
+            shared_spatial_map_provider=lambda: supplied,
+        )
+
+        first = service.shared_spatial_map()
+        first["robots"][0]["robot_pose"]["x_mm"] = 999
+        second = service.shared_spatial_map()
+
+        self.assertEqual(second["robots"], supplied["robots"])
+        self.assertIsNot(second, supplied)
+        self.assertIsNot(second["robots"], supplied["robots"])
+        self.assertEqual(
+            service.bootstrap()["capabilities"]["shared_spatial_map"],
+            "read_only",
+        )
+
+        without_shared = self.make_service(
+            episode_runner=ScriptedRunner()
+        )
+        self.assertNotIn(
+            "shared_spatial_map",
+            without_shared.bootstrap()["capabilities"],
+        )
+        with self.assertRaises(DashboardServiceError) as unavailable:
+            without_shared.shared_spatial_map()
+        self.assertEqual(unavailable.exception.status, 503)
+        self.assertEqual(
+            unavailable.exception.code,
+            "spatial_map_unavailable",
+        )
+
+    def test_shared_spatial_map_prefers_snapshot_capability(self):
+        class CapabilitySeparatedStore:
+            def __init__(self):
+                self.reads = 0
+                self.write_calls = 0
+
+            def __call__(self, _observation=None):
+                self.write_calls += 1
+                raise AssertionError("write capability was invoked")
+
+            def snapshot(self):
+                self.reads += 1
+                return {
+                    "schema": "robot-spatial-map/v2",
+                    "read_only": True,
+                    "status": "available",
+                    "robots": [],
+                }
+
+        store = CapabilitySeparatedStore()
+        service = self.make_service(
+            episode_runner=ScriptedRunner(),
+            shared_spatial_map_provider=store,
+        )
+
+        snapshot = service.shared_spatial_map()
+
+        self.assertEqual(snapshot["schema"], "robot-spatial-map/v2")
+        self.assertEqual(store.reads, 1)
+        self.assertEqual(store.write_calls, 0)
+
+    def test_shared_spatial_map_rejects_invalid_nonfinite_and_oversize(self):
+        invalid_snapshots = (
+            [],
+            {"schema": "robot-spatial-map/v1", "read_only": True},
+            {
+                "schema": "robot-spatial-map/v2",
+                "read_only": True,
+                "x_mm": math.nan,
+            },
+            {
+                "schema": "robot-spatial-map/v2",
+                "read_only": True,
+                "padding": "x" * MAX_SPATIAL_MAP_BYTES,
+            },
+        )
+
+        for supplied in invalid_snapshots:
+            with self.subTest(snapshot_type=type(supplied).__name__):
+                service = self.make_service(
+                    episode_runner=ScriptedRunner(),
+                    shared_spatial_map_provider=lambda value=supplied: value,
+                )
+                with self.assertRaises(DashboardServiceError) as raised:
+                    service.shared_spatial_map()
+                self.assertEqual(raised.exception.status, 503)
+                self.assertEqual(
+                    raised.exception.code,
+                    "spatial_map_unavailable",
+                )
+                self.assertEqual(
+                    str(raised.exception),
+                    "Spatial map snapshot is unavailable",
+                )
+
+    def test_shared_provider_errors_are_generic_at_both_boundaries(self):
+        class RaisingSnapshotDescriptor:
+            @property
+            def snapshot(self):
+                raise RuntimeError("constructor secret")
+
+        with self.assertRaises(DashboardServiceError) as configuration:
+            self.make_service(
+                episode_runner=ScriptedRunner(),
+                shared_spatial_map_provider=RaisingSnapshotDescriptor(),
+            )
+        self.assertEqual(configuration.exception.status, 500)
+        self.assertEqual(
+            configuration.exception.code,
+            "invalid_service_configuration",
+        )
+        self.assertNotIn("secret", str(configuration.exception).lower())
+
+        def failing_provider():
+            raise DashboardServiceError(
+                418, "provider_secret", "provider secret"
+            )
+
+        service = self.make_service(
+            episode_runner=ScriptedRunner(),
+            shared_spatial_map_provider=failing_provider,
+        )
+        with self.assertRaises(DashboardServiceError) as unavailable:
+            service.shared_spatial_map()
+        self.assertEqual(unavailable.exception.status, 503)
+        self.assertEqual(
+            unavailable.exception.code,
+            "spatial_map_unavailable",
+        )
+        self.assertNotIn("secret", str(unavailable.exception).lower())
 
     def test_bootstrap_uses_typed_catalog_keys_for_curated_copy(self):
         service = self.make_service(

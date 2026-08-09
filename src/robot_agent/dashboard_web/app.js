@@ -10,7 +10,7 @@
   const {
     createDashboardRequest,
     createSessionGuard,
-    normalizeSpatialMap,
+    normalizeSpatialMap, selectSpatialMapEndpoint,
     TURN_POLL_POLICY,
     replaceRenderedItems,
     transitionTurnPoll,
@@ -1593,7 +1593,7 @@
     }
     state.mapBusy = true;
     try {
-      const payload = await api("/api/v1/map", {
+      const payload = await api(selectSpatialMapEndpoint(safeObject(state.bootstrap).capabilities), {
         timeout: 5000,
       });
       renderSpatialMap(payload.map, "connected");

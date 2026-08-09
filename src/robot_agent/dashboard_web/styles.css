@@ -2504,6 +2504,30 @@ textarea:focus-visible,
   stroke-width: 5;
 }
 
+.map-shared-robot-0 .map-path,
+.map-shared-robot-0 .map-path-start,
+.map-shared-robot-0.map-shared-heading,
+.map-shared-robot-0.map-shared-footprint {
+  stroke: var(--evidence);
+}
+
+.map-shared-robot-0.map-shared-body,
+.map-shared-robot-0.map-shared-robot-label {
+  fill: var(--evidence);
+}
+
+.map-shared-robot-1 .map-path,
+.map-shared-robot-1 .map-path-start,
+.map-shared-robot-1.map-shared-heading,
+.map-shared-robot-1.map-shared-footprint {
+  stroke: var(--warning);
+}
+
+.map-shared-robot-1.map-shared-body,
+.map-shared-robot-1.map-shared-robot-label {
+  fill: var(--warning);
+}
+
 .map-local-imu-heading {
   fill: none;
   stroke: var(--evidence);

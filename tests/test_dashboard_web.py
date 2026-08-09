@@ -999,7 +999,10 @@ function ev3Button(status) {
         self.assertIn("RobotMissionPanelUI.create", self.robot_control)
         self.assertIn("robot-spatial-map/v1", self.dashboard_logic)
         self.assertIn("normalizeSpatialMap", self.dashboard_logic)
-        self.assertIn('api("/api/v1/map"', self.javascript)
+        self.assertIn("selectSpatialMapEndpoint", self.javascript)
+        self.assertIn('"/api/v1/map"', self.dashboard_logic)
+        self.assertIn(".map-shared-robot-0", self.css)
+        self.assertIn(".map-shared-robot-1", self.css)
         self.assertIn(
             "RobotSpatialMapPresenter.create",
             self.javascript,
@@ -2269,7 +2272,8 @@ function ev3Button(status) {
             "/api/v1/runtime/lm-studio/probe",
             self.javascript,
         )
-        self.assertIn("/api/v1/map", self.javascript)
+        self.assertIn("selectSpatialMapEndpoint", self.javascript)
+        self.assertIn("/api/v1/map", self.dashboard_logic)
         for forbidden_route in (
             "/move",
             "/drive",

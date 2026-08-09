@@ -114,6 +114,16 @@ class FakeDashboardService:
             "object_hypotheses": [],
         }
 
+    def shared_spatial_map(self):
+        self.calls.append(("shared_spatial_map",))
+        return {
+            "schema": "robot-spatial-map/v2",
+            "status": "available",
+            "read_only": True,
+            "frame_id": "lab-world",
+            "robots": [],
+        }
+
     def create_conversation(self, title=None):
         self.calls.append(("create_conversation", title))
         return {
@@ -535,6 +545,78 @@ class DashboardHTTPTests(unittest.TestCase):
         response = self.router.handle(
             "GET",
             "/api/v1/map",
+            self.headers(),
+        )
+
+        self.assertEqual(response.status, 503)
+        self.assertLessEqual(len(response.body), MAX_SPATIAL_MAP_RESPONSE_BYTES)
+        self.assertEqual(
+            self.decoded(response)["error"]["code"],
+            "spatial_map_unavailable",
+        )
+
+    def test_shared_map_is_authenticated_query_free_and_isolated(self):
+        shared = self.router.handle(
+            "GET",
+            "/api/v1/shared-map",
+            self.headers(),
+        )
+        local = self.router.handle(
+            "GET",
+            "/api/v1/map",
+            self.headers(),
+        )
+
+        self.assertEqual(shared.status, 200)
+        self.assertEqual(
+            self.decoded(shared)["map"]["schema"],
+            "robot-spatial-map/v2",
+        )
+        self.assertEqual(local.status, 200)
+        self.assertEqual(
+            self.decoded(local)["map"]["schema"],
+            "robot-spatial-map/v1",
+        )
+        self.assertEqual(
+            self.service.calls,
+            [("shared_spatial_map",), ("spatial_map",)],
+        )
+
+        unauthenticated = self.router.handle(
+            "GET",
+            "/api/v1/shared-map",
+            self.headers(authenticated=False),
+        )
+        queried = self.router.handle(
+            "GET",
+            "/api/v1/shared-map?robot_id=blast-01",
+            self.headers(),
+        )
+        mutation = self.router.handle(
+            "POST",
+            "/api/v1/shared-map",
+            self.headers(mutation=True),
+            b"{}",
+        )
+
+        self.assertEqual(unauthenticated.status, 403)
+        self.assertEqual(queried.status, 400)
+        self.assertEqual(mutation.status, 404)
+        self.assertEqual(
+            self.service.calls,
+            [("shared_spatial_map",), ("spatial_map",)],
+        )
+
+    def test_shared_map_limit_applies_to_the_final_http_body(self):
+        self.service.shared_spatial_map = lambda: {
+            "schema": "robot-spatial-map/v2",
+            "read_only": True,
+            "padding": "x" * MAX_SPATIAL_MAP_RESPONSE_BYTES,
+        }
+
+        response = self.router.handle(
+            "GET",
+            "/api/v1/shared-map",
             self.headers(),
         )
 

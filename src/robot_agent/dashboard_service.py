@@ -66,6 +66,7 @@ from .research_loop import (
 SERVICE_SCHEMA = "dashboard-bootstrap/v1"
 RUNTIME_SCHEMA = "dashboard-runtime/v1"
 SPATIAL_MAP_SCHEMA = "robot-spatial-map/v1"
+SHARED_SPATIAL_MAP_SCHEMA = "robot-spatial-map/v2"
 MAX_CHAT_JOBS = 8
 MAX_HISTORY_MESSAGES = 20
 MAX_SPATIAL_MAP_BYTES = 4 * 1024 * 1024
@@ -412,6 +413,7 @@ class DashboardService:
         probe_transport: ProbeTransport = direct_http_request,
         server_instance_id: Optional[str] = None,
         spatial_map_provider: Optional[SpatialMapProvider] = None,
+        shared_spatial_map_provider: Optional[SpatialMapProvider] = None,
         speech_transcriber=None,
         controller_runtime_providers: Tuple[object, ...] = (),
     ):
@@ -420,10 +422,32 @@ class DashboardService:
             "snapshot",
             None,
         )
+        try:
+            shared_spatial_snapshot = getattr(
+                shared_spatial_map_provider,
+                "snapshot",
+                None,
+            )
+        except Exception:
+            raise DashboardServiceError(
+                500,
+                "invalid_service_configuration",
+                "Dashboard service configuration is invalid",
+            ) from None
         if (
             spatial_map_provider is not None
             and not callable(spatial_map_provider)
             and not callable(spatial_snapshot)
+        ):
+            raise DashboardServiceError(
+                500,
+                "invalid_service_configuration",
+                "Dashboard service configuration is invalid",
+            )
+        if (
+            shared_spatial_map_provider is not None
+            and not callable(shared_spatial_map_provider)
+            and not callable(shared_spatial_snapshot)
         ):
             raise DashboardServiceError(
                 500,
@@ -483,6 +507,12 @@ class DashboardService:
             self._spatial_map_provider = spatial_snapshot
         else:
             self._spatial_map_provider = spatial_map_provider
+        if shared_spatial_map_provider is None:
+            self._shared_spatial_map_provider = None
+        elif callable(shared_spatial_snapshot):
+            self._shared_spatial_map_provider = shared_spatial_snapshot
+        else:
+            self._shared_spatial_map_provider = shared_spatial_map_provider
         self._jobs = queue.Queue(maxsize=queue_capacity)
         self._job_slots = threading.BoundedSemaphore(queue_capacity)
         self._stop_requested = threading.Event()
@@ -704,30 +734,33 @@ class DashboardService:
                 "reason_code": "physical_probe_not_run",
             },
         )
+        capabilities = {
+            "chat": True,
+            "research": ["weather.current"],
+            "spatial_map": "read_only",
+            "speech_to_text": self._stt.capability(),
+            # This object describes only the conversational workbench.
+            # Physical robot control is a separate, explicitly injected
+            # service with its own status endpoint and state machine.
+            "workbench": {
+                "schema": "dashboard-workbench-capabilities/v1",
+                "tool_effects": "read_only",
+                "physical_control": False,
+                "ssh": False,
+                "tts": False,
+            },
+            "physical_control": False,
+            "ssh": False,
+            "tts": False,
+        }
+        if self._shared_spatial_map_provider is not None:
+            capabilities["shared_spatial_map"] = "read_only"
         return {
             "schema": SERVICE_SCHEMA,
             "api_version": "robot-dashboard/v1",
             "server_instance_id": self._server_instance_id,
             "physical_control_enabled": False,
-            "capabilities": {
-                "chat": True,
-                "research": ["weather.current"],
-                "spatial_map": "read_only",
-                "speech_to_text": self._stt.capability(),
-                # This object describes only the conversational workbench.
-                # Physical robot control is a separate, explicitly injected
-                # service with its own status endpoint and state machine.
-                "workbench": {
-                    "schema": "dashboard-workbench-capabilities/v1",
-                    "tool_effects": "read_only",
-                    "physical_control": False,
-                    "ssh": False,
-                    "tts": False,
-                },
-                "physical_control": False,
-                "ssh": False,
-                "tts": False,
-            },
+            "capabilities": capabilities,
             "settings": self.settings(),
             "registry": self.registry(),
             "experiments": self.experiments(),
@@ -790,8 +823,43 @@ class DashboardService:
                 or snapshot.get("read_only") is not True
             ):
                 raise ValueError("map snapshot contract mismatch")
-        except DashboardServiceError:
-            raise
+        except Exception:
+            raise DashboardServiceError(
+                503,
+                "spatial_map_unavailable",
+                "Spatial map snapshot is unavailable",
+            ) from None
+        return snapshot
+
+    def shared_spatial_map(self):
+        """Return one detached, finite shared-world map snapshot."""
+
+        if self._shared_spatial_map_provider is None:
+            raise DashboardServiceError(
+                503,
+                "spatial_map_unavailable",
+                "Spatial map snapshot is unavailable",
+            )
+        try:
+            supplied = self._shared_spatial_map_provider()
+            to_dict = getattr(supplied, "to_dict", None)
+            if callable(to_dict):
+                supplied = to_dict()
+            encoded = json.dumps(
+                supplied,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            if len(encoded) > MAX_SPATIAL_MAP_BYTES:
+                raise ValueError("map snapshot is too large")
+            snapshot = strict_json_object(encoded)
+            if (
+                snapshot.get("schema") != SHARED_SPATIAL_MAP_SCHEMA
+                or snapshot.get("read_only") is not True
+            ):
+                raise ValueError("map snapshot contract mismatch")
         except Exception:
             raise DashboardServiceError(
                 503,

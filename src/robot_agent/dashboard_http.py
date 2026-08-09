@@ -356,6 +356,17 @@ class DashboardRouter:
                 ) from None
             raise
 
+    def _spatial_map_response(self, operation):
+        value = self._service_call(operation)
+        response = self._response(200, {"map": value})
+        if len(response.body) > MAX_SPATIAL_MAP_RESPONSE_BYTES:
+            raise DashboardHTTPError(
+                503,
+                "spatial_map_unavailable",
+                "Spatial map response exceeds its byte capacity",
+            )
+        return response
+
     def _authorize(
         self,
         method: str,
@@ -656,15 +667,18 @@ class DashboardRouter:
                     "invalid_query",
                     "Map endpoint accepts no query",
                 )
-            value = self._service_call(self._service.spatial_map)
-            response = self._response(200, {"map": value})
-            if len(response.body) > MAX_SPATIAL_MAP_RESPONSE_BYTES:
+            return self._spatial_map_response(self._service.spatial_map)
+
+        if method == "GET" and path == "/api/v1/shared-map":
+            if parsed.query:
                 raise DashboardHTTPError(
-                    503,
-                    "spatial_map_unavailable",
-                    "Spatial map response exceeds its byte capacity",
+                    400,
+                    "invalid_query",
+                    "Shared map endpoint accepts no query",
                 )
-            return response
+            return self._spatial_map_response(
+                self._service.shared_spatial_map
+            )
 
         if method == "POST" and path == STT_TRANSCRIPTIONS_PATH:
             if parsed.query:

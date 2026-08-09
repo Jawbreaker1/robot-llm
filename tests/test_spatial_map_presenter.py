@@ -1150,6 +1150,263 @@ process.stdout.write(JSON.stringify({
         self.assertIsNone(result["invalidEcho"])
         self.assertIsNone(result["overCapacity"])
 
+    def test_shared_world_renders_separate_robots_without_local_evidence(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+class FakeNode {
+  constructor(tag, id = null) {
+    this.tag = tag;
+    this.id = id;
+    this.className = "";
+    this.hidden = false;
+    this.attributes = {};
+    this.children = [];
+    this._text = "";
+  }
+  set textContent(value) { this._text = String(value); this.children = []; }
+  get textContent() {
+    return this._text + this.children.map((child) => child.textContent).join("");
+  }
+  appendChild(child) { this.children.push(child); return child; }
+  replaceChildren(...children) { this._text = ""; this.children = children; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+}
+const ids = [
+  "map-connection-status", "map-frame-label", "map-empty-state",
+  "map-empty-title", "map-empty-body", "map-metadata",
+  "map-qualitative-list", "map-qualitative-count", "map-object-list",
+  "map-object-count", "map-local-odometry-layer", "map-cell-layer",
+  "map-path-layer", "map-ray-layer", "map-object-layer", "map-robot-layer",
+];
+const nodes = Object.fromEntries(ids.map((id) => [id, new FakeNode("div", id)]));
+const document = {
+  getElementById(id) { return nodes[id]; },
+  createElement(tag) { return new FakeNode(tag); },
+  createElementNS(_namespace, tag) { return new FakeNode(tag); },
+};
+const context = {};
+for (const filename of process.argv.slice(1)) {
+  vm.runInNewContext(fs.readFileSync(filename, "utf8"), context, { filename });
+}
+function pose(robotId, localFrameId, xMm, yMm, headingMdeg, stateVersion) {
+  return {
+    x_mm: xMm,
+    y_mm: yMm,
+    heading_mdeg: headingMdeg,
+    frame_id: "shared-world",
+    local_frame_id: localFrameId,
+    state_version: stateVersion,
+    source_id: `${robotId}-odometry`,
+    provenance: "CALIBRATED_FIXED_START_SE2_PROJECTION",
+    observed_at_unix_ms: 1800 + stateVersion,
+    age_ms: 100,
+  };
+}
+function robot({
+  robotId, controllerId, localFrameId, generationId, poses, geometry,
+}) {
+  return {
+    read_only: true,
+    status: "available",
+    reason_code: "pose_transformed",
+    robot_id: robotId,
+    controller_instance_id: controllerId,
+    local_frame_id: localFrameId,
+    local_generation_id: generationId,
+    robot_pose: poses[poses.length - 1],
+    pose_history: poses,
+    pose_history_evicted: 0,
+    collision_geometry: geometry,
+    frame_transform: {
+      source_robot_id: robotId,
+      source_controller_id: controllerId,
+      source_frame_id: localFrameId,
+      source_generation_id: generationId,
+      world_frame_id: "shared-world",
+      world_generation_id: "world-gen-1",
+      tx_mm: 0,
+      ty_mm: 0,
+      yaw_mdeg: 0,
+      position_uncertainty_mm: 10,
+      yaw_uncertainty_mdeg: 500,
+      provenance: ["FIXED_START_MEASUREMENT"],
+    },
+    source_map_id: `${robotId}-map`,
+    source_map_version: 3,
+    source_status: "pose_only",
+    captured_at_unix_ms: 2000,
+    source_age_ms: 100,
+  };
+}
+const rectangle = {
+  geometry: "ASYMMETRIC_RECTANGLE",
+  reference_point: "DIFFERENTIAL_DRIVE_ORIGIN",
+  front_extent_mm: 110,
+  rear_extent_mm: 90,
+  left_extent_mm: 105,
+  right_extent_mm: 160,
+  clearance_margin_mm: 10,
+};
+const circle = {
+  geometry: "SYMMETRIC_CIRCLE",
+  reference_point: "DIFFERENTIAL_DRIVE_ORIGIN",
+  radius_mm: 120,
+};
+const ev3 = robot({
+  robotId: "ev3rstorm-01",
+  controllerId: "ev3-controller",
+  localFrameId: "ev3-local",
+  generationId: "ev3-gen",
+  poses: [
+    pose("ev3rstorm-01", "ev3-local", 0, 0, 0, 1),
+    pose("ev3rstorm-01", "ev3-local", 200, 0, 0, 2),
+  ],
+  geometry: rectangle,
+});
+const blast = robot({
+  robotId: "blast-01",
+  controllerId: "blast-controller",
+  localFrameId: "blast-local",
+  generationId: "blast-gen",
+  poses: [
+    pose("blast-01", "blast-local", 1000, 500, 90000, 1),
+    pose("blast-01", "blast-local", 1000, 700, 90000, 2),
+  ],
+  geometry: circle,
+});
+function shared(robots) {
+  return {
+    schema: "robot-spatial-map/v2",
+    read_only: true,
+    status: "available",
+    reason_code: "all_sources_available",
+    map_id: "shared-world.shared-fixed-start.world-gen-1",
+    frame_id: "shared-world",
+    frame_kind: "SHARED_FIXED_START",
+    world_generation_id: "world-gen-1",
+    source_id: "shared-spatial-map-compositor",
+    provenance: "CALIBRATED_FIXED_START_SE2_PROJECTION",
+    snapshot_semantics: "LATEST_AVAILABLE_NOT_ATOMIC",
+    robots,
+    bounds: null,
+    cells: [],
+    sensor_rays: [],
+    qualitative_observations: [],
+    scan_evidence_history: [],
+    object_hypotheses: [],
+    navigation_authority: null,
+    captured_at_unix_ms: 2000,
+  };
+}
+function translate(key) { return key; }
+const presenter = context.RobotSpatialMapPresenter.create({
+  document,
+  normalizeSpatialMap: context.RobotDashboardLogic.normalizeSpatialMap,
+  translate,
+  formatNumber: (value) => String(value),
+});
+const rendered = presenter.render(shared([ev3, blast]), "connected", 2100);
+const firstRender = {
+  schema: rendered.schema,
+  connectionClass: nodes["map-connection-status"].className,
+  frame: nodes["map-frame-label"].textContent,
+  emptyHidden: nodes["map-empty-state"].hidden,
+  pathGroups: nodes["map-path-layer"].children.map((node) => ({
+    robotId: node.attributes["data-robot-id"],
+    tags: node.children.map((child) => child.tag),
+  })),
+  robotGroups: nodes["map-robot-layer"].children.map((node) => ({
+    robotId: node.attributes["data-robot-id"],
+    generation: node.attributes["data-local-generation-id"],
+    tags: node.children.map((child) => child.tag),
+    classes: node.children.map((child) => child.attributes.class),
+    text: node.textContent,
+    bodyCx: node.children.find((child) => (
+      String(child.attributes.class).includes("map-shared-body")
+    )).attributes.cx,
+  })),
+  cellCount: nodes["map-cell-layer"].children.length,
+  rayCount: nodes["map-ray-layer"].children.length,
+  objectCount: nodes["map-object-layer"].children.length,
+  localCount: nodes["map-local-odometry-layer"].children.length,
+};
+presenter.render(shared([ev3, {
+  ...blast,
+  frame_transform: {
+    ...blast.frame_transform,
+    source_generation_id: "stale-blast-gen",
+  },
+}]), "connected", 2100);
+process.stdout.write(JSON.stringify({
+  firstRender,
+  fencedRobotIds: nodes["map-robot-layer"].children.map(
+    (node) => node.attributes["data-robot-id"],
+  ),
+  fencedPathIds: nodes["map-path-layer"].children.map(
+    (node) => node.attributes["data-robot-id"],
+  ),
+  fencedLocalCount: nodes["map-local-odometry-layer"].children.length,
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(WEB_ROOT / "dashboard_logic.js"),
+                str(WEB_ROOT / "spatial_map_presenter.js"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        rendered = result["firstRender"]
+        self.assertEqual(rendered["schema"], "robot-spatial-map/v2")
+        self.assertEqual(rendered["connectionClass"], "state-chip state-ready")
+        self.assertEqual(rendered["frame"], "shared-world")
+        self.assertTrue(rendered["emptyHidden"])
+        self.assertEqual(
+            [group["robotId"] for group in rendered["pathGroups"]],
+            ["ev3rstorm-01", "blast-01"],
+        )
+        self.assertTrue(all(
+            group["tags"] == ["path", "circle"]
+            for group in rendered["pathGroups"]
+        ))
+        self.assertEqual(
+            [group["robotId"] for group in rendered["robotGroups"]],
+            ["ev3rstorm-01", "blast-01"],
+        )
+        self.assertEqual(
+            [group["generation"] for group in rendered["robotGroups"]],
+            ["ev3-gen", "blast-gen"],
+        )
+        self.assertIn("polygon", rendered["robotGroups"][0]["tags"])
+        self.assertIn("circle", rendered["robotGroups"][1]["tags"])
+        self.assertTrue(all(
+            any("map-shared-heading" in str(class_name) for class_name in group["classes"])
+            for group in rendered["robotGroups"]
+        ))
+        self.assertIn("ev3rstorm-01", rendered["robotGroups"][0]["text"])
+        self.assertIn("blast-01", rendered["robotGroups"][1]["text"])
+        self.assertNotEqual(
+            rendered["robotGroups"][0]["bodyCx"],
+            rendered["robotGroups"][1]["bodyCx"],
+        )
+        self.assertEqual(rendered["cellCount"], 0)
+        self.assertEqual(rendered["rayCount"], 0)
+        self.assertEqual(rendered["objectCount"], 0)
+        self.assertEqual(rendered["localCount"], 0)
+        self.assertEqual(result["fencedRobotIds"], ["ev3rstorm-01"])
+        self.assertEqual(result["fencedPathIds"], ["ev3rstorm-01"])
+        self.assertEqual(result["fencedLocalCount"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

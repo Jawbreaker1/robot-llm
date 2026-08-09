@@ -450,13 +450,17 @@ process.stdout.write(JSON.stringify({
                 "MAX_POSE_HISTORY",
                 "MAX_QUALITATIVE_OBSERVATIONS",
                 "MAX_SCAN_EVIDENCE",
+                "MAX_SHARED_ROBOTS",
+                "SHARED_SPATIAL_MAP_SCHEMA",
                 "SPATIAL_MAP_SCHEMA",
                 "TURN_POLL_POLICY",
                 "createDashboardRequest",
                 "createSessionGuard",
                 "isTerminalSessionError",
+                "normalizeSharedSpatialMap",
                 "normalizeSpatialMap",
                 "replaceRenderedItems",
+                "selectSpatialMapEndpoint",
                 "transitionTurnPoll",
             ],
         )
@@ -984,6 +988,224 @@ process.stdout.write(JSON.stringify({
         self.assertIsNone(result["invalidEnforcement"])
         self.assertIsNone(result["mismatchedReference"])
         self.assertIsNone(result["mismatchedEnforced"])
+
+    def test_shared_map_normalization_fences_frames_and_is_bounded(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const context = {};
+vm.runInNewContext(source, context, { filename: process.argv[1] });
+const logic = context.RobotDashboardLogic;
+
+function pose(robotId, localFrameId, index) {
+  return {
+    x_mm: index,
+    y_mm: robotId === "blast-01" ? 500 : 0,
+    heading_mdeg: robotId === "blast-01" ? 90000 : 0,
+    frame_id: "shared-world",
+    local_frame_id: localFrameId,
+    state_version: index,
+    source_id: `${robotId}-odometry`,
+    provenance: "CALIBRATED_FIXED_START_SE2_PROJECTION",
+    observed_at_unix_ms: 1000 + index,
+    age_ms: 100,
+  };
+}
+function robot(robotId, controllerId, localFrameId, generationId, count = 2) {
+  const history = Array.from(
+    { length: count },
+    (_unused, index) => pose(robotId, localFrameId, index),
+  );
+  return {
+    read_only: true,
+    status: "available",
+    reason_code: "pose_transformed",
+    robot_id: robotId,
+    controller_instance_id: controllerId,
+    local_frame_id: localFrameId,
+    local_generation_id: generationId,
+    robot_pose: history[history.length - 1],
+    pose_history: history,
+    pose_history_evicted: 5,
+    collision_geometry: {
+      geometry: "ASYMMETRIC_RECTANGLE",
+      reference_point: "DIFFERENTIAL_DRIVE_ORIGIN",
+      front_extent_mm: 100,
+      rear_extent_mm: 80,
+      left_extent_mm: 90,
+      right_extent_mm: 90,
+      clearance_margin_mm: 10,
+    },
+    frame_transform: {
+      source_robot_id: robotId,
+      source_controller_id: controllerId,
+      source_frame_id: localFrameId,
+      source_generation_id: generationId,
+      world_frame_id: "shared-world",
+      world_generation_id: "world-generation-1",
+      tx_mm: robotId === "blast-01" ? 1000 : 0,
+      ty_mm: robotId === "blast-01" ? 500 : 0,
+      yaw_mdeg: robotId === "blast-01" ? 90000 : 0,
+      position_uncertainty_mm: 20,
+      yaw_uncertainty_mdeg: 1000,
+      provenance: ["FIXED_START_MEASUREMENT"],
+    },
+    source_map_id: `${robotId}-map`,
+    source_map_version: 7,
+    source_status: "pose_only",
+    captured_at_unix_ms: 5000,
+    source_age_ms: 100,
+  };
+}
+function shared(robots) {
+  return {
+    schema: "robot-spatial-map/v2",
+    read_only: true,
+    status: "available",
+    reason_code: "all_sources_available",
+    map_id: "shared-world.shared-fixed-start.world-generation-1",
+    frame_id: "shared-world",
+    frame_kind: "SHARED_FIXED_START",
+    world_generation_id: "world-generation-1",
+    source_id: "shared-spatial-map-compositor",
+    provenance: "CALIBRATED_FIXED_START_SE2_PROJECTION",
+    snapshot_semantics: "LATEST_AVAILABLE_NOT_ATOMIC",
+    robots,
+    bounds: null,
+    cells: [],
+    sensor_rays: [],
+    qualitative_observations: [],
+    scan_evidence_history: [],
+    object_hypotheses: [],
+    navigation_authority: null,
+    captured_at_unix_ms: 5000,
+  };
+}
+const ev3 = robot("ev3rstorm-01", "ev3-controller", "ev3-local", "ev3-gen");
+const blast = robot("blast-01", "blast-controller", "blast-local", "blast-gen");
+const valid = logic.normalizeSpatialMap(shared([ev3, blast]), 6000);
+const badTransform = logic.normalizeSharedSpatialMap(shared([
+  ev3,
+  {
+    ...blast,
+    frame_transform: {
+      ...blast.frame_transform,
+      world_generation_id: "wrong-generation",
+    },
+  },
+]), 6000);
+const badPoseFrame = logic.normalizeSharedSpatialMap(shared([
+  ev3,
+  {
+    ...blast,
+    robot_pose: { ...blast.robot_pose, frame_id: "blast-local" },
+  },
+]), 6000);
+const boundedRobot = robot(
+  "ev3rstorm-01", "ev3-controller", "ev3-local", "ev3-gen", 2050,
+);
+const bounded = logic.normalizeSharedSpatialMap(shared([boundedRobot]), 6000);
+const producerUnavailable = logic.normalizeSharedSpatialMap({
+  ...shared([ev3]), status: "unavailable", reason_code: "no_sources_available",
+}, 6000);
+const producerDegraded = logic.normalizeSharedSpatialMap({
+  ...shared([ev3]), status: "degraded", reason_code: "some_sources_unavailable",
+}, 6000);
+const tooMany = logic.normalizeSharedSpatialMap(shared(
+  Array.from({ length: 17 }, (_unused, index) => robot(
+    `robot-${index}`, `controller-${index}`, `local-${index}`, `gen-${index}`,
+  )),
+), 6000);
+process.stdout.write(JSON.stringify({
+  endpoints: [
+    logic.selectSpatialMapEndpoint({ shared_spatial_map: "read_only" }),
+    logic.selectSpatialMapEndpoint({ spatial_map: "read_only" }),
+    logic.selectSpatialMapEndpoint({ shared_spatial_map: "write" }),
+    logic.selectSpatialMapEndpoint(null),
+  ],
+  valid: {
+    schema: valid.schema,
+    contractValid: valid.contractValid,
+    status: valid.status,
+    robotCount: valid.robots.length,
+    poses: valid.robots.map((item) => item.robotPose),
+    robotsFrozen: Object.isFrozen(valid.robots),
+    poseHistoryFrozen: Object.isFrozen(valid.robots[0].poseHistory),
+  },
+  badTransform: {
+    status: badTransform.status,
+    firstPose: badTransform.robots[0].robotPose,
+    secondPose: badTransform.robots[1].robotPose,
+    reason: badTransform.robots[1].reasonCode,
+  },
+  badPoseFrame: {
+    firstPose: badPoseFrame.robots[0].robotPose,
+    secondPose: badPoseFrame.robots[1].robotPose,
+  },
+  bounded: {
+    count: bounded.robots[0].poseHistory.length,
+    evicted: bounded.robots[0].poseHistoryEvicted,
+    firstX: bounded.robots[0].poseHistory[0].xMm,
+    lastX: bounded.robots[0].poseHistory[2047].xMm,
+  },
+  producerStatus: [producerUnavailable.status, producerDegraded.status],
+  tooMany: {
+    contractValid: tooMany.contractValid,
+    robotCount: tooMany.robots.length,
+  },
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(LOGIC_ASSET),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(
+            result["endpoints"],
+            [
+                "/api/v1/shared-map",
+                "/api/v1/map",
+                "/api/v1/map",
+                "/api/v1/map",
+            ],
+        )
+        self.assertEqual(result["valid"]["schema"], "robot-spatial-map/v2")
+        self.assertTrue(result["valid"]["contractValid"])
+        self.assertEqual(result["valid"]["status"], "available")
+        self.assertEqual(result["valid"]["robotCount"], 2)
+        self.assertTrue(all(result["valid"]["poses"]))
+        self.assertTrue(result["valid"]["robotsFrozen"])
+        self.assertTrue(result["valid"]["poseHistoryFrozen"])
+        self.assertEqual(result["badTransform"]["status"], "degraded")
+        self.assertIsNotNone(result["badTransform"]["firstPose"])
+        self.assertIsNone(result["badTransform"]["secondPose"])
+        self.assertEqual(
+            result["badTransform"]["reason"],
+            "source_identity_mismatch",
+        )
+        self.assertIsNotNone(result["badPoseFrame"]["firstPose"])
+        self.assertIsNone(result["badPoseFrame"]["secondPose"])
+        self.assertEqual(
+            result["bounded"],
+            {"count": 2048, "evicted": 7, "firstX": 2, "lastX": 2049},
+        )
+        self.assertEqual(
+            result["producerStatus"], ["unavailable", "degraded"]
+        )
+        self.assertFalse(result["tooMany"]["contractValid"])
+        self.assertEqual(result["tooMany"]["robotCount"], 0)
 
 
 if __name__ == "__main__":
