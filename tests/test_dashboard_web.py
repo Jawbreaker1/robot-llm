@@ -1057,6 +1057,34 @@ function ev3Button(status) {
         self.assertNotIn("map-waypoint", self.html)
         self.assertNotIn("map-stop", self.html)
 
+    def test_enforced_blast_detour_is_visibly_distinct_from_reference(self):
+        self.assertIn(
+            '"data-navigation-enforced": String(goalEnforced)',
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            '"map.navigation_trace.final_goal_enforced_label"',
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            '"map.navigation_trace.local_detour_waypoint_label"',
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            '.map-final-goal[data-navigation-enforced="true"] '
+            ".map-final-goal-line",
+            self.css,
+        )
+        self.assertIn(
+            '.map-planned-leg[data-route-eligible="true"] '
+            ".map-planned-leg-line",
+            self.css,
+        )
+        self.assertIn("FINAL GOAL · ENFORCED", self.i18n)
+        self.assertIn("FINAL-GOAL REFERENCE · NOT ENFORCED", self.i18n)
+        self.assertIn("SLUTMÅL · STYRANDE", self.i18n)
+        self.assertIn("SLUTMÅLSREFERENS · EJ STYRANDE", self.i18n)
+
     def test_speech_input_logic_is_bounded_and_emits_pcm16_wav(self):
         contract = self.speech_input_contract
         self.assertTrue(contract["frozen"])

@@ -11,6 +11,14 @@ from typing import Callable, Mapping
 from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
 )
+from .blast_detour_route import (
+    bind_blast_detour_route,
+    blast_detour_action_sweep_is_clear,
+    blast_detour_guidance,
+    blast_detour_needs_pass_buffer,
+    blast_detour_required_slots,
+    blast_detour_scan_allows_progress,
+)
 from .blast_observation_monitor import (
     CONTROLLER_ID,
     RANGE_STATE_MEASURED,
@@ -45,6 +53,11 @@ from .lm_studio_controller_action import (
     ControllerActionContext,
     ControllerActionPlannerResult,
 )
+from .local_detour_route import (
+    MERGE_GOAL_AXIS,
+    PASS_BEYOND_TARGET,
+    ROUTE_COMPLETE,
+)
 from .physical_navigation_contract import (
     ADVANCE,
     REVERSE,
@@ -72,6 +85,12 @@ DEFAULT_MINIMUM_FORWARD_PROGRESS_MM = 420
 _SIDE_SEARCH_IMU_ODOMETRY_TOLERANCE_MDEG = 30_000
 _PLANNER_ACTION_SOURCE = "PLANNER_ACTION"
 _HOST_SIDE_SEARCH_ACTION_SOURCE = "HOST_SIDE_SEARCH_ACTION"
+_HOST_LOCAL_DETOUR_ACTION_SOURCE = "HOST_LOCAL_DETOUR_ACTION"
+_SCAN_REFUSAL_CODES = frozenset((
+    "scan_start_clearance_unverified",
+    "scan_sweep_clearance_lost",
+    "scan_sweep_observation_unverified",
+))
 
 
 def _map_pose(pose: PhysicalPose):
@@ -104,6 +123,7 @@ class _BlastEpisodeMapTrace:
             minimum_forward_progress_mm=minimum_forward_progress_mm,
             pose=pose,
         )
+        self.navigation_enforced = False
         self.planned_leg = None
         self.planar_scan_views = []
         self._offer(
@@ -128,7 +148,7 @@ class _BlastEpisodeMapTrace:
         current = self.mission.longitudinal_progress_mm(pose)
         return {
             "kind": "DIRECTIONAL_HEADING",
-            "navigation_enforced": False,
+            "navigation_enforced": self.navigation_enforced,
             "origin_x_mm": self.mission.origin_x_mm,
             "origin_y_mm": self.mission.origin_y_mm,
             "target_x_mm": int(round(
@@ -190,6 +210,7 @@ class _BlastEpisodeMapTrace:
         waypoint,
         bind_pose,
         scan_view,
+        route=None,
     ):
         if not isinstance(observation, Mapping):
             return
@@ -221,6 +242,30 @@ class _BlastEpisodeMapTrace:
                     "heading_mdeg": waypoint["target_heading_mdeg"],
                 },
             }
+        if route is not None:
+            self.navigation_enforced = True
+            if route.status == ROUTE_COMPLETE:
+                self.planned_leg = None
+            else:
+                active = route.active_waypoint
+                self.planned_leg = {
+                    "kind": active.kind,
+                    "scope": "LOCAL_DETOUR_ROUTE",
+                    "clearance_proven": False,
+                    "passage_proven": False,
+                    "route_eligible": True,
+                    "selected_side": (
+                        "LEFT"
+                        if route.detour_side == "LEFT_OF_GOAL"
+                        else "RIGHT"
+                    ),
+                    "bind_pose": _map_pose(pose),
+                    "waypoint": {
+                        "x_mm": active.x_mm,
+                        "y_mm": active.y_mm,
+                        "heading_mdeg": active.heading_mdeg,
+                    },
+                }
         if isinstance(scan_view, Mapping):
             self.planar_scan_views.append({
                 "scan_id": "{}-scan-{}".format(
@@ -314,6 +359,7 @@ class BlastEpisodeRuntimeAdapter:
         minimum_forward_progress_mm: int = (
             DEFAULT_MINIMUM_FORWARD_PROGRESS_MM
         ),
+        execute_provisional_detour: bool = False,
         spatial_map_bridge=None,
         monotonic_ms: Callable[[], int] = (
             lambda: time.monotonic_ns() // 1_000_000
@@ -336,6 +382,7 @@ class BlastEpisodeRuntimeAdapter:
             or isinstance(minimum_forward_progress_mm, bool)
             or not isinstance(minimum_forward_progress_mm, int)
             or not 1 <= minimum_forward_progress_mm <= 2_000
+            or type(execute_provisional_detour) is not bool
         ):
             raise ValueError("BLAST episode adapter configuration is invalid")
         if spatial_map_bridge is None:
@@ -360,6 +407,7 @@ class BlastEpisodeRuntimeAdapter:
         self.max_observation_age_ms = max_observation_age_ms
         self.minimum_forward_clearance_mm = minimum_forward_clearance_mm
         self.minimum_forward_progress_mm = minimum_forward_progress_mm
+        self.execute_provisional_detour = execute_provisional_detour
         self.spatial_map_provider = spatial_map_bridge
         self.monotonic_ms = monotonic_ms
         self._lock = threading.Lock()
@@ -447,6 +495,32 @@ class BlastEpisodeRuntimeAdapter:
             return False
         return float(distance) > _minimum_rotation_clearance_mm()
 
+    @classmethod
+    def _turn_slice_allows_continuation(cls, command_result) -> bool:
+        if not (
+            isinstance(command_result, Mapping)
+            and command_result.get("completed") is True
+            and command_result.get("observation_settled") is True
+        ):
+            return False
+        sensors = command_result.get("observation")
+        if not (
+            isinstance(sensors, Mapping)
+            and sensors.get("motion_active") is False
+            and _navigation_body_matched(sensors)
+            and cls._heading(sensors) is not None
+        ):
+            return False
+        distance = sensors.get("distance_mm")
+        state = blast_range_state(distance)
+        return (
+            state == RANGE_STATE_NO_VALID_DISTANCE
+            or (
+                state == RANGE_STATE_MEASURED
+                and float(distance) > _minimum_rotation_clearance_mm()
+            )
+        )
+
     def _current_observation_allows_action(self, action, observation) -> bool:
         sensors = observation["sensors"]
         if not _navigation_body_matched(sensors):
@@ -532,6 +606,28 @@ class BlastEpisodeRuntimeAdapter:
                 "message": message,
             },
         )
+
+    def _scan_failure_outcome(
+        self, code, *, side_search_rescan, detour_verification,
+    ):
+        if code not in _SCAN_REFUSAL_CODES:
+            return None
+        sweep_stopped = code != "scan_start_clearance_unverified"
+        if detour_verification:
+            reason = "detour_verification_unavailable"
+            message = (
+                "BLAST detour verification scan stopped between pulses; "
+                "reposition before retry"
+                if sweep_stopped
+                else "BLAST detour verification scan could not start safely"
+            )
+        else:
+            reason, message = _scan_refusal(side_search_rescan)
+            if sweep_stopped:
+                message = (
+                    "BLAST scan stopped between pulses; reposition before retry"
+                )
+        return self._outcome(reason, False, message)
 
     def _fresh_planner_action_observation(
         self,
@@ -697,6 +793,408 @@ class BlastEpisodeRuntimeAdapter:
             )
         return side, waypoint, None
 
+    def _local_detour_step(
+        self,
+        *,
+        route,
+        pose,
+        observation,
+        available_actions,
+        pass_scan_complete,
+        final_scan_complete,
+        mission,
+    ):
+        guidance = blast_detour_guidance(
+            route, pose, available_actions,
+        )
+        route = guidance.route
+        scan_role = None
+        needs_pass_buffer = (
+            route.status != ROUTE_COMPLETE
+            and not pass_scan_complete
+            and blast_detour_needs_pass_buffer(route, pose)
+        )
+        if route.status == ROUTE_COMPLETE:
+            if (
+                not mission.heading_aligned(pose)
+                or abs(mission.lateral_offset_mm(pose))
+                > route.position_tolerance_mm
+            ):
+                required_action = None
+            elif mission.longitudinal_progress_mm(pose) < (
+                mission.minimum_forward_progress_mm
+            ):
+                required_action = ADVANCE
+            elif final_scan_complete:
+                return route, guidance, None, None, True
+            else:
+                required_action = SCAN_FRONT_ARC
+                scan_role = "FINAL"
+        elif needs_pass_buffer:
+            required_action = ADVANCE
+        elif (
+            route.active_waypoint.kind == MERGE_GOAL_AXIS
+            and not pass_scan_complete
+        ):
+            required_action = SCAN_FRONT_ARC
+            scan_role = "PASS"
+        else:
+            choices = guidance.allowed_motion_actions
+            required_action = (
+                next(iter(choices))
+                if choices is not None and len(choices) == 1
+                else None
+            )
+        pass_advance = (
+            required_action == ADVANCE
+            and route.status != ROUTE_COMPLETE
+            and (
+                needs_pass_buffer
+                or route.active_waypoint.kind == PASS_BEYOND_TARGET
+            )
+        )
+        side_sign = 1 if route.detour_side == "LEFT_OF_GOAL" else -1
+        if pass_advance and (
+            not mission.heading_aligned(pose)
+            or side_sign * (
+                mission.lateral_offset_mm(pose)
+                - route.route_lateral_offset_mm
+            ) < -route.position_tolerance_mm
+        ):
+            required_action = None
+        if (
+            required_action in (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90)
+            and not blast_detour_action_sweep_is_clear(
+                route, pose, required_action,
+            )
+        ):
+            required_action = None
+        correlated = (
+            _side_search_heading_correlated(observation, pose)
+            and _navigation_body_matched(observation["sensors"])
+        )
+        if not correlated:
+            required_action = None
+        if required_action == ADVANCE and (
+            blast_range_state(
+                observation["sensors"].get("distance_mm")
+            ) != RANGE_STATE_MEASURED
+            or ADVANCE not in available_actions
+        ):
+            required_action = None
+        if required_action in (
+            TURN_LEFT_90, TURN_RIGHT_90, SCAN_FRONT_ARC,
+        ) and not self._current_range_allows_rotation(observation):
+            required_action = None
+        if required_action not in available_actions:
+            raise BlastEpisodeError(
+                "blast_detour_blocked",
+                "BLAST has no verified local-detour progress action",
+            )
+        return route, guidance, required_action, scan_role, False
+
+    def _bind_local_detour(
+        self,
+        *,
+        origin_view,
+        side_view,
+        selected_side,
+        side_waypoint,
+        mission,
+        pose,
+        remaining_slots,
+    ):
+        try:
+            route = bind_blast_detour_route(
+                origin_view=origin_view,
+                side_view=side_view,
+                selected_side=selected_side,
+                side_waypoint=side_waypoint,
+                mission=mission,
+                current_pose=pose,
+            )
+            required = blast_detour_required_slots(
+                route, pose, mission,
+            )
+        except ValueError:
+            return None, self._outcome(
+                "detour_route_unavailable",
+                False,
+                "The two BLAST views could not bind a local detour route",
+            )
+        if required > remaining_slots:
+            return None, self._outcome(
+                "detour_budget_insufficient",
+                False,
+                "The bounded episode cannot complete the local detour",
+            )
+        return route, None
+
+    def _planner_step(
+        self,
+        *,
+        planner,
+        context,
+        observation,
+        history,
+        available_actions,
+        completion_allowed,
+        scan_allows_turn,
+        latest_scan_view,
+        motion_executor,
+        episode_start_heading,
+        remaining_slots,
+    ):
+        result = planner.decide(ControllerActionContext(
+            goal=context.request.goal,
+            locale=context.request.locale,
+            robot_id=ROBOT_ID,
+            controller_id=CONTROLLER_ID,
+            available_actions=available_actions,
+            observation=observation,
+            history=tuple(history[-12:]),
+            completion_allowed=completion_allowed,
+        ))
+        if self._cancelled(context):
+            return None, self._outcome("stopped", False, "stopped")
+        if not isinstance(result, ControllerActionPlannerResult):
+            raise BlastEpisodeError(
+                "blast_planner_result_invalid",
+                "BLAST planner returned an invalid result",
+            )
+        decision = result.decision
+        action = decision.action
+        selects_side = (
+            self._scan_is_current(history)
+            and scan_allows_turn
+            and action in (TURN_LEFT_90, TURN_RIGHT_90)
+        )
+        detour_origin_pose = None
+        if selects_side:
+            detour_origin_pose = motion_executor.pose
+            _waypoint, blocked = self._prepare_side_search(
+                origin_pose=detour_origin_pose,
+                side=_detour_side(action),
+                scan_view=latest_scan_view,
+                remaining_slots=remaining_slots,
+            )
+            if blocked is not None:
+                return None, blocked
+        terminal_actions = (
+            (COMPLETE, ABORT) if completion_allowed else (ABORT,)
+        )
+        if action not in available_actions + terminal_actions:
+            raise BlastEpisodeError(
+                "blast_planner_action_invalid",
+                "BLAST planner selected an unavailable action",
+            )
+        if action in ACTION_COMMANDS or action == SCAN_FRONT_ARC:
+            observation, stopped = self._fresh_planner_observation_or_stop(
+                action, selects_side, episode_start_heading,
+                motion_executor, context,
+            )
+            if stopped is not None:
+                return None, stopped
+        assessment = decision.assessment
+        context.publish({
+            "current_action": None if action in (COMPLETE, ABORT) else action,
+            "plan": list(decision.plan),
+            "model_latency_ms": result.latency_ms,
+            "message": decision.utterance or assessment,
+            "obstacle": {
+                "distance_mm": observation["sensors"].get("distance_mm"),
+                "observed_at_monotonic_ms": observation[
+                    "observed_at_monotonic_ms"
+                ],
+            },
+        })
+        if action == COMPLETE:
+            return None, self._outcome("completed", True, assessment)
+        if action == ABORT:
+            return None, self._outcome(
+                "planner_aborted", False, assessment,
+            )
+        return {
+            "action": action,
+            "assessment": assessment,
+            "plan": list(decision.plan),
+            "action_source": _PLANNER_ACTION_SOURCE,
+            "observation": observation,
+            "selects_detour_side": selects_side,
+            "detour_origin_pose": detour_origin_pose,
+        }, None
+
+    def _host_step(
+        self,
+        *,
+        context,
+        observation,
+        available_actions,
+        side_search_progress,
+        detour_guidance,
+        detour_scan_role,
+        previous_outbound_distance_mm,
+        host_side_search_actions,
+    ):
+        if detour_guidance is not None:
+            action = available_actions[0]
+            source = _HOST_LOCAL_DETOUR_ACTION_SOURCE
+            phase = (
+                detour_scan_role
+                or detour_guidance.active_waypoint_kind
+                or ROUTE_COMPLETE
+            )
+            message = f"Host follows the local-detour route: {phase} / {action}"
+        else:
+            action = side_search_progress["required_action"]
+            source = _HOST_SIDE_SEARCH_ACTION_SOURCE
+            if action == ADVANCE:
+                distance = side_search_progress["distance_remaining_mm"]
+                if (
+                    previous_outbound_distance_mm is not None
+                    and distance >= previous_outbound_distance_mm
+                ):
+                    raise BlastEpisodeError(
+                        "blast_side_search_not_progressing",
+                        "BLAST side-search motion did not reduce the waypoint "
+                        "distance",
+                    )
+                previous_outbound_distance_mm = distance
+            host_side_search_actions.append(action)
+            message = (
+                "Host follows the selected side-search waypoint: "
+                f"{side_search_progress['phase']} / {action}"
+            )
+        context.publish({
+            "current_action": action,
+            "plan": [],
+            "model_latency_ms": None,
+            "message": message,
+            "obstacle": {
+                "distance_mm": observation["sensors"].get("distance_mm"),
+                "observed_at_monotonic_ms": observation[
+                    "observed_at_monotonic_ms"
+                ],
+            },
+        })
+        return {
+            "action": action,
+            "assessment": None,
+            "plan": [],
+            "action_source": source,
+            "observation": observation,
+            "selects_detour_side": False,
+            "detour_origin_pose": None,
+        }, previous_outbound_distance_mm
+
+    def _finish_side_rescan(
+        self,
+        *,
+        origin_view,
+        side_view,
+        selected_side,
+        waypoint,
+        pose,
+        result_observation,
+        episode_start_heading,
+        diagnostic_scan,
+        host_actions,
+        mission,
+        remaining_slots,
+    ):
+        correlated = (
+            origin_view is not None
+            and side_view is not None
+            and side_view is not origin_view
+            and _side_search_heading_correlated(
+                self._with_navigation_reference(
+                    {"sensors": result_observation}, episode_start_heading,
+                ),
+                pose,
+            )
+            and _navigation_body_matched(result_observation)
+        )
+        if not correlated:
+            return None, None, self._outcome(
+                "side_search_observation_unavailable",
+                False,
+                "Side observation could not be correlated",
+            )
+        origin_pose = origin_view["scan_pose"]
+        side_pose = side_view["scan_pose"]
+        separation = int(round(math.hypot(
+            side_pose["x_mm"] - origin_pose["x_mm"],
+            side_pose["y_mm"] - origin_pose["y_mm"],
+        )))
+        stride = int(round(math.hypot(
+            waypoint["target_x_mm"] - origin_pose["x_mm"],
+            waypoint["target_y_mm"] - origin_pose["y_mm"],
+        )))
+        if separation < stride - _SIDE_SEARCH_POSITION_TOLERANCE_MM:
+            return None, None, self._outcome(
+                "side_search_observation_unavailable",
+                False,
+                "Side observation viewpoints were not distinct",
+            )
+        final_scan = copy.deepcopy(diagnostic_scan)
+        final_scan["multi_view_observations"] = {
+            "schema": "blast-multi-view-scan-observations/v1",
+            "frame": "EPISODE_LOCAL_ODOMETRY",
+            "quality": "PROVISIONAL_YAW_ONLY",
+            "selected_side": selected_side,
+            "strategy_source": _PLANNER_ACTION_SOURCE,
+            "execution_source": _HOST_SIDE_SEARCH_ACTION_SOURCE,
+            "host_action_count": len(host_actions),
+            "host_action_trace": list(host_actions),
+            "viewpoint_separation_mm": separation,
+            "object_association_proven": False,
+            "clearance_proven": False,
+            "passage_proven": False,
+            "route_eligible": False,
+            "views": [origin_view, side_view],
+        }
+        if not self.execute_provisional_detour:
+            return final_scan, None, self._outcome(
+                "side_search_observation_collected",
+                False,
+                "Two scan viewpoints collected; passage is not proven",
+            )
+        route, blocked = self._bind_local_detour(
+            origin_view=origin_view,
+            side_view=side_view,
+            selected_side=selected_side,
+            side_waypoint=waypoint,
+            mission=mission,
+            pose=pose,
+            remaining_slots=remaining_slots,
+        )
+        if blocked is not None:
+            return final_scan, None, blocked
+        final_scan["multi_view_observations"]["route_eligible"] = True
+        return final_scan, route, None
+
+    def _detour_scan_verified(
+        self, *, scan_view, role, selected_side, result_observation,
+        episode_start_heading, pose, route,
+    ):
+        restored = self._with_navigation_reference(
+            {"sensors": result_observation}, episode_start_heading,
+        )
+        distance = result_observation.get("distance_mm")
+        return (
+            blast_detour_scan_allows_progress(
+                scan_view,
+                role=role,
+                selected_side=selected_side,
+                minimum_clearance_mm=self.minimum_forward_clearance_mm,
+                route=route,
+            )
+            and blast_range_state(distance) == RANGE_STATE_MEASURED
+            and float(distance) > self.minimum_forward_clearance_mm
+            and _navigation_body_matched(result_observation)
+            and _side_search_heading_correlated(restored, pose)
+        )
+
     def _begin_map_trace(
         self, context, pose, observation, episode_start_heading,
     ):
@@ -713,6 +1211,7 @@ class BlastEpisodeRuntimeAdapter:
     @staticmethod
     def _record_map_result(
         trace, action, pose, observation, selected_side, waypoint, scan_view,
+        route=None,
     ):
         trace.record(
             pose=pose,
@@ -722,6 +1221,7 @@ class BlastEpisodeRuntimeAdapter:
             waypoint=waypoint,
             bind_pose=pose,
             scan_view=(scan_view if action == SCAN_FRONT_ARC else None),
+            route=route,
         )
 
     @staticmethod
@@ -766,6 +1266,9 @@ class BlastEpisodeRuntimeAdapter:
         reorientation_attempted = False
         previous_outbound_distance_mm = None
         host_side_search_actions = []
+        local_detour_route = None
+        detour_pass_scan_complete = False
+        detour_final_scan_complete = False
         try:
             planner = self.planner_factory(context.settings.model)
             if not callable(getattr(planner, "decide", None)):
@@ -797,7 +1300,10 @@ class BlastEpisodeRuntimeAdapter:
                 )
                 observation["odometry"] = motion_executor.pose.to_dict()
                 side_search_progress = None
-                if selected_detour_side is not None:
+                if (
+                    selected_detour_side is not None
+                    and local_detour_route is None
+                ):
                     side_search_progress = _side_search_progress(
                         motion_executor.pose,
                         side_search_waypoint,
@@ -864,133 +1370,100 @@ class BlastEpisodeRuntimeAdapter:
                     observation["navigation_intent"][
                         "side_search_progress"
                     ] = dict(side_search_progress)
-                if side_search_progress is None and not available_actions:
+                detour_guidance = None
+                detour_scan_role = None
+                if local_detour_route is not None:
+                    (
+                        local_detour_route,
+                        detour_guidance,
+                        required_action,
+                        detour_scan_role,
+                        detour_complete,
+                    ) = self._local_detour_step(
+                        route=local_detour_route,
+                        pose=motion_executor.pose,
+                        observation=observation,
+                        available_actions=available_actions,
+                        pass_scan_complete=detour_pass_scan_complete,
+                        final_scan_complete=detour_final_scan_complete,
+                        mission=map_trace.mission,
+                    )
+                    if detour_complete:
+                        if self._cancelled(context):
+                            return self._outcome(
+                                "stopped", False, "stopped"
+                            )
+                        map_trace.record(
+                            pose=motion_executor.pose,
+                            observation=observation["sensors"],
+                            pose_observed=False,
+                            selected_side=selected_detour_side,
+                            waypoint=side_search_waypoint,
+                            bind_pose=motion_executor.pose,
+                            scan_view=None,
+                            route=local_detour_route,
+                        )
+                        return self._outcome(
+                            "completed",
+                            True,
+                            "BLAST completed the host-owned local detour",
+                        )
+                    available_actions = (required_action,)
+                    observation["navigation_intent"] = {
+                        "selected_detour_side_relative_to_scan": (
+                            selected_detour_side
+                        ),
+                        "local_detour_route": local_detour_route.to_dict(),
+                        "local_detour_guidance": detour_guidance.to_dict(),
+                    }
+                if (
+                    side_search_progress is None
+                    and detour_guidance is None
+                    and not available_actions
+                ):
                     return self._outcome(
                         "no_safe_blast_action",
                         False,
                         "BLAST has no currently observed safe motion or scan",
                     )
                 completion_allowed = self._completion_allowed(history)
-                selects_detour_side = False
-                if side_search_progress is None:
-                    result = planner.decide(ControllerActionContext(
-                        goal=context.request.goal,
-                        locale=context.request.locale,
-                        robot_id=ROBOT_ID,
-                        controller_id=CONTROLLER_ID,
-                        available_actions=available_actions,
+                if side_search_progress is None and detour_guidance is None:
+                    step, outcome = self._planner_step(
+                        planner=planner,
+                        context=context,
                         observation=observation,
-                        history=tuple(history[-12:]),
+                        history=history,
+                        available_actions=available_actions,
                         completion_allowed=completion_allowed,
-                    ))
-                    if self._cancelled(context):
-                        return self._outcome("stopped", False, "stopped")
-                    if not isinstance(result, ControllerActionPlannerResult):
-                        raise BlastEpisodeError(
-                            "blast_planner_result_invalid",
-                            "BLAST planner returned an invalid result",
-                        )
-                    decision = result.decision
-                    action = decision.action
-                    assessment = decision.assessment
-                    plan = list(decision.plan)
-                    action_source = _PLANNER_ACTION_SOURCE
-                    selects_detour_side = (
-                        self._scan_is_current(history)
-                        and scan_allows_turn
-                        and action in (TURN_LEFT_90, TURN_RIGHT_90)
+                        scan_allows_turn=scan_allows_turn,
+                        latest_scan_view=latest_scan_view,
+                        motion_executor=motion_executor,
+                        episode_start_heading=episode_start_heading,
+                        remaining_slots=self.max_decisions - _index,
                     )
-                    if selects_detour_side:
-                        detour_origin_pose = motion_executor.pose
-                        selected_side_candidate = _detour_side(action)
-                        _waypoint, blocked = self._prepare_side_search(
-                            origin_pose=detour_origin_pose,
-                            side=selected_side_candidate,
-                            scan_view=latest_scan_view,
-                            remaining_slots=self.max_decisions - _index,
-                        )
-                        if blocked is not None:
-                            return blocked
-                    terminal_actions = (
-                        (COMPLETE, ABORT)
-                        if completion_allowed
-                        else (ABORT,)
-                    )
-                    if action not in available_actions + terminal_actions:
-                        raise BlastEpisodeError(
-                            "blast_planner_action_invalid",
-                            "BLAST planner selected an unavailable action",
-                        )
-                    if action in ACTION_COMMANDS or action == SCAN_FRONT_ARC:
-                        observation, stopped = (
-                            self._fresh_planner_observation_or_stop(
-                                action, selects_detour_side,
-                                episode_start_heading, motion_executor, context,
-                            )
-                        )
-                        if stopped is not None:
-                            return stopped
-                    context.publish({
-                        "current_action": (
-                            None if action in (COMPLETE, ABORT) else action
-                        ),
-                        "plan": list(plan),
-                        "model_latency_ms": result.latency_ms,
-                        "message": decision.utterance or assessment,
-                        "obstacle": {
-                            "distance_mm": observation["sensors"].get(
-                                "distance_mm"
-                            ),
-                            "observed_at_monotonic_ms": observation[
-                                "observed_at_monotonic_ms"
-                            ],
-                        },
-                    })
-                    if action == COMPLETE:
-                        return self._outcome("completed", True, assessment)
-                    if action == ABORT:
-                        return self._outcome(
-                            "planner_aborted",
-                            False,
-                            assessment,
-                        )
+                    if outcome is not None:
+                        return outcome
                 else:
-                    action = side_search_progress["required_action"]
-                    assessment = None
-                    plan = []
-                    action_source = _HOST_SIDE_SEARCH_ACTION_SOURCE
-                    if action == ADVANCE:
-                        distance = side_search_progress[
-                            "distance_remaining_mm"
-                        ]
-                        if (
-                            previous_outbound_distance_mm is not None
-                            and distance >= previous_outbound_distance_mm
-                        ):
-                            raise BlastEpisodeError(
-                                "blast_side_search_not_progressing",
-                                "BLAST side-search motion did not reduce the "
-                                "waypoint distance",
-                            )
-                        previous_outbound_distance_mm = distance
-                    host_side_search_actions.append(action)
-                    context.publish({
-                        "current_action": action,
-                        "plan": [],
-                        "model_latency_ms": None,
-                        "message": (
-                            "Host follows the selected side-search waypoint: "
-                            f"{side_search_progress['phase']} / {action}"
+                    step, previous_outbound_distance_mm = self._host_step(
+                        context=context,
+                        observation=observation,
+                        available_actions=available_actions,
+                        side_search_progress=side_search_progress,
+                        detour_guidance=detour_guidance,
+                        detour_scan_role=detour_scan_role,
+                        previous_outbound_distance_mm=(
+                            previous_outbound_distance_mm
                         ),
-                        "obstacle": {
-                            "distance_mm": observation["sensors"].get(
-                                "distance_mm"
-                            ),
-                            "observed_at_monotonic_ms": observation[
-                                "observed_at_monotonic_ms"
-                            ],
-                        },
-                    })
+                        host_side_search_actions=host_side_search_actions,
+                    )
+                action = step["action"]
+                assessment = step["assessment"]
+                plan = step["plan"]
+                action_source = step["action_source"]
+                observation = step["observation"]
+                selects_detour_side = step["selects_detour_side"]
+                if step["detour_origin_pose"] is not None:
+                    detour_origin_pose = step["detour_origin_pose"]
                 scan_pose = (
                     motion_executor.pose
                     if action == SCAN_FRONT_ARC
@@ -1006,6 +1479,16 @@ class BlastEpisodeRuntimeAdapter:
                     and side_search_progress["phase"] == "RESCAN"
                     and action == SCAN_FRONT_ARC
                 )
+                is_detour_pass_scan = (
+                    detour_guidance is not None
+                    and detour_scan_role == "PASS"
+                    and action == SCAN_FRONT_ARC
+                )
+                is_detour_final_scan = (
+                    detour_guidance is not None
+                    and detour_scan_role == "FINAL"
+                    and action == SCAN_FRONT_ARC
+                )
                 if is_side_search_reorientation:
                     reorientation_attempted = True
                 try:
@@ -1018,27 +1501,31 @@ class BlastEpisodeRuntimeAdapter:
                         execution = motion_executor.execute(
                             action,
                             cancel_requested=lambda: self._cancelled(context),
+                            continue_requested=(
+                                self._turn_slice_allows_continuation
+                                if action in (TURN_LEFT_90, TURN_RIGHT_90)
+                                else None
+                            ),
                         )
                         command_result = execution.controller_results[-1]
                 except BlastControllerError as error:
                     if (
-                        error.code == "controller_command_interrupted"
+                        error.code in (
+                            {"controller_command_interrupted"}
+                            | _SCAN_REFUSAL_CODES
+                        )
                         and self._cancelled(context)
                     ):
                         return self._outcome("stopped", False, "stopped")
-                    if error.code == "scan_start_clearance_unverified":
-                        if self._cancelled(context):
-                            return self._outcome(
-                                "stopped", False, "stopped"
-                            )
-                        reason, message = _scan_refusal(
-                            is_side_search_rescan
-                        )
-                        return self._outcome(
-                            reason,
-                            False,
-                            message,
-                        )
+                    scan_outcome = self._scan_failure_outcome(
+                        error.code,
+                        side_search_rescan=is_side_search_rescan,
+                        detour_verification=(
+                            is_detour_pass_scan or is_detour_final_scan
+                        ),
+                    )
+                    if scan_outcome is not None:
+                        return scan_outcome
                     raise
                 if not isinstance(command_result, Mapping):
                     raise BlastEpisodeError(
@@ -1147,6 +1634,7 @@ class BlastEpisodeRuntimeAdapter:
                     map_trace, action, motion_executor.pose,
                     result_observation, selected_detour_side,
                     side_search_waypoint, latest_scan_view,
+                    route=local_detour_route,
                 )
                 history.append(history_item)
                 diagnostic_scan = self._publish_action_result(
@@ -1155,84 +1643,89 @@ class BlastEpisodeRuntimeAdapter:
                 )
                 if self._cancelled(context):
                     return self._outcome("stopped", False, "stopped")
+                if is_detour_pass_scan or is_detour_final_scan:
+                    scan_role = "PASS" if is_detour_pass_scan else "FINAL"
+                    if not self._detour_scan_verified(
+                        scan_view=latest_scan_view,
+                        role=scan_role,
+                        selected_side=selected_detour_side,
+                        result_observation=result_observation,
+                        episode_start_heading=episode_start_heading,
+                        pose=motion_executor.pose,
+                        route=local_detour_route,
+                    ):
+                        return self._outcome(
+                            "detour_verification_unavailable",
+                            False,
+                            "BLAST detour verification scan was unavailable",
+                        )
+                    if is_detour_pass_scan:
+                        detour_pass_scan_complete = True
+                    else:
+                        detour_final_scan_complete = True
+                        return self._outcome(
+                            "completed",
+                            True,
+                            "BLAST completed the host-owned local detour",
+                        )
                 if (
                     (
                         action_source == _HOST_SIDE_SEARCH_ACTION_SOURCE
+                        or action_source == _HOST_LOCAL_DETOUR_ACTION_SOURCE
                         or selects_detour_side
                     )
                     and action in ACTION_COMMANDS
                     and execution.motion.complete is not True
                 ):
+                    detour_motion = (
+                        action_source == _HOST_LOCAL_DETOUR_ACTION_SOURCE
+                    )
                     return self._outcome(
-                        "side_search_motion_incomplete",
+                        (
+                            "detour_motion_incomplete"
+                            if detour_motion
+                            else "side_search_motion_incomplete"
+                        ),
                         False,
-                        "Host side-search motion was incomplete",
+                        (
+                            "Host local-detour motion was incomplete"
+                            if detour_motion
+                            else "Host side-search motion was incomplete"
+                        ),
                     )
                 if side_search_setup_outcome is not None:
                     return side_search_setup_outcome
                 if is_side_search_rescan:
-                    side_scan_view = latest_scan_view
-                    if not (
-                        origin_scan_view is not None
-                        and side_scan_view is not None
-                        and side_scan_view is not origin_scan_view
-                        and _side_search_heading_correlated(
-                            self._with_navigation_reference(
-                                {"sensors": result_observation},
-                                episode_start_heading,
-                            ),
-                            motion_executor.pose,
-                        )
-                        and _navigation_body_matched(result_observation)
-                    ):
-                        return self._outcome(
-                            "side_search_observation_unavailable",
-                            False,
-                            "Side observation could not be correlated",
-                        )
-                    origin_pose = origin_scan_view["scan_pose"]
-                    side_pose = side_scan_view["scan_pose"]
-                    separation = int(round(math.hypot(
-                        side_pose["x_mm"] - origin_pose["x_mm"],
-                        side_pose["y_mm"] - origin_pose["y_mm"],
-                    )))
-                    stride = int(round(math.hypot(
-                        side_search_waypoint["target_x_mm"]
-                        - origin_pose["x_mm"],
-                        side_search_waypoint["target_y_mm"]
-                        - origin_pose["y_mm"],
-                    )))
-                    if separation < (
-                        stride - _SIDE_SEARCH_POSITION_TOLERANCE_MM
-                    ):
-                        return self._outcome(
-                            "side_search_observation_unavailable",
-                            False,
-                            "Side observation viewpoints were not distinct",
-                        )
-                    final_scan = copy.deepcopy(diagnostic_scan)
-                    final_scan["multi_view_observations"] = {
-                        "schema": "blast-multi-view-scan-observations/v1",
-                        "frame": "EPISODE_LOCAL_ODOMETRY",
-                        "quality": "PROVISIONAL_YAW_ONLY",
-                        "selected_side": selected_detour_side,
-                        "strategy_source": _PLANNER_ACTION_SOURCE,
-                        "execution_source": _HOST_SIDE_SEARCH_ACTION_SOURCE,
-                        "host_action_count": len(host_side_search_actions),
-                        "host_action_trace": list(host_side_search_actions),
-                        "viewpoint_separation_mm": separation,
-                        "object_association_proven": False,
-                        "clearance_proven": False,
-                        "passage_proven": False,
-                        "route_eligible": False,
-                        "views": [origin_scan_view, side_scan_view],
-                    }
-                    context.publish({"scan": final_scan})
-                    return self._outcome(
-                        "side_search_observation_collected",
-                        False,
-                        "Two scan viewpoints collected; passage is not proven",
+                    final_scan, route, outcome = self._finish_side_rescan(
+                        origin_view=origin_scan_view,
+                        side_view=latest_scan_view,
+                        selected_side=selected_detour_side,
+                        waypoint=side_search_waypoint,
+                        pose=motion_executor.pose,
+                        result_observation=result_observation,
+                        episode_start_heading=episode_start_heading,
+                        diagnostic_scan=diagnostic_scan,
+                        host_actions=host_side_search_actions,
+                        mission=map_trace.mission,
+                        remaining_slots=self.max_decisions - _index - 1,
                     )
+                    if route is not None:
+                        local_detour_route = route
+                        map_trace.record(
+                            pose=motion_executor.pose,
+                            observation=result_observation,
+                            pose_observed=False,
+                            selected_side=selected_detour_side,
+                            waypoint=side_search_waypoint,
+                            bind_pose=motion_executor.pose,
+                            scan_view=None,
+                            route=local_detour_route,
+                        )
+                    if final_scan is not None:
+                        context.publish({"scan": final_scan})
+                    if outcome is not None:
+                        return outcome
+                    continue
             return self._outcome(
                 "decision_budget_exhausted",
                 False,

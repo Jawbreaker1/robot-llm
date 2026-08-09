@@ -197,6 +197,57 @@ class FakeScanController(FakeController):
         return result
 
 
+class FullDetourController(FakeScanController):
+    def __init__(
+        self, *, scan_centers=None, pass_side_distance=1_500.0,
+        result_ranges=None,
+    ):
+        super().__init__(1_000)
+        self.scan_count = 0
+        self.scan_centers = dict(scan_centers or {})
+        self.pass_side_distance = pass_side_distance
+        self.result_ranges = dict(result_ranges or {})
+
+    def command(self, command, *, cancel_requested=None):
+        result = super().command(
+            command, cancel_requested=cancel_requested,
+        )
+        result["observation"]["distance_mm"] = 1_000
+        self.snapshot_value["observation"]["distance_mm"] = 1_000
+        if command == "scan_front_arc":
+            self.scan_count += 1
+            if self.scan_count == 1:
+                scan = scan_result(center_distance_mm=310.0)
+                scan["rays"][1].update({
+                    "distance_mm": 368.0,
+                    "heading_deg": -23.322266,
+                    "relative_heading_deg": -23.322266,
+                })
+                scan["rays"][3].update({
+                    "distance_mm": 286.0,
+                    "heading_deg": 25.093086,
+                    "relative_heading_deg": 25.093086,
+                })
+            else:
+                scan = scan_result(center_distance_mm=(
+                    self.scan_centers.get(self.scan_count, 1_500.0)
+                ))
+                if self.scan_count == 2:
+                    for index in (1, 3):
+                        scan["rays"][index]["distance_mm"] = 1_500.0
+                if self.scan_count == 3:
+                    for index in (1, 3):
+                        scan["rays"][index]["distance_mm"] = (
+                            self.pass_side_distance
+                        )
+            result["scan"] = scan
+            if self.scan_count in self.result_ranges:
+                distance = self.result_ranges[self.scan_count]
+                result["observation"]["distance_mm"] = distance
+                self.snapshot_value["observation"]["distance_mm"] = distance
+        return result
+
+
 class Planner:
     def __init__(self, decisions):
         self.decisions = list(decisions)
@@ -605,11 +656,11 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     if self.mismatch_location == "ray":
                         result["scan"]["rays"][2][
                             "body_motor_angle_deg"
-                        ] = 159
+                        ] = 160
                     else:
                         result["observation"]["motor_angles_deg"][
                             "body"
-                        ] = 159
+                        ] = 160
                 return result
 
         for mismatch_location in ("ray", "final"):
@@ -987,6 +1038,181 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertFalse(multi_view["clearance_proven"])
         self.assertFalse(multi_view["passage_proven"])
         self.assertFalse(multi_view["route_eligible"])
+
+    def test_two_view_side_choice_executes_full_host_detour(self):
+        controller = FullDetourController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+
+        adapter = self.adapter(
+            controller,
+            planner,
+            max_decisions=51,
+            execute_provisional_detour=True,
+        )
+        context, updates = episode_context()
+
+        result = adapter.run(context)
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.terminal_reason, "completed")
+        self.assertEqual(len(planner.contexts), 2)
+        self.assertGreaterEqual(controller.commands.count("scan_front_arc"), 4)
+        self.assertIn("turn_right", controller.commands)
+        self.assertGreater(controller.commands.count("drive_forward"), 9)
+        trace = adapter.spatial_map_provider.snapshot()["navigation_trace"]
+        self.assertTrue(trace["final_goal"]["navigation_enforced"])
+        self.assertGreaterEqual(
+            trace["final_goal"]["current_forward_progress_mm"],
+            trace["final_goal"]["minimum_forward_progress_mm"],
+        )
+        self.assertIsNone(trace["planned_leg"])
+        self.assertTrue(any(
+            str(update.get("message", "")).startswith(
+                "Host follows the local-detour route:"
+            )
+            for update in updates
+        ))
+
+    def test_close_pass_or_final_scan_never_completes_detour(self):
+        cases = (
+            ({3: 54.0}, 1_500.0, {}, 3),
+            ({}, 54.0, {}, 3),
+            ({4: 54.0}, 1_500.0, {}, 4),
+            ({}, 1_500.0, {4: 54.0}, 4),
+        )
+        for scan_centers, side_distance, result_ranges, scan_number in cases:
+            with self.subTest(
+                scan_centers=scan_centers,
+                side_distance=side_distance,
+            ):
+                controller = FullDetourController(
+                    scan_centers=scan_centers,
+                    pass_side_distance=side_distance,
+                    result_ranges=result_ranges,
+                )
+                planner = Planner([
+                    decision(SCAN_FRONT_ARC),
+                    decision(TURN_LEFT_90),
+                ])
+
+                result = self.adapter(
+                    controller,
+                    planner,
+                    max_decisions=64,
+                    execute_provisional_detour=True,
+                ).run(episode_context()[0])
+
+                self.assertFalse(result.completed)
+                self.assertEqual(
+                    result.terminal_reason,
+                    "detour_verification_unavailable",
+                )
+                self.assertEqual(controller.scan_count, scan_number)
+                self.assertEqual(controller.commands[-1], "scan_front_arc")
+                self.assertEqual(len(planner.contexts), 2)
+
+    def test_close_range_stops_host_turn_after_one_pulse(self):
+        class CloseDuringMergeTurnController(FullDetourController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "turn_right" and self.scan_count == 3:
+                    result["observation"]["distance_mm"] = 40
+                    self.snapshot_value["observation"]["distance_mm"] = 40
+                return result
+
+        controller = CloseDuringMergeTurnController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+
+        result = self.adapter(
+            controller,
+            planner,
+            max_decisions=64,
+            execute_provisional_detour=True,
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "detour_motion_incomplete")
+        self.assertEqual(controller.scan_count, 3)
+        pass_scan_index = max(
+            index
+            for index, command in enumerate(controller.commands)
+            if command == "scan_front_arc"
+        )
+        self.assertEqual(
+            controller.commands[pass_scan_index + 1:],
+            ["turn_right"],
+        )
+        self.assertEqual(len(planner.contexts), 2)
+
+    def test_full_host_detour_is_symmetric_to_the_right(self):
+        controller = FullDetourController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_RIGHT_90),
+        ])
+
+        result = self.adapter(
+            controller,
+            planner,
+            max_decisions=64,
+            execute_provisional_detour=True,
+        ).run(episode_context()[0])
+
+        self.assertTrue(result.completed)
+        self.assertEqual(len(planner.contexts), 2)
+        self.assertGreater(controller.commands.count("drive_forward"), 5)
+        self.assertIn("turn_left", controller.commands)
+        self.assertEqual(controller.commands[-1], "scan_front_arc")
+
+    def test_short_second_view_refuses_detour_without_pass_motion(self):
+        class ShortViewController(FakeScanController):
+            def __init__(self):
+                super().__init__(1_000)
+                self.scan_count = 0
+
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    self.scan_count += 1
+                    if self.scan_count == 1:
+                        scan = scan_result(center_distance_mm=310.0)
+                        scan["rays"][1].update({
+                            "distance_mm": 368.0,
+                            "heading_deg": -23.322266,
+                            "relative_heading_deg": -23.322266,
+                        })
+                        result["scan"] = scan
+                return result
+
+        controller = ShortViewController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+
+        result = self.adapter(
+            controller,
+            planner,
+            max_decisions=64,
+            execute_provisional_detour=True,
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "detour_route_unavailable")
+        self.assertEqual(len(planner.contexts), 2)
+        self.assertEqual(controller.commands.count("scan_front_arc"), 2)
+        self.assertEqual(controller.commands.count("drive_forward"), 9)
 
     def test_stop_after_side_rescan_wins_over_collected_outcome(self):
         context, updates = episode_context()
@@ -1894,7 +2120,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertIn(SCAN_FRONT_ARC, available)
 
     def test_unobserved_or_too_close_state_authorizes_no_action(self):
-        for distance, body in ((2_000, 158), (53, 158), (500, 157)):
+        for distance, body in ((2_000, 158), (53, 158), (500, 156)):
             with self.subTest(distance=distance, body=body):
                 controller = FakeController(distance)
                 controller.snapshot_value["observation"][
@@ -1924,7 +2150,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             ),
             (
                 TURN_LEFT_90,
-                ("body", 157),
+                ("body", 156),
                 "blast_action_start_unverified",
             ),
         ):
@@ -1989,36 +2215,41 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(len(planner.contexts), 2)
 
     def test_settled_scan_refusal_is_safe_noncomplete(self):
-        for cancelled, terminal_reason in (
-            (False, "no_safe_blast_action"),
-            (True, "stopped"),
+        for error_code in (
+            "scan_start_clearance_unverified",
+            "scan_sweep_clearance_lost",
+            "scan_sweep_observation_unverified",
         ):
-            with self.subTest(cancelled=cancelled):
-                context, _updates = episode_context()
+            for cancelled, terminal_reason in (
+                (False, "no_safe_blast_action"),
+                (True, "stopped"),
+            ):
+                with self.subTest(error_code=error_code, cancelled=cancelled):
+                    context, _updates = episode_context()
 
-                class RefusingScanController(FakeScanController):
-                    def command(self, command, *, cancel_requested=None):
-                        if command == "scan_front_arc":
-                            if cancelled:
-                                context.stop_requested.set()
-                            raise BlastControllerError(
-                                "scan_start_clearance_unverified",
-                                "settled scan start was unsafe",
+                    class RefusingScanController(FakeScanController):
+                        def command(self, command, *, cancel_requested=None):
+                            if command == "scan_front_arc":
+                                if cancelled:
+                                    context.stop_requested.set()
+                                raise BlastControllerError(
+                                    error_code,
+                                    "settled scan start was unsafe",
+                                )
+                            return super().command(
+                                command,
+                                cancel_requested=cancel_requested,
                             )
-                        return super().command(
-                            command,
-                            cancel_requested=cancel_requested,
-                        )
 
-                controller = RefusingScanController(500)
-                planner = Planner([decision(SCAN_FRONT_ARC)])
+                    controller = RefusingScanController(500)
+                    planner = Planner([decision(SCAN_FRONT_ARC)])
 
-                result = self.adapter(controller, planner).run(context)
+                    result = self.adapter(controller, planner).run(context)
 
-                self.assertFalse(result.completed)
-                self.assertEqual(result.terminal_reason, terminal_reason)
-                self.assertEqual(controller.commands, [])
-                self.assertEqual(len(planner.contexts), 1)
+                    self.assertFalse(result.completed)
+                    self.assertEqual(result.terminal_reason, terminal_reason)
+                    self.assertEqual(controller.commands, [])
+                    self.assertEqual(len(planner.contexts), 1)
 
     def test_side_rescan_refusal_does_not_publish_multi_view(self):
         for cancelled, terminal_reason in (

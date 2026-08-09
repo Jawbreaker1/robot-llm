@@ -150,7 +150,7 @@ class BlastScanPlanarProjectionTests(TestCase):
             lambda value: value.update(restoration_verified=False),
             lambda value: value.update(all_observations_settled=False),
             lambda value: value["rays"][2].update(observation_settled=False),
-            lambda value: value["rays"][2].update(body_motor_angle_deg=159),
+            lambda value: value["rays"][2].update(body_motor_angle_deg=160),
         )
         for mutate in mutations:
             with self.subTest(mutate=mutate):
@@ -166,6 +166,19 @@ class BlastScanPlanarProjectionTests(TestCase):
                 scan=scan_result(),
                 scan_pose="not-a-pose",
             )
+
+    def test_body_pose_tolerance_boundary_is_projection_ready(self):
+        scan = scan_result((100.0,) * 5)
+        for ray in scan["rays"]:
+            ray["body_motor_angle_deg"] = 159
+
+        self.assertEqual(
+            len(project_blast_scan_planar_surfaces(
+                scan=scan,
+                scan_pose=PhysicalPose(),
+            )["points"]),
+            5,
+        )
 
     def test_heading_topology_and_v3_contract_fail_closed(self):
         mutations = (

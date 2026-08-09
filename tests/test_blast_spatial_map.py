@@ -26,10 +26,10 @@ def observation(left=0, right=0):
     }
 
 
-def final_goal(current=0):
+def final_goal(current=0, navigation_enforced=False):
     return {
         "kind": "DIRECTIONAL_HEADING",
-        "navigation_enforced": False,
+        "navigation_enforced": navigation_enforced,
         "origin_x_mm": 0,
         "origin_y_mm": 0,
         "target_x_mm": 420,
@@ -39,6 +39,20 @@ def final_goal(current=0):
         "heading_tolerance_mdeg": 5_000,
         "current_forward_progress_mm": current,
         "remaining_forward_progress_mm": max(0, 420 - current),
+    }
+
+
+def planned_leg(kind="SIDE_SEARCH", scope="SEARCH_POSITION_ONLY",
+                route_eligible=False):
+    return {
+        "kind": kind,
+        "scope": scope,
+        "clearance_proven": False,
+        "passage_proven": False,
+        "route_eligible": route_eligible,
+        "selected_side": "LEFT",
+        "bind_pose": {"x_mm": 45, "y_mm": 0, "heading_mdeg": 0},
+        "waypoint": {"x_mm": 90, "y_mm": 210, "heading_mdeg": 90_000},
     }
 
 
@@ -157,6 +171,98 @@ class BlastSpatialMapBridgeTests(TestCase):
         self.assertEqual(trace["provenance"], (
             "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY"
         ))
+
+    def test_enforced_local_detour_trace_accepts_shared_waypoint_kinds(self):
+        waypoint_kinds = (
+            "LATERAL_CLEARANCE",
+            "REACQUIRE_GOAL_HEADING",
+            "PASS_BEYOND_TARGET",
+            "MERGE_GOAL_AXIS",
+            "RESUME_GOAL_HEADING",
+        )
+        for kind in waypoint_kinds:
+            with self.subTest(kind=kind):
+                bridge = self.bridge()
+                bridge.begin_episode(
+                    episode_id="episode-a",
+                    pose=PhysicalPose(),
+                    observation=observation(),
+                )
+                leg = planned_leg(
+                    kind=kind,
+                    scope="LOCAL_DETOUR_ROUTE",
+                    route_eligible=True,
+                )
+
+                self.assertTrue(bridge.offer_trace(
+                    episode_id="episode-a",
+                    final_goal=final_goal(navigation_enforced=True),
+                    planned_leg=leg,
+                ))
+                trace = bridge.snapshot()["navigation_trace"]
+                self.assertTrue(trace["final_goal"]["navigation_enforced"])
+                self.assertEqual(trace["planned_leg"], leg)
+
+    def test_planned_leg_claims_and_fields_remain_exact_and_conservative(self):
+        bridge = self.bridge()
+        bridge.begin_episode(
+            episode_id="episode-a",
+            pose=PhysicalPose(),
+            observation=observation(),
+        )
+        invalid_legs = []
+        extra = planned_leg()
+        extra["future_claim"] = False
+        invalid_legs.append(extra)
+        for field in ("clearance_proven", "passage_proven"):
+            claimed = planned_leg(
+                kind="PASS_BEYOND_TARGET",
+                scope="LOCAL_DETOUR_ROUTE",
+                route_eligible=True,
+            )
+            claimed[field] = True
+            invalid_legs.append(claimed)
+        invalid_legs.append(planned_leg(
+            kind="SIDE_SEARCH",
+            scope="SEARCH_POSITION_ONLY",
+            route_eligible=True,
+        ))
+        invalid_legs.append(planned_leg(
+            kind="SIDE_SEARCH",
+            scope="LOCAL_DETOUR_ROUTE",
+            route_eligible=True,
+        ))
+
+        for leg in invalid_legs:
+            with self.subTest(leg=leg):
+                with self.assertRaisesRegex(ValueError, "trace is invalid"):
+                    bridge.offer_trace(
+                        episode_id="episode-a",
+                        final_goal=final_goal(navigation_enforced=True),
+                        planned_leg=leg,
+                    )
+        mismatches = (
+            (
+                final_goal(navigation_enforced=False),
+                planned_leg(
+                    kind="PASS_BEYOND_TARGET",
+                    scope="LOCAL_DETOUR_ROUTE",
+                    route_eligible=True,
+                ),
+            ),
+            (
+                final_goal(navigation_enforced=True),
+                planned_leg(),
+            ),
+        )
+        for goal, leg in mismatches:
+            with self.subTest(goal=goal, leg=leg):
+                with self.assertRaisesRegex(ValueError, "trace is invalid"):
+                    bridge.offer_trace(
+                        episode_id="episode-a",
+                        final_goal=goal,
+                        planned_leg=leg,
+                    )
 
     def test_invalid_or_closed_publication_fails_closed(self):
         bridge = self.bridge()

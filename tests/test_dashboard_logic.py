@@ -829,6 +829,162 @@ function response(status, payload) {
         self.assertFalse(legacy["spatiallyRenderable"])
         self.assertIsNone(legacy["scanPose"])
 
+    def test_blast_navigation_trace_normalizes_enforced_local_detours(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const context = {};
+vm.runInNewContext(source, context, { filename: process.argv[1] });
+const logic = context.RobotDashboardLogic;
+
+const goal = {
+  kind: "DIRECTIONAL_HEADING",
+  navigation_enforced: false,
+  origin_x_mm: 0,
+  origin_y_mm: 0,
+  target_x_mm: 420,
+  target_y_mm: 0,
+  desired_heading_mdeg: 0,
+  minimum_forward_progress_mm: 420,
+  heading_tolerance_mdeg: 5000,
+  current_forward_progress_mm: 45,
+  remaining_forward_progress_mm: 375,
+};
+const sideSearch = {
+  kind: "SIDE_SEARCH",
+  scope: "SEARCH_POSITION_ONLY",
+  clearance_proven: false,
+  passage_proven: false,
+  route_eligible: false,
+  selected_side: "LEFT",
+  bind_pose: { x_mm: 45, y_mm: 0, heading_mdeg: 0 },
+  waypoint: { x_mm: 45, y_mm: 210, heading_mdeg: 90000 },
+};
+const localDetour = {
+  ...sideSearch,
+  kind: "PASS_BEYOND_TARGET",
+  scope: "LOCAL_DETOUR_ROUTE",
+  route_eligible: true,
+};
+function mapFor(finalGoal, plannedLeg) {
+  return {
+    schema: "robot-spatial-map/v1",
+    read_only: true,
+    status: "pose_only",
+    frame_id: "episode-a-local-odometry",
+    frame_kind: "LOCAL_ODOMETRY",
+    bounds: null,
+    cells: [],
+    sensor_rays: [],
+    qualitative_observations: [],
+    object_hypotheses: [],
+    scan_evidence_history: [],
+    navigation_trace: {
+      schema: "robot-navigation-trace/v1",
+      read_only: true,
+      frame_id: "episode-a-local-odometry",
+      provenance: "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY",
+      final_goal: finalGoal,
+      planned_leg: plannedLeg,
+      imu_heading: null,
+      planar_scan_views: [],
+    },
+  };
+}
+const reference = logic.normalizeSpatialMap(mapFor(goal, sideSearch), 2000)
+  .navigationTrace;
+const enforced = logic.normalizeSpatialMap(mapFor(
+  { ...goal, navigation_enforced: true },
+  localDetour,
+), 2000).navigationTrace;
+const invalidClaim = logic.normalizeSpatialMap(mapFor(
+  { ...goal, navigation_enforced: true },
+  { ...localDetour, clearance_proven: true },
+), 2000).navigationTrace;
+const invalidKind = logic.normalizeSpatialMap(mapFor(
+  { ...goal, navigation_enforced: true },
+  { ...localDetour, kind: "SIDE_SEARCH" },
+), 2000).navigationTrace;
+const invalidEnforcement = logic.normalizeSpatialMap(mapFor(
+  { ...goal, navigation_enforced: "true" },
+  localDetour,
+), 2000).navigationTrace;
+const mismatchedReference = logic.normalizeSpatialMap(mapFor(
+  goal,
+  localDetour,
+), 2000).navigationTrace;
+const mismatchedEnforced = logic.normalizeSpatialMap(mapFor(
+  { ...goal, navigation_enforced: true },
+  sideSearch,
+), 2000).navigationTrace;
+
+process.stdout.write(JSON.stringify({
+  reference: {
+    navigationEnforced: reference.finalGoal.navigationEnforced,
+    plannedLeg: reference.plannedLeg,
+  },
+  enforced: {
+    navigationEnforced: enforced.finalGoal.navigationEnforced,
+    plannedLeg: enforced.plannedLeg,
+    frozen: Object.isFrozen(enforced.plannedLeg),
+  },
+  invalidClaim,
+  invalidKind,
+  invalidEnforcement,
+  mismatchedReference,
+  mismatchedEnforced,
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(LOGIC_ASSET),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertFalse(result["reference"]["navigationEnforced"])
+        self.assertEqual(
+            result["reference"]["plannedLeg"]["scope"],
+            "SEARCH_POSITION_ONLY",
+        )
+        self.assertFalse(
+            result["reference"]["plannedLeg"]["routeEligible"]
+        )
+        self.assertTrue(result["enforced"]["navigationEnforced"])
+        self.assertEqual(
+            result["enforced"]["plannedLeg"]["kind"],
+            "PASS_BEYOND_TARGET",
+        )
+        self.assertEqual(
+            result["enforced"]["plannedLeg"]["scope"],
+            "LOCAL_DETOUR_ROUTE",
+        )
+        self.assertTrue(
+            result["enforced"]["plannedLeg"]["routeEligible"]
+        )
+        self.assertFalse(
+            result["enforced"]["plannedLeg"]["clearanceProven"]
+        )
+        self.assertFalse(
+            result["enforced"]["plannedLeg"]["passageProven"]
+        )
+        self.assertTrue(result["enforced"]["frozen"])
+        self.assertIsNone(result["invalidClaim"])
+        self.assertIsNone(result["invalidKind"])
+        self.assertIsNone(result["invalidEnforcement"])
+        self.assertIsNone(result["mismatchedReference"])
+        self.assertIsNone(result["mismatchedEnforced"])
+
 
 if __name__ == "__main__":
     unittest.main()

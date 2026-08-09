@@ -120,8 +120,9 @@
       "navigation_body_motor_reference": {
         "observed_at_local_date": "2026-08-09",
         "angle_deg": 158,
-        "tolerance_deg": 0,
+        "tolerance_deg": 1,
         "basis": "provisional accumulated encoder reference for the current build",
+        "tolerance_selection": "Smallest non-zero integer-degree allowance; it permits only 157..159 and remains provisional because the rejected per-ray value was not retained",
         "operator_observation": "Sensor faced nearly straight forward",
         "power_cycle_validation": {
           "angle_before_deg": 158,
@@ -130,6 +131,13 @@
           "distance_after_mm": 345,
           "drive_angles_unchanged": true,
           "chassis_rear_tilt_deg_approx": 2.6
+        },
+        "later_runtime_observation": {
+          "observed_at_local_date": "2026-08-09",
+          "episode_id": "episode-cd3e82e13cae4b44314057d8",
+          "outcome": "blast_scan_sensor_pose_unverified",
+          "final_settled_body_angle_deg": 158,
+          "limitation": "The exact-comparison failure proves at least one compared sample differed, but that rejected per-ray body value was not retained"
         },
         "limitation": "Not a mechanical home; manual linkage movement or rebuilding invalidates this reference"
       },
@@ -144,7 +152,7 @@
     "Actual-encoder turn scale is provisional evidence from one physical left/right reference pair",
     "Footprint and range-sensor extrinsics are approximate folding-rule measurements",
     "Ultrasonic vertical pitch remains unmeasured and body pitch varies with the support wheels",
-    "The navigation body-motor reference is provisional and has not been validated after moving away and returning to the pose",
+    "The navigation body-motor reference and one-degree tolerance are provisional; the rejected per-ray body value from the later restored scan was not retained",
     "The runtime consumes selected typed values, but this evidence remains provisional"
   ]
 }

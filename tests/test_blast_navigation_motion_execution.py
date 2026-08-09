@@ -312,6 +312,64 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertEqual(result.motion.requested_slice_count, 4)
         self.assertEqual(result.pose.heading_mdeg, 47_040)
 
+    def test_turn_continuation_gate_stops_after_close_slice(self):
+        controller, executor = self.executor()
+        original_command = controller.command
+
+        def command(name, *, cancel_requested=None):
+            result = original_command(
+                name,
+                cancel_requested=cancel_requested,
+            )
+            result["observation"]["distance_mm"] = 40
+            return result
+
+        controller.command = command
+
+        result = executor.execute(
+            TURN_LEFT_90,
+            continue_requested=lambda command_result: (
+                command_result["observation"]["distance_mm"] > 53
+            ),
+        )
+
+        self.assertEqual(controller.commands, ["turn_left"])
+        self.assertFalse(result.motion.complete)
+        self.assertEqual(result.motion.verified_slice_count, 1)
+        self.assertEqual(result.pose.heading_mdeg, 23_520)
+
+    def test_invalid_first_turn_receipt_stops_before_second_pulse(self):
+        for corruption in ("command", "encoder_direction"):
+            with self.subTest(corruption=corruption):
+                controller, executor = self.executor()
+                original_command = controller.command
+
+                def command(name, *, cancel_requested=None):
+                    result = original_command(
+                        name,
+                        cancel_requested=cancel_requested,
+                    )
+                    if corruption == "command":
+                        result["command"] = "turn_right"
+                    else:
+                        before = result["receipt"]["before_angles_deg"]
+                        result["observation"]["motor_angles_deg"].update({
+                            "left_drive": before["left_drive"] + 47,
+                            "right_drive": before["right_drive"] - 49,
+                        })
+                    return result
+
+                controller.command = command
+
+                with self.assertRaises(PhysicalNavigationContractError):
+                    executor.execute(
+                        TURN_LEFT_90,
+                        continue_requested=lambda _result: True,
+                    )
+
+                self.assertEqual(controller.commands, ["turn_left"])
+                self.assertFalse(executor.localization_valid)
+
     def test_cross_action_encoder_gap_fails_closed_without_advancing_pose(self):
         controller, executor = self.executor()
         first = executor.execute(ADVANCE)

@@ -2244,6 +2244,23 @@ textarea:focus-visible,
   stroke-width: 4;
 }
 
+.map-final-goal[data-navigation-enforced="true"] .map-final-goal-line {
+  stroke: var(--ready);
+  stroke-dasharray: none;
+  stroke-width: 6;
+}
+
+.map-final-goal[data-navigation-enforced="true"] .map-final-goal-target {
+  fill: rgb(83 214 140 / 28%);
+  stroke: var(--ready);
+  stroke-width: 5;
+}
+
+.map-final-goal[data-navigation-enforced="true"] .map-final-goal-heading {
+  stroke: var(--ready);
+  stroke-width: 5;
+}
+
 .map-planned-leg-line {
   fill: none;
   stroke: var(--model);
@@ -2265,6 +2282,23 @@ textarea:focus-visible,
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 3;
+}
+
+.map-planned-leg[data-route-eligible="true"] .map-planned-leg-line {
+  stroke: var(--ready);
+  stroke-dasharray: none;
+  stroke-width: 7;
+}
+
+.map-planned-leg[data-route-eligible="true"] .map-planned-leg-bind,
+.map-planned-leg[data-route-eligible="true"] .map-planned-waypoint {
+  stroke: var(--ready);
+  stroke-width: 5;
+}
+
+.map-planned-leg[data-route-eligible="true"] .map-planned-waypoint-heading {
+  stroke: var(--ready);
+  stroke-width: 4;
 }
 
 .map-blast-scan-ray-line {
@@ -2295,6 +2329,12 @@ textarea:focus-visible,
 
 .map-final-goal-label {
   fill: var(--warning);
+}
+
+.map-final-goal[data-navigation-enforced="true"] .map-final-goal-label,
+.map-planned-leg[data-route-eligible="true"] .map-planned-waypoint-label {
+  fill: var(--ready);
+  font-size: 11px;
 }
 
 .map-planned-waypoint-label {

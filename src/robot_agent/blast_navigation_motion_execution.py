@@ -102,6 +102,25 @@ class BlastNavigationMotionExecutor:
         self._localization_valid = False
         _fail(code, message)
 
+    def _validated_result(self, action, results):
+        final_observation = results[-1].get("observation")
+        final_angles = _encoder_angles(final_observation)
+        canonical = build_blast_navigation_motion_result(
+            action,
+            results,
+            expected_start_angles=self._expected_start_angles,
+            canonical_observation=_canonical_observation(final_observation),
+            allow_initial_settling=True,
+        )
+        motion = verified_motion_from_result(action, canonical)
+        pose = apply_verified_motion(
+            self._pose,
+            motion,
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+            max_uncommanded_drift_degrees=1,
+        )
+        return final_angles, motion, pose
+
     def reanchor_after_restored_scan(self, command_result) -> bool:
         """Pose-preserving approximation for one verified restored scan."""
         if not self._localization_valid:
@@ -148,12 +167,20 @@ class BlastNavigationMotionExecutor:
         self._expected_start_angles = angles
         return True
 
-    def execute(self, action: str, *, cancel_requested=None):
+    def execute(
+        self,
+        action: str,
+        *,
+        cancel_requested=None,
+        continue_requested=None,
+    ):
         if action not in BLAST_NAVIGATION_COMMANDS:
             _fail("invalid_blast_motion_action",
                   "BLAST cannot execute this semantic motion action")
         if cancel_requested is not None and not callable(cancel_requested):
             raise ValueError("BLAST cancellation callback is invalid")
+        if continue_requested is not None and not callable(continue_requested):
+            raise ValueError("BLAST continuation callback is invalid")
         if not self._localization_valid:
             _fail("blast_navigation_localization_invalid",
                   "BLAST encoder localization must be restarted")
@@ -189,7 +216,8 @@ class BlastNavigationMotionExecutor:
         results = []
         command_attempted = False
         try:
-            for command in BLAST_NAVIGATION_COMMANDS[action]:
+            commands = BLAST_NAVIGATION_COMMANDS[action]
+            for command_index, command in enumerate(commands):
                 if cancel_requested is not None and cancel_requested():
                     if not results:
                         raise BlastControllerError(
@@ -206,24 +234,16 @@ class BlastNavigationMotionExecutor:
                     _fail("blast_command_result_invalid",
                           "BLAST returned an invalid command result")
                 results.append(command_result)
+                if command_index + 1 < len(commands):
+                    self._validated_result(action, results)
+                    if (
+                        continue_requested is not None
+                        and not continue_requested(command_result)
+                    ):
+                        break
 
-            final_observation = results[-1].get("observation")
-            final_angles = _encoder_angles(final_observation)
-            canonical = build_blast_navigation_motion_result(
-                action,
-                results,
-                expected_start_angles=self._expected_start_angles,
-                canonical_observation=_canonical_observation(
-                    final_observation
-                ),
-                allow_initial_settling=True,
-            )
-            motion = verified_motion_from_result(action, canonical)
-            pose = apply_verified_motion(
-                self._pose,
-                motion,
-                BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
-                max_uncommanded_drift_degrees=1,
+            final_angles, motion, pose = self._validated_result(
+                action, results,
             )
         except Exception:
             if command_attempted:

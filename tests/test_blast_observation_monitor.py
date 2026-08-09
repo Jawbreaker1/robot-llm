@@ -469,19 +469,70 @@ class BlastObservationMonitorTests(unittest.TestCase):
         monitor.command("drive_forward")
 
         self.assertEqual(
-            monitor.settle_timeouts[:6],
-            [SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS] * 6,
+            monitor.settle_timeouts[:9],
+            [SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS] * 9,
         )
         self.assertIsNone(monitor.settle_timeouts[-1])
         self.assertGreaterEqual(
             SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
-            6 * SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS + 6,
+            9 * SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS + 6,
         )
         self.assertGreaterEqual(
             SCAN_COMMAND_TIMEOUT_SECONDS,
             SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS + 3,
         )
         monitor.close()
+
+    def test_scan_stops_after_first_close_settled_turn_pulse(self):
+        for distance, body, heading, error_code in (
+            (40, 158, 12, "scan_sweep_clearance_lost"),
+            (-1, 158, 12, "scan_sweep_observation_unverified"),
+            (2_001, 158, 12, "scan_sweep_observation_unverified"),
+            (321, 156, 12, "scan_sweep_observation_unverified"),
+            (321, 158, None, "scan_sweep_observation_unverified"),
+        ):
+            with self.subTest(distance=distance, body=body, heading=heading):
+                FakeRuntime.instances = []
+
+                class UnsafeAfterFirstTurnRuntime(FakeRuntime):
+                    def __init__(self, **kwargs):
+                        super().__init__(**kwargs)
+                        self.unsafe = False
+
+                    async def observe(self):
+                        observation = await super().observe()
+                        if self.unsafe:
+                            observation["distance_mm"] = distance
+                            observation["motor_angles_deg"]["body"] = body
+                            observation["imu"]["heading_deg"] = heading
+                        return observation
+
+                    async def turn_pulse(self, direction):
+                        receipt = await super().turn_pulse(direction)
+                        self.unsafe = True
+                        return receipt
+
+                monitor = BlastObservationMonitor(
+                    poll_interval_seconds=0.05,
+                    runtime_factory=UnsafeAfterFirstTurnRuntime,
+                )
+                monitor.start()
+                self.wait_for(monitor, "online")
+
+                with self.assertRaises(BlastControllerError) as raised:
+                    monitor.command(SCAN_COMMAND)
+
+                self.assertEqual(raised.exception.code, error_code)
+                runtime = FakeRuntime.instances[0]
+                self.assertEqual(
+                    [
+                        call for call in runtime.calls
+                        if call[0] == "turn_pulse"
+                    ],
+                    [("turn_pulse", "left")],
+                )
+                self.assertEqual(monitor.snapshot()["state"], "online")
+                monitor.close()
 
     def test_scan_range_state_distinguishes_no_return_from_invalid(self):
         self.assertEqual(blast_range_state(1_999), RANGE_STATE_MEASURED)
@@ -498,7 +549,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
             (40, 158),
             (53, 158),
             (2_000, 158),
-            (300, 157),
+            (300, 156),
         ):
             with self.subTest(distance=distance, body=body):
                 class UnsafeScanRuntime(FakeRuntime):

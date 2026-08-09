@@ -492,6 +492,8 @@ def _configured_robot_runtime_adapter(args, *, blast_monitor=None):
         return BlastEpisodeRuntimeAdapter(
             controller=blast_monitor,
             planner_factory=planner_factory,
+            max_decisions=64,
+            execute_provisional_detour=True,
         )
     if args.robot_profile != EV3RSTORM_PROFILE_ID:
         raise ValueError("physical robot profile is unsupported")

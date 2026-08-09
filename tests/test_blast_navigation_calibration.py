@@ -49,12 +49,15 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
                 sensor.left_offset_mm,
                 sensor.yaw_mdeg,
                 sensor.navigation_body_motor_angle_deg,
+                sensor.navigation_body_motor_tolerance_deg,
             ),
-            (110, 80, 0, 158),
+            (110, 80, 0, 158, 1),
         )
-        self.assertTrue(sensor.matches_navigation_body_angle(158))
+        for value in (157, 158, 159):
+            with self.subTest(value=value):
+                self.assertTrue(sensor.matches_navigation_body_angle(value))
         self.assertEqual(calibration.minimum_rotation_clearance_mm(), 53)
-        for value in (157, 159, None, True):
+        for value in (156, 160, None, True, 158.0):
             with self.subTest(value=value):
                 self.assertFalse(sensor.matches_navigation_body_angle(value))
         self.assertTrue(calibration.complete)
@@ -82,6 +85,22 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
                     calibration_status="test",
                     calibration_evidence="invalid body fixture",
                     navigation_body_motor_angle_deg=value,
+                )
+
+    def test_invalid_navigation_body_tolerance_is_rejected(self):
+        for value in (True, -1, 11, 1.0):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError,
+                "body tolerance is invalid",
+            ):
+                BlastRangeSensorExtrinsics(
+                    forward_offset_mm=100,
+                    left_offset_mm=50,
+                    yaw_mdeg=0,
+                    calibration_status="test",
+                    calibration_evidence="invalid tolerance fixture",
+                    navigation_body_motor_angle_deg=158,
+                    navigation_body_motor_tolerance_deg=value,
                 )
 
     def test_complete_fixture_can_cross_the_activation_gate(self):
@@ -258,7 +277,11 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
             calibration.range_sensor_extrinsics
             .navigation_body_motor_angle_deg,
         )
-        self.assertEqual(body_reference["tolerance_deg"], 0)
+        self.assertEqual(
+            body_reference["tolerance_deg"],
+            calibration.range_sensor_extrinsics
+            .navigation_body_motor_tolerance_deg,
+        )
 
 
 if __name__ == "__main__":

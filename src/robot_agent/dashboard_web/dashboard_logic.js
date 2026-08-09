@@ -27,6 +27,13 @@
   const MAX_NAVIGATION_SCAN_POINTS = 5;
   const MAX_LOCAL_COORDINATE_MM = 1_000_000;
   const MAX_MEASURED_RANGE_MM = 10_000;
+  const LOCAL_DETOUR_WAYPOINT_KINDS = new Set([
+    "LATERAL_CLEARANCE",
+    "REACQUIRE_GOAL_HEADING",
+    "PASS_BEYOND_TARGET",
+    "MERGE_GOAL_AXIS",
+    "RESUME_GOAL_HEADING",
+  ]);
   const SESSION_REJECTED_CODE = "session_token_rejected";
   const BODY_RELATIVE_BEARING_CONVENTION = (
     "POSITIVE_LEFT_NEGATIVE_RIGHT"
@@ -134,7 +141,7 @@
     );
     if (
       goal.kind !== "DIRECTIONAL_HEADING"
-      || goal.navigation_enforced !== false
+      || typeof goal.navigation_enforced !== "boolean"
       || originX === null
       || originY === null
       || targetX === null
@@ -170,7 +177,7 @@
     }
     return Object.freeze({
       kind: "DIRECTIONAL_HEADING",
-      navigationEnforced: false,
+      navigationEnforced: goal.navigation_enforced,
       originX,
       originY,
       targetX,
@@ -214,12 +221,20 @@
     const leg = record(value);
     const bindPose = normalizeTracePose(leg.bind_pose);
     const waypoint = normalizeTracePose(leg.waypoint);
+    const sideSearch = (
+      leg.kind === "SIDE_SEARCH"
+      && leg.scope === "SEARCH_POSITION_ONLY"
+      && leg.route_eligible === false
+    );
+    const localDetourRoute = (
+      LOCAL_DETOUR_WAYPOINT_KINDS.has(leg.kind)
+      && leg.scope === "LOCAL_DETOUR_ROUTE"
+      && leg.route_eligible === true
+    );
     if (
-      leg.kind !== "SIDE_SEARCH"
-      || leg.scope !== "SEARCH_POSITION_ONLY"
+      (!sideSearch && !localDetourRoute)
       || leg.clearance_proven !== false
       || leg.passage_proven !== false
-      || leg.route_eligible !== false
       || !["LEFT", "RIGHT"].includes(leg.selected_side)
       || bindPose === null
       || waypoint === null
@@ -227,11 +242,11 @@
       return undefined;
     }
     return Object.freeze({
-      kind: "SIDE_SEARCH",
-      scope: "SEARCH_POSITION_ONLY",
+      kind: leg.kind,
+      scope: leg.scope,
       clearanceProven: false,
       passageProven: false,
-      routeEligible: false,
+      routeEligible: leg.route_eligible,
       selectedSide: leg.selected_side,
       bindPose,
       waypoint,
@@ -358,6 +373,14 @@
       || finalGoal === null
       || imuHeading === undefined
       || plannedLeg === undefined
+      || (
+        plannedLeg?.scope === "SEARCH_POSITION_ONLY"
+        && finalGoal.navigationEnforced !== false
+      )
+      || (
+        plannedLeg?.scope === "LOCAL_DETOUR_ROUTE"
+        && finalGoal.navigationEnforced !== true
+      )
       || !Array.isArray(trace.planar_scan_views)
       || trace.planar_scan_views.length > MAX_NAVIGATION_SCAN_VIEWS
     ) {

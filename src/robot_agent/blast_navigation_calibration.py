@@ -32,6 +32,7 @@ class BlastRangeSensorExtrinsics:
     calibration_status: str
     calibration_evidence: str
     navigation_body_motor_angle_deg: Optional[int] = None
+    navigation_body_motor_tolerance_deg: int = 0
 
     def __post_init__(self) -> None:
         values = (
@@ -57,6 +58,9 @@ class BlastRangeSensorExtrinsics:
             or not -1_000_000 <= angle <= 1_000_000
         ):
             raise ValueError("BLAST navigation body reference is invalid")
+        tolerance = self.navigation_body_motor_tolerance_deg
+        if type(tolerance) is not int or not 0 <= tolerance <= 10:
+            raise ValueError("BLAST navigation body tolerance is invalid")
         if not _text(self.calibration_status) or not _text(
             self.calibration_evidence
         ):
@@ -77,7 +81,10 @@ class BlastRangeSensorExtrinsics:
         ):
             return False
         assert self.navigation_body_motor_angle_deg is not None
-        return value == self.navigation_body_motor_angle_deg
+        return (
+            abs(value - self.navigation_body_motor_angle_deg)
+            <= self.navigation_body_motor_tolerance_deg
+        )
 
 
 @dataclass(frozen=True)
@@ -182,9 +189,13 @@ BLAST_PROVISIONAL_NAVIGATION_CALIBRATION = BlastNavigationCalibration(
             "Operator folding-rule measurement to the ultrasonic face "
             "centre with the left arm in navigation pose; the body encoder "
             "remained exactly 158 degrees across a hub power cycle while "
-            "the operator confirmed the sensor still faced nearly forward"
+            "the operator confirmed the sensor still faced nearly forward. "
+            "A later restored side scan was rejected by exact per-ray "
+            "comparison although its final settled body reading was 158; "
+            "one degree is the smallest non-zero provisional allowance"
         ),
         navigation_body_motor_angle_deg=158,
+        navigation_body_motor_tolerance_deg=1,
     ),
     evidence_id=BLAST_NAVIGATION_EVIDENCE_ID,
 )

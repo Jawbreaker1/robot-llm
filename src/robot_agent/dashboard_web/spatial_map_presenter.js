@@ -370,10 +370,11 @@
       const goalOrigin = projection.point(goal.originX, goal.originY);
       const goalTarget = projection.point(goal.targetX, goal.targetY);
       const goalHeading = goal.desiredHeadingMdeg / 1000 * Math.PI / 180;
+      const goalEnforced = goal.navigationEnforced === true;
       const goalGroup = createSvgElement("g", {
         class: "map-final-goal",
         "data-kind": goal.kind,
-        "data-navigation-enforced": "false",
+        "data-navigation-enforced": String(goalEnforced),
         "data-minimum-forward-progress-mm": (
           goal.minimumForwardProgressMm
         ),
@@ -387,7 +388,11 @@
         "data-heading-tolerance-mdeg": goal.headingToleranceMdeg,
       });
       appendSvgTitle(goalGroup, [
-        t("map.navigation_trace.final_goal_title"),
+        t(
+          goalEnforced
+            ? "map.navigation_trace.final_goal_enforced_title"
+            : "map.navigation_trace.final_goal_title",
+        ),
         t("map.navigation_trace.goal_progress", {
           current: formatNumber(goal.currentForwardProgressMm),
           target: formatNumber(goal.minimumForwardProgressMm),
@@ -424,16 +429,25 @@
         y: goalTarget.y - 15,
         class: "map-navigation-trace-label map-final-goal-label",
       });
-      goalLabel.textContent = t("map.navigation_trace.final_goal_label", {
-        heading: formatNumber(goal.desiredHeadingMdeg / 1000, {
-          maximumFractionDigits: 1,
-        }),
-      });
+      goalLabel.textContent = t(
+        goalEnforced
+          ? "map.navigation_trace.final_goal_enforced_label"
+          : "map.navigation_trace.final_goal_label",
+        {
+          heading: formatNumber(goal.desiredHeadingMdeg / 1000, {
+            maximumFractionDigits: 1,
+          }),
+        },
+      );
       goalGroup.appendChild(goalLabel);
       layer.appendChild(goalGroup);
 
       const leg = trace.plannedLeg;
       if (leg) {
+        const enforcedRoute = (
+          leg.scope === "LOCAL_DETOUR_ROUTE"
+          && leg.routeEligible === true
+        );
         const bind = projection.point(
           leg.bindPose.xMm,
           leg.bindPose.yMm,
@@ -450,15 +464,25 @@
           "data-kind": leg.kind,
           "data-scope": leg.scope,
           "data-selected-side": leg.selectedSide,
-          "data-clearance-proven": "false",
-          "data-passage-proven": "false",
-          "data-route-eligible": "false",
+          "data-clearance-proven": String(leg.clearanceProven),
+          "data-passage-proven": String(leg.passageProven),
+          "data-route-eligible": String(leg.routeEligible),
         });
         appendSvgTitle(group, [
-          t("map.navigation_trace.planned_leg_title", {
-            side: leg.selectedSide,
-          }),
-          t("map.navigation_trace.search_position_only"),
+          t(
+            enforcedRoute
+              ? "map.navigation_trace.local_detour_title"
+              : "map.navigation_trace.planned_leg_title",
+            {
+              kind: leg.kind,
+              side: leg.selectedSide,
+            },
+          ),
+          t(
+            enforcedRoute
+              ? "map.navigation_trace.local_detour_conservative"
+              : "map.navigation_trace.search_position_only",
+          ),
         ]);
         group.appendChild(createSvgElement("path", {
           d: `M ${bind.x} ${bind.y} L ${waypoint.x} ${waypoint.y}`,
@@ -486,7 +510,9 @@
           class: "map-navigation-trace-label map-planned-waypoint-label",
         });
         label.textContent = t(
-          "map.navigation_trace.planned_waypoint_label",
+          enforcedRoute
+            ? "map.navigation_trace.local_detour_waypoint_label"
+            : "map.navigation_trace.planned_waypoint_label",
         );
         group.appendChild(label);
         layer.appendChild(group);

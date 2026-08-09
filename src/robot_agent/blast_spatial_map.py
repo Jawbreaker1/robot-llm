@@ -16,6 +16,7 @@ from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
 )
 from .blast_observation_monitor import CONTROLLER_ID, ROBOT_ID
+from .local_detour_route import WAYPOINT_KINDS
 from .physical_odometry import PhysicalPose
 from .spatial_map_contract import (
     ASYMMETRIC_RECTANGLE,
@@ -141,7 +142,7 @@ def _final_goal(value) -> bool:
     )
     if not _exact(value, fields) or not (
         value["kind"] == "DIRECTIONAL_HEADING"
-        and value["navigation_enforced"] is False
+        and type(value["navigation_enforced"]) is bool
         and _integer(value["origin_x_mm"], -1_000_000, 1_000_000)
         and _integer(value["origin_y_mm"], -1_000_000, 1_000_000)
         and _integer(value["target_x_mm"], -1_000_000, 1_000_000)
@@ -169,20 +170,31 @@ def _final_goal(value) -> bool:
 
 
 def _planned_leg(value) -> bool:
-    return value is None or (
+    if value is None:
+        return True
+    if not (
         _exact(value, (
             "kind", "scope", "clearance_proven", "passage_proven",
             "route_eligible", "selected_side", "bind_pose", "waypoint",
         ))
-        and value["kind"] == "SIDE_SEARCH"
-        and value["scope"] == "SEARCH_POSITION_ONLY"
         and value["clearance_proven"] is False
         and value["passage_proven"] is False
-        and value["route_eligible"] is False
         and value["selected_side"] in ("LEFT", "RIGHT")
         and _pose(value["bind_pose"])
         and _pose(value["waypoint"])
-    )
+    ):
+        return False
+    if value["scope"] == "SEARCH_POSITION_ONLY":
+        return (
+            value["kind"] == "SIDE_SEARCH"
+            and value["route_eligible"] is False
+        )
+    if value["scope"] == "LOCAL_DETOUR_ROUTE":
+        return (
+            value["kind"] in WAYPOINT_KINDS
+            and value["route_eligible"] is True
+        )
+    return False
 
 
 def _imu_heading(value, now_unix_ms) -> bool:
@@ -286,6 +298,17 @@ def _trace_inputs(final_goal, planned_leg, imu_heading,
         and isinstance(planar_scan_views, (tuple, list))
         and len(planar_scan_views) <= MAX_PLANAR_SCAN_VIEWS
         and all(_scan_view(view, now_unix_ms) for view in planar_scan_views)
+    ):
+        return False
+    if planned_leg is not None and (
+        (
+            planned_leg["scope"] == "SEARCH_POSITION_ONLY"
+            and final_goal["navigation_enforced"] is not False
+        )
+        or (
+            planned_leg["scope"] == "LOCAL_DETOUR_ROUTE"
+            and final_goal["navigation_enforced"] is not True
+        )
     ):
         return False
     ids = [view["scan_id"] for view in planar_scan_views]
