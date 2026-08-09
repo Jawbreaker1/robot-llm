@@ -61,6 +61,8 @@ DEFAULT_MIN_FORWARD_CLEARANCE_MM = 120
 _SIDE_SEARCH_POSITION_TOLERANCE_MM = 35
 _SIDE_SEARCH_HEADING_TOLERANCE_MDEG = 20_000
 _SIDE_SEARCH_IMU_ODOMETRY_TOLERANCE_MDEG = 30_000
+_PLANNER_ACTION_SOURCE = "PLANNER_ACTION"
+_HOST_SIDE_SEARCH_ACTION_SOURCE = "HOST_SIDE_SEARCH_ACTION"
 
 
 def _blast_nominal_pose(pose: PhysicalPose, action: str) -> PhysicalPose:
@@ -221,7 +223,7 @@ class BlastEpisodeError(RuntimeError):
 
 
 class BlastEpisodeRuntimeAdapter:
-    """Let the shared control service run one model-directed BLAST episode."""
+    """Run one BLAST episode with model strategy and verified host progress."""
 
     def __init__(
         self,
@@ -431,6 +433,8 @@ class BlastEpisodeRuntimeAdapter:
         latest_scan_view = None
         origin_scan_view = None
         reorientation_attempted = False
+        previous_outbound_distance_mm = None
+        host_side_search_actions = []
         try:
             planner = self.planner_factory(context.settings.model)
             if not callable(getattr(planner, "decide", None)):
@@ -438,6 +442,8 @@ class BlastEpisodeRuntimeAdapter:
                     "blast_planner_invalid",
                     "BLAST planner is invalid",
                 )
+            # Preserve the existing hard episode bound: host-owned waypoint
+            # actions consume the same semantic action slots as model actions.
             for _index in range(self.max_decisions):
                 if self._cancelled(context):
                     return self._outcome("stopped", False, "stopped")
@@ -524,100 +530,162 @@ class BlastEpisodeRuntimeAdapter:
                         "side_search_progress"
                     ] = dict(side_search_progress)
                 completion_allowed = self._completion_allowed(history)
-                result = planner.decide(ControllerActionContext(
-                    goal=context.request.goal,
-                    locale=context.request.locale,
-                    robot_id=ROBOT_ID,
-                    controller_id=CONTROLLER_ID,
-                    available_actions=available_actions,
-                    observation=observation,
-                    history=tuple(history[-12:]),
-                    completion_allowed=completion_allowed,
-                ))
-                if not isinstance(result, ControllerActionPlannerResult):
-                    raise BlastEpisodeError(
-                        "blast_planner_result_invalid",
-                        "BLAST planner returned an invalid result",
+                selects_detour_side = False
+                detour_origin_pose = None
+                if side_search_progress is None:
+                    result = planner.decide(ControllerActionContext(
+                        goal=context.request.goal,
+                        locale=context.request.locale,
+                        robot_id=ROBOT_ID,
+                        controller_id=CONTROLLER_ID,
+                        available_actions=available_actions,
+                        observation=observation,
+                        history=tuple(history[-12:]),
+                        completion_allowed=completion_allowed,
+                    ))
+                    if self._cancelled(context):
+                        return self._outcome("stopped", False, "stopped")
+                    if not isinstance(result, ControllerActionPlannerResult):
+                        raise BlastEpisodeError(
+                            "blast_planner_result_invalid",
+                            "BLAST planner returned an invalid result",
+                        )
+                    decision = result.decision
+                    action = decision.action
+                    assessment = decision.assessment
+                    plan = list(decision.plan)
+                    action_source = _PLANNER_ACTION_SOURCE
+                    selects_detour_side = (
+                        self._scan_is_current(history)
+                        and scan_allows_turn
+                        and action in (TURN_LEFT_90, TURN_RIGHT_90)
                     )
-                if self._cancelled(context):
-                    return self._outcome("stopped", False, "stopped")
-                decision = result.decision
-                selects_detour_side = (
-                    selected_detour_side is None
-                    and self._scan_is_current(history)
-                    and scan_allows_turn
-                    and decision.action in (TURN_LEFT_90, TURN_RIGHT_90)
-                )
-                detour_origin_pose = (
-                    motion_executor.pose if selects_detour_side else None
-                )
-                terminal_actions = (
-                    (COMPLETE, ABORT)
-                    if completion_allowed
-                    else (ABORT,)
-                )
-                if decision.action not in available_actions + terminal_actions:
-                    raise BlastEpisodeError(
-                        "blast_planner_action_invalid",
-                        "BLAST planner selected an unavailable action",
+                    detour_origin_pose = (
+                        motion_executor.pose if selects_detour_side else None
                     )
-                context.publish({
-                    "current_action": (
-                        None
-                        if decision.action in (COMPLETE, ABORT)
-                        else decision.action
-                    ),
-                    "plan": list(decision.plan),
-                    "model_latency_ms": result.latency_ms,
-                    "message": decision.utterance or decision.assessment,
-                    "obstacle": {
-                        "distance_mm": observation["sensors"].get(
-                            "distance_mm"
+                    terminal_actions = (
+                        (COMPLETE, ABORT)
+                        if completion_allowed
+                        else (ABORT,)
+                    )
+                    if action not in available_actions + terminal_actions:
+                        raise BlastEpisodeError(
+                            "blast_planner_action_invalid",
+                            "BLAST planner selected an unavailable action",
+                        )
+                    if selects_detour_side:
+                        fresh_observation = self._with_navigation_reference(
+                            self._observation(),
+                            episode_start_heading,
+                        )
+                        fresh_observation["odometry"] = (
+                            motion_executor.pose.to_dict()
+                        )
+                        if not (
+                            _side_search_heading_correlated(
+                                fresh_observation,
+                                motion_executor.pose,
+                            )
+                            and _navigation_body_matched(
+                                fresh_observation["sensors"]
+                            )
+                            and self._current_range_allows_rotation(
+                                fresh_observation
+                            )
+                        ):
+                            raise BlastEpisodeError(
+                                "blast_side_search_blocked",
+                                "BLAST side selection lost current motion "
+                                "safety evidence",
+                            )
+                        observation = fresh_observation
+                    context.publish({
+                        "current_action": (
+                            None if action in (COMPLETE, ABORT) else action
                         ),
-                        "observed_at_monotonic_ms": observation[
-                            "observed_at_monotonic_ms"
-                        ],
-                    },
-                })
-                if decision.action == COMPLETE:
-                    return self._outcome(
-                        "completed",
-                        True,
-                        decision.assessment,
-                    )
-                if decision.action == ABORT:
-                    return self._outcome(
-                        "planner_aborted",
-                        False,
-                        decision.assessment,
-                    )
+                        "plan": list(plan),
+                        "model_latency_ms": result.latency_ms,
+                        "message": decision.utterance or assessment,
+                        "obstacle": {
+                            "distance_mm": observation["sensors"].get(
+                                "distance_mm"
+                            ),
+                            "observed_at_monotonic_ms": observation[
+                                "observed_at_monotonic_ms"
+                            ],
+                        },
+                    })
+                    if action == COMPLETE:
+                        return self._outcome("completed", True, assessment)
+                    if action == ABORT:
+                        return self._outcome(
+                            "planner_aborted",
+                            False,
+                            assessment,
+                        )
+                else:
+                    action = side_search_progress["required_action"]
+                    assessment = None
+                    plan = []
+                    action_source = _HOST_SIDE_SEARCH_ACTION_SOURCE
+                    if action == ADVANCE:
+                        distance = side_search_progress[
+                            "distance_remaining_mm"
+                        ]
+                        if (
+                            previous_outbound_distance_mm is not None
+                            and distance >= previous_outbound_distance_mm
+                        ):
+                            raise BlastEpisodeError(
+                                "blast_side_search_not_progressing",
+                                "BLAST side-search motion did not reduce the "
+                                "waypoint distance",
+                            )
+                        previous_outbound_distance_mm = distance
+                    host_side_search_actions.append(action)
+                    context.publish({
+                        "current_action": action,
+                        "plan": [],
+                        "model_latency_ms": None,
+                        "message": (
+                            "Host follows the selected side-search waypoint: "
+                            f"{side_search_progress['phase']} / {action}"
+                        ),
+                        "obstacle": {
+                            "distance_mm": observation["sensors"].get(
+                                "distance_mm"
+                            ),
+                            "observed_at_monotonic_ms": observation[
+                                "observed_at_monotonic_ms"
+                            ],
+                        },
+                    })
                 scan_pose = (
                     motion_executor.pose
-                    if decision.action == SCAN_FRONT_ARC
+                    if action == SCAN_FRONT_ARC
                     else None
                 )
                 is_side_search_reorientation = (
                     side_search_progress is not None
                     and side_search_progress["phase"] == "REORIENT"
-                    and decision.action
-                    in (TURN_LEFT_90, TURN_RIGHT_90)
+                    and action in (TURN_LEFT_90, TURN_RIGHT_90)
                 )
                 is_side_search_rescan = (
                     side_search_progress is not None
                     and side_search_progress["phase"] == "RESCAN"
-                    and decision.action == SCAN_FRONT_ARC
+                    and action == SCAN_FRONT_ARC
                 )
                 if is_side_search_reorientation:
                     reorientation_attempted = True
                 try:
-                    if decision.action == SCAN_FRONT_ARC:
+                    if action == SCAN_FRONT_ARC:
                         command_result = self.controller.command(
                             "scan_front_arc",
                             cancel_requested=lambda: self._cancelled(context),
                         )
                     else:
                         execution = motion_executor.execute(
-                            decision.action,
+                            action,
                             cancel_requested=lambda: self._cancelled(context),
                         )
                         command_result = execution.controller_results[-1]
@@ -635,21 +703,22 @@ class BlastEpisodeRuntimeAdapter:
                     )
                 result_observation = command_result.get("observation")
                 history_item = {
-                    "action": decision.action,
-                    "assessment": decision.assessment,
-                    "plan": list(decision.plan),
+                    "action": action,
+                    "assessment": assessment,
+                    "plan": list(plan),
+                    "action_source": action_source,
                     "result_observation": result_observation,
                     "observation_settled": command_result.get(
                         "observation_settled"
                     ),
                 }
-                if decision.action in ACTION_COMMANDS:
+                if action in ACTION_COMMANDS:
                     history_item["motion"] = execution.motion.to_dict()
                     history_item["pose"] = execution.pose.to_dict()
                     if selects_detour_side and execution.motion.complete:
                         selected_detour_side = (
                             "LEFT"
-                            if decision.action == TURN_LEFT_90
+                            if action == TURN_LEFT_90
                             else "RIGHT"
                         )
                         side_search_waypoint = _side_search_waypoint(
@@ -660,7 +729,7 @@ class BlastEpisodeRuntimeAdapter:
                 scan = command_result.get("scan")
                 planar_projection = None
                 if (
-                    decision.action == SCAN_FRONT_ARC
+                    action == SCAN_FRONT_ARC
                     and not isinstance(scan, Mapping)
                 ):
                     raise BlastEpisodeError(
@@ -730,7 +799,7 @@ class BlastEpisodeRuntimeAdapter:
                         }
                 history.append(history_item)
                 update = {
-                    "current_action": decision.action,
+                    "current_action": action,
                     "obstacle": {
                         "distance_mm": (
                             result_observation.get("distance_mm")
@@ -747,6 +816,21 @@ class BlastEpisodeRuntimeAdapter:
                         )
                     update["scan"] = diagnostic_scan
                 context.publish(update)
+                if self._cancelled(context):
+                    return self._outcome("stopped", False, "stopped")
+                if (
+                    (
+                        action_source == _HOST_SIDE_SEARCH_ACTION_SOURCE
+                        or selects_detour_side
+                    )
+                    and action in ACTION_COMMANDS
+                    and execution.motion.complete is not True
+                ):
+                    return self._outcome(
+                        "side_search_motion_incomplete",
+                        False,
+                        "Host side-search motion was incomplete",
+                    )
                 if is_side_search_rescan:
                     side_scan_view = latest_scan_view
                     if not (
@@ -793,6 +877,10 @@ class BlastEpisodeRuntimeAdapter:
                         "frame": "EPISODE_LOCAL_ODOMETRY",
                         "quality": "PROVISIONAL_YAW_ONLY",
                         "selected_side": selected_detour_side,
+                        "strategy_source": _PLANNER_ACTION_SOURCE,
+                        "execution_source": _HOST_SIDE_SEARCH_ACTION_SOURCE,
+                        "host_action_count": len(host_side_search_actions),
+                        "host_action_trace": list(host_side_search_actions),
                         "viewpoint_separation_mm": separation,
                         "object_association_proven": False,
                         "clearance_proven": False,
