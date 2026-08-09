@@ -64,6 +64,7 @@ def scan_result(*, center_distance_mm=500.0):
                     if distance_mm == 2_000
                     else RANGE_STATE_MEASURED
                 ),
+                "body_motor_angle_deg": 158,
             }
             for side, distance_mm in distances
         ],
@@ -86,7 +87,7 @@ class FakeController:
                     "left_drive": 0,
                     "right_drive": 0,
                     "claw": 0,
-                    "body": 0,
+                    "body": 158,
                 },
                 "imu": {"ready": True, "heading_deg": 0},
             },
@@ -391,7 +392,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 )
                 if command == "scan_front_arc":
                     result["scan"]["schema"] = (
-                        "blast-scan-front-arc/v1"
+                        "blast-scan-front-arc/v2"
                     )
                 return result
 
@@ -449,6 +450,44 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(rejected.exception.code, "blast_scan_result_invalid")
         self.assertEqual(controller.commands, ["scan_front_arc"])
         self.assertEqual(len(planner.contexts), 1)
+
+    def test_scan_with_off_reference_body_pose_is_rejected(self):
+        class OffPoseScanController(FakeScanController):
+            mismatch_location = "ray"
+
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    if self.mismatch_location == "ray":
+                        result["scan"]["rays"][2][
+                            "body_motor_angle_deg"
+                        ] = 159
+                    else:
+                        result["observation"]["motor_angles_deg"][
+                            "body"
+                        ] = 159
+                return result
+
+        for mismatch_location in ("ray", "final"):
+            with self.subTest(mismatch_location=mismatch_location):
+                controller = OffPoseScanController()
+                controller.mismatch_location = mismatch_location
+                planner = Planner([decision(SCAN_FRONT_ARC)])
+
+                with self.assertRaises(BlastEpisodeError) as rejected:
+                    self.adapter(controller, planner).run(
+                        episode_context()[0]
+                    )
+
+                self.assertEqual(
+                    rejected.exception.code,
+                    "blast_scan_sensor_pose_unverified",
+                )
+                self.assertEqual(controller.commands, ["scan_front_arc"])
+                self.assertEqual(len(planner.contexts), 1)
 
     def test_restored_scan_residue_reanchors_before_semantic_turn(self):
         class ResidualScanController(FakeScanController):

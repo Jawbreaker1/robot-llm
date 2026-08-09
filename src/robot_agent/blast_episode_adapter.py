@@ -14,7 +14,7 @@ from .blast_observation_monitor import (
     CONTROLLER_ID,
     ROBOT_ID,
     BlastControllerError,
-    validate_blast_scan_range_contract,
+    validate_blast_scan_ray_contract,
 )
 from .blast_navigation_action_profile import BLAST_NAVIGATION_COMMANDS
 from .blast_navigation_motion_execution import (
@@ -430,12 +430,38 @@ class BlastEpisodeRuntimeAdapter:
                     )
                 if isinstance(scan, Mapping):
                     try:
-                        scan = validate_blast_scan_range_contract(scan)
+                        scan = validate_blast_scan_ray_contract(scan)
                     except ValueError:
                         raise BlastEpisodeError(
                             "blast_scan_result_invalid",
                             "BLAST returned an invalid scan result",
                         ) from None
+                    sensor = (
+                        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+                        .range_sensor_extrinsics
+                    )
+                    final_motors = (
+                        result_observation.get("motor_angles_deg")
+                        if isinstance(result_observation, Mapping)
+                        else None
+                    )
+                    body_angles = [
+                        ray["body_motor_angle_deg"]
+                        for ray in scan["rays"]
+                    ] + [
+                        final_motors.get("body")
+                        if isinstance(final_motors, Mapping)
+                        else None
+                    ]
+                    if not all(
+                        sensor.matches_navigation_body_angle(value)
+                        for value in body_angles
+                    ):
+                        raise BlastEpisodeError(
+                            "blast_scan_sensor_pose_unverified",
+                            "BLAST scan body encoder did not match its "
+                            "provisional navigation reference",
+                        )
                     history_item["odometry_reanchored_after_scan"] = (
                         motion_executor.reanchor_after_restored_scan(
                             command_result

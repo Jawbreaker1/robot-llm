@@ -34,7 +34,7 @@ POST_MOTION_DISTANCE_RANGE_MM = 5.0
 POST_MOTION_TILT_RANGE_DEG = 1.0
 COMMAND_RESULT_SCHEMA = "controller-command-result/v1"
 SCAN_COMMAND = "scan_front_arc"
-SCAN_RESULT_SCHEMA = "blast-scan-front-arc/v2"
+SCAN_RESULT_SCHEMA = "blast-scan-front-arc/v3"
 SCAN_RESTORATION_TOLERANCE_DEG = 5.0
 PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM = 2_000
 RANGE_STATE_MEASURED = "MEASURED"
@@ -92,8 +92,22 @@ def blast_range_state(distance_mm):
     return RANGE_STATE_MEASURED
 
 
-def validate_blast_scan_range_contract(scan):
-    """Validate only the ray order and explicit range-state contract."""
+def _body_motor_angle(observation):
+    motor_angles = (
+        observation.get("motor_angles_deg")
+        if isinstance(observation, Mapping)
+        else None
+    )
+    value = (
+        motor_angles.get("body")
+        if isinstance(motor_angles, Mapping)
+        else None
+    )
+    return value if type(value) is int else None
+
+
+def validate_blast_scan_ray_contract(scan):
+    """Validate ray order, range state, and body-angle telemetry."""
 
     if not isinstance(scan, Mapping) or scan.get("schema") != (
         SCAN_RESULT_SCHEMA
@@ -108,8 +122,15 @@ def validate_blast_scan_range_contract(scan):
         )
         != SCAN_RAY_SIDES
         or any(
-            ray.get("range_state") != blast_range_state(
-                ray.get("distance_mm")
+            (
+                ray.get("range_state") != blast_range_state(
+                    ray.get("distance_mm")
+                )
+                or "body_motor_angle_deg" not in ray
+                or (
+                    ray.get("body_motor_angle_deg") is not None
+                    and type(ray.get("body_motor_angle_deg")) is not int
+                )
             )
             for ray in rays
         )
@@ -551,6 +572,7 @@ class BlastObservationMonitor:
             "side": side,
             "distance_mm": distance_mm,
             "range_state": blast_range_state(distance_mm),
+            "body_motor_angle_deg": _body_motor_angle(observation),
             "heading_deg": heading,
             "relative_heading_deg": cls._scan_heading_delta(
                 heading,

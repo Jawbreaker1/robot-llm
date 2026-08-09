@@ -30,6 +30,7 @@ class BlastRangeSensorExtrinsics:
     yaw_mdeg: Optional[int]
     calibration_status: str
     calibration_evidence: str
+    navigation_body_motor_angle_deg: Optional[int] = None
 
     def __post_init__(self) -> None:
         values = (
@@ -49,6 +50,12 @@ class BlastRangeSensorExtrinsics:
                 or not -180_000 <= yaw <= 179_999
             ):
                 raise ValueError("BLAST range-sensor extrinsics are invalid")
+        angle = self.navigation_body_motor_angle_deg
+        if angle is not None and (
+            type(angle) is not int
+            or not -1_000_000 <= angle <= 1_000_000
+        ):
+            raise ValueError("BLAST navigation body reference is invalid")
         if not _text(self.calibration_status) or not _text(
             self.calibration_evidence
         ):
@@ -57,6 +64,19 @@ class BlastRangeSensorExtrinsics:
     @property
     def complete(self) -> bool:
         return self.forward_offset_mm is not None
+
+    @property
+    def navigation_body_reference_complete(self) -> bool:
+        return self.navigation_body_motor_angle_deg is not None
+
+    def matches_navigation_body_angle(self, value: object) -> bool:
+        if (
+            not self.navigation_body_reference_complete
+            or type(value) is not int
+        ):
+            return False
+        assert self.navigation_body_motor_angle_deg is not None
+        return value == self.navigation_body_motor_angle_deg
 
 
 @dataclass(frozen=True)
@@ -148,8 +168,11 @@ BLAST_PROVISIONAL_NAVIGATION_CALIBRATION = BlastNavigationCalibration(
         calibration_status="measured-approximate-navigation-pose",
         calibration_evidence=(
             "Operator folding-rule measurement to the ultrasonic face "
-            "centre with the left arm in navigation pose"
+            "centre with the left arm in navigation pose; the body encoder "
+            "remained exactly 158 degrees across a hub power cycle while "
+            "the operator confirmed the sensor still faced nearly forward"
         ),
+        navigation_body_motor_angle_deg=158,
     ),
     evidence_id=BLAST_NAVIGATION_EVIDENCE_ID,
 )

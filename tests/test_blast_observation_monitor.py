@@ -52,7 +52,7 @@ class FakeRuntime:
                 "heading_deg": 12,
                 "raw_tilt_deg": [0.0, 0.0],
             },
-            "motor_angles_deg": {"left_drive": 10},
+            "motor_angles_deg": {"left_drive": 10, "body": 158},
             "motion_active": moving,
             "color": "Color.WHITE",
             "distance_mm": 321,
@@ -301,6 +301,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 RANGE_STATE_MEASURED,
                 RANGE_STATE_NO_VALID_DISTANCE,
             ],
+        )
+        self.assertEqual(
+            [ray["body_motor_angle_deg"] for ray in scan["rays"]],
+            [158] * 5,
         )
         self.assertEqual(
             [ray["relative_heading_deg"] for ray in scan["rays"]],

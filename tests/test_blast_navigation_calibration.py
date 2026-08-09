@@ -48,9 +48,14 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
                 sensor.forward_offset_mm,
                 sensor.left_offset_mm,
                 sensor.yaw_mdeg,
+                sensor.navigation_body_motor_angle_deg,
             ),
-            (110, 80, 0),
+            (110, 80, 0, 158),
         )
+        self.assertTrue(sensor.matches_navigation_body_angle(158))
+        for value in (157, 159, None, True):
+            with self.subTest(value=value):
+                self.assertFalse(sensor.matches_navigation_body_angle(value))
         self.assertTrue(calibration.complete)
 
     def test_partial_range_sensor_measurement_is_rejected(self):
@@ -62,6 +67,21 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
                 calibration_status="test",
                 calibration_evidence="partial fixture",
             )
+
+    def test_invalid_navigation_body_reference_is_rejected(self):
+        for value in (True, 1_000_001):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError,
+                "body reference is invalid",
+            ):
+                BlastRangeSensorExtrinsics(
+                    forward_offset_mm=100,
+                    left_offset_mm=50,
+                    yaw_mdeg=0,
+                    calibration_status="test",
+                    calibration_evidence="invalid body fixture",
+                    navigation_body_motor_angle_deg=value,
+                )
 
     def test_complete_fixture_can_cross_the_activation_gate(self):
         footprint = RobotFootprint(
@@ -229,6 +249,15 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
             ],
             "not measured",
         )
+        body_reference = evidence["geometry"][
+            "range_sensor_extrinsics"
+        ]["navigation_body_motor_reference"]
+        self.assertEqual(
+            body_reference["angle_deg"],
+            calibration.range_sensor_extrinsics
+            .navigation_body_motor_angle_deg,
+        )
+        self.assertEqual(body_reference["tolerance_deg"], 0)
 
 
 if __name__ == "__main__":

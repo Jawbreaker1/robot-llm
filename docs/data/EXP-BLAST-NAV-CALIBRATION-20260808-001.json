@@ -117,6 +117,22 @@
         "left_offset_mm": 80,
         "yaw_mdeg": 0
       },
+      "navigation_body_motor_reference": {
+        "observed_at_local_date": "2026-08-09",
+        "angle_deg": 158,
+        "tolerance_deg": 0,
+        "basis": "provisional accumulated encoder reference for the current build",
+        "operator_observation": "Sensor faced nearly straight forward",
+        "power_cycle_validation": {
+          "angle_before_deg": 158,
+          "angle_after_deg": 158,
+          "distance_before_mm": 345,
+          "distance_after_mm": 345,
+          "drive_angles_unchanged": true,
+          "chassis_rear_tilt_deg_approx": 2.6
+        },
+        "limitation": "Not a mechanical home; manual linkage movement or rebuilding invalidates this reference"
+      },
       "centre_height_mm_approx": 205,
       "vertical_pitch": "not measured",
       "mount_note": "Ultrasonic sensor is mounted beneath the movable left arm"
@@ -128,6 +144,7 @@
     "Actual-encoder turn scale is provisional evidence from one physical left/right reference pair",
     "Footprint and range-sensor extrinsics are approximate folding-rule measurements",
     "Ultrasonic vertical pitch remains unmeasured and body pitch varies with the support wheels",
-    "This evidence record is not consumed by the runtime"
+    "The navigation body-motor reference is provisional and has not been validated after moving away and returning to the pose",
+    "The runtime consumes selected typed values, but this evidence remains provisional"
   ]
 }
