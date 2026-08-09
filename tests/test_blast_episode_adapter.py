@@ -26,6 +26,7 @@ from robot_agent.lm_studio_controller_action import (
 from robot_agent.physical_navigation_contract import (
     SCAN_FRONT_ARC,
     TURN_LEFT_90,
+    TURN_RIGHT_90,
     PhysicalNavigationContractError,
 )
 from robot_agent.physical_odometry import PhysicalPose
@@ -600,27 +601,39 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             95_060,
         )
 
-    def test_scan_guided_side_search_reaches_one_bounded_position(self):
+    def test_scan_guided_side_search_collects_second_viewpoint(self):
         for action, side in (
             (TURN_LEFT_90, "LEFT"),
-            ("TURN_RIGHT_90", "RIGHT"),
+            (TURN_RIGHT_90, "RIGHT"),
         ):
             with self.subTest(action=action):
                 controller = FakeScanController(1_000)
+                restore_action = (
+                    TURN_RIGHT_90
+                    if action == TURN_LEFT_90
+                    else TURN_LEFT_90
+                )
                 planner = Planner([
                     decision(SCAN_FRONT_ARC),
                     decision(action),
                     *(decision("ADVANCE") for _index in range(5)),
+                    decision(restore_action),
+                    decision(SCAN_FRONT_ARC),
                 ])
+                context, updates = episode_context()
 
-                result = self.adapter(controller, planner).run(
-                    episode_context()[0]
+                result = self.adapter(
+                    controller,
+                    planner,
+                    max_decisions=9,
+                ).run(
+                    context
                 )
 
                 self.assertFalse(result.completed)
                 self.assertEqual(
                     result.terminal_reason,
-                    "side_search_position_reached",
+                    "side_search_observation_collected",
                 )
                 self.assertNotIn(
                     "navigation_intent",
@@ -645,13 +658,62 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     ]["phase"],
                     "OUTBOUND",
                 )
-                self.assertEqual(len(planner.contexts), 7)
+                self.assertEqual(
+                    planner.contexts[7].available_actions,
+                    (restore_action,),
+                )
+                self.assertEqual(
+                    planner.contexts[7].observation["navigation_intent"][
+                        "side_search_progress"
+                    ]["phase"],
+                    "REORIENT",
+                )
+                self.assertEqual(
+                    planner.contexts[8].available_actions,
+                    (SCAN_FRONT_ARC,),
+                )
+                self.assertEqual(
+                    planner.contexts[8].observation["navigation_intent"][
+                        "side_search_progress"
+                    ]["phase"],
+                    "RESCAN",
+                )
+                self.assertEqual(len(planner.contexts), 9)
                 self.assertEqual(
                     controller.commands,
                     ["scan_front_arc"]
                     + list(ACTION_COMMANDS[action])
-                    + ["drive_forward"] * 5,
+                    + ["drive_forward"] * 5
+                    + list(ACTION_COMMANDS[restore_action])
+                    + ["scan_front_arc"],
                 )
+                multi_view = updates[-1]["scan"][
+                    "multi_view_observations"
+                ]
+                self.assertGreaterEqual(
+                    multi_view["viewpoint_separation_mm"],
+                    190,
+                )
+                self.assertFalse(multi_view["object_association_proven"])
+                self.assertFalse(multi_view["clearance_proven"])
+                self.assertFalse(multi_view["passage_proven"])
+                self.assertFalse(multi_view["route_eligible"])
+                self.assertEqual(len(multi_view["views"]), 2)
+                self.assertIsNot(updates[-1]["scan"], updates[-2]["scan"])
+                origin_history_scan = planner.contexts[1].history[0]["scan"]
+                origin_view_scan = multi_view["views"][0]["scan"]
+                self.assertIsNot(origin_view_scan, origin_history_scan)
+                origin_history_scan["rays"][0]["distance_mm"] = 1
+                self.assertNotEqual(
+                    origin_view_scan["rays"][0]["distance_mm"],
+                    1,
+                )
+                runtime_update = None
+                for update in updates:
+                    runtime_update = RobotRuntimeUpdate.from_mapping(
+                        update,
+                        runtime_update,
+                    )
 
     def test_side_search_waypoint_uses_pre_turn_pose_frame(self):
         pose = PhysicalPose(x_mm=100, y_mm=-50, heading_mdeg=90_000)
@@ -673,6 +735,163 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertIs(left["clearance_proven"], False)
         self.assertEqual(left["origin_pose"], pose.to_dict())
         self.assertEqual(right["origin_pose"], pose.to_dict())
+
+    def test_side_search_requires_measured_rotation_clearance_at_waypoint(self):
+        class NoRangeAtWaypointController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if self.commands.count("drive_forward") == 5:
+                    result["observation"]["distance_mm"] = 2_000
+                    self.snapshot_value["observation"] = result["observation"]
+                return result
+
+        controller = NoRangeAtWaypointController(1_000)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+            *(decision("ADVANCE") for _index in range(5)),
+        ])
+
+        with self.assertRaises(BlastEpisodeError) as raised:
+            self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertEqual(raised.exception.code, "blast_side_search_blocked")
+        self.assertNotIn("turn_right", controller.commands)
+        self.assertEqual(len(planner.contexts), 7)
+
+    def test_side_search_does_not_retry_incomplete_reorientation(self):
+        class UndertravelController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "turn_right":
+                    before = result["receipt"]["before_angles_deg"]
+                    motors = result["observation"]["motor_angles_deg"]
+                    motors["left_drive"] = before["left_drive"] + 10
+                    motors["right_drive"] = before["right_drive"] - 10
+                    self.snapshot_value["observation"] = result["observation"]
+                return result
+
+        controller = UndertravelController(1_000)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+            *(decision("ADVANCE") for _index in range(5)),
+            decision(TURN_RIGHT_90),
+        ])
+
+        with self.assertRaises(BlastEpisodeError) as raised:
+            self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertEqual(raised.exception.code, "blast_side_search_blocked")
+        self.assertEqual(controller.commands.count("turn_right"), 4)
+        self.assertNotIn("scan_front_arc", controller.commands[1:])
+
+    def test_side_search_rechecks_range_after_reorientation(self):
+        for distance in (2_000, None, 40):
+            with self.subTest(distance=distance):
+                class BlockedAfterTurnController(FakeScanController):
+                    def command(self, command, *, cancel_requested=None):
+                        result = super().command(
+                            command,
+                            cancel_requested=cancel_requested,
+                        )
+                        if self.commands.count("turn_right") == 4:
+                            result["observation"]["distance_mm"] = distance
+                            self.snapshot_value["observation"] = (
+                                result["observation"]
+                            )
+                        return result
+
+                controller = BlockedAfterTurnController(1_000)
+                planner = Planner([
+                    decision(SCAN_FRONT_ARC),
+                    decision(TURN_LEFT_90),
+                    *(decision("ADVANCE") for _index in range(5)),
+                    decision(TURN_RIGHT_90),
+                ])
+
+                with self.assertRaises(BlastEpisodeError) as raised:
+                    self.adapter(controller, planner).run(
+                        episode_context()[0]
+                    )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    "blast_side_search_blocked",
+                )
+                self.assertEqual(
+                    controller.commands.count("scan_front_arc"),
+                    1,
+                )
+
+    def test_side_search_requires_projection_ready_second_scan(self):
+        class UnsettledSecondScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if (
+                    command == "scan_front_arc"
+                    and self.commands.count("scan_front_arc") == 2
+                ):
+                    result["scan"]["all_observations_settled"] = False
+                return result
+
+        controller = UnsettledSecondScanController(1_000)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+            *(decision("ADVANCE") for _index in range(5)),
+            decision(TURN_RIGHT_90),
+            decision(SCAN_FRONT_ARC),
+        ])
+
+        result = self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(
+            result.terminal_reason,
+            "side_search_observation_unavailable",
+        )
+        self.assertEqual(controller.commands.count("scan_front_arc"), 2)
+
+    def test_unprojectable_current_scan_cannot_reuse_an_older_view(self):
+        class UnsettledSecondScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if (
+                    command == "scan_front_arc"
+                    and self.commands.count("scan_front_arc") == 2
+                ):
+                    result["scan"]["all_observations_settled"] = False
+                return result
+
+        controller = UnsettledSecondScanController(1_000)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision("ADVANCE"),
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+
+        with self.assertRaises(BlastEpisodeError) as raised:
+            self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertEqual(raised.exception.code, "blast_planner_action_invalid")
+        self.assertEqual(
+            controller.commands,
+            ["scan_front_arc", "drive_forward", "scan_front_arc"],
+        )
 
     def test_side_search_progress_is_derived_from_pose_and_scan(self):
         for side, outbound_heading in (
@@ -698,8 +917,38 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 )["required_action"])
                 self.assertEqual(
                     _side_search_progress(reached_pose, waypoint)["phase"],
-                    "REACHED",
+                    "REORIENT",
                 )
+                restored_pose = PhysicalPose(
+                    x_mm=waypoint["target_x_mm"],
+                    y_mm=waypoint["target_y_mm"],
+                    heading_mdeg=waypoint["origin_pose"]["heading_mdeg"],
+                )
+                self.assertEqual(
+                    _side_search_progress(
+                        restored_pose,
+                        waypoint,
+                        reorientation_attempted=True,
+                    )["phase"],
+                    "RESCAN",
+                )
+                without_turn = _side_search_progress(
+                    restored_pose,
+                    waypoint,
+                )
+                self.assertEqual(without_turn["phase"], "REORIENT")
+                self.assertIsNone(without_turn["required_action"])
+                moved_after_turn = _side_search_progress(
+                    PhysicalPose(
+                        x_mm=restored_pose.x_mm + 100,
+                        y_mm=restored_pose.y_mm,
+                        heading_mdeg=restored_pose.heading_mdeg,
+                    ),
+                    waypoint,
+                    reorientation_attempted=True,
+                )
+                self.assertEqual(moved_after_turn["phase"], "BLOCKED")
+                self.assertIsNone(moved_after_turn["required_action"])
         left = _side_search_waypoint(PhysicalPose(), "LEFT")
         self.assertIsNone(_side_search_progress(
             PhysicalPose(y_mm=300, heading_mdeg=90_000),

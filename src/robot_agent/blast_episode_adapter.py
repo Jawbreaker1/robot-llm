@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import threading
 import time
@@ -93,6 +94,7 @@ def _side_search_waypoint(pose: PhysicalPose, side: str):
     local_left_y = math.cos(heading_radians)
     return {
         "kind": "SIDE_SEARCH",
+        "selected_side": side,
         "scope": "SEARCH_POSITION_ONLY",
         "clearance_proven": False,
         "frame": "EPISODE_LOCAL_ODOMETRY",
@@ -113,8 +115,10 @@ def _side_search_waypoint(pose: PhysicalPose, side: str):
 def _side_search_progress(
     pose: PhysicalPose,
     waypoint: Mapping[str, object],
+    *,
+    reorientation_attempted: bool = False,
 ):
-    """Derive one bounded action toward the model-selected search side."""
+    """Derive one bounded action for the selected side observation pose."""
 
     distance = _side_search_distance(pose, waypoint)
     target_heading = waypoint["target_heading_mdeg"]
@@ -122,14 +126,44 @@ def _side_search_progress(
         target_heading - pose.heading_mdeg
     )
     required_action = None
-    phase = "REACHED"
-    if distance > waypoint["position_tolerance_mm"]:
+    phase = "BLOCKED"
+    origin_heading = waypoint["origin_pose"]["heading_mdeg"]
+    origin_heading_error = normalize_heading_mdeg(
+        origin_heading - pose.heading_mdeg
+    )
+    if reorientation_attempted:
+        if (
+            distance <= waypoint["position_tolerance_mm"]
+            and abs(origin_heading_error)
+            <= _SIDE_SEARCH_HEADING_TOLERANCE_MDEG
+        ):
+            phase = "RESCAN"
+            heading_error = origin_heading_error
+            required_action = SCAN_FRONT_ARC
+    elif distance > waypoint["position_tolerance_mm"]:
         phase = "OUTBOUND"
         if abs(heading_error) <= _SIDE_SEARCH_HEADING_TOLERANCE_MDEG:
             if _side_search_distance(
                 _blast_nominal_pose(pose, ADVANCE), waypoint
             ) < distance:
                 required_action = ADVANCE
+    else:
+        phase = "REORIENT"
+        heading_error = origin_heading_error
+        action = (
+            TURN_RIGHT_90
+            if waypoint["selected_side"] == "LEFT"
+            else TURN_LEFT_90
+        )
+        projected = _blast_nominal_pose(pose, action)
+        projected_error = normalize_heading_mdeg(
+            origin_heading - projected.heading_mdeg
+        )
+        if (
+            abs(projected_error) < abs(heading_error)
+            and abs(projected_error) <= _SIDE_SEARCH_HEADING_TOLERANCE_MDEG
+        ):
+            required_action = action
     return {
         "phase": phase,
         "distance_remaining_mm": distance,
@@ -164,6 +198,18 @@ def _navigation_body_matched(sensors) -> bool:
         BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics
         .matches_navigation_body_angle(angle)
     )
+
+
+def _minimum_rotation_clearance_mm() -> int:
+    footprint, sensor = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    )
+    assert sensor.forward_offset_mm is not None
+    return max(0, math.ceil(
+        footprint.maximum_corner_radius_mm
+        + footprint.clearance_margin_mm
+        - sensor.forward_offset_mm
+    ))
 
 
 class BlastEpisodeError(RuntimeError):
@@ -286,16 +332,17 @@ class BlastEpisodeRuntimeAdapter:
             and rays[0].get("range_state") == RANGE_STATE_MEASURED
         ):
             return False
-        footprint, sensor = (
-            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+        return (
+            float(rays[0]["distance_mm"])
+            > _minimum_rotation_clearance_mm()
         )
-        assert sensor.forward_offset_mm is not None
-        minimum = math.ceil(
-            footprint.maximum_corner_radius_mm
-            + footprint.clearance_margin_mm
-            - sensor.forward_offset_mm
-        )
-        return float(rays[0]["distance_mm"]) > max(0, minimum)
+
+    @staticmethod
+    def _current_range_allows_rotation(observation) -> bool:
+        distance = observation["sensors"].get("distance_mm")
+        if blast_range_state(distance) != RANGE_STATE_MEASURED:
+            return False
+        return float(distance) > _minimum_rotation_clearance_mm()
 
     @classmethod
     def _completion_allowed(cls, history) -> bool:
@@ -381,6 +428,9 @@ class BlastEpisodeRuntimeAdapter:
         motion_executor = None
         selected_detour_side = None
         side_search_waypoint = None
+        latest_scan_view = None
+        origin_scan_view = None
+        reorientation_attempted = False
         try:
             planner = self.planner_factory(context.settings.model)
             if not callable(getattr(planner, "decide", None)):
@@ -410,6 +460,7 @@ class BlastEpisodeRuntimeAdapter:
                     side_search_progress = _side_search_progress(
                         motion_executor.pose,
                         side_search_waypoint,
+                        reorientation_attempted=reorientation_attempted,
                     )
                     observation["navigation_intent"] = {
                         "selected_detour_side_relative_to_scan": (
@@ -423,24 +474,13 @@ class BlastEpisodeRuntimeAdapter:
                         )
                         and _navigation_body_matched(observation["sensors"])
                     )
-                    if side_search_progress["phase"] == "REACHED":
-                        if not evidence_correlated:
-                            raise BlastEpisodeError(
-                                "blast_side_search_blocked",
-                                "BLAST side-search evidence is not correlated",
-                            )
-                        return self._outcome(
-                            "side_search_position_reached",
-                            False,
-                            "Side-search position reached; passage is not proven",
-                        )
                 available_actions = self._available_actions(
                     observation,
                     history,
                 )
                 scan_allows_turn = self._current_scan_allows_quarter_turn(
                     history
-                )
+                ) and latest_scan_view is not None
                 if self._scan_is_current(history) and not scan_allows_turn:
                     available_actions = tuple(
                         action for action in available_actions
@@ -458,6 +498,12 @@ class BlastEpisodeRuntimeAdapter:
                             or ADVANCE not in available_actions
                         ):
                             required_action = None
+                    if required_action in (
+                        TURN_LEFT_90,
+                        TURN_RIGHT_90,
+                        SCAN_FRONT_ARC,
+                    ) and not self._current_range_allows_rotation(observation):
+                        required_action = None
                     if required_action not in available_actions:
                         raise BlastEpisodeError(
                             "blast_side_search_blocked",
@@ -541,6 +587,19 @@ class BlastEpisodeRuntimeAdapter:
                     if decision.action == SCAN_FRONT_ARC
                     else None
                 )
+                is_side_search_reorientation = (
+                    side_search_progress is not None
+                    and side_search_progress["phase"] == "REORIENT"
+                    and decision.action
+                    in (TURN_LEFT_90, TURN_RIGHT_90)
+                )
+                is_side_search_rescan = (
+                    side_search_progress is not None
+                    and side_search_progress["phase"] == "RESCAN"
+                    and decision.action == SCAN_FRONT_ARC
+                )
+                if is_side_search_reorientation:
+                    reorientation_attempted = True
                 try:
                     if decision.action == SCAN_FRONT_ARC:
                         command_result = self.controller.command(
@@ -588,6 +647,7 @@ class BlastEpisodeRuntimeAdapter:
                             detour_origin_pose,
                             selected_detour_side,
                         )
+                        origin_scan_view = latest_scan_view
                 scan = command_result.get("scan")
                 planar_projection = None
                 if (
@@ -599,6 +659,7 @@ class BlastEpisodeRuntimeAdapter:
                         "BLAST returned an invalid scan result",
                     )
                 if isinstance(scan, Mapping):
+                    latest_scan_view = None
                     try:
                         scan = validate_blast_scan_ray_contract(scan)
                     except ValueError:
@@ -647,6 +708,17 @@ class BlastEpisodeRuntimeAdapter:
                     except ValueError:
                         planar_projection = None
                     history_item["scan"] = scan
+                    if (
+                        planar_projection is not None
+                        and command_result.get("observation_settled") is True
+                    ):
+                        latest_scan_view = {
+                            "scan_pose": scan_pose.to_dict(),
+                            "scan": copy.deepcopy(scan),
+                            "planar_projection": copy.deepcopy(
+                                planar_projection
+                            ),
+                        }
                 history.append(history_item)
                 update = {
                     "current_action": decision.action,
@@ -666,6 +738,65 @@ class BlastEpisodeRuntimeAdapter:
                         )
                     update["scan"] = diagnostic_scan
                 context.publish(update)
+                if is_side_search_rescan:
+                    side_scan_view = latest_scan_view
+                    if not (
+                        origin_scan_view is not None
+                        and side_scan_view is not None
+                        and side_scan_view is not origin_scan_view
+                        and _side_search_heading_correlated(
+                            self._with_navigation_reference(
+                                {"sensors": result_observation},
+                                episode_start_heading,
+                            ),
+                            motion_executor.pose,
+                        )
+                        and _navigation_body_matched(result_observation)
+                    ):
+                        return self._outcome(
+                            "side_search_observation_unavailable",
+                            False,
+                            "Side observation could not be correlated",
+                        )
+                    origin_pose = origin_scan_view["scan_pose"]
+                    side_pose = side_scan_view["scan_pose"]
+                    separation = int(round(math.hypot(
+                        side_pose["x_mm"] - origin_pose["x_mm"],
+                        side_pose["y_mm"] - origin_pose["y_mm"],
+                    )))
+                    stride = int(round(math.hypot(
+                        side_search_waypoint["target_x_mm"]
+                        - origin_pose["x_mm"],
+                        side_search_waypoint["target_y_mm"]
+                        - origin_pose["y_mm"],
+                    )))
+                    if separation < (
+                        stride - _SIDE_SEARCH_POSITION_TOLERANCE_MM
+                    ):
+                        return self._outcome(
+                            "side_search_observation_unavailable",
+                            False,
+                            "Side observation viewpoints were not distinct",
+                        )
+                    final_scan = copy.deepcopy(diagnostic_scan)
+                    final_scan["multi_view_observations"] = {
+                        "schema": "blast-multi-view-scan-observations/v1",
+                        "frame": "EPISODE_LOCAL_ODOMETRY",
+                        "quality": "PROVISIONAL_YAW_ONLY",
+                        "selected_side": selected_detour_side,
+                        "viewpoint_separation_mm": separation,
+                        "object_association_proven": False,
+                        "clearance_proven": False,
+                        "passage_proven": False,
+                        "route_eligible": False,
+                        "views": [origin_scan_view, side_scan_view],
+                    }
+                    context.publish({"scan": final_scan})
+                    return self._outcome(
+                        "side_search_observation_collected",
+                        False,
+                        "Two scan viewpoints collected; passage is not proven",
+                    )
             return self._outcome(
                 "decision_budget_exhausted",
                 False,
