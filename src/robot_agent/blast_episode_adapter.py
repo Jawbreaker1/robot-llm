@@ -16,6 +16,9 @@ from .blast_observation_monitor import (
     BlastControllerError,
     validate_blast_scan_ray_contract,
 )
+from .blast_scan_planar_projection import (
+    project_blast_scan_planar_surfaces,
+)
 from .blast_navigation_action_profile import BLAST_NAVIGATION_COMMANDS
 from .blast_navigation_motion_execution import (
     BlastNavigationMotionExecutor,
@@ -372,6 +375,11 @@ class BlastEpisodeRuntimeAdapter:
                         False,
                         decision.assessment,
                     )
+                scan_pose = (
+                    motion_executor.pose
+                    if decision.action == SCAN_FRONT_ARC
+                    else None
+                )
                 try:
                     if decision.action == SCAN_FRONT_ARC:
                         command_result = self.controller.command(
@@ -420,6 +428,7 @@ class BlastEpisodeRuntimeAdapter:
                             selected_detour_side,
                         )
                 scan = command_result.get("scan")
+                planar_projection = None
                 if (
                     decision.action == SCAN_FRONT_ARC
                     and not isinstance(scan, Mapping)
@@ -467,6 +476,15 @@ class BlastEpisodeRuntimeAdapter:
                             command_result
                         )
                     )
+                    try:
+                        planar_projection = (
+                            project_blast_scan_planar_surfaces(
+                                scan=scan,
+                                scan_pose=scan_pose,
+                            )
+                        )
+                    except ValueError:
+                        planar_projection = None
                     history_item["scan"] = scan
                 history.append(history_item)
                 update = {
@@ -480,7 +498,12 @@ class BlastEpisodeRuntimeAdapter:
                     },
                 }
                 if isinstance(scan, Mapping):
-                    update["scan"] = scan
+                    diagnostic_scan = dict(scan)
+                    if planar_projection is not None:
+                        diagnostic_scan["planar_projection"] = (
+                            planar_projection
+                        )
+                    update["scan"] = diagnostic_scan
                 context.publish(update)
             return self._outcome(
                 "decision_budget_exhausted",

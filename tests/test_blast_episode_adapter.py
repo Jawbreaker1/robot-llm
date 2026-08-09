@@ -52,9 +52,16 @@ def scan_result(*, center_distance_mm=500.0):
         ("right_near", 1_200.0),
         ("right_far", 2_000.0),
     )
+    relative_headings = (0.0, -22.0, -45.0, 24.0, 47.0)
     return {
         "schema": SCAN_RESULT_SCHEMA,
+        "state": "complete",
+        "result": "restored",
+        "start_heading_deg": 0.0,
+        "final_heading_deg": 0.0,
+        "restoration_error_deg": 0.0,
         "restoration_verified": True,
+        "all_observations_settled": True,
         "rays": [
             {
                 "side": side,
@@ -65,8 +72,14 @@ def scan_result(*, center_distance_mm=500.0):
                     else RANGE_STATE_MEASURED
                 ),
                 "body_motor_angle_deg": 158,
+                "heading_deg": relative_heading,
+                "relative_heading_deg": relative_heading,
+                "observation_settled": True,
             }
-            for side, distance_mm in distances
+            for (side, distance_mm), relative_heading in zip(
+                distances,
+                relative_headings,
+            )
         ],
     }
 
@@ -362,9 +375,16 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 RANGE_STATE_NO_VALID_DISTANCE,
             ],
         )
+        runtime_scan = [
+            update["scan"] for update in updates if "scan" in update
+        ][0]
+        self.assertNotIn("planar_projection", scan)
+        projection = runtime_scan["planar_projection"]
+        self.assertEqual(projection["quality"], "PROVISIONAL_YAW_ONLY")
+        self.assertFalse(projection["vertical_pitch_compensated"])
         self.assertEqual(
-            [update["scan"] for update in updates if "scan" in update],
-            [scan],
+            [point["side"] for point in projection["points"]],
+            ["center", "left_near", "right_near"],
         )
         self.assertIn(
             SCAN_FRONT_ARC,
@@ -382,6 +402,12 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 "heading_error_deg": 2.0,
             },
         )
+        runtime_update = None
+        for update in updates:
+            runtime_update = RobotRuntimeUpdate.from_mapping(
+                update,
+                runtime_update,
+            )
 
     def test_legacy_scan_schema_is_rejected_before_replanning(self):
         class LegacyScanController(FakeScanController):
@@ -450,6 +476,37 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(rejected.exception.code, "blast_scan_result_invalid")
         self.assertEqual(controller.commands, ["scan_front_arc"])
         self.assertEqual(len(planner.contexts), 1)
+
+    def test_unprojectable_heading_keeps_raw_scan_for_replanning(self):
+        class InvalidHeadingController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    result["scan"]["rays"][1][
+                        "relative_heading_deg"
+                    ] = 22.0
+                return result
+
+        controller = InvalidHeadingController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(COMPLETE, assessment="Raw scan remains available."),
+        ])
+        context, updates = episode_context()
+
+        result = self.adapter(controller, planner).run(context)
+
+        self.assertTrue(result.completed)
+        self.assertEqual(controller.commands, ["scan_front_arc"])
+        self.assertEqual(len(planner.contexts), 2)
+        self.assertIn("scan", planner.contexts[1].history[0])
+        runtime_scan = [
+            update["scan"] for update in updates if "scan" in update
+        ][0]
+        self.assertNotIn("planar_projection", runtime_scan)
 
     def test_scan_with_off_reference_body_pose_is_rejected(self):
         class OffPoseScanController(FakeScanController):
