@@ -7,6 +7,9 @@ import threading
 import time
 from typing import Callable, Mapping
 
+from .blast_navigation_calibration import (
+    BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
+)
 from .blast_observation_monitor import (
     CONTROLLER_ID,
     ROBOT_ID,
@@ -29,6 +32,7 @@ from .physical_navigation_contract import (
     TURN_LEFT_90,
     TURN_RIGHT_90,
 )
+from .physical_odometry import PhysicalPose, normalize_heading_mdeg
 from .robot_control_service import RobotEpisodeOutcome
 
 
@@ -40,6 +44,39 @@ ACTION_COMMANDS = {
 DEFAULT_MAX_DECISIONS = 16
 DEFAULT_MAX_OBSERVATION_AGE_MS = 3_000
 DEFAULT_MIN_FORWARD_CLEARANCE_MM = 120
+_SIDE_SEARCH_POSITION_TOLERANCE_MM = 35
+
+
+def _side_search_waypoint(pose: PhysicalPose, side: str):
+    footprint, _sensor = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    )
+    stride_mm = (
+        footprint.left_extent_mm
+        + footprint.right_extent_mm
+        + 2 * footprint.clearance_margin_mm
+    )
+    side_sign = 1 if side == "LEFT" else -1
+    heading_radians = math.radians(pose.heading_mdeg / 1_000.0)
+    local_left_x = -math.sin(heading_radians)
+    local_left_y = math.cos(heading_radians)
+    return {
+        "kind": "SIDE_SEARCH",
+        "scope": "SEARCH_POSITION_ONLY",
+        "clearance_proven": False,
+        "frame": "EPISODE_LOCAL_ODOMETRY",
+        "origin_pose": pose.to_dict(),
+        "target_x_mm": int(round(
+            pose.x_mm + side_sign * stride_mm * local_left_x
+        )),
+        "target_y_mm": int(round(
+            pose.y_mm + side_sign * stride_mm * local_left_y
+        )),
+        "target_heading_mdeg": normalize_heading_mdeg(
+            pose.heading_mdeg + side_sign * 90_000
+        ),
+        "position_tolerance_mm": _SIDE_SEARCH_POSITION_TOLERANCE_MM,
+    }
 
 
 class BlastEpisodeError(RuntimeError):
@@ -231,6 +268,7 @@ class BlastEpisodeRuntimeAdapter:
         episode_start_heading = None
         motion_executor = None
         selected_detour_side = None
+        side_search_waypoint = None
         try:
             planner = self.planner_factory(context.settings.model)
             if not callable(getattr(planner, "decide", None)):
@@ -260,6 +298,7 @@ class BlastEpisodeRuntimeAdapter:
                         "selected_detour_side_relative_to_scan": (
                             selected_detour_side
                         ),
+                        "side_search_waypoint": dict(side_search_waypoint),
                     }
                 available_actions = self._available_actions(
                     observation,
@@ -288,6 +327,9 @@ class BlastEpisodeRuntimeAdapter:
                     selected_detour_side is None
                     and self._scan_is_current(history)
                     and decision.action in (TURN_LEFT_90, TURN_RIGHT_90)
+                )
+                detour_origin_pose = (
+                    motion_executor.pose if selects_detour_side else None
                 )
                 terminal_actions = (
                     (COMPLETE, ABORT)
@@ -371,6 +413,10 @@ class BlastEpisodeRuntimeAdapter:
                             "LEFT"
                             if decision.action == TURN_LEFT_90
                             else "RIGHT"
+                        )
+                        side_search_waypoint = _side_search_waypoint(
+                            detour_origin_pose,
+                            selected_detour_side,
                         )
                 scan = command_result.get("scan")
                 if (

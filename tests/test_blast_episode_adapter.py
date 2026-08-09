@@ -6,6 +6,7 @@ from robot_agent.blast_episode_adapter import (
     ACTION_COMMANDS,
     BlastEpisodeError,
     BlastEpisodeRuntimeAdapter,
+    _side_search_waypoint,
 )
 from robot_agent.blast_observation_monitor import BlastControllerError
 from robot_agent.blast_observation_monitor import (
@@ -23,6 +24,7 @@ from robot_agent.physical_navigation_contract import (
     TURN_LEFT_90,
     PhysicalNavigationContractError,
 )
+from robot_agent.physical_odometry import PhysicalPose
 from robot_agent.robot_control_contract import RobotRuntimeUpdate
 
 
@@ -446,6 +448,19 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 )
                 expected = {
                     "selected_detour_side_relative_to_scan": side,
+                    "side_search_waypoint": {
+                        "kind": "SIDE_SEARCH",
+                        "scope": "SEARCH_POSITION_ONLY",
+                        "clearance_proven": False,
+                        "frame": "EPISODE_LOCAL_ODOMETRY",
+                        "origin_pose": PhysicalPose().to_dict(),
+                        "target_x_mm": 0,
+                        "target_y_mm": 225 if side == "LEFT" else -225,
+                        "target_heading_mdeg": (
+                            90_000 if side == "LEFT" else -90_000
+                        ),
+                        "position_tolerance_mm": 35,
+                    },
                 }
                 self.assertEqual(
                     planner.contexts[2].observation["navigation_intent"],
@@ -466,6 +481,27 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     + ["drive_forward"]
                     + list(ACTION_COMMANDS[opposite]),
                 )
+
+    def test_side_search_waypoint_uses_pre_turn_pose_frame(self):
+        pose = PhysicalPose(x_mm=100, y_mm=-50, heading_mdeg=90_000)
+
+        left = _side_search_waypoint(pose, "LEFT")
+        right = _side_search_waypoint(pose, "RIGHT")
+
+        self.assertEqual(
+            (left["target_x_mm"], left["target_y_mm"]),
+            (-125, -50),
+        )
+        self.assertEqual(left["target_heading_mdeg"], -180_000)
+        self.assertEqual(
+            (right["target_x_mm"], right["target_y_mm"]),
+            (325, -50),
+        )
+        self.assertEqual(right["target_heading_mdeg"], 0)
+        self.assertEqual(left["scope"], "SEARCH_POSITION_ONLY")
+        self.assertIs(left["clearance_proven"], False)
+        self.assertEqual(left["origin_pose"], pose.to_dict())
+        self.assertEqual(right["origin_pose"], pose.to_dict())
 
     def test_turn_without_current_scan_does_not_create_detour_intent(self):
         controller = FakeController(1_000)
