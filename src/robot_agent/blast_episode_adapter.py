@@ -486,6 +486,15 @@ class BlastEpisodeRuntimeAdapter:
                         action for action in available_actions
                         if action not in (TURN_LEFT_90, TURN_RIGHT_90)
                     )
+                elif (
+                    selected_detour_side is None
+                    and self._scan_is_current(history)
+                    and scan_allows_turn
+                ):
+                    available_actions = tuple(
+                        action for action in available_actions
+                        if action in (TURN_LEFT_90, TURN_RIGHT_90)
+                    )
                 if side_search_progress is not None:
                     required_action = side_search_progress["required_action"]
                     if not evidence_correlated:

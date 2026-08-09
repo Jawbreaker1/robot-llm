@@ -397,6 +397,10 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             planner.contexts[1].available_actions,
         )
         self.assertEqual(
+            planner.contexts[1].available_actions,
+            (TURN_LEFT_90, TURN_RIGHT_90),
+        )
+        self.assertEqual(
             planner.contexts[1].observation["navigation_reference"],
             {
                 "episode_start_heading_deg": 179.0,
@@ -504,11 +508,31 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(result.completed)
         self.assertEqual(controller.commands, ["scan_front_arc"])
         self.assertEqual(len(planner.contexts), 2)
+        self.assertIn("ADVANCE", planner.contexts[1].available_actions)
         self.assertIn("scan", planner.contexts[1].history[0])
         runtime_scan = [
             update["scan"] for update in updates if "scan" in update
         ][0]
         self.assertNotIn("planar_projection", runtime_scan)
+
+    def test_projected_scan_requires_side_choice_before_more_motion(self):
+        controller = FakeScanController(500)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision("ADVANCE"),
+        ])
+
+        with self.assertRaises(BlastEpisodeError) as rejected:
+            self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertEqual(rejected.exception.code, "blast_planner_action_invalid")
+        self.assertEqual(controller.commands, ["scan_front_arc"])
+        self.assertEqual(len(planner.contexts), 2)
+        self.assertEqual(
+            planner.contexts[1].available_actions,
+            (TURN_LEFT_90, TURN_RIGHT_90),
+        )
+        self.assertTrue(planner.contexts[1].completion_allowed)
 
     def test_scan_with_off_reference_body_pose_is_rejected(self):
         class OffPoseScanController(FakeScanController):
@@ -862,21 +886,18 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(controller.commands.count("scan_front_arc"), 2)
 
-    def test_unprojectable_current_scan_cannot_reuse_an_older_view(self):
-        class UnsettledSecondScanController(FakeScanController):
+    def test_unprojectable_current_scan_cannot_authorize_a_side_turn(self):
+        class UnsettledScanController(FakeScanController):
             def command(self, command, *, cancel_requested=None):
                 result = super().command(
                     command,
                     cancel_requested=cancel_requested,
                 )
-                if (
-                    command == "scan_front_arc"
-                    and self.commands.count("scan_front_arc") == 2
-                ):
+                if command == "scan_front_arc":
                     result["scan"]["all_observations_settled"] = False
                 return result
 
-        controller = UnsettledSecondScanController(1_000)
+        controller = UnsettledScanController(1_000)
         planner = Planner([
             decision(SCAN_FRONT_ARC),
             decision("ADVANCE"),
@@ -1116,7 +1137,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             planner.contexts[1].observation,
         )
 
-    def test_planned_later_turn_does_not_create_detour_intent(self):
+    def test_planned_later_turn_does_not_authorize_post_scan_advance(self):
         controller = FakeScanController(1_000)
         planner = Planner([
             decision(SCAN_FRONT_ARC),
@@ -1127,11 +1148,14 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             decision("ABORT"),
         ])
 
-        self.adapter(controller, planner).run(episode_context()[0])
+        with self.assertRaises(BlastEpisodeError) as raised:
+            self.adapter(controller, planner).run(episode_context()[0])
 
+        self.assertEqual(raised.exception.code, "blast_planner_action_invalid")
+        self.assertEqual(controller.commands, ["scan_front_arc"])
         self.assertNotIn(
             "navigation_intent",
-            planner.contexts[2].observation,
+            planner.contexts[1].observation,
         )
 
     def test_partial_scan_guided_turn_does_not_create_detour_intent(self):
