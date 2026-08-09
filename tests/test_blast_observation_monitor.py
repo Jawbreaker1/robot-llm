@@ -12,6 +12,7 @@ from robot_agent.blast_observation_monitor import (
     SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
     SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
     SCAN_RESULT_SCHEMA,
+    SETTLED_OBSERVATION_COMMAND,
     BlastControllerError,
     BlastObservationMonitor,
     blast_range_state,
@@ -191,6 +192,123 @@ class BlastObservationMonitorTests(unittest.TestCase):
             ("drive_pulse", "forward"),
             FakeRuntime.instances[0].calls,
         )
+        monitor.close()
+
+    def test_settled_observation_command_is_motorless(self):
+        class RecordingMonitor(BlastObservationMonitor):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.settle_timeouts = []
+
+            async def _observe_until_settled(
+                self,
+                runtime,
+                *,
+                generation,
+                initial_observation,
+                timeout_seconds=None,
+            ):
+                self.settle_timeouts.append(timeout_seconds)
+                return await super()._observe_until_settled(
+                    runtime,
+                    generation=generation,
+                    initial_observation=initial_observation,
+                    timeout_seconds=timeout_seconds,
+                )
+
+        monitor = RecordingMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        runtime = FakeRuntime.instances[0]
+        runtime.calls.clear()
+
+        result = monitor.command(SETTLED_OBSERVATION_COMMAND)
+
+        self.assertEqual(result["command"], SETTLED_OBSERVATION_COMMAND)
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["receipt"], {"motion_started": False})
+        self.assertTrue(result["observation_settled"])
+        self.assertEqual(monitor.settle_timeouts, [None])
+        self.assertGreaterEqual(
+            len([call for call in runtime.calls if call == ("observe",)]),
+            5,
+        )
+        self.assertFalse(any(
+            call[0] in {
+                "drive_pulse",
+                "turn_pulse",
+                "claw_pulse",
+                "body_pulse",
+                "stop",
+            }
+            for call in runtime.calls
+        ))
+        monitor.close()
+
+    def test_stop_preempts_settled_observation_without_motor_start(self):
+        settling_started = threading.Event()
+
+        class NeverSettledRuntime(FakeRuntime):
+            async def observe(self):
+                observation = await super().observe()
+                observation["distance_mm"] = 300 + self.observe_calls * 10
+                return observation
+
+        class SignallingMonitor(BlastObservationMonitor):
+            async def _observe_until_settled(
+                self,
+                runtime,
+                *,
+                generation,
+                initial_observation,
+                timeout_seconds=None,
+            ):
+                settling_started.set()
+                return await super()._observe_until_settled(
+                    runtime,
+                    generation=generation,
+                    initial_observation=initial_observation,
+                    timeout_seconds=timeout_seconds,
+                )
+
+        monitor = SignallingMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=NeverSettledRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        failures = []
+
+        def observe_settled():
+            try:
+                monitor.command(SETTLED_OBSERVATION_COMMAND)
+            except BlastControllerError as error:
+                failures.append(error.code)
+
+        command_thread = threading.Thread(target=observe_settled)
+        command_thread.start()
+        self.assertTrue(settling_started.wait(timeout=1.0))
+
+        stop_result = monitor.command("stop")
+        command_thread.join(timeout=1.0)
+
+        self.assertFalse(command_thread.is_alive())
+        self.assertEqual(failures, ["controller_command_interrupted"])
+        self.assertTrue(stop_result["completed"])
+        runtime = FakeRuntime.instances[0]
+        self.assertIn(("stop",), runtime.calls)
+        self.assertFalse(any(
+            call[0] in {
+                "drive_pulse",
+                "turn_pulse",
+                "claw_pulse",
+                "body_pulse",
+            }
+            for call in runtime.calls
+        ))
         monitor.close()
 
     def test_scan_front_arc_is_one_atomic_gyro_measured_command(self):

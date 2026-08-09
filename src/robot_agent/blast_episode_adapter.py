@@ -14,7 +14,9 @@ from .blast_navigation_calibration import (
 from .blast_observation_monitor import (
     CONTROLLER_ID,
     RANGE_STATE_MEASURED,
+    RANGE_STATE_NO_VALID_DISTANCE,
     ROBOT_ID,
+    SETTLED_OBSERVATION_COMMAND,
     BlastControllerError,
     blast_range_state,
     validate_blast_scan_ray_contract,
@@ -345,12 +347,51 @@ class BlastEpisodeRuntimeAdapter:
         selects_detour_side,
         episode_start_heading,
         motion_executor,
+        cancel_requested,
     ):
         observation = self._with_navigation_reference(
             self._observation(),
             episode_start_heading,
         )
         observation["odometry"] = motion_executor.pose.to_dict()
+        rejected_at = observation["observed_at_monotonic_ms"]
+        should_remeasure = (
+            selects_detour_side
+            and action in (TURN_LEFT_90, TURN_RIGHT_90)
+            and blast_range_state(
+                observation["sensors"].get("distance_mm")
+            ) == RANGE_STATE_NO_VALID_DISTANCE
+            and _side_search_heading_correlated(
+                observation, motion_executor.pose
+            )
+            and _navigation_body_matched(observation["sensors"])
+        )
+        if should_remeasure:
+            result = self.controller.command(
+                SETTLED_OBSERVATION_COMMAND,
+                cancel_requested=cancel_requested,
+            )
+            if cancel_requested():
+                raise BlastControllerError(
+                    "controller_command_interrupted",
+                    "BLAST observation was cancelled",
+                )
+            observation = self._with_navigation_reference(
+                self._observation(), episode_start_heading
+            )
+            observation["odometry"] = motion_executor.pose.to_dict()
+            if not (
+                isinstance(result, Mapping)
+                and result.get("command") == SETTLED_OBSERVATION_COMMAND
+                and result.get("accepted") is True
+                and result.get("completed") is True
+                and result.get("observation_settled") is True
+                and observation["observed_at_monotonic_ms"] > rejected_at
+            ):
+                raise BlastEpisodeError(
+                    "blast_side_search_blocked",
+                    "BLAST side selection has no fresh settled range",
+                )
         # The scan monitor settles five fresh samples and performs the final
         # range, heading, and sensor-pose gate before its first wheel pulse.
         # Do not let one unsmoothed adapter snapshot preempt that authority.
@@ -410,6 +451,26 @@ class BlastEpisodeRuntimeAdapter:
                 "The bounded episode cannot finish this side observation",
             )
         return waypoint, None
+
+    def _fresh_planner_observation_or_stop(
+        self, action, selects_detour_side, episode_start_heading,
+        motion_executor, context,
+    ):
+        try:
+            return self._fresh_planner_action_observation(
+                action=action,
+                selects_detour_side=selects_detour_side,
+                episode_start_heading=episode_start_heading,
+                motion_executor=motion_executor,
+                cancel_requested=lambda: self._cancelled(context),
+            ), None
+        except BlastControllerError as error:
+            if (
+                error.code == "controller_command_interrupted"
+                and self._cancelled(context)
+            ):
+                return None, self._outcome("stopped", False, "stopped")
+            raise
 
     def _complete_side_search(
         self,
@@ -614,14 +675,14 @@ class BlastEpisodeRuntimeAdapter:
                             "BLAST planner selected an unavailable action",
                         )
                     if action in ACTION_COMMANDS or action == SCAN_FRONT_ARC:
-                        observation = (
-                            self._fresh_planner_action_observation(
-                                action=action,
-                                selects_detour_side=selects_detour_side,
-                                episode_start_heading=episode_start_heading,
-                                motion_executor=motion_executor,
+                        observation, stopped = (
+                            self._fresh_planner_observation_or_stop(
+                                action, selects_detour_side,
+                                episode_start_heading, motion_executor, context,
                             )
                         )
+                        if stopped is not None:
+                            return stopped
                     context.publish({
                         "current_action": (
                             None if action in (COMPLETE, ABORT) else action

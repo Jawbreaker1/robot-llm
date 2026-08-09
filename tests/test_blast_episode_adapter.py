@@ -19,6 +19,7 @@ from robot_agent.blast_observation_monitor import (
     RANGE_STATE_NO_VALID_DISTANCE,
     ROBOT_ID,
     SCAN_RESULT_SCHEMA,
+    SETTLED_OBSERVATION_COMMAND,
 )
 from robot_agent.lm_studio_controller_action import (
     COMPLETE,
@@ -975,6 +976,56 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(controller.commands, ["scan_front_arc"])
         self.assertEqual(len(planner.contexts), 2)
 
+    def test_side_turn_remeasures_one_post_scan_no_return(self):
+        class SettledRemeasureController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == SETTLED_OBSERVATION_COMMAND:
+                    result["observation"]["distance_mm"] = 500
+                    result["observation_settled"] = True
+                    self.snapshot_value["observation"] = result[
+                        "observation"
+                    ]
+                    self.snapshot_value[
+                        "last_observed_at_monotonic_ms"
+                    ] = 1_000
+                return result
+
+        controller = SettledRemeasureController(500)
+        controller.snapshot_value["last_observed_at_monotonic_ms"] = 999
+
+        class NoReturnDuringSideChoice(Planner):
+            def decide(self, context):
+                result = super().decide(context)
+                if len(self.contexts) == 2:
+                    controller.snapshot_value["observation"][
+                        "distance_mm"
+                    ] = 2_000
+                return result
+
+        planner = NoReturnDuringSideChoice([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+
+        result = self.adapter(
+            controller,
+            planner,
+            max_decisions=16,
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(
+            result.terminal_reason, "side_search_observation_collected"
+        )
+        self.assertEqual(controller.commands[0], "scan_front_arc")
+        self.assertEqual(controller.commands[1], SETTLED_OBSERVATION_COMMAND)
+        self.assertEqual(controller.commands[2:6], ["turn_left"] * 4)
+        self.assertEqual(len(planner.contexts), 2)
+
     def test_side_search_waypoint_uses_pre_turn_pose_frame(self):
         pose = PhysicalPose(x_mm=100, y_mm=-50, heading_mdeg=90_000)
 
@@ -1793,6 +1844,11 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
     def test_action_safety_is_rechecked_after_model_latency(self):
         for action, change, code in (
             ("ADVANCE", ("distance_mm", 40), "blast_action_start_unverified"),
+            (
+                TURN_LEFT_90,
+                ("distance_mm", 2_000),
+                "blast_action_start_unverified",
+            ),
             (
                 TURN_LEFT_90,
                 ("body", 157),

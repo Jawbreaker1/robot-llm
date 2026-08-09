@@ -38,6 +38,7 @@ POST_MOTION_DISTANCE_RANGE_MM = 5.0
 POST_MOTION_TILT_RANGE_DEG = 1.0
 COMMAND_RESULT_SCHEMA = "controller-command-result/v1"
 SCAN_COMMAND = "scan_front_arc"
+SETTLED_OBSERVATION_COMMAND = "observe_settled"
 SCAN_RESULT_SCHEMA = "blast-scan-front-arc/v3"
 SCAN_RESTORATION_TOLERANCE_DEG = 5.0
 PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM = 2_000
@@ -61,6 +62,7 @@ COMMANDS = {
     "body_left": ("body_pulse", "left"),
     "body_right": ("body_pulse", "right"),
     SCAN_COMMAND: (None, None),
+    SETTLED_OBSERVATION_COMMAND: (None, None),
     "stop": ("stop", None),
 }
 NAVIGATION_MOTION_COMMANDS = {
@@ -793,20 +795,26 @@ class BlastObservationMonitor:
     async def _perform_command(self, runtime, generation, command: str):
         if command == SCAN_COMMAND:
             return await self._perform_scan_front_arc(runtime, generation)
-        operation, direction = COMMANDS[command]
-        method = getattr(runtime, operation)
-        receipt = (
-            await method()
-            if direction is None
-            else await method(direction)
-        )
+        if command == SETTLED_OBSERVATION_COMMAND:
+            receipt = {"motion_started": False}
+        else:
+            operation, direction = COMMANDS[command]
+            method = getattr(runtime, operation)
+            receipt = (
+                await method()
+                if direction is None
+                else await method(direction)
+            )
         observation = await self._observe_until_idle(
             runtime,
             generation=generation,
             stop_only=command == "stop",
         )
         observation_settled = None
-        if command in NAVIGATION_MOTION_COMMANDS:
+        if (
+            command in NAVIGATION_MOTION_COMMANDS
+            or command == SETTLED_OBSERVATION_COMMAND
+        ):
             observation, observation_settled = (
                 await self._observe_until_settled(
                     runtime,
