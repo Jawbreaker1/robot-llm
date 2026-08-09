@@ -23,11 +23,18 @@ from .blast_scan_planar_projection import (
     project_blast_scan_planar_surfaces,
 )
 from .blast_navigation_action_profile import (
-    BLAST_NAVIGATION_ACTION_SPECS,
     BLAST_NAVIGATION_COMMANDS,
 )
 from .blast_navigation_motion_execution import (
     BlastNavigationMotionExecutor,
+)
+from .blast_side_search_geometry import (
+    POSITION_TOLERANCE_MM as _SIDE_SEARCH_POSITION_TOLERANCE_MM,
+    side_search_distance as _side_search_distance,
+    side_search_followup_slots as _side_search_followup_slots,
+    side_search_progress as _side_search_progress,
+    side_search_required_slots as _side_search_required_slots,
+    side_search_waypoint as _side_search_waypoint,
 )
 from .lm_studio_controller_action import (
     ABORT,
@@ -44,7 +51,6 @@ from .physical_navigation_contract import (
 )
 from .physical_odometry import (
     PhysicalPose,
-    nominal_effect,
     normalize_heading_mdeg,
 )
 from .robot_control_service import RobotEpisodeOutcome
@@ -58,120 +64,25 @@ ACTION_COMMANDS = {
 DEFAULT_MAX_DECISIONS = 16
 DEFAULT_MAX_OBSERVATION_AGE_MS = 3_000
 DEFAULT_MIN_FORWARD_CLEARANCE_MM = 120
-_SIDE_SEARCH_POSITION_TOLERANCE_MM = 35
-_SIDE_SEARCH_HEADING_TOLERANCE_MDEG = 20_000
 _SIDE_SEARCH_IMU_ODOMETRY_TOLERANCE_MDEG = 30_000
 _PLANNER_ACTION_SOURCE = "PLANNER_ACTION"
 _HOST_SIDE_SEARCH_ACTION_SOURCE = "HOST_SIDE_SEARCH_ACTION"
 
 
-def _blast_nominal_pose(pose: PhysicalPose, action: str) -> PhysicalPose:
-    return nominal_effect(
-        pose,
-        action,
-        BLAST_NAVIGATION_ACTION_SPECS,
-        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
-    )[0]
-
-
-def _side_search_distance(pose: PhysicalPose, waypoint) -> int:
-    return int(round(math.hypot(
-        waypoint["target_x_mm"] - pose.x_mm,
-        waypoint["target_y_mm"] - pose.y_mm,
-    )))
-
-
-def _side_search_waypoint(pose: PhysicalPose, side: str):
-    footprint, _sensor = (
-        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
-    )
-    stride_mm = (
-        footprint.left_extent_mm
-        + footprint.right_extent_mm
-        + 2 * footprint.clearance_margin_mm
-    )
-    side_sign = 1 if side == "LEFT" else -1
-    heading_radians = math.radians(pose.heading_mdeg / 1_000.0)
-    local_left_x = -math.sin(heading_radians)
-    local_left_y = math.cos(heading_radians)
-    return {
-        "kind": "SIDE_SEARCH",
-        "selected_side": side,
-        "scope": "SEARCH_POSITION_ONLY",
-        "clearance_proven": False,
-        "frame": "EPISODE_LOCAL_ODOMETRY",
-        "origin_pose": pose.to_dict(),
-        "target_x_mm": int(round(
-            pose.x_mm + side_sign * stride_mm * local_left_x
-        )),
-        "target_y_mm": int(round(
-            pose.y_mm + side_sign * stride_mm * local_left_y
-        )),
-        "target_heading_mdeg": normalize_heading_mdeg(
-            pose.heading_mdeg + side_sign * 90_000
-        ),
-        "position_tolerance_mm": _SIDE_SEARCH_POSITION_TOLERANCE_MM,
-    }
-
-
-def _side_search_progress(
-    pose: PhysicalPose,
-    waypoint: Mapping[str, object],
-    *,
-    reorientation_attempted: bool = False,
-):
-    """Derive one bounded action for the selected side observation pose."""
-
-    distance = _side_search_distance(pose, waypoint)
-    target_heading = waypoint["target_heading_mdeg"]
-    heading_error = normalize_heading_mdeg(
-        target_heading - pose.heading_mdeg
-    )
-    required_action = None
-    phase = "BLOCKED"
-    origin_heading = waypoint["origin_pose"]["heading_mdeg"]
-    origin_heading_error = normalize_heading_mdeg(
-        origin_heading - pose.heading_mdeg
-    )
-    if reorientation_attempted:
-        if (
-            distance <= waypoint["position_tolerance_mm"]
-            and abs(origin_heading_error)
-            <= _SIDE_SEARCH_HEADING_TOLERANCE_MDEG
-        ):
-            phase = "RESCAN"
-            heading_error = origin_heading_error
-            required_action = SCAN_FRONT_ARC
-    elif distance > waypoint["position_tolerance_mm"]:
-        phase = "OUTBOUND"
-        if abs(heading_error) <= _SIDE_SEARCH_HEADING_TOLERANCE_MDEG:
-            if _side_search_distance(
-                _blast_nominal_pose(pose, ADVANCE), waypoint
-            ) < distance:
-                required_action = ADVANCE
-    else:
-        phase = "REORIENT"
-        heading_error = origin_heading_error
-        action = (
-            TURN_RIGHT_90
-            if waypoint["selected_side"] == "LEFT"
-            else TURN_LEFT_90
+def _scan_refusal(reason_is_side_search: bool):
+    if reason_is_side_search:
+        return (
+            "side_search_observation_unavailable",
+            "Side observation scan could not start safely",
         )
-        projected = _blast_nominal_pose(pose, action)
-        projected_error = normalize_heading_mdeg(
-            origin_heading - projected.heading_mdeg
-        )
-        if (
-            abs(projected_error) < abs(heading_error)
-            and abs(projected_error) <= _SIDE_SEARCH_HEADING_TOLERANCE_MDEG
-        ):
-            required_action = action
-    return {
-        "phase": phase,
-        "distance_remaining_mm": distance,
-        "heading_error_mdeg": heading_error,
-        "required_action": required_action,
-    }
+    return (
+        "no_safe_blast_action",
+        "BLAST scan could not start from settled safety evidence",
+    )
+
+
+def _detour_side(action: str) -> str:
+    return "LEFT" if action == TURN_LEFT_90 else "RIGHT"
 
 
 def _side_search_heading_correlated(observation, pose: PhysicalPose) -> bool:
@@ -472,6 +383,66 @@ class BlastEpisodeRuntimeAdapter:
             )
         return observation
 
+    def _prepare_side_search(
+        self,
+        *,
+        origin_pose,
+        side,
+        scan_view,
+        remaining_slots,
+    ):
+        try:
+            waypoint = _side_search_waypoint(
+                origin_pose,
+                side,
+                scan_view=scan_view,
+            )
+        except ValueError:
+            return None, self._outcome(
+                "side_search_observation_unavailable",
+                False,
+                "Origin scan could not size a side search",
+            )
+        if _side_search_required_slots(waypoint) > remaining_slots:
+            return None, self._outcome(
+                "side_search_budget_insufficient",
+                False,
+                "The bounded episode cannot finish this side observation",
+            )
+        return waypoint, None
+
+    def _complete_side_search(
+        self,
+        origin_pose,
+        action,
+        scan_view,
+        outbound_pose,
+        remaining_slots,
+    ):
+        side = _detour_side(action)
+        try:
+            waypoint = _side_search_waypoint(
+                origin_pose,
+                side,
+                scan_view=scan_view,
+                outbound_pose=outbound_pose,
+            )
+        except ValueError:
+            return None, None, self._outcome(
+                "side_search_observation_unavailable",
+                False,
+                "Verified side turn could not bind the search waypoint",
+            )
+        if _side_search_followup_slots(
+            outbound_pose, waypoint
+        ) > remaining_slots:
+            return None, None, self._outcome(
+                "side_search_budget_insufficient",
+                False,
+                "The bounded episode cannot finish this side observation",
+            )
+        return side, waypoint, None
+
     def run(self, context) -> RobotEpisodeOutcome:
         with self._lock:
             if self._active_episode_id is not None:
@@ -593,7 +564,6 @@ class BlastEpisodeRuntimeAdapter:
                     )
                 completion_allowed = self._completion_allowed(history)
                 selects_detour_side = False
-                detour_origin_pose = None
                 if side_search_progress is None:
                     result = planner.decide(ControllerActionContext(
                         goal=context.request.goal,
@@ -622,9 +592,17 @@ class BlastEpisodeRuntimeAdapter:
                         and scan_allows_turn
                         and action in (TURN_LEFT_90, TURN_RIGHT_90)
                     )
-                    detour_origin_pose = (
-                        motion_executor.pose if selects_detour_side else None
-                    )
+                    if selects_detour_side:
+                        detour_origin_pose = motion_executor.pose
+                        selected_side_candidate = _detour_side(action)
+                        _waypoint, blocked = self._prepare_side_search(
+                            origin_pose=detour_origin_pose,
+                            side=selected_side_candidate,
+                            scan_view=latest_scan_view,
+                            remaining_slots=self.max_decisions - _index,
+                        )
+                        if blocked is not None:
+                            return blocked
                     terminal_actions = (
                         (COMPLETE, ABORT)
                         if completion_allowed
@@ -745,17 +723,13 @@ class BlastEpisodeRuntimeAdapter:
                             return self._outcome(
                                 "stopped", False, "stopped"
                             )
-                        if is_side_search_rescan:
-                            return self._outcome(
-                                "side_search_observation_unavailable",
-                                False,
-                                "Side observation scan could not start safely",
-                            )
+                        reason, message = _scan_refusal(
+                            is_side_search_rescan
+                        )
                         return self._outcome(
-                            "no_safe_blast_action",
+                            reason,
                             False,
-                            "BLAST scan could not start from settled safety "
-                            "evidence",
+                            message,
                         )
                     raise
                 if not isinstance(command_result, Mapping):
@@ -774,20 +748,22 @@ class BlastEpisodeRuntimeAdapter:
                         "observation_settled"
                     ),
                 }
+                side_search_setup_outcome = None
                 if action in ACTION_COMMANDS:
                     history_item["motion"] = execution.motion.to_dict()
                     history_item["pose"] = execution.pose.to_dict()
                     if selects_detour_side and execution.motion.complete:
-                        selected_detour_side = (
-                            "LEFT"
-                            if action == TURN_LEFT_90
-                            else "RIGHT"
+                        side_search_setup = self._complete_side_search(
+                            detour_origin_pose, action, latest_scan_view,
+                            execution.pose, self.max_decisions - _index - 1,
                         )
-                        side_search_waypoint = _side_search_waypoint(
-                            detour_origin_pose,
+                        (
                             selected_detour_side,
-                        )
-                        origin_scan_view = latest_scan_view
+                            side_search_waypoint,
+                            side_search_setup_outcome,
+                        ) = side_search_setup
+                        if side_search_setup_outcome is None:
+                            origin_scan_view = latest_scan_view
                 scan = command_result.get("scan")
                 planar_projection = None
                 if (
@@ -893,6 +869,8 @@ class BlastEpisodeRuntimeAdapter:
                         False,
                         "Host side-search motion was incomplete",
                     )
+                if side_search_setup_outcome is not None:
+                    return side_search_setup_outcome
                 if is_side_search_rescan:
                     side_scan_view = latest_scan_view
                     if not (

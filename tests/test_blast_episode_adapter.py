@@ -6,7 +6,9 @@ from robot_agent.blast_episode_adapter import (
     ACTION_COMMANDS,
     BlastEpisodeError,
     BlastEpisodeRuntimeAdapter,
+    _side_search_followup_slots,
     _side_search_progress,
+    _side_search_required_slots,
     _side_search_waypoint,
 )
 from robot_agent.blast_observation_monitor import BlastControllerError
@@ -742,17 +744,175 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertFalse(result.completed)
         self.assertEqual(
             result.terminal_reason,
-            "decision_budget_exhausted",
+            "side_search_budget_insufficient",
+        )
+        self.assertEqual(len(planner.contexts), 2)
+        self.assertEqual(
+            controller.commands,
+            ["scan_front_arc"],
+        )
+        self.assertEqual(controller.commands.count("scan_front_arc"), 1)
+
+    def test_actual_post_turn_pose_rechecks_remaining_budget(self):
+        class ShiftedTurnController(FakeScanController):
+            def __init__(self):
+                super().__init__(1_000)
+                self.scan_count = 0
+
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    self.scan_count += 1
+                    if self.scan_count == 1:
+                        scan = scan_result(center_distance_mm=310.0)
+                        scan["rays"][1].update({
+                            "distance_mm": 368.0,
+                            "heading_deg": -23.322266,
+                            "relative_heading_deg": -23.322266,
+                        })
+                        scan["rays"][3].update({
+                            "distance_mm": 286.0,
+                            "heading_deg": 25.093086,
+                            "relative_heading_deg": 25.093086,
+                        })
+                        result["scan"] = scan
+                elif command == "turn_left":
+                    before = result["receipt"]["before_angles_deg"]
+                    motors = result["observation"]["motor_angles_deg"]
+                    motors["left_drive"] = before["left_drive"] - 91
+                    motors["right_drive"] = before["right_drive"] + 1
+                    self.snapshot_value["observation"] = result["observation"]
+                return result
+
+        controller = ShiftedTurnController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+
+        result = self.adapter(
+            controller,
+            planner,
+            max_decisions=13,
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(
+            result.terminal_reason,
+            "side_search_budget_insufficient",
+        )
+        self.assertEqual(
+            controller.commands,
+            ["scan_front_arc"] + ["turn_left"] * 4,
+        )
+        self.assertNotIn("drive_forward", controller.commands)
+        self.assertEqual(len(planner.contexts), 2)
+
+    def test_stop_wins_over_post_turn_waypoint_refusal(self):
+        context, _updates = episode_context()
+
+        class CancelOffHeadingController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "turn_left":
+                    before = result["receipt"]["before_angles_deg"]
+                    motors = result["observation"]["motor_angles_deg"]
+                    motors["left_drive"] = before["left_drive"] - 20
+                    motors["right_drive"] = before["right_drive"] + 20
+                    self.snapshot_value["observation"] = result["observation"]
+                    if self.commands.count("turn_left") == 4:
+                        context.stop_requested.set()
+                return result
+
+        controller = CancelOffHeadingController(1_000)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+
+        result = self.adapter(controller, planner).run(context)
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "stopped")
+        self.assertEqual(
+            controller.commands,
+            ["scan_front_arc"] + ["turn_left"] * 4,
+        )
+        self.assertNotIn("drive_forward", controller.commands)
+        self.assertEqual(len(planner.contexts), 2)
+
+    def test_live_surface_extent_drives_nine_bounded_left_steps(self):
+        class LiveSurfaceScanController(FakeScanController):
+            def __init__(self):
+                super().__init__(1_000)
+                self.scan_count = 0
+
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command != "scan_front_arc":
+                    return result
+                self.scan_count += 1
+                if self.scan_count == 1:
+                    scan = scan_result(center_distance_mm=310.0)
+                    scan["rays"][1].update({
+                        "distance_mm": 368.0,
+                        "heading_deg": -23.322266,
+                        "relative_heading_deg": -23.322266,
+                    })
+                    scan["rays"][3].update({
+                        "distance_mm": 286.0,
+                        "heading_deg": 25.093086,
+                        "relative_heading_deg": 25.093086,
+                    })
+                    result["scan"] = scan
+                return result
+
+        controller = LiveSurfaceScanController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+        context, updates = episode_context()
+
+        result = self.adapter(
+            controller,
+            planner,
+            max_decisions=13,
+        ).run(context)
+
+        self.assertFalse(result.completed)
+        self.assertEqual(
+            result.terminal_reason,
+            "side_search_observation_collected",
         )
         self.assertEqual(len(planner.contexts), 2)
         self.assertEqual(
             controller.commands,
             ["scan_front_arc"]
             + ["turn_left"] * 4
-            + ["drive_forward"] * 5
-            + ["turn_right"] * 4,
+            + ["drive_forward"] * 9
+            + ["turn_right"] * 4
+            + ["scan_front_arc"],
         )
-        self.assertEqual(controller.commands.count("scan_front_arc"), 1)
+        multi_view = updates[-1]["scan"]["multi_view_observations"]
+        self.assertGreaterEqual(multi_view["viewpoint_separation_mm"], 373)
+        self.assertEqual(
+            multi_view["host_action_trace"],
+            ["ADVANCE"] * 9 + [TURN_RIGHT_90, SCAN_FRONT_ARC],
+        )
+        self.assertFalse(multi_view["object_association_proven"])
+        self.assertFalse(multi_view["clearance_proven"])
+        self.assertFalse(multi_view["passage_proven"])
+        self.assertFalse(multi_view["route_eligible"])
 
     def test_stop_after_side_rescan_wins_over_collected_outcome(self):
         context, updates = episode_context()
@@ -835,6 +995,210 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertIs(left["clearance_proven"], False)
         self.assertEqual(left["origin_pose"], pose.to_dict())
         self.assertEqual(right["origin_pose"], pose.to_dict())
+
+    def test_side_search_waypoint_expands_from_same_depth_echoes(self):
+        pose = PhysicalPose()
+
+        def view(points, *, value_pose=pose):
+            return {
+                "scan_pose": value_pose.to_dict(),
+                "planar_projection": {
+                    "schema": "blast-planar-scan-projection/v1",
+                    "frame": "EPISODE_LOCAL_ODOMETRY",
+                    "quality": "PROVISIONAL_YAW_ONLY",
+                    "points": points,
+                },
+            }
+
+        live_points = [
+            {
+                "side": "center",
+                "nominal_echo_x_mm": 420,
+                "nominal_echo_y_mm": 80,
+            },
+            {
+                "side": "left_near",
+                "nominal_echo_x_mm": 407,
+                "nominal_echo_y_mm": 263,
+            },
+            {
+                "side": "right_near",
+                "nominal_echo_x_mm": 393,
+                "nominal_echo_y_mm": -95,
+            },
+        ]
+        left = _side_search_waypoint(
+            pose, "LEFT", scan_view=view(live_points)
+        )
+        right = _side_search_waypoint(
+            pose, "RIGHT", scan_view=view(live_points)
+        )
+
+        self.assertEqual(
+            (left["target_x_mm"], left["target_y_mm"]),
+            (0, 408),
+        )
+        self.assertEqual(
+            (right["target_x_mm"], right["target_y_mm"]),
+            (0, -245),
+        )
+        self.assertEqual(
+            left["search_basis"],
+            "PROVISIONAL_SAME_DEPTH_ECHO_REACH",
+        )
+        self.assertIs(left["search_target_capped"], False)
+        self.assertIs(left["clearance_proven"], False)
+        post_turn = _side_search_waypoint(
+            pose,
+            "LEFT",
+            scan_view=view(live_points),
+            outbound_pose=PhysicalPose(heading_mdeg=95_060),
+        )
+        self.assertEqual(
+            (post_turn["target_x_mm"], post_turn["target_y_mm"]),
+            (-36, 408),
+        )
+        translated_turn = _side_search_waypoint(
+            pose,
+            "LEFT",
+            scan_view=view(live_points),
+            outbound_pose=PhysicalPose(
+                x_mm=2,
+                y_mm=2,
+                heading_mdeg=94_815,
+            ),
+        )
+        self.assertEqual(
+            (
+                translated_turn["target_x_mm"],
+                translated_turn["target_y_mm"],
+            ),
+            (-32, 408),
+        )
+        self.assertEqual(
+            _side_search_followup_slots(
+                PhysicalPose(x_mm=2, y_mm=2, heading_mdeg=94_815),
+                translated_turn,
+            ),
+            11,
+        )
+
+        included = [live_points[0], {
+            "side": "left_near",
+            "nominal_echo_x_mm": 465,
+            "nominal_echo_y_mm": 263,
+        }]
+        excluded = [live_points[0], {
+            "side": "left_near",
+            "nominal_echo_x_mm": 466,
+            "nominal_echo_y_mm": 1_000,
+        }]
+        self.assertEqual(
+            _side_search_waypoint(
+                pose, "LEFT", scan_view=view(included)
+            )["target_lateral_offset_mm"],
+            408,
+        )
+        self.assertEqual(
+            _side_search_waypoint(
+                pose, "LEFT", scan_view=view(excluded)
+            )["target_lateral_offset_mm"],
+            225,
+        )
+        capped = [live_points[0], {
+            "side": "left_near",
+            "nominal_echo_x_mm": 420,
+            "nominal_echo_y_mm": 1_000,
+        }]
+        capped_waypoint = _side_search_waypoint(
+            pose, "LEFT", scan_view=view(capped)
+        )
+        self.assertEqual(capped_waypoint["target_lateral_offset_mm"], 450)
+        self.assertIs(capped_waypoint["search_target_capped"], True)
+        self.assertEqual(_side_search_required_slots(capped_waypoint), 13)
+        center_only = _side_search_waypoint(
+            pose, "LEFT", scan_view=view([live_points[0]])
+        )
+        self.assertEqual(center_only["target_lateral_offset_mm"], 225)
+        self.assertEqual(center_only["search_basis"], "FOOTPRINT_MINIMUM")
+        with self.assertRaises(ValueError):
+            _side_search_waypoint(
+                pose,
+                "LEFT",
+                scan_view=view(live_points, value_pose=PhysicalPose(x_mm=1)),
+            )
+        with self.assertRaises(ValueError):
+            _side_search_waypoint(
+                pose,
+                "LEFT",
+                scan_view=view(live_points),
+                outbound_pose=PhysicalPose(heading_mdeg=70_000),
+            )
+        away_from_surface = _side_search_waypoint(
+            pose,
+            "LEFT",
+            scan_view=view(live_points),
+            outbound_pose=PhysicalPose(heading_mdeg=110_000),
+        )
+        self.assertLess(away_from_surface["target_x_mm"], 0)
+
+        adapter = self.adapter(FakeScanController(), Planner([]))
+        side, waypoint, outcome = adapter._complete_side_search(
+            pose,
+            TURN_LEFT_90,
+            view(live_points),
+            PhysicalPose(x_mm=2, y_mm=2, heading_mdeg=94_815),
+            10,
+        )
+        self.assertIsNone(side)
+        self.assertIsNone(waypoint)
+        self.assertEqual(outcome.terminal_reason, "side_search_budget_insufficient")
+        side, waypoint, outcome = adapter._complete_side_search(
+            pose,
+            TURN_LEFT_90,
+            view(live_points),
+            PhysicalPose(heading_mdeg=39_000),
+            14,
+        )
+        self.assertIsNone(side)
+        self.assertIsNone(waypoint)
+        self.assertEqual(
+            outcome.terminal_reason,
+            "side_search_observation_unavailable",
+        )
+
+    def test_adaptive_side_search_is_invariant_in_rotated_origin_frame(self):
+        pose = PhysicalPose(x_mm=100, y_mm=-50, heading_mdeg=90_000)
+        scan_view = {
+            "scan_pose": pose.to_dict(),
+            "planar_projection": {
+                "schema": "blast-planar-scan-projection/v1",
+                "frame": "EPISODE_LOCAL_ODOMETRY",
+                "quality": "PROVISIONAL_YAW_ONLY",
+                "points": [
+                    {
+                        "side": "center",
+                        "nominal_echo_x_mm": 20,
+                        "nominal_echo_y_mm": 370,
+                    },
+                    {
+                        "side": "left_near",
+                        "nominal_echo_x_mm": -163,
+                        "nominal_echo_y_mm": 357,
+                    },
+                ],
+            },
+        }
+
+        waypoint = _side_search_waypoint(
+            pose, "LEFT", scan_view=scan_view
+        )
+
+        self.assertEqual(
+            (waypoint["target_x_mm"], waypoint["target_y_mm"]),
+            (-308, -50),
+        )
+        self.assertEqual(waypoint["target_lateral_offset_mm"], 408)
 
     def test_side_search_requires_measured_rotation_clearance_at_waypoint(self):
         class NoRangeAtWaypointController(FakeScanController):
@@ -1564,14 +1928,14 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertFalse(result.completed)
         self.assertEqual(
             result.terminal_reason,
-            "decision_budget_exhausted",
+            "side_search_budget_insufficient",
         )
         self.assertTrue(planner.contexts[0].completion_allowed)
         self.assertTrue(planner.contexts[1].completion_allowed)
         self.assertEqual(len(planner.contexts), 2)
         self.assertEqual(
             controller.commands,
-            ["scan_front_arc"] + ["turn_left"] * 4,
+            ["scan_front_arc"],
         )
 
     def test_scan_requires_a_structured_controller_result(self):
