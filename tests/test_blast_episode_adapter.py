@@ -1378,14 +1378,23 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 )["required_action"])
                 if side == "LEFT":
                     toward_front_heading = 70_000
+                    bounded_drift_heading = 85_961
                     away_from_front_heading = 110_000
                 else:
                     toward_front_heading = -70_000
+                    bounded_drift_heading = -85_961
                     away_from_front_heading = -110_000
                 self.assertIsNone(_side_search_progress(
                     PhysicalPose(heading_mdeg=toward_front_heading),
                     waypoint,
                 )["required_action"])
+                self.assertEqual(
+                    _side_search_progress(
+                        PhysicalPose(heading_mdeg=bounded_drift_heading),
+                        waypoint,
+                    )["required_action"],
+                    "ADVANCE",
+                )
                 self.assertEqual(
                     _side_search_progress(
                         PhysicalPose(heading_mdeg=away_from_front_heading),

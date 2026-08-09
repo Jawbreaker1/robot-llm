@@ -25,6 +25,9 @@ from .physical_odometry import (
 POSITION_TOLERANCE_MM = 35
 HEADING_TOLERANCE_MDEG = 20_000
 _PROJECTION_SCHEMA = "blast-planar-scan-projection/v1"
+# Admit the observed 85.96-degree turn while retaining useful margin inside
+# the calibrated rotation envelope at the current 450 mm search cap.
+_MAX_TOWARD_FRONT_HEADING_MDEG = 4_100
 
 
 def _nominal_pose(pose: PhysicalPose, action: str) -> PhysicalPose:
@@ -36,14 +39,16 @@ def _nominal_pose(pose: PhysicalPose, action: str) -> PhysicalPose:
     )[0]
 
 
-def _moves_toward_origin_front(
+def _exceeds_toward_front_limit(
     heading_mdeg: int,
     origin_heading_mdeg: int,
 ) -> bool:
-    difference = math.radians(
-        normalize_heading_mdeg(heading_mdeg - origin_heading_mdeg) / 1_000.0
+    difference = abs(normalize_heading_mdeg(
+        heading_mdeg - origin_heading_mdeg
+    ))
+    return difference < (
+        90_000 - _MAX_TOWARD_FRONT_HEADING_MDEG
     )
-    return math.cos(difference) > 1e-9
 
 
 def side_search_distance(pose: PhysicalPose, waypoint) -> int:
@@ -157,7 +162,7 @@ def side_search_waypoint(
             math.cos(travel_heading),
             math.sin(travel_heading),
         )
-        if _moves_toward_origin_front(
+        if _exceeds_toward_front_limit(
             target_heading,
             pose.heading_mdeg,
         ):
@@ -242,7 +247,7 @@ def side_search_progress(
         phase = "OUTBOUND"
         if (
             abs(heading_error) <= HEADING_TOLERANCE_MDEG
-            and not _moves_toward_origin_front(
+            and not _exceeds_toward_front_limit(
                 pose.heading_mdeg,
                 origin_heading,
             )
