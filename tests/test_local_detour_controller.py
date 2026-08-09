@@ -1,6 +1,12 @@
 import unittest
 
 from robot_agent.active_ir_scan_contract import ActiveIrScanCalibration
+from robot_agent.blast_navigation_action_profile import (
+    BLAST_NAVIGATION_ACTION_SPECS,
+)
+from robot_agent.blast_navigation_calibration import (
+    BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
+)
 from robot_agent.ev3rstorm_profile import EV3RSTORMProfile
 from robot_agent.local_detour_controller import (
     GUIDANCE_ADVANCE_FOR_TURN_ROOM,
@@ -535,6 +541,78 @@ class LocalDetourRouteSynchronizationTests(unittest.TestCase):
 
 
 class LocalDetourGuidanceTests(unittest.TestCase):
+    def test_shared_route_guidance_accepts_blast_motion_profile(self):
+        cases = (
+            (
+                "LEFT_OF_GOAL",
+                (
+                    ("LATERAL_CLEARANCE", TURN_LEFT_90, 205, 90_000),
+                    ("REACQUIRE_GOAL_HEADING", TURN_RIGHT_90, 0, -90_000),
+                    ("PASS_BEYOND_TARGET", ADVANCE, 428, 0),
+                    ("MERGE_GOAL_AXIS", TURN_RIGHT_90, 205, -90_000),
+                    ("RESUME_GOAL_HEADING", TURN_LEFT_90, 0, 90_000),
+                ),
+            ),
+            (
+                "RIGHT_OF_GOAL",
+                (
+                    ("LATERAL_CLEARANCE", TURN_RIGHT_90, 185, -90_000),
+                    ("REACQUIRE_GOAL_HEADING", TURN_LEFT_90, 0, 90_000),
+                    ("PASS_BEYOND_TARGET", ADVANCE, 428, 0),
+                    ("MERGE_GOAL_AXIS", TURN_LEFT_90, 185, 90_000),
+                    ("RESUME_GOAL_HEADING", TURN_RIGHT_90, 0, -90_000),
+                ),
+            ),
+        )
+        calibration = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
+        for side, expected_steps in cases:
+            with self.subTest(side=side):
+                route = built_route(side=side)
+                pose = PhysicalPose()
+                for index, expected in enumerate(expected_steps):
+                    kind, action, distance, heading_error = expected
+                    guidance = derive_local_detour_guidance(
+                        route,
+                        current_pose=pose,
+                        motion_feasibility=feasibility(),
+                        action_specs=BLAST_NAVIGATION_ACTION_SPECS,
+                        odometry_calibration=calibration,
+                    )
+
+                    self.assertIs(guidance.route, route)
+                    self.assertEqual(guidance.active_waypoint_kind, kind)
+                    self.assertEqual(
+                        guidance.allowed_motion_actions,
+                        frozenset((action,)),
+                    )
+                    self.assertEqual(
+                        guidance.reason,
+                        GUIDANCE_ADVANCE_TO_WAYPOINT
+                        if action == ADVANCE
+                        else GUIDANCE_TURN_TO_WAYPOINT,
+                    )
+                    self.assertEqual(
+                        guidance.distance_to_waypoint_mm,
+                        distance,
+                    )
+                    self.assertEqual(
+                        guidance.heading_error_mdeg,
+                        heading_error,
+                    )
+
+                    waypoint = route.active_waypoint
+                    previous = route
+                    pose = PhysicalPose(
+                        x_mm=waypoint.x_mm,
+                        y_mm=waypoint.y_mm,
+                        heading_mdeg=waypoint.heading_mdeg,
+                    )
+                    route = route.advance_reached(pose)
+                    self.assertEqual(route.version, previous.version + 1)
+                    self.assertEqual(route.active_index, index + 1)
+
+                self.assertEqual(route.status, ROUTE_COMPLETE)
+
     def test_gate_activity_is_derived_but_remains_serialized(self):
         inactive = derive_local_detour_guidance(
             None,
