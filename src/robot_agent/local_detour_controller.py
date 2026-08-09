@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import math
 from typing import Mapping, Optional, Tuple
 
+from .local_detour_collision_snapshot import LocalDetourCollisionSnapshot
 from .local_detour_route import (
     LATERAL_CLEARANCE,
     ROUTE_ACTIVE,
@@ -150,41 +151,63 @@ def _maneuver_route_choice(active_maneuver) -> Optional[Tuple[str, str]]:
     return target_id, detour_side
 
 
-def _route_target_geometry(
+def detour_collision_snapshot_from_hazard_map(
     hazard_map: ProvisionalHazardMap,
     target_id: str,
-):
+) -> Optional[LocalDetourCollisionSnapshot]:
+    if not isinstance(hazard_map, ProvisionalHazardMap):
+        raise LocalDetourControllerError("hazard map is invalid")
     target = hazard_map.get(target_id)
     group = hazard_map.active_collision_group(target_id)
     if target is None or not group:
         return None
-    support_points = tuple(dict.fromkeys(
+    support_points = tuple(sorted(set(
         point
         for hazard in group
         for point in hazard_map.active_collision_support_points(
             hazard.hypothesis_id
         )
-    ))
+    )))
     if not support_points:
         return None
-    return target, max(hazard.radius_mm for hazard in group), support_points
+    return LocalDetourCollisionSnapshot(
+        frame_id=hazard_map.frame_id,
+        map_generation_id=hazard_map.map_generation_id,
+        map_version=hazard_map.revision,
+        target_hypothesis_id=target_id,
+        target_centroid_x_mm=target.centroid_x_mm,
+        target_centroid_y_mm=target.centroid_y_mm,
+        target_envelope_radius_mm=max(
+            hazard.radius_mm for hazard in group
+        ),
+        target_support_points=support_points,
+        robot_footprint=hazard_map.calibration.robot_footprint,
+        lateral_clearance_margin_mm=(
+            hazard_map.calibration.detour_lateral_clearance_margin_mm
+        ),
+    )
 
 
-def _build_route(
+def build_local_detour_route_from_collision_snapshot(
+    snapshot: LocalDetourCollisionSnapshot,
     *,
     current_pose: PhysicalPose,
     mission: DirectionalMission,
-    hazard_map: ProvisionalHazardMap,
-    target_id: str,
     detour_side: str,
-    position_tolerance_mm: int,
-    heading_tolerance_mdeg: int,
-) -> Optional[LocalDetourRoute]:
-    geometry = _route_target_geometry(hazard_map, target_id)
-    if geometry is None:
-        return None
-    hazard, target_radius_mm, target_support_points = geometry
-    footprint = hazard_map.calibration.robot_footprint
+    position_tolerance_mm: int = 35,
+    heading_tolerance_mdeg: int = 20_000,
+) -> LocalDetourRoute:
+    """Build the existing route from source-neutral collision geometry."""
+
+    if not isinstance(snapshot, LocalDetourCollisionSnapshot):
+        raise LocalDetourControllerError(
+            "local detour collision snapshot is invalid"
+        )
+    if not isinstance(current_pose, PhysicalPose):
+        raise LocalDetourControllerError("current pose is invalid")
+    if not isinstance(mission, DirectionalMission):
+        raise LocalDetourControllerError("directional mission is invalid")
+    footprint = snapshot.robot_footprint
     if footprint is None:
         raise LocalDetourControllerError(
             "local detour routes require a calibrated robot footprint"
@@ -193,22 +216,43 @@ def _build_route(
         current_pose=current_pose,
         goal_heading_mdeg=mission.reference_heading_mdeg,
         detour_side=detour_side,
-        target_hypothesis_id=target_id,
-        target_centroid_x_mm=hazard.centroid_x_mm,
-        target_centroid_y_mm=hazard.centroid_y_mm,
-        target_radius_mm=target_radius_mm,
-        target_support_points=target_support_points,
+        target_hypothesis_id=snapshot.target_hypothesis_id,
+        target_centroid_x_mm=snapshot.target_centroid_x_mm,
+        target_centroid_y_mm=snapshot.target_centroid_y_mm,
+        target_radius_mm=snapshot.target_envelope_radius_mm,
+        target_support_points=snapshot.target_support_points,
         footprint=footprint,
-        frame_id=hazard_map.frame_id,
-        map_generation_id=hazard_map.map_generation_id,
-        map_version=hazard_map.revision,
+        frame_id=snapshot.frame_id,
+        map_generation_id=snapshot.map_generation_id,
+        map_version=snapshot.map_version,
         goal_origin_x_mm=mission.origin_x_mm,
         goal_origin_y_mm=mission.origin_y_mm,
         position_tolerance_mm=position_tolerance_mm,
         heading_tolerance_mdeg=heading_tolerance_mdeg,
         lateral_clearance_margin_mm=(
-            hazard_map.calibration.detour_lateral_clearance_margin_mm
+            snapshot.lateral_clearance_margin_mm
         ),
+    )
+
+
+def _build_route(
+    *,
+    current_pose: PhysicalPose,
+    mission: DirectionalMission,
+    snapshot: Optional[LocalDetourCollisionSnapshot],
+    detour_side: str,
+    position_tolerance_mm: int,
+    heading_tolerance_mdeg: int,
+) -> Optional[LocalDetourRoute]:
+    if snapshot is None:
+        return None
+    return build_local_detour_route_from_collision_snapshot(
+        snapshot,
+        current_pose=current_pose,
+        mission=mission,
+        detour_side=detour_side,
+        position_tolerance_mm=position_tolerance_mm,
+        heading_tolerance_mdeg=heading_tolerance_mdeg,
     ).advance_reached(current_pose)
 
 
@@ -251,12 +295,15 @@ def synchronize_local_detour_route(
             reason="NO_ACTIVE_MANEUVER",
         )
     target_id, detour_side = choice
-    geometry = _route_target_geometry(hazard_map, target_id)
-    target_active = geometry is not None
+    snapshot = detour_collision_snapshot_from_hazard_map(
+        hazard_map,
+        target_id,
+    )
+    target_active = snapshot is not None
     if target_active:
-        hazard, target_radius_mm, target_support_points = geometry
+        target_radius_mm = snapshot.target_envelope_radius_mm
+        target_support_points = snapshot.target_support_points
     else:
-        hazard = None
         target_radius_mm = None
         target_support_points = ()
 
@@ -264,8 +311,7 @@ def synchronize_local_detour_route(
         built = _build_route(
             current_pose=current_pose,
             mission=mission,
-            hazard_map=hazard_map,
-            target_id=target_id,
+            snapshot=snapshot,
             detour_side=detour_side,
             position_tolerance_mm=position_tolerance_mm,
             heading_tolerance_mdeg=heading_tolerance_mdeg,
@@ -292,8 +338,7 @@ def synchronize_local_detour_route(
         rebuilt = _build_route(
             current_pose=current_pose,
             mission=mission,
-            hazard_map=hazard_map,
-            target_id=target_id,
+            snapshot=snapshot,
             detour_side=detour_side,
             position_tolerance_mm=position_tolerance_mm,
             heading_tolerance_mdeg=heading_tolerance_mdeg,
@@ -312,10 +357,10 @@ def synchronize_local_detour_route(
         map_version=hazard_map.revision,
         target_hypothesis_id=target_id if target_active else None,
         target_centroid_x_mm=(
-            None if not target_active else hazard.centroid_x_mm
+            None if not target_active else snapshot.target_centroid_x_mm
         ),
         target_centroid_y_mm=(
-            None if not target_active else hazard.centroid_y_mm
+            None if not target_active else snapshot.target_centroid_y_mm
         ),
         target_radius_mm=target_radius_mm,
         target_support_points=(
@@ -355,8 +400,7 @@ def synchronize_local_detour_route(
         rebuilt = _build_route(
             current_pose=current_pose,
             mission=mission,
-            hazard_map=hazard_map,
-            target_id=target_id,
+            snapshot=snapshot,
             detour_side=detour_side,
             position_tolerance_mm=position_tolerance_mm,
             heading_tolerance_mdeg=heading_tolerance_mdeg,
@@ -672,6 +716,8 @@ __all__ = (
     "SYNC_REBUILT",
     "SYNC_TARGET_MISSING",
     "SYNC_UNCHANGED",
+    "build_local_detour_route_from_collision_snapshot",
+    "detour_collision_snapshot_from_hazard_map",
     "derive_local_detour_guidance",
     "filter_local_detour_actions",
     "local_detour_tail_action_allowed",

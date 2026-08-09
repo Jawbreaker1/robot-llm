@@ -21,6 +21,8 @@ from robot_agent.local_detour_controller import (
     SYNC_REBUILT,
     SYNC_TARGET_MISSING,
     LocalDetourControllerError,
+    build_local_detour_route_from_collision_snapshot,
+    detour_collision_snapshot_from_hazard_map,
     derive_local_detour_guidance,
     filter_local_detour_actions,
     local_detour_tail_action_allowed,
@@ -234,6 +236,59 @@ class ActiveCollisionGroupTests(unittest.TestCase):
 
 
 class LocalDetourRouteSynchronizationTests(unittest.TestCase):
+    def test_ev3_map_snapshot_builds_the_same_source_neutral_route(self):
+        world = hazard_map(
+            values=(
+                hazard(
+                    hypothesis_id="h2",
+                    centroid_x_mm=256,
+                    centroid_y_mm=-4,
+                    radius_mm=70,
+                ),
+                hazard(
+                    hypothesis_id="h1",
+                    centroid_x_mm=377,
+                    centroid_y_mm=-12,
+                    radius_mm=90,
+                ),
+            ),
+            revision=9,
+        )
+        snapshot = detour_collision_snapshot_from_hazard_map(world, "h2")
+
+        self.assertEqual(snapshot.frame_id, "frame-a")
+        self.assertEqual(snapshot.map_generation_id, "generation-a")
+        self.assertEqual(snapshot.map_version, 9)
+        self.assertEqual(snapshot.target_hypothesis_id, "h2")
+        self.assertEqual(
+            (snapshot.target_centroid_x_mm, snapshot.target_centroid_y_mm),
+            (256, -4),
+        )
+        self.assertEqual(snapshot.target_envelope_radius_mm, 90)
+        self.assertEqual(
+            snapshot.target_support_points,
+            ((256, -4), (377, -12)),
+        )
+        self.assertIs(snapshot.robot_footprint, world.calibration.robot_footprint)
+        direct = build_local_detour_route_from_collision_snapshot(
+            snapshot,
+            current_pose=PhysicalPose(),
+            mission=mission(),
+            detour_side="LEFT_OF_GOAL",
+        )
+        through_ev3_map = synchronize_local_detour_route(
+            None,
+            active_maneuver=maneuver(
+                side="LEFT_OF_GOAL",
+                target_id="h2",
+            ),
+            current_pose=PhysicalPose(),
+            mission=mission(),
+            hazard_map=world,
+        ).route
+
+        self.assertEqual(direct.to_dict(), through_ev3_map.to_dict())
+
     def test_model_side_builds_and_persists_the_route(self):
         first = synchronize_local_detour_route(
             None,
