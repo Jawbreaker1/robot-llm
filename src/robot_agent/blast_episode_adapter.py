@@ -12,14 +12,19 @@ from .blast_navigation_calibration import (
 )
 from .blast_observation_monitor import (
     CONTROLLER_ID,
+    RANGE_STATE_MEASURED,
     ROBOT_ID,
     BlastControllerError,
+    blast_range_state,
     validate_blast_scan_ray_contract,
 )
 from .blast_scan_planar_projection import (
     project_blast_scan_planar_surfaces,
 )
-from .blast_navigation_action_profile import BLAST_NAVIGATION_COMMANDS
+from .blast_navigation_action_profile import (
+    BLAST_NAVIGATION_ACTION_SPECS,
+    BLAST_NAVIGATION_COMMANDS,
+)
 from .blast_navigation_motion_execution import (
     BlastNavigationMotionExecutor,
 )
@@ -36,7 +41,11 @@ from .physical_navigation_contract import (
     TURN_LEFT_90,
     TURN_RIGHT_90,
 )
-from .physical_odometry import PhysicalPose, normalize_heading_mdeg
+from .physical_odometry import (
+    PhysicalPose,
+    nominal_effect,
+    normalize_heading_mdeg,
+)
 from .robot_control_service import RobotEpisodeOutcome
 
 
@@ -49,6 +58,24 @@ DEFAULT_MAX_DECISIONS = 16
 DEFAULT_MAX_OBSERVATION_AGE_MS = 3_000
 DEFAULT_MIN_FORWARD_CLEARANCE_MM = 120
 _SIDE_SEARCH_POSITION_TOLERANCE_MM = 35
+_SIDE_SEARCH_HEADING_TOLERANCE_MDEG = 20_000
+_SIDE_SEARCH_IMU_ODOMETRY_TOLERANCE_MDEG = 30_000
+
+
+def _blast_nominal_pose(pose: PhysicalPose, action: str) -> PhysicalPose:
+    return nominal_effect(
+        pose,
+        action,
+        BLAST_NAVIGATION_ACTION_SPECS,
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+    )[0]
+
+
+def _side_search_distance(pose: PhysicalPose, waypoint) -> int:
+    return int(round(math.hypot(
+        waypoint["target_x_mm"] - pose.x_mm,
+        waypoint["target_y_mm"] - pose.y_mm,
+    )))
 
 
 def _side_search_waypoint(pose: PhysicalPose, side: str):
@@ -81,6 +108,62 @@ def _side_search_waypoint(pose: PhysicalPose, side: str):
         ),
         "position_tolerance_mm": _SIDE_SEARCH_POSITION_TOLERANCE_MM,
     }
+
+
+def _side_search_progress(
+    pose: PhysicalPose,
+    waypoint: Mapping[str, object],
+):
+    """Derive one bounded action toward the model-selected search side."""
+
+    distance = _side_search_distance(pose, waypoint)
+    target_heading = waypoint["target_heading_mdeg"]
+    heading_error = normalize_heading_mdeg(
+        target_heading - pose.heading_mdeg
+    )
+    required_action = None
+    phase = "REACHED"
+    if distance > waypoint["position_tolerance_mm"]:
+        phase = "OUTBOUND"
+        if abs(heading_error) <= _SIDE_SEARCH_HEADING_TOLERANCE_MDEG:
+            if _side_search_distance(
+                _blast_nominal_pose(pose, ADVANCE), waypoint
+            ) < distance:
+                required_action = ADVANCE
+    return {
+        "phase": phase,
+        "distance_remaining_mm": distance,
+        "heading_error_mdeg": heading_error,
+        "required_action": required_action,
+    }
+
+
+def _side_search_heading_correlated(observation, pose: PhysicalPose) -> bool:
+    reference = observation.get("navigation_reference")
+    raw_error = (
+        reference.get("heading_error_deg")
+        if isinstance(reference, Mapping)
+        else None
+    )
+    if (
+        isinstance(raw_error, bool)
+        or not isinstance(raw_error, (int, float))
+        or not math.isfinite(float(raw_error))
+    ):
+        return False
+    # Pybricks IMU heading is clockwise-positive; odometry is left-positive.
+    imu_heading = normalize_heading_mdeg(-round(float(raw_error) * 1_000))
+    error = normalize_heading_mdeg(imu_heading - pose.heading_mdeg)
+    return abs(error) <= _SIDE_SEARCH_IMU_ODOMETRY_TOLERANCE_MDEG
+
+
+def _navigation_body_matched(sensors) -> bool:
+    motors = sensors.get("motor_angles_deg")
+    angle = motors.get("body") if isinstance(motors, Mapping) else None
+    return (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics
+        .matches_navigation_body_angle(angle)
+    )
 
 
 class BlastEpisodeError(RuntimeError):
@@ -188,6 +271,20 @@ class BlastEpisodeRuntimeAdapter:
             if action in ACTION_COMMANDS:
                 return False
         return False
+
+    @staticmethod
+    def _current_scan_has_measured_center(history) -> bool:
+        if not history or history[-1].get("action") != SCAN_FRONT_ARC:
+            return False
+        scan = history[-1].get("scan")
+        rays = scan.get("rays") if isinstance(scan, Mapping) else None
+        return bool(
+            isinstance(rays, list)
+            and rays
+            and isinstance(rays[0], Mapping)
+            and rays[0].get("side") == "center"
+            and rays[0].get("range_state") == RANGE_STATE_MEASURED
+        )
 
     @classmethod
     def _completion_allowed(cls, history) -> bool:
@@ -297,17 +394,61 @@ class BlastEpisodeRuntimeAdapter:
                     episode_start_heading,
                 )
                 observation["odometry"] = motion_executor.pose.to_dict()
+                side_search_progress = None
                 if selected_detour_side is not None:
+                    side_search_progress = _side_search_progress(
+                        motion_executor.pose,
+                        side_search_waypoint,
+                    )
                     observation["navigation_intent"] = {
                         "selected_detour_side_relative_to_scan": (
                             selected_detour_side
                         ),
                         "side_search_waypoint": dict(side_search_waypoint),
                     }
+                    evidence_correlated = (
+                        _side_search_heading_correlated(
+                            observation, motion_executor.pose
+                        )
+                        and _navigation_body_matched(observation["sensors"])
+                    )
+                    if side_search_progress["phase"] == "REACHED":
+                        if not evidence_correlated:
+                            raise BlastEpisodeError(
+                                "blast_side_search_blocked",
+                                "BLAST side-search evidence is not correlated",
+                            )
+                        return self._outcome(
+                            "side_search_position_reached",
+                            False,
+                            "Side-search position reached; passage is not proven",
+                        )
                 available_actions = self._available_actions(
                     observation,
                     history,
                 )
+                if side_search_progress is not None:
+                    required_action = side_search_progress["required_action"]
+                    if not evidence_correlated:
+                        required_action = None
+                    if required_action == ADVANCE:
+                        if (
+                            blast_range_state(
+                                observation["sensors"].get("distance_mm")
+                            ) != RANGE_STATE_MEASURED
+                            or ADVANCE not in available_actions
+                        ):
+                            required_action = None
+                    if required_action not in available_actions:
+                        raise BlastEpisodeError(
+                            "blast_side_search_blocked",
+                            "BLAST has no verified side-search progress action",
+                        )
+                    available_actions = (required_action,)
+                if side_search_progress is not None:
+                    observation["navigation_intent"][
+                        "side_search_progress"
+                    ] = dict(side_search_progress)
                 completion_allowed = self._completion_allowed(history)
                 result = planner.decide(ControllerActionContext(
                     goal=context.request.goal,
@@ -330,6 +471,7 @@ class BlastEpisodeRuntimeAdapter:
                 selects_detour_side = (
                     selected_detour_side is None
                     and self._scan_is_current(history)
+                    and self._current_scan_has_measured_center(history)
                     and decision.action in (TURN_LEFT_90, TURN_RIGHT_90)
                 )
                 detour_origin_pose = (
