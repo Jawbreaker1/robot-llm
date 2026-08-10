@@ -436,7 +436,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertTrue(scan["all_observations_settled"])
         monitor.close()
 
-    def test_scan_uses_a_longer_settle_window_than_navigation(self):
+    def test_scan_and_turns_use_a_longer_settle_window_than_driving(self):
         class RecordingMonitor(BlastObservationMonitor):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -466,13 +466,17 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.wait_for(monitor, "online")
 
         monitor.command(SCAN_COMMAND)
+        monitor.command("turn_left")
         monitor.command("drive_forward")
 
         self.assertEqual(
             monitor.settle_timeouts[:9],
             [SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS] * 9,
         )
-        self.assertIsNone(monitor.settle_timeouts[-1])
+        self.assertEqual(
+            monitor.settle_timeouts[-2:],
+            [SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS, None],
+        )
         self.assertGreaterEqual(
             SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
             9 * SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS + 6,

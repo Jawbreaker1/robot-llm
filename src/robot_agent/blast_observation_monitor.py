@@ -849,6 +849,11 @@ class BlastObservationMonitor:
                     runtime,
                     generation=generation,
                     initial_observation=observation,
+                    timeout_seconds=(
+                        SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS
+                        if command in ("turn_left", "turn_right")
+                        else None
+                    ),
                 )
             )
         result = {
