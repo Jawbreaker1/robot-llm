@@ -1350,6 +1350,183 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(controller.commands.count("scan_front_arc"), 2)
         self.assertEqual(controller.commands.count("drive_forward"), 9)
 
+    def test_no_return_side_view_runs_one_bounded_target_reacquisition(self):
+        class ReacquisitionController(FakeScanController):
+            def __init__(
+                self, resolved, block_after_side=False,
+                selected_side="LEFT",
+            ):
+                super().__init__(1_000)
+                self.scan_count = 0
+                self.resolved = resolved
+                self.block_after_side = block_after_side
+                self.selected_side = selected_side
+
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command != "scan_front_arc":
+                    return result
+                self.scan_count += 1
+                if self.scan_count == 1:
+                    scan = scan_result(center_distance_mm=245.0)
+                    scan["rays"][1]["distance_mm"] = 286.0
+                    scan["rays"][3]["distance_mm"] = 232.0
+                elif self.scan_count == 2:
+                    scan = scan_result(center_distance_mm=1_352.0)
+                    outer = 1 if self.selected_side == "LEFT" else 3
+                    target = (3, 4) if self.selected_side == "LEFT" else (1, 2)
+                    scan["rays"][outer]["distance_mm"] = 1_420.0
+                    for index in target:
+                        scan["rays"][index].update({
+                            "distance_mm": 2_000.0,
+                            "range_state": RANGE_STATE_NO_VALID_DISTANCE,
+                        })
+                else:
+                    scan = scan_result(center_distance_mm=900.0)
+                    target = 3 if self.selected_side == "LEFT" else 1
+                    if self.resolved:
+                        scan["rays"][target]["distance_mm"] = 300.0
+                    else:
+                        indices = (
+                            (3, 4) if self.selected_side == "LEFT"
+                            else (1, 2)
+                        )
+                        for index in indices:
+                            scan["rays"][index].update({
+                                "distance_mm": 2_000.0,
+                                "range_state": RANGE_STATE_NO_VALID_DISTANCE,
+                            })
+                result["scan"] = scan
+                if self.scan_count == 2 and self.block_after_side:
+                    result["observation"]["distance_mm"] = 2_000
+                    self.snapshot_value["observation"][
+                        "distance_mm"
+                    ] = 2_000
+                return result
+
+        for resolved, terminal_reason in (
+            (True, "target_reacquisition_observation_collected"),
+            (False, "target_reacquisition_unresolved"),
+        ):
+            with self.subTest(resolved=resolved):
+                controller = ReacquisitionController(resolved)
+                planner = Planner([
+                    decision(SCAN_FRONT_ARC),
+                    decision(TURN_LEFT_90),
+                ])
+                context, updates = episode_context()
+
+                result = self.adapter(
+                    controller,
+                    planner,
+                    max_decisions=64,
+                    execute_provisional_detour=True,
+                ).run(context)
+
+                self.assertFalse(result.completed)
+                self.assertEqual(result.terminal_reason, terminal_reason)
+                self.assertEqual(len(planner.contexts), 2)
+                self.assertEqual(controller.scan_count, 3)
+                second_scan = [
+                    index for index, command in enumerate(controller.commands)
+                    if command == "scan_front_arc"
+                ][1]
+                self.assertEqual(
+                    controller.commands[second_scan + 1:],
+                    ["turn_right"] * 4
+                    + ["drive_forward"] * 6
+                    + ["turn_left"] * 4
+                    + ["scan_front_arc"],
+                )
+                evidence = next(
+                    update["scan"]["multi_view_observations"][
+                        "target_reacquisition"
+                    ]
+                    for update in reversed(updates)
+                    if "target_reacquisition" in update.get(
+                        "scan", {}
+                    ).get("multi_view_observations", {})
+                    and update["scan"]["multi_view_observations"][
+                        "target_reacquisition"
+                    ]["attempted"]
+                )
+                self.assertIs(evidence["resolved"], resolved)
+                trace = self.adapter(
+                    ReacquisitionController(resolved),
+                    Planner([
+                        decision(SCAN_FRONT_ARC),
+                        decision(TURN_LEFT_90),
+                    ]),
+                    max_decisions=21,
+                    execute_provisional_detour=True,
+                )
+                exact = trace.run(episode_context()[0])
+                self.assertEqual(exact.terminal_reason, terminal_reason)
+                planned = trace.spatial_map_provider.snapshot()[
+                    "navigation_trace"
+                ]["planned_leg"]
+                self.assertLess(planned["waypoint"]["y_mm"], 150)
+                self.assertGreater(planned["bind_pose"]["y_mm"], 300)
+
+        controller = ReacquisitionController(True)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+        result = self.adapter(
+            controller,
+            planner,
+            max_decisions=20,
+            execute_provisional_detour=True,
+        ).run(episode_context()[0])
+        self.assertEqual(
+            result.terminal_reason,
+            "target_reacquisition_budget_insufficient",
+        )
+        self.assertEqual(controller.scan_count, 2)
+        self.assertEqual(controller.commands[-1], "scan_front_arc")
+
+        controller = ReacquisitionController(
+            True, selected_side="RIGHT",
+        )
+        result = self.adapter(
+            controller,
+            Planner([
+                decision(SCAN_FRONT_ARC), decision(TURN_RIGHT_90),
+            ]),
+            max_decisions=64,
+            execute_provisional_detour=True,
+        ).run(episode_context()[0])
+        self.assertEqual(
+            result.terminal_reason,
+            "target_reacquisition_observation_collected",
+        )
+        second_scan = [
+            index for index, command in enumerate(controller.commands)
+            if command == "scan_front_arc"
+        ][1]
+        tail = controller.commands[second_scan + 1:]
+        self.assertEqual(tail[:4], ["turn_left"] * 4)
+        self.assertEqual(tail[-5:], ["turn_right"] * 4 + ["scan_front_arc"])
+        self.assertIn(tail.count("drive_forward"), range(1, 7))
+
+        controller = ReacquisitionController(True, block_after_side=True)
+        result = self.adapter(
+            controller,
+            Planner([
+                decision(SCAN_FRONT_ARC), decision(TURN_LEFT_90),
+            ]),
+            max_decisions=64,
+            execute_provisional_detour=True,
+        ).run(episode_context()[0])
+        self.assertEqual(
+            result.terminal_reason, "target_reacquisition_blocked",
+        )
+        self.assertEqual(controller.scan_count, 2)
+        self.assertEqual(controller.commands[-1], "scan_front_arc")
+
     def test_stop_after_side_rescan_wins_over_collected_outcome(self):
         context, updates = episode_context()
 

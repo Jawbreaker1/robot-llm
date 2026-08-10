@@ -36,6 +36,10 @@ from .blast_observation_monitor import (
 from .blast_scan_planar_projection import (
     project_blast_scan_planar_surfaces,
 )
+from .blast_side_observation import (
+    build_blast_multi_view_observation, finish_target_reacquisition,
+    plan_target_reacquisition, side_search_action_admission,
+    side_search_planned_leg)
 from .blast_spatial_map import BlastSpatialMapBridge
 from .blast_navigation_action_profile import (
     BLAST_NAVIGATION_COMMANDS,
@@ -45,7 +49,6 @@ from .blast_navigation_motion_execution import (
 )
 from .blast_turn_safety import blast_turn_slice_allows_continuation
 from .blast_side_search_geometry import (
-    POSITION_TOLERANCE_MM as _SIDE_SEARCH_POSITION_TOLERANCE_MM,
     side_search_distance as _side_search_distance,
     side_search_followup_slots as _side_search_followup_slots,
     side_search_progress as _side_search_progress,
@@ -76,7 +79,6 @@ from .physical_odometry import (
 )
 from .physical_navigation_mission import DirectionalMission
 from .robot_control_service import RobotEpisodeOutcome
-
 BLAST_PROFILE_ID = ROBOT_ID
 ACTION_COMMANDS = {
     action: BLAST_NAVIGATION_COMMANDS[action]
@@ -224,26 +226,13 @@ class _BlastEpisodeMapTrace:
                 pose=pose,
                 observation=observation,
             )
-        if (
+        next_leg = side_search_planned_leg(
+            selected_side, waypoint, bind_pose)
+        if next_leg is not None and (
             self.planned_leg is None
-            and selected_side in ("LEFT", "RIGHT")
-            and isinstance(waypoint, Mapping)
-            and isinstance(bind_pose, PhysicalPose)
+            or self.planned_leg.get("waypoint") != next_leg["waypoint"]
         ):
-            self.planned_leg = {
-                "kind": "SIDE_SEARCH",
-                "scope": "SEARCH_POSITION_ONLY",
-                "clearance_proven": False,
-                "passage_proven": False,
-                "route_eligible": False,
-                "selected_side": selected_side,
-                "bind_pose": _map_pose(bind_pose),
-                "waypoint": {
-                    "x_mm": waypoint["target_x_mm"],
-                    "y_mm": waypoint["target_y_mm"],
-                    "heading_mdeg": waypoint["target_heading_mdeg"],
-                },
-            }
+            self.planned_leg = next_leg
         if route is not None:
             self.navigation_enforced = True
             if route.status == ROUTE_COMPLETE:
@@ -1157,39 +1146,29 @@ class BlastEpisodeRuntimeAdapter:
                 False,
                 "Side observation could not be correlated",
             )
-        origin_pose = origin_view["scan_pose"]
-        side_pose = side_view["scan_pose"]
-        separation = int(round(math.hypot(
-            side_pose["x_mm"] - origin_pose["x_mm"],
-            side_pose["y_mm"] - origin_pose["y_mm"],
-        )))
-        stride = int(round(math.hypot(
-            waypoint["target_x_mm"] - origin_pose["x_mm"],
-            waypoint["target_y_mm"] - origin_pose["y_mm"],
-        )))
-        if separation < stride - _SIDE_SEARCH_POSITION_TOLERANCE_MM:
+        try:
+            final_scan = build_blast_multi_view_observation(
+                origin_view=origin_view,
+                side_view=side_view,
+                selected_side=selected_side,
+                waypoint=waypoint,
+                pose=pose,
+                diagnostic_scan=diagnostic_scan,
+                host_actions=host_actions,
+            )
+        except ValueError:
             return None, None, self._outcome(
                 "side_search_observation_unavailable",
                 False,
                 "Side observation viewpoints were not distinct",
             )
-        final_scan = copy.deepcopy(diagnostic_scan)
-        final_scan["multi_view_observations"] = {
-            "schema": "blast-multi-view-scan-observations/v1",
-            "frame": "EPISODE_LOCAL_ODOMETRY",
-            "quality": "PROVISIONAL_YAW_ONLY",
-            "selected_side": selected_side,
-            "strategy_source": _PLANNER_ACTION_SOURCE,
-            "execution_source": _HOST_SIDE_SEARCH_ACTION_SOURCE,
-            "host_action_count": len(host_actions),
-            "host_action_trace": list(host_actions),
-            "viewpoint_separation_mm": separation,
-            "object_association_proven": False,
-            "clearance_proven": False,
-            "passage_proven": False,
-            "route_eligible": False,
-            "views": [origin_view, side_view],
-        }
+        terminal = finish_target_reacquisition(
+            final_scan, origin_view, side_view, selected_side, waypoint)
+        if terminal is not None:
+            return final_scan, None, self._outcome(
+                terminal, False,
+                "BLAST completed one bounded target reacquisition view",
+            )
         if not self.execute_provisional_detour:
             return final_scan, None, self._outcome(
                 "side_search_observation_collected",
@@ -1206,6 +1185,17 @@ class BlastEpisodeRuntimeAdapter:
             remaining_slots=remaining_slots,
         )
         if blocked is not None:
+            if blocked.terminal_reason == "detour_route_unavailable":
+                next_waypoint, budget_blocked = plan_target_reacquisition(
+                    final_scan, origin_view, side_view, selected_side, pose,
+                    remaining_slots)
+                if budget_blocked:
+                    return final_scan, None, self._outcome(
+                        "target_reacquisition_budget_insufficient", False,
+                        "The episode cannot finish target reacquisition",
+                    )
+                if next_waypoint is not None:
+                    return final_scan, next_waypoint, None
             return final_scan, None, blocked
         final_scan["multi_view_observations"]["route_eligible"] = True
         return final_scan, route, None
@@ -1248,12 +1238,13 @@ class BlastEpisodeRuntimeAdapter:
     @staticmethod
     def _record_map_result(
         trace, action, pose, observation, selected_side, waypoint, scan_view,
-        route=None,
+        route=None, pose_observed=None,
     ):
         trace.record(
             pose=pose,
             observation=observation,
-            pose_observed=action in ACTION_COMMANDS,
+            pose_observed=(action in ACTION_COMMANDS if pose_observed is None
+                           else pose_observed),
             selected_side=selected_side,
             waypoint=waypoint,
             bind_pose=pose,
@@ -1315,8 +1306,6 @@ class BlastEpisodeRuntimeAdapter:
                     "blast_planner_invalid",
                     "BLAST planner is invalid",
                 )
-            # Preserve the existing hard episode bound: host-owned waypoint
-            # actions consume the same semantic action slots as model actions.
             for _index in range(self.max_decisions):
                 outcome = self._control_outcome(context, deadline_ms)
                 if outcome is not None:
@@ -1383,29 +1372,20 @@ class BlastEpisodeRuntimeAdapter:
                         if action in (TURN_LEFT_90, TURN_RIGHT_90)
                     )
                 if side_search_progress is not None:
-                    required_action = side_search_progress["required_action"]
-                    if not evidence_correlated:
-                        required_action = None
-                    if required_action == ADVANCE:
-                        if (
-                            blast_range_state(
-                                observation["sensors"].get("distance_mm")
-                            ) != RANGE_STATE_MEASURED
-                            or ADVANCE not in available_actions
-                        ):
-                            required_action = None
-                    if required_action in (
-                        TURN_LEFT_90,
-                        TURN_RIGHT_90,
-                        SCAN_FRONT_ARC,
-                    ) and not self._current_range_allows_rotation(observation):
-                        required_action = None
-                    if required_action not in available_actions:
+                    available_actions, blocked = side_search_action_admission(
+                        side_search_progress, side_search_waypoint,
+                        observation["sensors"], available_actions,
+                        evidence_correlated,
+                        self._current_range_allows_rotation(observation),
+                    )
+                    if blocked == "target_reacquisition_blocked":
+                        return self._outcome(blocked, False,
+                            "BLAST cannot safely reach the next target view")
+                    if blocked is not None:
                         raise BlastEpisodeError(
                             "blast_side_search_blocked",
                             "BLAST has no verified side-search progress action",
                         )
-                    available_actions = (required_action,)
                 if side_search_progress is not None:
                     observation["navigation_intent"][
                         "side_search_progress"
@@ -1745,7 +1725,7 @@ class BlastEpisodeRuntimeAdapter:
                 if side_search_setup_outcome is not None:
                     return side_search_setup_outcome
                 if is_side_search_rescan:
-                    final_scan, route, outcome = self._finish_side_rescan(
+                    final_scan, continuation, outcome = self._finish_side_rescan(
                         origin_view=origin_scan_view,
                         side_view=latest_scan_view,
                         selected_side=selected_detour_side,
@@ -1758,17 +1738,24 @@ class BlastEpisodeRuntimeAdapter:
                         mission=map_trace.mission,
                         remaining_slots=self.max_decisions - _index - 1,
                     )
-                    if route is not None:
-                        local_detour_route = route
-                        map_trace.record(
-                            pose=motion_executor.pose,
-                            observation=result_observation,
+                    if isinstance(continuation, Mapping):
+                        side_search_waypoint = continuation
+                        reorientation_attempted = False
+                        previous_outbound_distance_mm = None
+                        self._record_map_result(
+                            map_trace, action, motion_executor.pose,
+                            result_observation, selected_detour_side,
+                            side_search_waypoint, None,
                             pose_observed=False,
-                            selected_side=selected_detour_side,
-                            waypoint=side_search_waypoint,
-                            bind_pose=motion_executor.pose,
-                            scan_view=None,
+                        )
+                    elif continuation is not None:
+                        local_detour_route = continuation
+                        self._record_map_result(
+                            map_trace, action, motion_executor.pose,
+                            result_observation, selected_detour_side,
+                            side_search_waypoint, None,
                             route=local_detour_route,
+                            pose_observed=False,
                         )
                     if final_scan is not None:
                         context.publish({"scan": final_scan})
