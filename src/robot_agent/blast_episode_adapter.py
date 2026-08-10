@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from functools import partial
 import math
 import threading
 import time
@@ -42,6 +43,7 @@ from .blast_navigation_action_profile import (
 from .blast_navigation_motion_execution import (
     BlastNavigationMotionExecutor,
 )
+from .blast_turn_safety import blast_turn_slice_allows_continuation
 from .blast_side_search_geometry import (
     POSITION_TOLERANCE_MM as _SIDE_SEARCH_POSITION_TOLERANCE_MM,
     side_search_distance as _side_search_distance,
@@ -495,28 +497,6 @@ class BlastEpisodeRuntimeAdapter:
             return False
         return float(distance) > _minimum_rotation_clearance_mm()
 
-    @classmethod
-    def _turn_slice_allows_continuation(cls, command_result) -> bool:
-        if not (
-            isinstance(command_result, Mapping)
-            and command_result.get("completed") is True
-            and command_result.get("observation_settled") is True
-        ):
-            return False
-        sensors = command_result.get("observation")
-        if not (
-            isinstance(sensors, Mapping)
-            and sensors.get("motion_active") is False
-            and _navigation_body_matched(sensors)
-            and cls._heading(sensors) is not None
-        ):
-            return False
-        distance = sensors.get("distance_mm")
-        return (
-            blast_range_state(distance) == RANGE_STATE_MEASURED
-            and float(distance) > _minimum_rotation_clearance_mm()
-        )
-
     def _current_observation_allows_action(self, action, observation) -> bool:
         sensors = observation["sensors"]
         if not _navigation_body_matched(sensors):
@@ -612,21 +592,32 @@ class BlastEpisodeRuntimeAdapter:
             return None
         return self._outcome(value[0], False, value[1])
 
-    def _dispatch_action(self, action, motion_executor, control_requested):
+    def _dispatch_action(
+        self,
+        action,
+        motion_executor,
+        control_requested,
+        *,
+        allow_turn_no_valid_with_bounded_evidence=False,
+    ):
         if action == SCAN_FRONT_ARC:
             result = self.controller.command(
                 "scan_front_arc",
                 cancel_requested=control_requested,
             )
             return result, None
+        continuation_gate = (
+            partial(
+                blast_turn_slice_allows_continuation,
+                allow_no_valid_distance_with_bounded_evidence=(
+                    allow_turn_no_valid_with_bounded_evidence
+                ),
+            ) if action in (TURN_LEFT_90, TURN_RIGHT_90) else None
+        )
         execution = motion_executor.execute(
             action,
             cancel_requested=control_requested,
-            continue_requested=(
-                self._turn_slice_allows_continuation
-                if action in (TURN_LEFT_90, TURN_RIGHT_90)
-                else None
-            ),
+            continue_requested=continuation_gate,
         )
         return execution.controller_results[-1], execution
 
@@ -1065,6 +1056,7 @@ class BlastEpisodeRuntimeAdapter:
             "action_source": _PLANNER_ACTION_SOURCE,
             "observation": observation,
             "selects_detour_side": selects_side,
+            "bounded_turn_no_valid_eligible": selects_side,
             "detour_origin_pose": detour_origin_pose,
         }, None
 
@@ -1128,6 +1120,7 @@ class BlastEpisodeRuntimeAdapter:
             "action_source": source,
             "observation": observation,
             "selects_detour_side": False,
+            "bounded_turn_no_valid_eligible": True,
             "detour_origin_pose": None,
         }, previous_outbound_distance_mm
 
@@ -1551,7 +1544,12 @@ class BlastEpisodeRuntimeAdapter:
                 )
                 try:
                     command_result, execution = self._dispatch_action(
-                        action, motion_executor, control_requested,
+                        action,
+                        motion_executor,
+                        control_requested,
+                        allow_turn_no_valid_with_bounded_evidence=(
+                            step["bounded_turn_no_valid_eligible"]
+                        ),
                     )
                 except BlastControllerError as error:
                     outcome = self._control_outcome(context, deadline_ms)

@@ -1,3 +1,4 @@
+import copy
 import threading
 import unittest
 from types import SimpleNamespace
@@ -20,6 +21,9 @@ from robot_agent.blast_observation_monitor import (
     ROBOT_ID,
     SCAN_RESULT_SCHEMA,
     SETTLED_OBSERVATION_COMMAND,
+)
+from robot_agent.blast_turn_safety import (
+    blast_turn_slice_allows_continuation,
 )
 from robot_agent.lm_studio_controller_action import (
     COMPLETE,
@@ -1155,7 +1159,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(len(planner.contexts), 2)
 
-    def test_no_valid_range_stops_side_turn_after_one_pulse(self):
+    def test_scan_supported_side_turn_continues_through_no_valid_range(self):
         class NoReturnDuringSideTurnController(FakeScanController):
             def command(self, command, *, cancel_requested=None):
                 result = super().command(
@@ -1163,9 +1167,12 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 )
                 if command == "turn_left":
                     result["observation"]["distance_mm"] = 2_000
-                    self.snapshot_value["observation"][
-                        "distance_mm"
-                    ] = 2_000
+                    if self.commands.count("turn_left") == 4:
+                        # Make the next semantic action fail closed without
+                        # changing the four settled pulse results under test.
+                        self.snapshot_value["observation"][
+                            "distance_mm"
+                        ] = None
                 return result
 
         controller = NoReturnDuringSideTurnController(500)
@@ -1174,18 +1181,67 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             decision(TURN_LEFT_90),
         ])
 
-        result = self.adapter(controller, planner).run(
-            episode_context()[0]
-        )
+        with self.assertRaises(BlastEpisodeError) as raised:
+            self.adapter(controller, planner).run(episode_context()[0])
 
-        self.assertFalse(result.completed)
+        self.assertEqual(raised.exception.code, "blast_side_search_blocked")
         self.assertEqual(
-            result.terminal_reason, "side_search_motion_incomplete"
-        )
-        self.assertEqual(
-            controller.commands, ["scan_front_arc", "turn_left"]
+            controller.commands, ["scan_front_arc"] + ["turn_left"] * 4
         )
         self.assertEqual(len(planner.contexts), 2)
+
+    def test_no_valid_turn_eligibility_preserves_other_slice_gates(self):
+        controller = FakeController(500)
+        result = controller.command("turn_left")
+
+        result["observation"]["distance_mm"] = 2_000
+        self.assertFalse(blast_turn_slice_allows_continuation(result))
+        self.assertTrue(blast_turn_slice_allows_continuation(
+            result,
+            allow_no_valid_distance_with_bounded_evidence=True,
+        ))
+
+        for fault in ("close", "invalid", "body", "heading", "unsettled"):
+            with self.subTest(fault=fault):
+                candidate = copy.deepcopy(result)
+                if fault == "close":
+                    candidate["observation"]["distance_mm"] = 40
+                elif fault == "invalid":
+                    candidate["observation"]["distance_mm"] = None
+                elif fault == "body":
+                    candidate["observation"]["motor_angles_deg"][
+                        "body"
+                    ] = 156
+                elif fault == "heading":
+                    candidate["observation"]["imu"]["heading_deg"] = None
+                else:
+                    candidate["observation_settled"] = False
+                self.assertFalse(blast_turn_slice_allows_continuation(
+                    candidate,
+                    allow_no_valid_distance_with_bounded_evidence=True,
+                ))
+
+    def test_arbitrary_planner_turn_still_stops_on_no_valid_range(self):
+        class NoReturnDuringPlannerTurn(FakeController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "turn_left":
+                    result["observation"]["distance_mm"] = 2_000
+                    self.snapshot_value["observation"] = (
+                        result["observation"]
+                    )
+                return result
+
+        controller = NoReturnDuringPlannerTurn(500)
+        result = self.adapter(
+            controller, Planner([decision(TURN_LEFT_90)]),
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "no_safe_blast_action")
+        self.assertEqual(controller.commands, ["turn_left"])
 
     def test_control_wins_during_final_detour_verification(self):
         for control, terminal_reason in (
@@ -1723,6 +1779,35 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     controller.commands.count("scan_front_arc"),
                     1,
                 )
+
+    def test_host_reorient_no_return_finishes_then_scan_rechecks_range(self):
+        class NoReturnDuringHostReorient(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "turn_right":
+                    result["observation"]["distance_mm"] = 2_000
+                    if self.commands.count("turn_right") == 4:
+                        self.snapshot_value["observation"][
+                            "distance_mm"
+                        ] = 2_000
+                return result
+
+        controller = NoReturnDuringHostReorient(1_000)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+            *(decision("ADVANCE") for _index in range(5)),
+            decision(TURN_RIGHT_90),
+        ])
+
+        with self.assertRaises(BlastEpisodeError) as raised:
+            self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertEqual(raised.exception.code, "blast_side_search_blocked")
+        self.assertEqual(controller.commands.count("turn_right"), 4)
+        self.assertEqual(controller.commands.count("scan_front_arc"), 1)
 
     def test_side_search_requires_projection_ready_second_scan(self):
         class UnsettledSecondScanController(FakeScanController):
