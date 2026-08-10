@@ -145,6 +145,24 @@ class BlastScanPlanarProjectionTests(TestCase):
             [],
         )
 
+    def test_unsettled_far_ray_is_excluded_from_partial_projection(self):
+        scan = scan_result((300.0, 1_489.0, 500.0, 600.0, 700.0))
+        scan["all_observations_settled"] = False
+        scan["rays"][1].update({
+            "observation_settled": False,
+            "evidence_use": "SWEEP_CONTINUATION_ONLY",
+        })
+
+        points = projected_points(scan)
+
+        self.assertEqual(
+            [point["side"] for point in points],
+            ["center", "left_far", "right_near", "right_far"],
+        )
+        self.assertNotIn(1_489.0, (
+            point["measured_range_mm"] for point in points
+        ))
+
     def test_unready_scan_or_sensor_pose_is_rejected(self):
         mutations = (
             lambda value: value.update(restoration_verified=False),

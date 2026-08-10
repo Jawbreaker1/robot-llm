@@ -25,8 +25,8 @@ DEFAULT_RECONNECT_INTERVAL_SECONDS = 3.0
 DISCONNECT_TIMEOUT_SECONDS = 3.0
 COMMAND_TIMEOUT_SECONDS = 15.0
 INTERNAL_COMMAND_TIMEOUT_SECONDS = 12.0
-SCAN_COMMAND_TIMEOUT_SECONDS = 60.0
-SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS = 57.0
+SCAN_COMMAND_TIMEOUT_SECONDS = 36.0
+SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS = 33.0
 MIN_COMMAND_BUDGET_SECONDS = 2.0
 COMMAND_RESPONSE_MARGIN_SECONDS = 0.25
 MOTION_TIMEOUT_SECONDS = 4.0
@@ -45,6 +45,8 @@ PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM = 2_000
 RANGE_STATE_MEASURED = "MEASURED"
 RANGE_STATE_NO_VALID_DISTANCE = "NO_VALID_DISTANCE"
 RANGE_STATE_INVALID = "INVALID"
+SCAN_RAY_EVIDENCE_SETTLED = "SETTLED_RANGE"
+SCAN_RAY_EVIDENCE_SWEEP_ONLY = "SWEEP_CONTINUATION_ONLY"
 SCAN_RAY_SIDES = (
     "center",
     "left_near",
@@ -130,9 +132,27 @@ def validate_blast_scan_ray_contract(scan):
             for ray in rays
         )
         != SCAN_RAY_SIDES
+        or type(scan.get("all_observations_settled")) is not bool
+        or scan.get("all_observations_settled") != all(
+            isinstance(ray, Mapping)
+            and ray.get("observation_settled") is True
+            for ray in rays
+        )
         or any(
             (
-                ray.get("range_state") != blast_range_state(
+                type(ray.get("observation_settled")) is not bool
+                or (
+                    ray.get("observation_settled") is True
+                    and ray.get(
+                        "evidence_use", SCAN_RAY_EVIDENCE_SETTLED
+                    ) != SCAN_RAY_EVIDENCE_SETTLED
+                )
+                or (
+                    ray.get("observation_settled") is False
+                    and ray.get("evidence_use")
+                    != SCAN_RAY_EVIDENCE_SWEEP_ONLY
+                )
+                or ray.get("range_state") != blast_range_state(
                     ray.get("distance_mm")
                 )
                 or "body_motor_angle_deg" not in ray
@@ -185,6 +205,7 @@ class BlastObservationMonitor:
         self._loop = None
         self._task = None
         self._runtime_generation = 0
+        self._settling_samples = ()
         self._pending_command = None
         self._preempt_stop_request = None
         self._command_queue = Queue(maxsize=1)
@@ -579,6 +600,7 @@ class BlastObservationMonitor:
         observation,
         start_heading,
         observation_settled,
+        evidence_use=SCAN_RAY_EVIDENCE_SETTLED,
     ):
         heading = cls._scan_heading(observation)
         observed_at_ms = observation.get("observed_at_ms")
@@ -596,8 +618,42 @@ class BlastObservationMonitor:
                 start_heading,
             ),
             "observation_settled": observation_settled,
+            "evidence_use": evidence_use,
             "observed_at_ms": observed_at_ms,
         }
+
+    def _scan_sweep_window_allows_continuation(self, observation) -> bool:
+        samples = self._settling_samples
+        if (
+            observation.get("motion_active") is not False
+            or len(samples) != POST_MOTION_SETTLE_SAMPLE_COUNT
+            or self._scan_heading(observation) is None
+            or not (
+                BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+                .range_sensor_extrinsics
+                .matches_navigation_body_angle(_body_motor_angle(observation))
+            )
+        ):
+            return False
+        tilt_ranges = tuple(
+            max(sample[index] for sample in samples)
+            - min(sample[index] for sample in samples)
+            for index in (1, 2)
+        )
+        if any(value > POST_MOTION_TILT_RANGE_DEG for value in tilt_ranges):
+            return False
+        minimum = (
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+            .minimum_rotation_clearance_mm()
+        )
+        return all(
+            blast_range_state(sample[0]) == RANGE_STATE_NO_VALID_DISTANCE
+            or (
+                blast_range_state(sample[0]) == RANGE_STATE_MEASURED
+                and sample[0] > minimum
+            )
+            for sample in samples
+        )
 
     async def _scan_turn(
         self,
@@ -626,45 +682,18 @@ class BlastObservationMonitor:
             )
         )
         distance = observation.get("distance_mm")
-        sensor = (
-            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-            .range_sensor_extrinsics
-        )
-        range_state = blast_range_state(distance)
-        if (
-            observation_settled is not True
-            and observation.get("motion_active") is False
-            and self._scan_heading(observation) is not None
-            and sensor.matches_navigation_body_angle(
-                _body_motor_angle(observation)
-            )
-            and (
-                range_state == RANGE_STATE_NO_VALID_DISTANCE
-                or (
-                    range_state == RANGE_STATE_MEASURED
-                    and float(distance) > (
-                        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-                        .minimum_rotation_clearance_mm()
-                    )
-                )
-            )
+        sweep_only = observation_settled is not True
+        if sweep_only and not self._scan_sweep_window_allows_continuation(
+            observation
         ):
-            observation, observation_settled = (
-                await self._observe_until_settled(
-                    runtime,
-                    generation=generation,
-                    initial_observation=observation,
-                    timeout_seconds=(
-                        SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS
-                    ),
-                )
-            )
-            distance = observation.get("distance_mm")
-        if observation_settled is not True:
             raise BlastControllerError(
                 "scan_sweep_observation_unverified",
                 "BLAST scan could not settle safely between turn pulses",
             )
+        sensor = (
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+            .range_sensor_extrinsics
+        )
         if (
             self._scan_heading(observation) is None
             or not sensor.matches_navigation_body_angle(
@@ -689,7 +718,16 @@ class BlastObservationMonitor:
                 "scan_sweep_clearance_lost",
                 "BLAST scan stopped after a close settled observation",
             )
-        return receipt, observation, observation_settled
+        return (
+            receipt,
+            observation,
+            observation_settled,
+            (
+                SCAN_RAY_EVIDENCE_SWEEP_ONLY
+                if sweep_only
+                else SCAN_RAY_EVIDENCE_SETTLED
+            ),
+        )
 
     async def _perform_scan_front_arc(self, runtime, generation):
         center = await self._observe_until_idle(
@@ -727,14 +765,24 @@ class BlastObservationMonitor:
                 "front clearance and navigation sensor pose",
             )
 
-        _left_near_receipt, left_near, left_near_settled = (
+        (
+            _left_near_receipt,
+            left_near,
+            left_near_settled,
+            left_near_evidence,
+        ) = (
             await self._scan_turn(
                 runtime,
                 generation,
                 "left",
             )
         )
-        _left_far_receipt, left_far, left_far_settled = (
+        (
+            _left_far_receipt,
+            left_far,
+            left_far_settled,
+            left_far_evidence,
+        ) = (
             await self._scan_turn(
                 runtime,
                 generation,
@@ -751,14 +799,24 @@ class BlastObservationMonitor:
             generation,
             "right",
         )
-        _right_near_receipt, right_near, right_near_settled = (
+        (
+            _right_near_receipt,
+            right_near,
+            right_near_settled,
+            right_near_evidence,
+        ) = (
             await self._scan_turn(
                 runtime,
                 generation,
                 "right",
             )
         )
-        _right_far_receipt, right_far, right_far_settled = (
+        (
+            _right_far_receipt,
+            right_far,
+            right_far_settled,
+            right_far_evidence,
+        ) = (
             await self._scan_turn(
                 runtime,
                 generation,
@@ -770,11 +828,12 @@ class BlastObservationMonitor:
             generation,
             "left",
         )
-        _return_receipt, final, final_settled = await self._scan_turn(
-            runtime,
-            generation,
-            "left",
-        )
+        (
+            _return_receipt,
+            final,
+            final_settled,
+            _final_evidence,
+        ) = await self._scan_turn(runtime, generation, "left")
 
         final_heading = self._scan_heading(final)
         restoration_error = self._scan_heading_delta(
@@ -803,7 +862,6 @@ class BlastObservationMonitor:
                 left_far_settled,
                 right_near_settled,
                 right_far_settled,
-                final_settled,
             )),
             "rays": [
                 self._scan_ray(
@@ -817,24 +875,28 @@ class BlastObservationMonitor:
                     left_near,
                     start_heading,
                     left_near_settled,
+                    left_near_evidence,
                 ),
                 self._scan_ray(
                     "left_far",
                     left_far,
                     start_heading,
                     left_far_settled,
+                    left_far_evidence,
                 ),
                 self._scan_ray(
                     "right_near",
                     right_near,
                     start_heading,
                     right_near_settled,
+                    right_near_evidence,
                 ),
                 self._scan_ray(
                     "right_far",
                     right_far,
                     start_heading,
                     right_far_settled,
+                    right_far_evidence,
                 ),
             ],
         }
@@ -996,6 +1058,7 @@ class BlastObservationMonitor:
         )
         latest = initial_observation
         samples = []
+        self._settling_samples = ()
         while True:
             if await self._service_preempt_stop(runtime, generation):
                 raise BlastControllerError(
@@ -1011,6 +1074,7 @@ class BlastObservationMonitor:
             settled = self._settling_window_is_stable(samples)
             timed_out = asyncio.get_running_loop().time() >= deadline
             if settled or timed_out:
+                self._settling_samples = tuple(samples)
                 if await self._service_preempt_stop(runtime, generation):
                     raise BlastControllerError(
                         "controller_command_interrupted",

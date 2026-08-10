@@ -16,6 +16,7 @@ from robot_agent.blast_observation_monitor import (
     BlastControllerError,
     BlastObservationMonitor,
     blast_range_state,
+    validate_blast_scan_ray_contract,
 )
 
 
@@ -479,7 +480,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         self.assertGreaterEqual(
             SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
-            17 * SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS + 6,
+            9 * SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS + 6,
         )
         self.assertGreaterEqual(
             SCAN_COMMAND_TIMEOUT_SECONDS,
@@ -487,7 +488,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         monitor.close()
 
-    def test_scan_retries_one_unsettled_turn_at_the_same_pose(self):
+    def test_scan_continues_with_tilt_stable_unresolved_far_window(self):
         class RetryMonitor(BlastObservationMonitor):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -505,9 +506,21 @@ class BlastObservationMonitorTests(unittest.TestCase):
                     call for call in runtime.calls
                     if call[0] == "turn_pulse"
                 ]))
+                if len(self.turn_counts_at_settle) == 2:
+                    self._settling_samples = (
+                        (1_391.0, 0.0, 0.0),
+                        (1_503.0, 0.1, -0.1),
+                        (1_420.0, 0.0, 0.0),
+                        (2_000.0, -0.1, 0.1),
+                        (1_489.0, 0.0, 0.0),
+                    )
+                    return {
+                        **initial_observation,
+                        "distance_mm": 1_489,
+                    }, False
                 return (
                     initial_observation,
-                    len(self.turn_counts_at_settle) != 2,
+                    True,
                 )
 
         monitor = RetryMonitor(
@@ -527,11 +540,95 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         self.assertEqual(
             monitor.turn_counts_at_settle,
-            [0, 1, 1, 2, 3, 4, 5, 6, 7, 8],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8],
+        )
+        self.assertFalse(result["scan"]["all_observations_settled"])
+        left_near = result["scan"]["rays"][1]
+        self.assertEqual(left_near["distance_mm"], 1_489.0)
+        self.assertFalse(left_near["observation_settled"])
+        self.assertEqual(
+            left_near["evidence_use"], "SWEEP_CONTINUATION_ONLY",
         )
         monitor.close()
 
-    def test_scan_stops_after_one_retry_when_turn_stays_unsettled(self):
+    def test_unstored_sweep_only_pulses_do_not_change_ray_aggregate(self):
+        for unsettled_call in (4, 9):
+            with self.subTest(unsettled_call=unsettled_call):
+                FakeRuntime.instances = []
+
+                class UnstoredSweepOnlyMonitor(BlastObservationMonitor):
+                    def __init__(self, **kwargs):
+                        super().__init__(**kwargs)
+                        self.settle_calls = 0
+
+                    async def _observe_until_settled(
+                        self,
+                        runtime,
+                        *,
+                        generation,
+                        initial_observation,
+                        timeout_seconds=None,
+                    ):
+                        self.settle_calls += 1
+                        if self.settle_calls == unsettled_call:
+                            self._settling_samples = (
+                                (1_400.0, 0.0, 0.0),
+                            ) * 5
+                            return initial_observation, False
+                        return initial_observation, True
+
+                monitor = UnstoredSweepOnlyMonitor(
+                    poll_interval_seconds=0.05,
+                    runtime_factory=FakeRuntime,
+                )
+                monitor.start()
+                self.wait_for(monitor, "online")
+
+                result = monitor.command(SCAN_COMMAND)
+
+                self.assertTrue(
+                    result["scan"]["all_observations_settled"]
+                )
+                self.assertEqual(
+                    result["observation_settled"],
+                    unsettled_call != 9,
+                )
+                validate_blast_scan_ray_contract(result["scan"])
+                monitor.close()
+
+    def test_sweep_only_window_rejects_each_pose_and_range_fault(self):
+        monitor = BlastObservationMonitor(runtime_factory=FakeRuntime)
+        observation = {
+            "motion_active": False,
+            "imu": {"heading_deg": 0.0},
+            "motor_angles_deg": {"body": 158},
+        }
+        safe = ((1_400.0, 0.0, 0.0),) * 5
+        monitor._settling_samples = safe
+        self.assertTrue(
+            monitor._scan_sweep_window_allows_continuation(observation)
+        )
+
+        cases = (
+            ("short", safe[:4], observation),
+            ("close", ((53.0, 0.0, 0.0),) * 5, observation),
+            ("invalid", ((-1.0, 0.0, 0.0),) * 5, observation),
+            ("tilt", safe[:4] + ((1_400.0, 1.1, 0.0),), observation),
+            ("moving", safe, {**observation, "motion_active": True}),
+            ("heading", safe, {**observation, "imu": {}}),
+            ("body", safe, {
+                **observation,
+                "motor_angles_deg": {"body": 160},
+            }),
+        )
+        for name, samples, candidate in cases:
+            with self.subTest(name=name):
+                monitor._settling_samples = samples
+                self.assertFalse(
+                    monitor._scan_sweep_window_allows_continuation(candidate)
+                )
+
+    def test_scan_stops_when_unsettled_turn_has_no_safe_window(self):
         class NeverSettledTurnMonitor(BlastObservationMonitor):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -567,10 +664,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
             [call for call in runtime.calls if call[0] == "turn_pulse"],
             [("turn_pulse", "left")],
         )
-        self.assertEqual(monitor.settle_calls, 3)
+        self.assertEqual(monitor.settle_calls, 2)
         monitor.close()
 
-    def test_scan_does_not_retry_unsettled_close_or_invalid_evidence(self):
+    def test_scan_does_not_continue_unsettled_close_or_invalid_evidence(self):
         for distance in (40, -1):
             with self.subTest(distance=distance):
                 FakeRuntime.instances = []
@@ -618,8 +715,8 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 self.assertEqual(monitor.settle_calls, 2)
                 monitor.close()
 
-    def test_stop_cancellation_wins_during_scan_settle_retry(self):
-        retry_started = threading.Event()
+    def test_stop_cancellation_wins_during_scan_settle_window(self):
+        settle_started = threading.Event()
 
         class UnstableAfterTurnRuntime(FakeRuntime):
             def __init__(self, **kwargs):
@@ -646,8 +743,8 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
             async def _observe_until_settled(self, *args, **kwargs):
                 self.settle_calls += 1
-                if self.settle_calls == 3:
-                    retry_started.set()
+                if self.settle_calls == 2:
+                    settle_started.set()
                 return await super()._observe_until_settled(
                     *args,
                     **kwargs,
@@ -674,7 +771,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         ):
             scan_thread = threading.Thread(target=scan)
             scan_thread.start()
-            self.assertTrue(retry_started.wait(timeout=1.0))
+            self.assertTrue(settle_started.wait(timeout=1.0))
             stop_result = monitor.command("stop")
             scan_thread.join(timeout=1.0)
 

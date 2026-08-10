@@ -63,8 +63,8 @@ def project_blast_scan_planar_surfaces(
         checked.get("state") == "complete"
         and checked.get("result") == "restored"
         and checked.get("restoration_verified") is True
-        and checked.get("all_observations_settled") is True
-        and all(ray.get("observation_settled") is True for ray in checked["rays"])
+        and checked["rays"][0].get("side") == "center"
+        and checked["rays"][0].get("observation_settled") is True
     ):
         raise ValueError("BLAST scan is not projection-ready")
     sensor = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics
@@ -86,7 +86,10 @@ def project_blast_scan_planar_surfaces(
 
     points = []
     for ray, raw_heading in zip(checked["rays"], raw_headings):
-        if ray["range_state"] != scan_contract.RANGE_STATE_MEASURED:
+        if (
+            ray.get("observation_settled") is not True
+            or ray["range_state"] != scan_contract.RANGE_STATE_MEASURED
+        ):
             continue
         magnitude = round(abs(raw_heading) * 1_000)
         if ray["side"] == "center":

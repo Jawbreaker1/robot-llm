@@ -471,6 +471,7 @@ class BlastEpisodeRuntimeAdapter:
             and rays
             and isinstance(rays[0], Mapping)
             and rays[0].get("side") == "center"
+            and rays[0].get("observation_settled") is True
             and rays[0].get("range_state") == RANGE_STATE_MEASURED
         ):
             return False
@@ -1642,10 +1643,14 @@ class BlastEpisodeRuntimeAdapter:
                         )
                     except ValueError:
                         planar_projection = None
-                    history_item["scan"] = scan
+                    planner_scan = copy.deepcopy(scan)
+                    for ray in planner_scan["rays"]:
+                        if ray["observation_settled"] is not True:
+                            ray["distance_mm"] = None
+                            ray["range_state"] = "UNRESOLVED_SWEEP_ONLY"
+                    history_item["scan"] = planner_scan
                     if (
                         planar_projection is not None
-                        and command_result.get("observation_settled") is True
                     ):
                         latest_scan_view = {
                             "scan_pose": scan_pose.to_dict(),

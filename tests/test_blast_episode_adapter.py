@@ -630,6 +630,47 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         ][0]
         self.assertNotIn("planar_projection", runtime_scan)
 
+    def test_sweep_only_range_is_withheld_from_planner_history(self):
+        class UnresolvedFarController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    result["scan"]["all_observations_settled"] = False
+                    result["scan"]["rays"][1].update({
+                        "distance_mm": 1_489.0,
+                        "range_state": RANGE_STATE_MEASURED,
+                        "observation_settled": False,
+                        "evidence_use": "SWEEP_CONTINUATION_ONLY",
+                    })
+                return result
+
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(COMPLETE, assessment="Search observation recorded."),
+        ])
+        context, updates = episode_context()
+
+        result = self.adapter(
+            UnresolvedFarController(), planner,
+        ).run(context)
+
+        self.assertTrue(result.completed)
+        planner_ray = planner.contexts[1].history[0]["scan"]["rays"][1]
+        self.assertIsNone(planner_ray["distance_mm"])
+        self.assertEqual(
+            planner_ray["range_state"], "UNRESOLVED_SWEEP_ONLY",
+        )
+        runtime_scan = [
+            update["scan"] for update in updates if "scan" in update
+        ][0]
+        self.assertEqual(runtime_scan["rays"][1]["distance_mm"], 1_489.0)
+        self.assertEqual(
+            runtime_scan["rays"][1]["evidence_use"],
+            "SWEEP_CONTINUATION_ONLY",
+        )
+
     def test_projected_scan_requires_side_choice_before_more_motion(self):
         controller = FakeScanController(500)
         planner = Planner([
@@ -1998,6 +2039,10 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     and self.commands.count("scan_front_arc") == 2
                 ):
                     result["scan"]["all_observations_settled"] = False
+                    result["scan"]["rays"][0].update({
+                        "observation_settled": False,
+                        "evidence_use": "SWEEP_CONTINUATION_ONLY",
+                    })
                 return result
 
         controller = UnsettledSecondScanController(1_000)
@@ -2027,6 +2072,10 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 )
                 if command == "scan_front_arc":
                     result["scan"]["all_observations_settled"] = False
+                    result["scan"]["rays"][0].update({
+                        "observation_settled": False,
+                        "evidence_use": "SWEEP_CONTINUATION_ONLY",
+                    })
                 return result
 
         controller = UnsettledScanController(1_000)

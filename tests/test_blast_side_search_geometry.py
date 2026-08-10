@@ -176,6 +176,17 @@ class BlastTargetReacquisitionGeometryTests(unittest.TestCase):
                 self.origin, measured, "LEFT", self.current
             )
 
+        unsettled = copy.deepcopy(self.failed)
+        unsettled["scan"]["all_observations_settled"] = False
+        unsettled["scan"]["rays"][3].update({
+            "observation_settled": False,
+            "evidence_use": "SWEEP_CONTINUATION_ONLY",
+        })
+        with self.assertRaises(ValueError):
+            target_reacquisition_waypoint(
+                self.origin, unsettled, "LEFT", self.current
+            )
+
     def test_reacquisition_advance_vetoes_frozen_target_sweep(self):
         waypoint = target_reacquisition_waypoint(
             self.origin, self.failed, "LEFT", self.current

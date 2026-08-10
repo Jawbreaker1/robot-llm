@@ -177,10 +177,12 @@ def _target_side_has_only_no_valid_rays(view, selected_side):
     center = [ray for ray in scan["rays"] if ray["side"] == "center"]
     return (
         len(center) == 1
+        and center[0].get("observation_settled") is True
         and center[0]["range_state"] == RANGE_STATE_MEASURED
         and len(rays) == 2
         and all(
             ray["range_state"] == RANGE_STATE_NO_VALID_DISTANCE
+            and ray.get("observation_settled") is True
             and float(ray["distance_mm"]) == 2_000.0
             for ray in rays
         )
