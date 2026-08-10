@@ -86,6 +86,33 @@ def local_map(
     }
 
 
+def navigation_trace(frame_id):
+    return {
+        "schema": "robot-navigation-trace/v1",
+        "read_only": True,
+        "frame_id": frame_id,
+        "provenance": (
+            "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY"
+        ),
+        "final_goal": {
+            "kind": "DIRECTIONAL_HEADING",
+            "origin_x_mm": 0,
+            "origin_y_mm": 0,
+            "target_x_mm": 420,
+            "target_y_mm": 0,
+            "desired_heading_mdeg": 0,
+            "minimum_forward_progress_mm": 420,
+            "heading_tolerance_mdeg": 5_000,
+            "current_forward_progress_mm": 0,
+            "remaining_forward_progress_mm": 420,
+            "navigation_enforced": False,
+        },
+        "imu_heading": None,
+        "planned_leg": None,
+        "planar_scan_views": [],
+    }
+
+
 def provider(local, peer, **changes):
     values = {
         "local_provider": local,
@@ -107,6 +134,60 @@ def provider(local, peer, **changes):
 
 
 class FixedStartSharedMapProviderTests(TestCase):
+    def test_navigation_traces_follow_bound_identity_and_peer_transform(self):
+        local_value = local_map(
+            LOCAL_IDENTITY,
+            "blast-frame-1",
+            "blast-generation-1",
+        )
+        local_value["navigation_trace"] = navigation_trace(
+            "blast-frame-1"
+        )
+        peer_value = local_map(
+            PEER_IDENTITY,
+            "ev3-frame-1",
+            "ev3-generation-1",
+        )
+        peer_value["navigation_trace"] = navigation_trace("ev3-frame-1")
+
+        value = provider(
+            Provider(local_value), Provider(peer_value)
+        ).snapshot()
+
+        self.assertEqual(value["status"], "available")
+        self.assertIsNone(value["navigation_authority"])
+        robots = {robot["robot_id"]: robot for robot in value["robots"]}
+        local_trace = robots[LOCAL_IDENTITY[0]]["navigation_trace"]
+        self.assertEqual(
+            (
+                local_trace["final_goal"]["origin_x_mm"],
+                local_trace["final_goal"]["origin_y_mm"],
+                local_trace["final_goal"]["target_x_mm"],
+                local_trace["final_goal"]["target_y_mm"],
+                local_trace["final_goal"]["desired_heading_mdeg"],
+            ),
+            (0, 0, 420, 0, 0),
+        )
+        self.assertEqual(
+            local_trace["transform_provenance"],
+            ["FIXED_START_LOCAL_ANCHOR"],
+        )
+        peer_trace = robots[PEER_IDENTITY[0]]["navigation_trace"]
+        self.assertEqual(
+            (
+                peer_trace["final_goal"]["origin_x_mm"],
+                peer_trace["final_goal"]["origin_y_mm"],
+                peer_trace["final_goal"]["target_x_mm"],
+                peer_trace["final_goal"]["target_y_mm"],
+                peer_trace["final_goal"]["desired_heading_mdeg"],
+            ),
+            (1_000, 500, 1_000, 920, 90_000),
+        )
+        self.assertEqual(
+            peer_trace["transform_provenance"],
+            ["FIXED_START_PEER_SE2"],
+        )
+
     def test_pending_is_valid_v2_and_first_complete_pair_binds(self):
         local = Provider(local_map(
             LOCAL_IDENTITY,

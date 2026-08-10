@@ -1207,6 +1207,244 @@ process.stdout.write(JSON.stringify({
         self.assertFalse(result["tooMany"]["contractValid"])
         self.assertEqual(result["tooMany"]["robotCount"], 0)
 
+    def test_shared_navigation_trace_is_strict_frozen_and_per_robot(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const context = {};
+vm.runInNewContext(source, context, { filename: process.argv[1] });
+const logic = context.RobotDashboardLogic;
+
+const identity = {
+  robotId: "blast-01",
+  controllerId: "blast-controller",
+  localFrameId: "blast-local",
+  generationId: "blast-gen",
+};
+const trace = {
+  schema: "robot-navigation-trace/v1",
+  read_only: true,
+  frame_id: "shared-world",
+  world_generation_id: "world-gen",
+  local_frame_id: identity.localFrameId,
+  local_generation_id: identity.generationId,
+  source_robot_id: identity.robotId,
+  source_controller_instance_id: identity.controllerId,
+  provenance: "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY",
+  transform_provenance: ["FIXED_START_MEASUREMENT"],
+  final_goal: {
+    kind: "DIRECTIONAL_HEADING",
+    navigation_enforced: false,
+    origin_x_mm: 1000,
+    origin_y_mm: 500,
+    target_x_mm: 1000,
+    target_y_mm: 900,
+    desired_heading_mdeg: 90000,
+    minimum_forward_progress_mm: 400,
+    heading_tolerance_mdeg: 5000,
+    current_forward_progress_mm: 50,
+    remaining_forward_progress_mm: 350,
+  },
+  imu_heading: {
+    reference: "EPISODE_START",
+    heading_mdeg: 90000,
+    observed_at_unix_ms: 1900,
+  },
+  planned_leg: {
+    kind: "SIDE_SEARCH",
+    scope: "SEARCH_POSITION_ONLY",
+    clearance_proven: false,
+    passage_proven: false,
+    route_eligible: false,
+    selected_side: "LEFT",
+    bind_pose: { x_mm: 1000, y_mm: 550, heading_mdeg: 90000 },
+    waypoint: { x_mm: 800, y_mm: 550, heading_mdeg: -180000 },
+  },
+  planar_scan_views: [{
+    scan_id: "shared-scan",
+    observed_at_unix_ms: 1950,
+    scan_pose: { x_mm: 1000, y_mm: 550, heading_mdeg: 90000 },
+    projection: {
+      schema: "blast-planar-scan-projection/v1",
+      frame: "SHARED_FIXED_START",
+      local_frame: "EPISODE_LOCAL_ODOMETRY",
+      quality: "PROVISIONAL_YAW_ONLY",
+      vertical_pitch_compensated: false,
+      ultrasonic_beam_width_modeled: false,
+      scan_turn_translation_compensated: false,
+      points: [{
+        side: "left_near",
+        measured_range_mm: 100,
+        relative_bearing_mdeg: 90000,
+        sensor_origin_x_mm: 1000,
+        sensor_origin_y_mm: 550,
+        beam_heading_mdeg: -180000,
+        nominal_echo_x_mm: 900,
+        nominal_echo_y_mm: 550,
+      }],
+    },
+  }],
+};
+function pose() {
+  return {
+    x_mm: 1000, y_mm: 550, heading_mdeg: 90000,
+    frame_id: "shared-world", local_frame_id: identity.localFrameId,
+    state_version: 2, source_id: "blast-odometry",
+    provenance: "CALIBRATED_FIXED_START_SE2_PROJECTION",
+    observed_at_unix_ms: 1900, age_ms: 100,
+  };
+}
+function robot(navigationTrace) {
+  return {
+    read_only: true, status: "available", reason_code: "pose_transformed",
+    robot_id: identity.robotId,
+    controller_instance_id: identity.controllerId,
+    local_frame_id: identity.localFrameId,
+    local_generation_id: identity.generationId,
+    robot_pose: pose(), pose_history: [pose()], pose_history_evicted: 0,
+    collision_geometry: null,
+    frame_transform: {
+      source_robot_id: identity.robotId,
+      source_controller_id: identity.controllerId,
+      source_frame_id: identity.localFrameId,
+      source_generation_id: identity.generationId,
+      world_frame_id: "shared-world", world_generation_id: "world-gen",
+      tx_mm: 1000, ty_mm: 500, yaw_mdeg: 90000,
+      position_uncertainty_mm: 10, yaw_uncertainty_mdeg: 500,
+      provenance: ["FIXED_START_MEASUREMENT"],
+    },
+    navigation_trace: navigationTrace,
+    source_map_id: "blast-map", source_map_version: 3,
+    source_status: "pose_only", captured_at_unix_ms: 2000,
+    source_age_ms: 100,
+  };
+}
+function shared(navigationTrace) {
+  return {
+    schema: "robot-spatial-map/v2", read_only: true, status: "available",
+    reason_code: "all_sources_available", map_id: "shared-map",
+    frame_id: "shared-world", frame_kind: "SHARED_FIXED_START",
+    world_generation_id: "world-gen",
+    source_id: "shared-spatial-map-compositor",
+    provenance: "CALIBRATED_FIXED_START_SE2_PROJECTION",
+    snapshot_semantics: "LATEST_AVAILABLE_NOT_ATOMIC",
+    robots: [robot(navigationTrace)], bounds: null, cells: [],
+    sensor_rays: [], qualitative_observations: [],
+    scan_evidence_history: [], object_hypotheses: [],
+    navigation_authority: null, captured_at_unix_ms: 2000,
+  };
+}
+function normalized(navigationTrace) {
+  return logic.normalizeSharedSpatialMap(shared(navigationTrace), 2100)
+    .robots[0];
+}
+const valid = normalized(trace);
+const badGeneration = normalized({
+  ...trace, local_generation_id: "stale-generation",
+});
+const badProjection = normalized({
+  ...trace,
+  planar_scan_views: [{
+    ...trace.planar_scan_views[0],
+    projection: {
+      ...trace.planar_scan_views[0].projection,
+      frame: "EPISODE_LOCAL_ODOMETRY",
+    },
+  }],
+});
+const badEcho = normalized({
+  ...trace,
+  planar_scan_views: [{
+    ...trace.planar_scan_views[0],
+    projection: {
+      ...trace.planar_scan_views[0].projection,
+      points: [{
+        ...trace.planar_scan_views[0].projection.points[0],
+        nominal_echo_x_mm: 0,
+      }],
+    },
+  }],
+});
+const quantizedTransform = normalized({
+  ...trace,
+  final_goal: {
+    ...trace.final_goal,
+    target_x_mm: 1002,
+  },
+  planar_scan_views: [{
+    ...trace.planar_scan_views[0],
+    projection: {
+      ...trace.planar_scan_views[0].projection,
+      points: [{
+        ...trace.planar_scan_views[0].projection.points[0],
+        nominal_echo_x_mm: 898,
+      }],
+    },
+  }],
+});
+process.stdout.write(JSON.stringify({
+  valid: {
+    status: valid.status,
+    trace: valid.navigationTrace,
+    frozen: Object.isFrozen(valid.navigationTrace)
+      && Object.isFrozen(valid.navigationTrace.finalGoal)
+      && Object.isFrozen(valid.navigationTrace.plannedLeg)
+      && Object.isFrozen(valid.navigationTrace.planarScanViews)
+      && Object.isFrozen(valid.navigationTrace.planarScanViews[0].points)
+      && Object.isFrozen(valid.navigationTrace.transformProvenance),
+  },
+  invalid: [badGeneration, badProjection, badEcho].map((item) => ({
+    status: item.status,
+    pose: item.robotPose,
+    trace: item.navigationTrace,
+  })),
+  quantizedTransform: quantizedTransform.navigationTrace,
+  missing: normalized(null).navigationTrace,
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(LOGIC_ASSET),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["valid"]["status"], "available")
+        self.assertTrue(result["valid"]["frozen"])
+        normalized_trace = result["valid"]["trace"]
+        self.assertEqual(normalized_trace["frameId"], "shared-world")
+        self.assertEqual(normalized_trace["worldGenerationId"], "world-gen")
+        self.assertEqual(normalized_trace["sourceRobotId"], "blast-01")
+        self.assertEqual(normalized_trace["finalGoal"]["targetY"], 900)
+        self.assertEqual(
+            normalized_trace["planarScanViews"][0]["projectionFrame"],
+            "SHARED_FIXED_START",
+        )
+        self.assertEqual(
+            normalized_trace["planarScanViews"][0]["points"][0][
+                "nominalEchoX"
+            ],
+            900,
+        )
+        self.assertTrue(all(
+            item["status"] == "available"
+            and item["pose"] is not None
+            and item["trace"] is None
+            for item in result["invalid"]
+        ))
+        self.assertIsNotNone(result["quantizedTransform"])
+        self.assertIsNone(result["missing"])
+
 
 if __name__ == "__main__":
     unittest.main()

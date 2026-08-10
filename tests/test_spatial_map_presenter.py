@@ -1275,6 +1275,66 @@ const blast = robot({
   ],
   geometry: circle,
 });
+blast.navigation_trace = {
+  schema: "robot-navigation-trace/v1",
+  read_only: true,
+  frame_id: "shared-world",
+  world_generation_id: "world-gen-1",
+  local_frame_id: "blast-local",
+  local_generation_id: "blast-gen",
+  source_robot_id: "blast-01",
+  source_controller_instance_id: "blast-controller",
+  provenance: "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY",
+  transform_provenance: ["FIXED_START_MEASUREMENT"],
+  final_goal: {
+    kind: "DIRECTIONAL_HEADING",
+    navigation_enforced: false,
+    origin_x_mm: 1000,
+    origin_y_mm: 500,
+    target_x_mm: 1000,
+    target_y_mm: 1100,
+    desired_heading_mdeg: 90000,
+    minimum_forward_progress_mm: 600,
+    heading_tolerance_mdeg: 5000,
+    current_forward_progress_mm: 200,
+    remaining_forward_progress_mm: 400,
+  },
+  imu_heading: null,
+  planned_leg: {
+    kind: "SIDE_SEARCH",
+    scope: "SEARCH_POSITION_ONLY",
+    clearance_proven: false,
+    passage_proven: false,
+    route_eligible: false,
+    selected_side: "LEFT",
+    bind_pose: { x_mm: 1000, y_mm: 700, heading_mdeg: 90000 },
+    waypoint: { x_mm: 700, y_mm: 700, heading_mdeg: -180000 },
+  },
+  planar_scan_views: [{
+    scan_id: "shared-blast-scan",
+    observed_at_unix_ms: 1950,
+    scan_pose: { x_mm: 1000, y_mm: 700, heading_mdeg: 90000 },
+    projection: {
+      schema: "blast-planar-scan-projection/v1",
+      frame: "SHARED_FIXED_START",
+      local_frame: "EPISODE_LOCAL_ODOMETRY",
+      quality: "PROVISIONAL_YAW_ONLY",
+      vertical_pitch_compensated: false,
+      ultrasonic_beam_width_modeled: false,
+      scan_turn_translation_compensated: false,
+      points: [{
+        side: "left_near",
+        measured_range_mm: 400,
+        relative_bearing_mdeg: 90000,
+        sensor_origin_x_mm: 1000,
+        sensor_origin_y_mm: 700,
+        beam_heading_mdeg: -180000,
+        nominal_echo_x_mm: 600,
+        nominal_echo_y_mm: 700,
+      }],
+    },
+  }],
+};
 function shared(robots) {
   return {
     schema: "robot-spatial-map/v2",
@@ -1307,12 +1367,28 @@ const presenter = context.RobotSpatialMapPresenter.create({
   formatNumber: (value) => String(value),
 });
 const rendered = presenter.render(shared([ev3, blast]), "connected", 2100);
+function descendants(root) {
+  return [root, ...root.children.flatMap(descendants)];
+}
+const tracePathGroups = nodes["map-path-layer"].children.filter((node) => (
+  String(node.attributes.class).includes("map-shared-navigation-trace")
+));
+const traceRayGroups = nodes["map-ray-layer"].children.filter((node) => (
+  String(node.attributes.class).includes("map-shared-navigation-trace")
+));
+const traceNodes = tracePathGroups.flatMap(descendants);
+const rayNodes = traceRayGroups.flatMap(descendants);
+const goalTarget = traceNodes.find((node) => (
+  node.attributes.class === "map-final-goal-target"
+));
 const firstRender = {
   schema: rendered.schema,
   connectionClass: nodes["map-connection-status"].className,
   frame: nodes["map-frame-label"].textContent,
   emptyHidden: nodes["map-empty-state"].hidden,
-  pathGroups: nodes["map-path-layer"].children.map((node) => ({
+  pathGroups: nodes["map-path-layer"].children.filter((node) => (
+    String(node.attributes.class).includes("map-shared-robot-path")
+  )).map((node) => ({
     robotId: node.attributes["data-robot-id"],
     tags: node.children.map((child) => child.tag),
   })),
@@ -1327,9 +1403,52 @@ const firstRender = {
     )).attributes.cx,
   })),
   cellCount: nodes["map-cell-layer"].children.length,
+  tracePaths: tracePathGroups.map((node) => ({
+    robotId: node.attributes["data-robot-id"],
+    className: node.attributes.class,
+    provisional: node.attributes["data-provisional"],
+    text: node.textContent,
+  })),
+  traceRays: traceRayGroups.map((node) => ({
+    robotId: node.attributes["data-robot-id"],
+    className: node.attributes.class,
+    provisional: node.attributes["data-provisional"],
+  })),
+  goalAttributes: traceNodes.find((node) => (
+    node.attributes.class === "map-final-goal"
+  )).attributes,
+  legAttributes: traceNodes.find((node) => (
+    node.attributes.class === "map-planned-leg"
+  )).attributes,
+  scanAttributes: rayNodes.find((node) => (
+    node.attributes.class === "map-blast-scan-view"
+  )).attributes,
+  echoCount: rayNodes.filter((node) => (
+    node.attributes.class === "map-blast-scan-echo"
+  )).length,
+  fittedGoalTarget: {
+    cx: Number(goalTarget.attributes.cx),
+    cy: Number(goalTarget.attributes.cy),
+  },
   rayCount: nodes["map-ray-layer"].children.length,
   objectCount: nodes["map-object-layer"].children.length,
   localCount: nodes["map-local-odometry-layer"].children.length,
+};
+presenter.render(shared([ev3, {
+  ...blast,
+  navigation_trace: {
+    ...blast.navigation_trace,
+    local_generation_id: "stale-trace-generation",
+  },
+}]), "connected", 2100);
+const invalidTraceRender = {
+  robotIds: nodes["map-robot-layer"].children.map(
+    (node) => node.attributes["data-robot-id"],
+  ),
+  traceRobotIds: nodes["map-path-layer"].children.filter((node) => (
+    String(node.attributes.class).includes("map-shared-navigation-trace")
+  )).map((node) => node.attributes["data-robot-id"]),
+  rayCount: nodes["map-ray-layer"].children.length,
 };
 presenter.render(shared([ev3, {
   ...blast,
@@ -1340,6 +1459,7 @@ presenter.render(shared([ev3, {
 }]), "connected", 2100);
 process.stdout.write(JSON.stringify({
   firstRender,
+  invalidTraceRender,
   fencedRobotIds: nodes["map-robot-layer"].children.map(
     (node) => node.attributes["data-robot-id"],
   ),
@@ -1399,10 +1519,59 @@ process.stdout.write(JSON.stringify({
             rendered["robotGroups"][0]["bodyCx"],
             rendered["robotGroups"][1]["bodyCx"],
         )
+        self.assertEqual(
+            [group["robotId"] for group in rendered["tracePaths"]],
+            ["blast-01"],
+        )
+        self.assertEqual(
+            [group["robotId"] for group in rendered["traceRays"]],
+            ["blast-01"],
+        )
+        self.assertIn(
+            "map-shared-robot-1",
+            rendered["tracePaths"][0]["className"],
+        )
+        self.assertIn(
+            "map-shared-robot-1",
+            rendered["traceRays"][0]["className"],
+        )
+        self.assertEqual(rendered["tracePaths"][0]["provisional"], "true")
+        self.assertEqual(rendered["traceRays"][0]["provisional"], "true")
+        self.assertIn(
+            "map.navigation_trace.layer_label",
+            rendered["tracePaths"][0]["text"],
+        )
+        self.assertEqual(
+            rendered["goalAttributes"]["data-navigation-enforced"],
+            "false",
+        )
+        self.assertEqual(
+            rendered["legAttributes"]["data-scope"],
+            "SEARCH_POSITION_ONLY",
+        )
+        self.assertEqual(
+            rendered["legAttributes"]["data-route-eligible"],
+            "false",
+        )
+        self.assertEqual(
+            rendered["scanAttributes"]["data-projection-frame"],
+            "SHARED_FIXED_START",
+        )
+        self.assertEqual(rendered["echoCount"], 1)
+        self.assertGreaterEqual(rendered["fittedGoalTarget"]["cx"], 46)
+        self.assertLessEqual(rendered["fittedGoalTarget"]["cx"], 914)
+        self.assertGreaterEqual(rendered["fittedGoalTarget"]["cy"], 46)
+        self.assertLessEqual(rendered["fittedGoalTarget"]["cy"], 554)
         self.assertEqual(rendered["cellCount"], 0)
-        self.assertEqual(rendered["rayCount"], 0)
+        self.assertEqual(rendered["rayCount"], 1)
         self.assertEqual(rendered["objectCount"], 0)
         self.assertEqual(rendered["localCount"], 0)
+        self.assertEqual(
+            result["invalidTraceRender"]["robotIds"],
+            ["ev3rstorm-01", "blast-01"],
+        )
+        self.assertEqual(result["invalidTraceRender"]["traceRobotIds"], [])
+        self.assertEqual(result["invalidTraceRender"]["rayCount"], 0)
         self.assertEqual(result["fencedRobotIds"], ["ev3rstorm-01"])
         self.assertEqual(result["fencedPathIds"], ["ev3rstorm-01"])
         self.assertEqual(result["fencedLocalCount"], 0)

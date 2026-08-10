@@ -2528,6 +2528,87 @@ textarea:focus-visible,
   fill: var(--warning);
 }
 
+.map-shared-robot-0 {
+  color: var(--evidence);
+}
+
+.map-shared-robot-1 {
+  color: var(--warning);
+}
+
+.map-shared-robot-2 {
+  color: var(--ready);
+}
+
+.map-shared-robot-3 {
+  color: var(--model);
+}
+
+.map-shared-robot-4 {
+  color: var(--danger);
+}
+
+.map-shared-robot-5 {
+  color: #e88ac7;
+}
+
+.map-shared-robot-6 {
+  color: #8bd450;
+}
+
+.map-shared-robot-7 {
+  color: #ef8f52;
+}
+
+.map-shared-robot-path .map-path,
+.map-shared-robot-path .map-path-start,
+.map-shared-heading,
+.map-shared-footprint {
+  stroke: currentColor;
+}
+
+.map-shared-body,
+.map-shared-robot-label {
+  fill: currentColor;
+}
+
+.map-shared-navigation-trace[data-provisional="true"]
+  :is(
+    .map-final-goal-line,
+    .map-final-goal-heading,
+    .map-final-goal-target,
+    .map-planned-leg-line,
+    .map-planned-leg-bind,
+    .map-planned-waypoint,
+    .map-planned-waypoint-heading,
+    .map-blast-scan-ray-line,
+    .map-blast-scan-echo
+  ) {
+  stroke: currentColor;
+}
+
+.map-shared-navigation-trace[data-provisional="true"]
+  :is(
+    .map-final-goal-target,
+    .map-planned-leg-bind,
+    .map-planned-waypoint,
+    .map-blast-scan-origin,
+    .map-blast-scan-echo
+  ) {
+  fill: currentColor;
+  fill-opacity: 0.24;
+}
+
+.map-shared-navigation-trace[data-provisional="true"]
+  .map-blast-scan-origin {
+  fill-opacity: 1;
+}
+
+.map-shared-navigation-trace[data-provisional="true"]
+  .map-navigation-trace-label {
+  fill: currentColor;
+}
+
 .map-local-imu-heading {
   fill: none;
   stroke: var(--evidence);

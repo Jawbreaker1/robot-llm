@@ -1088,6 +1088,32 @@ function ev3Button(status) {
         self.assertIn("SLUTMÅL · STYRANDE", self.i18n)
         self.assertIn("SLUTMÅLSREFERENS · EJ STYRANDE", self.i18n)
 
+    def test_shared_navigation_traces_keep_robot_color_and_caveats(self):
+        self.assertIn(
+            "appendNavigationTracePoints(\n          robot.navigationTrace",
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            'class: `map-shared-navigation-trace ${robotClass}`',
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            '"data-provisional": "true"',
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            '"data-projection-frame": view.projectionFrame',
+            self.spatial_map_presenter,
+        )
+        self.assertIn(
+            '.map-shared-navigation-trace[data-provisional="true"]',
+            self.css,
+        )
+        self.assertIn("stroke: currentColor", self.css)
+        self.assertIn("fill: currentColor", self.css)
+        self.assertIn(".map-shared-robot-7", self.css)
+        self.assertLess(len(self.javascript.splitlines()), 1900)
+
     def test_speech_input_logic_is_bounded_and_emits_pcm16_wav(self):
         contract = self.speech_input_contract
         self.assertTrue(contract["frozen"])

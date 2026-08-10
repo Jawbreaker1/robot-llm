@@ -135,6 +135,31 @@
       };
     }
 
+    function appendNavigationTracePoints(trace, addPoint) {
+      if (!trace) {
+        return;
+      }
+      addPoint(trace.finalGoal.originX, trace.finalGoal.originY);
+      addPoint(trace.finalGoal.targetX, trace.finalGoal.targetY);
+      if (trace.plannedLeg) {
+        addPoint(
+          trace.plannedLeg.bindPose.xMm,
+          trace.plannedLeg.bindPose.yMm,
+        );
+        addPoint(
+          trace.plannedLeg.waypoint.xMm,
+          trace.plannedLeg.waypoint.yMm,
+        );
+      }
+      trace.planarScanViews.forEach((view) => {
+        addPoint(view.scanPose.xMm, view.scanPose.yMm);
+        view.points.forEach((point) => {
+          addPoint(point.sensorOriginX, point.sensorOriginY);
+          addPoint(point.nominalEchoX, point.nominalEchoY);
+        });
+      });
+    }
+
     function localOdometryScene(map) {
       const points = [];
       const cues = [];
@@ -177,28 +202,7 @@
       map.poseHistory.forEach((pose) => {
         addPoint(pose.xMm, pose.yMm);
       });
-      const trace = map.navigationTrace;
-      if (trace) {
-        addPoint(trace.finalGoal.originX, trace.finalGoal.originY);
-        addPoint(trace.finalGoal.targetX, trace.finalGoal.targetY);
-        if (trace.plannedLeg) {
-          addPoint(
-            trace.plannedLeg.bindPose.xMm,
-            trace.plannedLeg.bindPose.yMm,
-          );
-          addPoint(
-            trace.plannedLeg.waypoint.xMm,
-            trace.plannedLeg.waypoint.yMm,
-          );
-        }
-        trace.planarScanViews.forEach((view) => {
-          addPoint(view.scanPose.xMm, view.scanPose.yMm);
-          view.points.forEach((point) => {
-            addPoint(point.sensorOriginX, point.sensorOriginY);
-            addPoint(point.nominalEchoX, point.nominalEchoY);
-          });
-        });
-      }
+      appendNavigationTracePoints(map.navigationTrace, addPoint);
       map.objectHypotheses.forEach((hypothesis) => {
         if (
           hypothesis.provisional
@@ -332,6 +336,10 @@
         }
         robot.poseHistory.forEach(addPoint);
         addPoint(robot.robotPose);
+        appendNavigationTracePoints(
+          robot.navigationTrace,
+          (xMm, yMm) => addPoint({ xMm, yMm }),
+        );
         footprintCorners(
           robot.robotPose,
           robot.collisionGeometry,
@@ -408,7 +416,12 @@
       ].join(" ");
     }
 
-    function renderNavigationTrace(layer, map, projection) {
+    function renderNavigationTrace(
+      layer,
+      map,
+      projection,
+      scanLayer = layer,
+    ) {
       const trace = map.navigationTrace;
       if (!trace) {
         return;
@@ -574,6 +587,10 @@
           "data-vertical-pitch-compensated": "false",
           "data-ultrasonic-beam-width-modeled": "false",
           "data-scan-turn-translation-compensated": "false",
+          "data-projection-frame": view.projectionFrame,
+          "data-projection-local-frame": (
+            view.projectionLocalFrame || ""
+          ),
         });
         appendSvgTitle(group, [
           t("map.navigation_trace.scan_title", {
@@ -640,7 +657,7 @@
           count: formatNumber(viewIndex + 1),
         });
         group.appendChild(label);
-        layer.appendChild(group);
+        scanLayer.appendChild(group);
       });
     }
 
@@ -1579,6 +1596,44 @@
         });
         renderPath(pathGroup, robot.poseHistory, projection);
         pathLayer.appendChild(pathGroup);
+        if (robot.navigationTrace) {
+          const traceAttributes = {
+            class: `map-shared-navigation-trace ${robotClass}`,
+            "data-robot-id": robot.robotId,
+            "data-controller-instance-id": robot.controllerInstanceId,
+            "data-provisional": "true",
+          };
+          const tracePathGroup = createSvgElement("g", traceAttributes);
+          const traceRayGroup = createSvgElement("g", traceAttributes);
+          const traceAnchor = projection.point(
+            robot.robotPose.xMm,
+            robot.robotPose.yMm,
+          );
+          const traceLabel = createSvgElement("text", {
+            x: traceAnchor.x + 22,
+            y: traceAnchor.y + 35,
+            class: (
+              "map-navigation-trace-label "
+              + "map-shared-navigation-trace-label"
+            ),
+          });
+          traceLabel.textContent = `${robot.robotId} · ${t(
+            "map.navigation_trace.layer_label",
+          )}`;
+          tracePathGroup.appendChild(traceLabel);
+          renderNavigationTrace(
+            tracePathGroup,
+            { navigationTrace: robot.navigationTrace },
+            projection,
+            traceRayGroup,
+          );
+          if (tracePathGroup.children.length > 0) {
+            pathLayer.appendChild(tracePathGroup);
+          }
+          if (traceRayGroup.children.length > 0) {
+            rayLayer.appendChild(traceRayGroup);
+          }
+        }
 
         const pose = robot.robotPose;
         const robotPoint = projection.point(pose.xMm, pose.yMm);

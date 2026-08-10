@@ -1,14 +1,16 @@
 """Read-only projection of robot-local poses into one calibrated world.
 
-This first shared-map slice intentionally carries robot poses and physical
-footprints only.  It does not fuse sensor evidence, infer object identity, or
-own navigation authority.  A calibration is fenced to the exact local map
-generation so a reset robot cannot silently reuse an old fixed-start pose.
+This shared-map slice carries robot poses, physical footprints, and detached
+navigation diagnostics.  It does not fuse sensor evidence, infer object
+identity, or own navigation authority.  A calibration is fenced to the exact
+local map generation so a reset robot cannot silently reuse an old fixed-start
+pose or navigation trace.
 """
 
 from copy import deepcopy
 from typing import Mapping
 
+from .blast_spatial_map import NAVIGATION_TRACE_SCHEMA, _trace_inputs
 from .shared_frame_transform import (
     CalibratedFrameTransform,
     FrameTransformError,
@@ -27,6 +29,16 @@ LATEST_AVAILABLE_NOT_ATOMIC = "LATEST_AVAILABLE_NOT_ATOMIC"
 MAX_SHARED_ROBOTS = 16
 MAX_SHARED_POSE_HISTORY = MAX_POSE_HISTORY
 _MAX_INT = 2**63 - 1
+_NAVIGATION_TRACE_FIELDS = (
+    "schema",
+    "read_only",
+    "frame_id",
+    "provenance",
+    "final_goal",
+    "imu_heading",
+    "planned_leg",
+    "planar_scan_views",
+)
 
 
 class SharedSpatialMapError(ValueError):
@@ -150,6 +162,190 @@ def _source_scalar(value: object, *, identifier: bool = False):
     return _optional_integer(value)
 
 
+def _trace_identifier(value: object, maximum: int = 128) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > maximum
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise _SourceUnavailable("source_navigation_trace_invalid")
+    return value
+
+
+def _transform_trace_point(
+    x_mm: object,
+    y_mm: object,
+    transform: CalibratedFrameTransform,
+):
+    try:
+        return transform.to_world_point(
+            x_mm,
+            y_mm,
+            **_source_identity(transform),
+        )
+    except (FrameTransformError, TypeError):
+        raise _SourceUnavailable(
+            "source_navigation_trace_invalid"
+        ) from None
+
+
+def _transform_trace_heading(
+    heading_mdeg: object,
+    transform: CalibratedFrameTransform,
+):
+    try:
+        return transform.to_world_heading(
+            heading_mdeg,
+            **_source_identity(transform),
+        )
+    except (FrameTransformError, TypeError):
+        raise _SourceUnavailable(
+            "source_navigation_trace_invalid"
+        ) from None
+
+
+def _transform_trace_pose(
+    value: Mapping,
+    transform: CalibratedFrameTransform,
+):
+    x_mm, y_mm = _transform_trace_point(
+        value["x_mm"], value["y_mm"], transform
+    )
+    return {
+        "x_mm": x_mm,
+        "y_mm": y_mm,
+        "heading_mdeg": _transform_trace_heading(
+            value["heading_mdeg"], transform
+        ),
+    }
+
+
+def _transform_navigation_trace(
+    value: object,
+    transform: CalibratedFrameTransform,
+    *,
+    captured_at_unix_ms: int,
+):
+    if value is None:
+        return None
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != set(_NAVIGATION_TRACE_FIELDS)
+        or value.get("schema") != NAVIGATION_TRACE_SCHEMA
+        or value.get("read_only") is not True
+    ):
+        raise _SourceUnavailable("source_navigation_trace_invalid")
+    if value.get("frame_id") != transform.source_frame_id:
+        raise _SourceUnavailable(
+            "source_navigation_trace_frame_mismatch"
+        )
+    provenance = _trace_identifier(
+        value.get("provenance"), maximum=512
+    )
+    if not _trace_inputs(
+        value.get("final_goal"),
+        value.get("planned_leg"),
+        value.get("imu_heading"),
+        value.get("planar_scan_views"),
+        captured_at_unix_ms,
+    ):
+        raise _SourceUnavailable("source_navigation_trace_invalid")
+
+    final_goal = dict(value["final_goal"])
+    origin_x, origin_y = _transform_trace_point(
+        final_goal["origin_x_mm"],
+        final_goal["origin_y_mm"],
+        transform,
+    )
+    target_x, target_y = _transform_trace_point(
+        final_goal["target_x_mm"],
+        final_goal["target_y_mm"],
+        transform,
+    )
+    final_goal.update({
+        "origin_x_mm": origin_x,
+        "origin_y_mm": origin_y,
+        "target_x_mm": target_x,
+        "target_y_mm": target_y,
+        "desired_heading_mdeg": _transform_trace_heading(
+            final_goal["desired_heading_mdeg"], transform
+        ),
+    })
+
+    imu_heading = value["imu_heading"]
+    if imu_heading is not None:
+        imu_heading = dict(imu_heading)
+        imu_heading["heading_mdeg"] = _transform_trace_heading(
+            imu_heading["heading_mdeg"], transform
+        )
+
+    planned_leg = value["planned_leg"]
+    if planned_leg is not None:
+        planned_leg = dict(planned_leg)
+        planned_leg["bind_pose"] = _transform_trace_pose(
+            planned_leg["bind_pose"], transform
+        )
+        planned_leg["waypoint"] = _transform_trace_pose(
+            planned_leg["waypoint"], transform
+        )
+
+    planar_scan_views = []
+    for source_view in value["planar_scan_views"]:
+        view = dict(source_view)
+        view["scan_pose"] = _transform_trace_pose(
+            source_view["scan_pose"], transform
+        )
+        source_projection = source_view["projection"]
+        projection = dict(source_projection)
+        projection["frame"] = SHARED_FIXED_START
+        projection["local_frame"] = source_projection["frame"]
+        points = []
+        for source_point in source_projection["points"]:
+            point = dict(source_point)
+            origin_x, origin_y = _transform_trace_point(
+                source_point["sensor_origin_x_mm"],
+                source_point["sensor_origin_y_mm"],
+                transform,
+            )
+            echo_x, echo_y = _transform_trace_point(
+                source_point["nominal_echo_x_mm"],
+                source_point["nominal_echo_y_mm"],
+                transform,
+            )
+            point.update({
+                "sensor_origin_x_mm": origin_x,
+                "sensor_origin_y_mm": origin_y,
+                "beam_heading_mdeg": _transform_trace_heading(
+                    source_point["beam_heading_mdeg"], transform
+                ),
+                "nominal_echo_x_mm": echo_x,
+                "nominal_echo_y_mm": echo_y,
+            })
+            points.append(point)
+        projection["points"] = points
+        view["projection"] = projection
+        planar_scan_views.append(view)
+
+    return {
+        "schema": value["schema"],
+        "read_only": value["read_only"],
+        "frame_id": transform.world_frame_id,
+        "world_generation_id": transform.world_generation_id,
+        "local_frame_id": transform.source_frame_id,
+        "local_generation_id": transform.source_generation_id,
+        "source_robot_id": transform.source_robot_id,
+        "source_controller_instance_id": transform.source_controller_id,
+        "provenance": provenance,
+        "transform_provenance": list(transform.provenance),
+        "final_goal": final_goal,
+        "imu_heading": imu_heading,
+        "planned_leg": planned_leg,
+        "planar_scan_views": planar_scan_views,
+    }
+
+
 class SharedSpatialMapCompositor:
     """Compose detached local pose snapshots without touching their owners."""
 
@@ -245,6 +441,7 @@ class SharedSpatialMapCompositor:
             "pose_history": [],
             "pose_history_evicted": 0,
             "collision_geometry": None,
+            "navigation_trace": None,
             "frame_transform": transform.to_dict(),
             "source_map_id": None,
             "source_map_version": None,
@@ -326,6 +523,12 @@ class SharedSpatialMapCompositor:
         if source_evicted > _MAX_INT - locally_evicted:
             raise _SourceUnavailable("source_pose_history_invalid")
 
+        navigation_trace = _transform_navigation_trace(
+            snapshot.get("navigation_trace"),
+            transform,
+            captured_at_unix_ms=captured_at_unix_ms,
+        )
+
         return {
             "read_only": True,
             "status": "available",
@@ -340,6 +543,7 @@ class SharedSpatialMapCompositor:
             "collision_geometry": _collision_geometry(
                 snapshot.get("collision_geometry")
             ),
+            "navigation_trace": navigation_trace,
             "frame_transform": transform.to_dict(),
             "source_map_id": source_map_id,
             "source_map_version": source_map_version,

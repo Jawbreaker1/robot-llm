@@ -31,6 +31,7 @@
   const MAX_NAVIGATION_SCAN_POINTS = 5;
   const MAX_LOCAL_COORDINATE_MM = 1_000_000;
   const MAX_MEASURED_RANGE_MM = 10_000;
+  const SHARED_TRANSFORM_QUANTIZATION_TOLERANCE_MM = 3.5;
   const LOCAL_DETOUR_WAYPOINT_KINDS = new Set([
     "LATERAL_CLEARANCE",
     "REACQUIRE_GOAL_HEADING",
@@ -140,7 +141,7 @@
     return Object.freeze({ xMm, yMm, headingMdeg });
   }
 
-  function normalizeFinalGoal(value) {
+  function normalizeFinalGoal(value, geometryToleranceMm = 1.5) {
     const goal = record(value);
     const originX = localCoordinate(goal.origin_x_mm);
     const originY = localCoordinate(goal.origin_y_mm);
@@ -191,8 +192,8 @@
       minimumForwardProgressMm - currentForwardProgressMm,
     );
     if (
-      Math.abs(targetX - expectedTargetX) > 1.5
-      || Math.abs(targetY - expectedTargetY) > 1.5
+      Math.abs(targetX - expectedTargetX) > geometryToleranceMm
+      || Math.abs(targetY - expectedTargetY) > geometryToleranceMm
       || Math.abs(remainingForwardProgressMm - expectedRemaining) > 1
     ) {
       return null;
@@ -275,7 +276,7 @@
     });
   }
 
-  function normalizePlanarScanPoint(value) {
+  function normalizePlanarScanPoint(value, geometryToleranceMm = 1.5) {
     const point = record(value);
     const measuredRangeMm = positive(point.measured_range_mm);
     const relativeBearingMdeg = finite(point.relative_bearing_mdeg);
@@ -315,8 +316,8 @@
     const expectedEchoY = sensorOriginY
       + measuredRangeMm * Math.sin(headingRadians);
     if (
-      Math.abs(nominalEchoX - expectedEchoX) > 1.5
-      || Math.abs(nominalEchoY - expectedEchoY) > 1.5
+      Math.abs(nominalEchoX - expectedEchoX) > geometryToleranceMm
+      || Math.abs(nominalEchoY - expectedEchoY) > geometryToleranceMm
     ) {
       return null;
     }
@@ -332,7 +333,13 @@
     });
   }
 
-  function normalizePlanarScanView(value, nowUnixMs) {
+  function normalizePlanarScanView(
+    value,
+    nowUnixMs,
+    projectionFrame = "EPISODE_LOCAL_ODOMETRY",
+    projectionLocalFrame = null,
+    geometryToleranceMm = 1.5,
+  ) {
     const view = record(value);
     const projection = record(view.projection);
     const scanPose = normalizeTracePose(view.scan_pose);
@@ -346,7 +353,12 @@
       || observedAtUnixMs > nowUnixMs
       || scanPose === null
       || projection.schema !== BLAST_SCAN_PROJECTION_SCHEMA
-      || projection.frame !== "EPISODE_LOCAL_ODOMETRY"
+      || projection.frame !== projectionFrame
+      || (
+        projectionLocalFrame === null
+          ? projection.local_frame !== undefined
+          : projection.local_frame !== projectionLocalFrame
+      )
       || projection.quality !== "PROVISIONAL_YAW_ONLY"
       || projection.vertical_pitch_compensated !== false
       || projection.ultrasonic_beam_width_modeled !== false
@@ -356,7 +368,9 @@
     ) {
       return null;
     }
-    const points = projection.points.map(normalizePlanarScanPoint);
+    const points = projection.points.map((point) => (
+      normalizePlanarScanPoint(point, geometryToleranceMm)
+    ));
     if (
       points.some((point) => point === null)
       || new Set(points.map((point) => point.side)).size !== points.length
@@ -368,6 +382,8 @@
       observedAtUnixMs,
       ageMs: nowUnixMs - observedAtUnixMs,
       scanPose,
+      projectionFrame,
+      projectionLocalFrame,
       quality: "PROVISIONAL_YAW_ONLY",
       verticalPitchCompensated: false,
       ultrasonicBeamWidthModeled: false,
@@ -376,14 +392,46 @@
     });
   }
 
-  function normalizeNavigationTrace(value, frameId, nowUnixMs) {
+  function normalizeNavigationTrace(
+    value,
+    frameId,
+    nowUnixMs,
+    sharedIdentity = null,
+  ) {
     if (value === null || value === undefined) {
       return null;
     }
     const trace = record(value);
-    const finalGoal = normalizeFinalGoal(trace.final_goal);
+    const shared = sharedIdentity !== null;
+    const geometryToleranceMm = shared
+      ? SHARED_TRANSFORM_QUANTIZATION_TOLERANCE_MM
+      : 1.5;
+    const finalGoal = normalizeFinalGoal(
+      trace.final_goal,
+      geometryToleranceMm,
+    );
     const imuHeading = normalizeImuHeading(trace.imu_heading, nowUnixMs);
     const plannedLeg = normalizePlannedLeg(trace.planned_leg);
+    const transformProvenance = shared
+      ? trace.transform_provenance
+      : null;
+    const sharedIdentityValid = !shared || (
+      trace.world_generation_id === sharedIdentity.worldGenerationId
+      && trace.local_frame_id === sharedIdentity.localFrameId
+      && trace.local_generation_id === sharedIdentity.localGenerationId
+      && trace.source_robot_id === sharedIdentity.robotId
+      && trace.source_controller_instance_id
+        === sharedIdentity.controllerInstanceId
+      && Array.isArray(transformProvenance)
+      && transformProvenance.length > 0
+      && transformProvenance.length <= 32
+      && transformProvenance.every((item, index) => (
+        identifier(item) !== null
+        && item === sharedIdentity.transformProvenance[index]
+      ))
+      && transformProvenance.length
+        === sharedIdentity.transformProvenance.length
+    );
     if (
       trace.schema !== NAVIGATION_TRACE_SCHEMA
       || trace.read_only !== true
@@ -392,6 +440,7 @@
       || trace.frame_id !== frameId
       || trace.provenance
         !== "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY"
+      || !sharedIdentityValid
       || finalGoal === null
       || imuHeading === undefined
       || plannedLeg === undefined
@@ -409,7 +458,13 @@
       return null;
     }
     const planarScanViews = trace.planar_scan_views.map((scan) => (
-      normalizePlanarScanView(scan, nowUnixMs)
+      normalizePlanarScanView(
+        scan,
+        nowUnixMs,
+        shared ? SHARED_FIXED_START : "EPISODE_LOCAL_ODOMETRY",
+        shared ? "EPISODE_LOCAL_ODOMETRY" : null,
+        geometryToleranceMm,
+      )
     ));
     if (
       planarScanViews.some((scan) => scan === null)
@@ -422,7 +477,21 @@
       schema: NAVIGATION_TRACE_SCHEMA,
       readOnly: true,
       frameId,
+      worldGenerationId: shared
+        ? sharedIdentity.worldGenerationId
+        : null,
+      localFrameId: shared ? sharedIdentity.localFrameId : null,
+      localGenerationId: shared
+        ? sharedIdentity.localGenerationId
+        : null,
+      sourceRobotId: shared ? sharedIdentity.robotId : null,
+      sourceControllerInstanceId: shared
+        ? sharedIdentity.controllerInstanceId
+        : null,
       provenance: trace.provenance,
+      transformProvenance: shared
+        ? Object.freeze([...transformProvenance])
+        : Object.freeze([]),
       finalGoal,
       imuHeading,
       plannedLeg,
@@ -797,6 +866,7 @@
       poseHistory: Object.freeze([]),
       poseHistoryEvicted: 0,
       collisionGeometry: null,
+      navigationTrace: null,
       frameTransform: transform,
       sourceMapId: null,
       sourceMapVersion: null,
@@ -806,7 +876,7 @@
     });
   }
 
-  function normalizeSharedRobot(value, worldIdentity) {
+  function normalizeSharedRobot(value, worldIdentity, nowUnixMs) {
     const robot = record(value);
     const identity = Object.freeze({
       robotId: identifier(robot.robot_id),
@@ -884,6 +954,15 @@
     const collisionGeometry = normalizeCollisionGeometry(
       robot.collision_geometry,
     );
+    const navigationTrace = normalizeNavigationTrace(
+      robot.navigation_trace,
+      identity.worldFrameId,
+      nowUnixMs,
+      Object.freeze({
+        ...identity,
+        transformProvenance: transform.provenance,
+      }),
+    );
     const sourceStatusValid = [
       "available", "pose_only", "qualitative_only",
     ].includes(robot.source_status);
@@ -932,6 +1011,7 @@
       poseHistory: Object.freeze(poseHistory),
       poseHistoryEvicted,
       collisionGeometry,
+      navigationTrace,
       frameTransform: transform,
       sourceMapId,
       sourceMapVersion,
@@ -976,7 +1056,11 @@
     );
     const seen = new Set();
     const robots = topValid ? map.robots.map((rawRobot) => {
-      const normalized = normalizeSharedRobot(rawRobot, worldIdentity);
+      const normalized = normalizeSharedRobot(
+        rawRobot,
+        worldIdentity,
+        now,
+      );
       const key = `${normalized.robotId}\u0000${
         normalized.controllerInstanceId
       }`;

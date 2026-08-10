@@ -131,6 +131,80 @@ def local_map(
     }
 
 
+def navigation_trace(frame_id):
+    return {
+        "schema": "robot-navigation-trace/v1",
+        "read_only": True,
+        "frame_id": frame_id,
+        "provenance": (
+            "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY"
+        ),
+        "final_goal": {
+            "kind": "DIRECTIONAL_HEADING",
+            "origin_x_mm": 0,
+            "origin_y_mm": 0,
+            "target_x_mm": 420,
+            "target_y_mm": 0,
+            "desired_heading_mdeg": 0,
+            "minimum_forward_progress_mm": 420,
+            "heading_tolerance_mdeg": 5_000,
+            "current_forward_progress_mm": 45,
+            "remaining_forward_progress_mm": 375,
+            "navigation_enforced": False,
+        },
+        "imu_heading": {
+            "heading_mdeg": 0,
+            "reference": "EPISODE_START",
+            "observed_at_unix_ms": 1_000,
+        },
+        "planned_leg": {
+            "kind": "SIDE_SEARCH",
+            "scope": "SEARCH_POSITION_ONLY",
+            "clearance_proven": False,
+            "passage_proven": False,
+            "route_eligible": False,
+            "selected_side": "LEFT",
+            "bind_pose": {
+                "x_mm": 45,
+                "y_mm": 0,
+                "heading_mdeg": 0,
+            },
+            "waypoint": {
+                "x_mm": 90,
+                "y_mm": 210,
+                "heading_mdeg": 90_000,
+            },
+        },
+        "planar_scan_views": [{
+            "scan_id": "scan-1",
+            "observed_at_unix_ms": 1_000,
+            "scan_pose": {
+                "x_mm": 10,
+                "y_mm": 20,
+                "heading_mdeg": 0,
+            },
+            "projection": {
+                "schema": "blast-planar-scan-projection/v1",
+                "frame": "EPISODE_LOCAL_ODOMETRY",
+                "quality": "PROVISIONAL_YAW_ONLY",
+                "vertical_pitch_compensated": False,
+                "ultrasonic_beam_width_modeled": False,
+                "scan_turn_translation_compensated": False,
+                "points": [{
+                    "side": "center",
+                    "measured_range_mm": 300.0,
+                    "relative_bearing_mdeg": 0,
+                    "sensor_origin_x_mm": 110,
+                    "sensor_origin_y_mm": 20,
+                    "beam_heading_mdeg": 0,
+                    "nominal_echo_x_mm": 410,
+                    "nominal_echo_y_mm": 20,
+                }],
+            },
+        }],
+    }
+
+
 def compositor(*bindings):
     return SharedSpatialMapCompositor(
         world_frame_id=WORLD_FRAME_ID,
@@ -140,6 +214,253 @@ def compositor(*bindings):
 
 
 class SharedSpatialMapCompositorTests(TestCase):
+    def test_navigation_trace_is_transformed_for_identity_translation_and_yaw(self):
+        cases = (
+            {
+                "name": "identity",
+                "tx_mm": 0,
+                "ty_mm": 0,
+                "yaw_mdeg": 0,
+                "goal": (0, 0, 420, 0, 0),
+                "bind_pose": (45, 0, 0),
+                "waypoint": (90, 210, 90_000),
+                "scan_pose": (10, 20, 0),
+                "ray": (110, 20, 0, 410, 20),
+            },
+            {
+                "name": "translation",
+                "tx_mm": 1_000,
+                "ty_mm": 500,
+                "yaw_mdeg": 0,
+                "goal": (1_000, 500, 1_420, 500, 0),
+                "bind_pose": (1_045, 500, 0),
+                "waypoint": (1_090, 710, 90_000),
+                "scan_pose": (1_010, 520, 0),
+                "ray": (1_110, 520, 0, 1_410, 520),
+            },
+            {
+                "name": "quarter_turn",
+                "tx_mm": 1_000,
+                "ty_mm": 500,
+                "yaw_mdeg": 90_000,
+                "goal": (1_000, 500, 1_000, 920, 90_000),
+                "bind_pose": (1_000, 545, 90_000),
+                "waypoint": (790, 590, -180_000),
+                "scan_pose": (980, 510, 90_000),
+                "ray": (980, 610, 90_000, 980, 910),
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                calibration = frame_transform(
+                    "blast-01",
+                    "blast-hub",
+                    "blast-local",
+                    "episode-a",
+                    tx_mm=case["tx_mm"],
+                    ty_mm=case["ty_mm"],
+                    yaw_mdeg=case["yaw_mdeg"],
+                )
+                value = local_map(
+                    "blast-01",
+                    "blast-hub",
+                    "blast-local",
+                    "episode-a",
+                )
+                value["navigation_trace"] = navigation_trace(
+                    "blast-local"
+                )
+
+                robot = compositor(
+                    (Provider(value), calibration)
+                ).snapshot()["robots"][0]
+                trace = robot["navigation_trace"]
+
+                self.assertEqual(robot["status"], "available")
+                self.assertEqual(trace["frame_id"], WORLD_FRAME_ID)
+                self.assertEqual(
+                    trace["world_generation_id"], WORLD_GENERATION_ID
+                )
+                self.assertEqual(trace["local_frame_id"], "blast-local")
+                self.assertEqual(
+                    trace["local_generation_id"], "episode-a"
+                )
+                self.assertEqual(trace["source_robot_id"], "blast-01")
+                self.assertEqual(
+                    trace["source_controller_instance_id"], "blast-hub"
+                )
+                self.assertTrue(trace["read_only"])
+                self.assertEqual(
+                    trace["provenance"],
+                    value["navigation_trace"]["provenance"],
+                )
+                self.assertEqual(
+                    trace["transform_provenance"],
+                    ["FIXED_START_POSE"],
+                )
+                goal = trace["final_goal"]
+                self.assertEqual(
+                    (
+                        goal["origin_x_mm"],
+                        goal["origin_y_mm"],
+                        goal["target_x_mm"],
+                        goal["target_y_mm"],
+                        goal["desired_heading_mdeg"],
+                    ),
+                    case["goal"],
+                )
+                self.assertFalse(goal["navigation_enforced"])
+                self.assertEqual(
+                    trace["imu_heading"]["heading_mdeg"],
+                    case["yaw_mdeg"],
+                )
+                self.assertEqual(
+                    tuple(trace["planned_leg"]["bind_pose"].values()),
+                    case["bind_pose"],
+                )
+                self.assertEqual(
+                    tuple(trace["planned_leg"]["waypoint"].values()),
+                    case["waypoint"],
+                )
+                projection = trace["planar_scan_views"][0]["projection"]
+                self.assertEqual(projection["frame"], "SHARED_FIXED_START")
+                self.assertEqual(
+                    projection["local_frame"],
+                    "EPISODE_LOCAL_ODOMETRY",
+                )
+                self.assertEqual(
+                    tuple(
+                        trace["planar_scan_views"][0]["scan_pose"].values()
+                    ),
+                    case["scan_pose"],
+                )
+                ray = projection["points"][0]
+                self.assertEqual(
+                    (
+                        ray["sensor_origin_x_mm"],
+                        ray["sensor_origin_y_mm"],
+                        ray["beam_heading_mdeg"],
+                        ray["nominal_echo_x_mm"],
+                        ray["nominal_echo_y_mm"],
+                    ),
+                    case["ray"],
+                )
+                self.assertEqual(ray["measured_range_mm"], 300.0)
+                self.assertEqual(ray["relative_bearing_mdeg"], 0)
+
+    def test_malformed_navigation_trace_isolated_from_healthy_source(self):
+        broken_value = local_map(
+            "blast-01", "blast-hub", "blast-local", "episode-a"
+        )
+        broken_value["navigation_trace"] = navigation_trace("blast-local")
+        broken_value["navigation_trace"]["planar_scan_views"][0][
+            "projection"
+        ]["points"][0]["nominal_echo_x_mm"] = 999
+        healthy_value = local_map(
+            "ev3rstorm-01",
+            "ev3-controller",
+            "ev3-local",
+            "generation-a",
+        )
+
+        value = compositor(
+            (
+                Provider(broken_value),
+                frame_transform(
+                    "blast-01",
+                    "blast-hub",
+                    "blast-local",
+                    "episode-a",
+                ),
+            ),
+            (
+                Provider(healthy_value),
+                frame_transform(
+                    "ev3rstorm-01",
+                    "ev3-controller",
+                    "ev3-local",
+                    "generation-a",
+                ),
+            ),
+        ).snapshot()
+
+        self.assertEqual(value["status"], "degraded")
+        robots = {robot["robot_id"]: robot for robot in value["robots"]}
+        self.assertEqual(robots["ev3rstorm-01"]["status"], "available")
+        self.assertIsNone(robots["ev3rstorm-01"]["navigation_trace"])
+        self.assertEqual(robots["blast-01"]["status"], "unavailable")
+        self.assertEqual(
+            robots["blast-01"]["reason_code"],
+            "source_navigation_trace_invalid",
+        )
+        self.assertIsNone(robots["blast-01"]["navigation_trace"])
+
+    def test_navigation_trace_frame_mismatch_fails_closed(self):
+        calibration = frame_transform(
+            "blast-01", "blast-hub", "blast-local", "episode-a"
+        )
+        value = local_map(
+            "blast-01", "blast-hub", "blast-local", "episode-a"
+        )
+        value["navigation_trace"] = navigation_trace("retired-frame")
+
+        robot = compositor(
+            (Provider(value), calibration)
+        ).snapshot()["robots"][0]
+
+        self.assertEqual(robot["status"], "unavailable")
+        self.assertEqual(
+            robot["reason_code"],
+            "source_navigation_trace_frame_mismatch",
+        )
+        self.assertIsNone(robot["navigation_trace"])
+
+    def test_navigation_enforcement_and_proof_flags_are_not_promoted(self):
+        calibration = frame_transform(
+            "blast-01", "blast-hub", "blast-local", "episode-a"
+        )
+        value = local_map(
+            "blast-01", "blast-hub", "blast-local", "episode-a"
+        )
+        trace = navigation_trace("blast-local")
+        trace["final_goal"]["navigation_enforced"] = True
+        trace["planned_leg"].update({
+            "kind": "LATERAL_CLEARANCE",
+            "scope": "LOCAL_DETOUR_ROUTE",
+            "route_eligible": True,
+        })
+        value["navigation_trace"] = trace
+
+        shared = compositor((Provider(value), calibration)).snapshot()
+        transformed = shared["robots"][0]["navigation_trace"]
+
+        self.assertTrue(transformed["final_goal"]["navigation_enforced"])
+        self.assertTrue(transformed["planned_leg"]["route_eligible"])
+        self.assertFalse(transformed["planned_leg"]["clearance_proven"])
+        self.assertFalse(transformed["planned_leg"]["passage_proven"])
+        self.assertIsNone(shared["navigation_authority"])
+
+    def test_source_without_navigation_trace_remains_available(self):
+        calibration = frame_transform(
+            "ev3rstorm-01",
+            "ev3-controller",
+            "ev3-local",
+            "generation-a",
+        )
+        value = local_map(
+            "ev3rstorm-01",
+            "ev3-controller",
+            "ev3-local",
+            "generation-a",
+        )
+
+        robot = compositor(
+            (Provider(value), calibration)
+        ).snapshot()["robots"][0]
+
+        self.assertEqual(robot["status"], "available")
+        self.assertIsNone(robot["navigation_trace"])
+
     def test_exact_two_source_fixture_is_canonical_and_world_aligned(self):
         ev3_transform = frame_transform(
             "ev3rstorm-01",
@@ -492,7 +813,6 @@ class SharedSpatialMapCompositorTests(TestCase):
             "qualitative_observations": [{"relation": "NEAR_OBSTACLE"}],
             "scan_evidence_history": [{"scan_id": "scan-a"}],
             "object_hypotheses": [{"hypothesis_id": "object-a"}],
-            "navigation_trace": {"planned_leg": "ADVANCE"},
         })
 
         shared = compositor((Provider(value), calibration)).snapshot()
@@ -513,10 +833,10 @@ class SharedSpatialMapCompositorTests(TestCase):
             "qualitative_observations",
             "scan_evidence_history",
             "object_hypotheses",
-            "navigation_trace",
             "navigation_authority",
         ):
             self.assertNotIn(forbidden, robot)
+        self.assertIsNone(robot["navigation_trace"])
 
 
 if __name__ == "__main__":
