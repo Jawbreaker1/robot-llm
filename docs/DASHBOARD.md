@@ -81,6 +81,50 @@ scripts/start_lab_console.sh --port 8877
   flyttats. `--robot-memory-path` väljer episodens atomiska arbetsfil.
   Dashboardens heta events, snapshots och pose trail är processlokala.
 
+## Gemensam fixed-start-karta för EV3 och BLAST
+
+Två aktiva robotar körs i varsin dashboardprocess så att varje
+`RobotControlService` fortsatt ensam äger sin hårdvara. Den dashboard som ska
+visas hämtar den andra processens lokala v1-karta över autentiserad loopback
+och projicerar båda robotarnas pose, bana, riktning och fysiska footprint i
+samma befintliga kartvy.
+
+Starta exempelvis EV3 på peer-porten:
+
+```sh
+ROBOT_LLM_STT_URL='' scripts/start_ev3rstorm_console.sh --port 8766
+```
+
+Starta därefter BLAST som kartankare på port 8765. Följande `600, 0, 0` är
+bara ett räkneexempel och ska ersättas med den uppmätta EV3-startpunkten i
+BLASTs startram: `+X` framåt, `+Y` vänster och positiv yaw åt vänster
+(moturs), i millimeter respektive milligrader.
+
+```sh
+ROBOT_LLM_STT_URL='' scripts/start_blast_console.sh \
+  --port 8765 \
+  --shared-peer-port 8766 \
+  --shared-peer-access-key-file ~/.robot-llm/dashboard-access-key \
+  --shared-peer-x-mm 600 \
+  --shared-peer-y-mm 0 \
+  --shared-peer-yaw-mdeg 0
+```
+
+Alla fem `--shared-peer-*`-flaggor är obligatoriska tillsammans. Peer-porten
+måste skilja sig från den lokala porten, och peerprofilen är alltid den andra
+kända roboten. Åtkomstnyckeln stannar på serversidan och samma vanliga
+owner-only-nyckelfil kan användas av båda loopbackprocesserna.
+
+Bindningen görs exakt en gång mot det första kompletta paret av lokala
+`frame_id` och `local_generation_id`. En ny episod byter lokal generation och
+ger därför `fixed_start_rebind_required`; den gamla transformen återanvänds
+aldrig automatiskt. Placera då tillbaka båda robotarna på startmarkeringarna
+och starta om dashboarden som visar den gemensamma kartan.
+
+Denna version är avsiktligt observation-only: den delar robotarnas beräknade
+odometribana men ännu inga hinderhypoteser och ingen navigationsauktoritet.
+Kör robotarna en i taget under den första frame-valideringen.
+
 För att först köra den riktiga 2D-simulatornavigationen och därefter visa dess
 ackumulerade karta i dashboarden:
 

@@ -20,7 +20,11 @@ from .dashboard_http import (
     new_session_token,
 )
 from .dashboard_service import DashboardService
-from .blast_observation_monitor import BlastObservationMonitor
+from .blast_observation_monitor import (
+    CONTROLLER_ID as BLAST_CONTROLLER_ID,
+    ROBOT_ID as BLAST_ROBOT_ID,
+    BlastObservationMonitor,
+)
 from .blast_episode_adapter import (
     BLAST_PROFILE_ID,
     BlastEpisodeRuntimeAdapter,
@@ -39,10 +43,13 @@ from .lm_studio_robot_input import (
     REQUEST_TIMEOUT_SECONDS as ROBOT_INPUT_TIMEOUT_SECONDS,
 )
 from .robot_control_contract import RobotControlSettings
-from .robot_control_http import RobotControlHTTPRouter
+from .robot_control_http import EV3_CONTROLLER_ID, RobotControlHTTPRouter
 from .robot_control_service import RobotControlService
 from .robot_input_service import RobotInputService
 from .robot_turn_speech import RobotTurnSpeechSink
+from .remote_spatial_map import RemoteSpatialMapProvider
+from .shared_fixed_start_map import FixedStartSharedMapProvider
+from .shared_frame_transform import MAX_FRAME_COORDINATE_MM
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -399,6 +406,33 @@ def _parser() -> argparse.ArgumentParser:
             "planner (default: %(default)s)"
         ),
     )
+    parser.add_argument(
+        "--shared-peer-port",
+        type=int,
+        help=(
+            "Loopback port of the opposite robot dashboard whose local "
+            "map should be projected into this fixed-start shared map"
+        ),
+    )
+    parser.add_argument(
+        "--shared-peer-access-key-file",
+        help="Owner-only access-key file used by the peer dashboard",
+    )
+    parser.add_argument(
+        "--shared-peer-x-mm",
+        type=int,
+        help="Peer start X in this robot's start frame, in millimetres",
+    )
+    parser.add_argument(
+        "--shared-peer-y-mm",
+        type=int,
+        help="Peer start Y in this robot's start frame, in millimetres",
+    )
+    parser.add_argument(
+        "--shared-peer-yaw-mdeg",
+        type=int,
+        help="Peer start heading in this robot's frame, in millidegrees",
+    )
     stt_source = parser.add_mutually_exclusive_group()
     stt_source.add_argument(
         "--stt-model",
@@ -528,6 +562,69 @@ def _configured_robot_runtime_adapter(args, *, blast_monitor=None):
     )
 
 
+def _configured_shared_spatial_map(args, *, local_map_provider):
+    """Compose an explicit one-shot fixed-start peer map, if requested."""
+
+    option_values = (
+        args.shared_peer_port,
+        args.shared_peer_access_key_file,
+        args.shared_peer_x_mm,
+        args.shared_peer_y_mm,
+        args.shared_peer_yaw_mdeg,
+    )
+    if not any(value is not None for value in option_values):
+        return None
+    if not all(value is not None for value in option_values):
+        raise ValueError(
+            "Fixed-start shared peer options must be supplied together"
+        )
+    if args.robot_profile not in (BLAST_PROFILE_ID, EV3RSTORM_PROFILE_ID):
+        raise ValueError(
+            "Fixed-start shared mapping requires one physical robot profile"
+        )
+    if local_map_provider is None:
+        raise ValueError(
+            "Fixed-start shared mapping requires a local physical map"
+        )
+    if (
+        not 1 <= args.shared_peer_port <= 65_535
+        or args.shared_peer_port == args.port
+        or not -MAX_FRAME_COORDINATE_MM
+        <= args.shared_peer_x_mm
+        <= MAX_FRAME_COORDINATE_MM
+        or not -MAX_FRAME_COORDINATE_MM
+        <= args.shared_peer_y_mm
+        <= MAX_FRAME_COORDINATE_MM
+        or not -180_000 <= args.shared_peer_yaw_mdeg <= 179_999
+    ):
+        raise ValueError("Fixed-start shared peer geometry is invalid")
+
+    access_key = load_or_create_dashboard_access_key(
+        Path(args.shared_peer_access_key_file),
+    )
+    peer_provider = RemoteSpatialMapProvider(
+        args.shared_peer_port,
+        access_key,
+    )
+    if args.robot_profile == BLAST_PROFILE_ID:
+        local_identity = BLAST_ROBOT_ID, BLAST_CONTROLLER_ID
+        peer_identity = EV3RSTORM_PROFILE_ID, EV3_CONTROLLER_ID
+    else:
+        local_identity = EV3RSTORM_PROFILE_ID, EV3_CONTROLLER_ID
+        peer_identity = BLAST_ROBOT_ID, BLAST_CONTROLLER_ID
+    return FixedStartSharedMapProvider(
+        local_provider=local_map_provider,
+        peer_provider=peer_provider,
+        local_robot_id=local_identity[0],
+        local_controller_id=local_identity[1],
+        peer_robot_id=peer_identity[0],
+        peer_controller_id=peer_identity[1],
+        peer_tx_mm=args.shared_peer_x_mm,
+        peer_ty_mm=args.shared_peer_y_mm,
+        peer_yaw_mdeg=args.shared_peer_yaw_mdeg,
+    )
+
+
 def _close_resources(
     server,
     service,
@@ -577,6 +674,7 @@ def _run(
     args = _parser().parse_args(argv)
     injected_robot_runtime = robot_runtime_adapter is not None
     map_runtime = None
+    shared_map_runtime = None
     blast_monitor = None
     whisper_runtime = None
     service = None
@@ -652,6 +750,10 @@ def _run(
                 and callable(getattr(candidate, "close", None))
             ):
                 map_runtime = candidate
+        shared_map_runtime = _configured_shared_spatial_map(
+            args,
+            local_map_provider=map_runtime,
+        )
         speech_transcriber = None
         if args.stt_model:
             from .stt_whisper_cpp import WhisperCppTranscriber
@@ -703,6 +805,7 @@ def _run(
             base_url=args.lm_studio_url,
             model=args.model,
             spatial_map_provider=map_runtime,
+            shared_spatial_map_provider=shared_map_runtime,
             speech_transcriber=speech_transcriber,
             controller_runtime_providers=controller_runtime_providers,
         )
@@ -791,6 +894,11 @@ def _run(
                             if map_runtime is not None
                             else "unavailable"
                         )
+                    ),
+                    "shared_spatial_map_mode": (
+                        "fixed_start_peer"
+                        if shared_map_runtime is not None
+                        else "unavailable"
                     ),
                 },
                 ensure_ascii=False,

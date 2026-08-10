@@ -9,6 +9,7 @@ from unittest import mock
 from robot_agent.dashboard_cli import (
     ROBOT_PROFILE_DISABLED,
     _configured_robot_runtime_adapter,
+    _configured_shared_spatial_map,
     _parser,
     _run,
 )
@@ -24,7 +25,186 @@ class DashboardRobotProfileTests(unittest.TestCase):
         self.assertIsNone(args.robot_target)
         self.assertEqual(args.robot_planner_timeout_seconds, 30.0)
         self.assertEqual(args.robot_input_timeout_seconds, 10.0)
+        self.assertIsNone(args.shared_peer_port)
+        self.assertIsNone(args.shared_peer_access_key_file)
         self.assertIsNone(_configured_robot_runtime_adapter(args))
+
+    def test_fixed_start_peer_options_are_all_or_none_and_physical(self):
+        local_map = mock.Mock()
+        partial = _parser().parse_args([
+            "--robot-profile",
+            BLAST_PROFILE_ID,
+            "--blast-hub-name",
+            "BLAST-TEST",
+            "--shared-peer-port",
+            "8766",
+        ])
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            _configured_shared_spatial_map(
+                partial,
+                local_map_provider=local_map,
+            )
+
+        disabled = _parser().parse_args([
+            "--shared-peer-port",
+            "8766",
+            "--shared-peer-access-key-file",
+            "/tmp/peer-key",
+            "--shared-peer-x-mm",
+            "600",
+            "--shared-peer-y-mm",
+            "0",
+            "--shared-peer-yaw-mdeg",
+            "0",
+        ])
+        with self.assertRaisesRegex(ValueError, "physical robot profile"):
+            _configured_shared_spatial_map(
+                disabled,
+                local_map_provider=local_map,
+            )
+
+    def test_fixed_start_peer_configuration_is_loopback_and_opposite(self):
+        args = _parser().parse_args([
+            "--robot-profile",
+            BLAST_PROFILE_ID,
+            "--blast-hub-name",
+            "BLAST-TEST",
+            "--shared-peer-port",
+            "8766",
+            "--shared-peer-access-key-file",
+            "~/.robot-llm/peer-key",
+            "--shared-peer-x-mm",
+            "600",
+            "--shared-peer-y-mm",
+            "-25",
+            "--shared-peer-yaw-mdeg",
+            "90000",
+        ])
+        local_map = mock.Mock()
+        remote = mock.Mock()
+        shared = mock.Mock()
+        with (
+            mock.patch(
+                "robot_agent.dashboard_cli."
+                "load_or_create_dashboard_access_key",
+                return_value="p" * 64,
+            ) as key_loader,
+            mock.patch(
+                "robot_agent.dashboard_cli.RemoteSpatialMapProvider",
+                return_value=remote,
+            ) as remote_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.FixedStartSharedMapProvider",
+                return_value=shared,
+            ) as shared_type,
+        ):
+            value = _configured_shared_spatial_map(
+                args,
+                local_map_provider=local_map,
+            )
+
+        self.assertIs(value, shared)
+        key_loader.assert_called_once_with(Path("~/.robot-llm/peer-key"))
+        remote_type.assert_called_once_with(8766, "p" * 64)
+        self.assertEqual(
+            shared_type.call_args.kwargs,
+            {
+                "local_provider": local_map,
+                "peer_provider": remote,
+                "local_robot_id": "blast-01",
+                "local_controller_id": "blast-01.hub",
+                "peer_robot_id": "ev3rstorm-01",
+                "peer_controller_id": "ev3rstorm-01.ev3-main",
+                "peer_tx_mm": 600,
+                "peer_ty_mm": -25,
+                "peer_yaw_mdeg": 90000,
+            },
+        )
+
+    def test_ev3_anchor_maps_the_blast_peer_in_the_configured_frame(self):
+        args = _parser().parse_args([
+            "--robot-profile",
+            EV3RSTORM_PROFILE_ID,
+            "--robot-target",
+            "robot@ev3dev.local",
+            "--shared-peer-port",
+            "8766",
+            "--shared-peer-access-key-file",
+            "/tmp/peer-key",
+            "--shared-peer-x-mm",
+            "-500",
+            "--shared-peer-y-mm",
+            "100",
+            "--shared-peer-yaw-mdeg",
+            "-90000",
+        ])
+        with (
+            mock.patch(
+                "robot_agent.dashboard_cli."
+                "load_or_create_dashboard_access_key",
+                return_value="p" * 64,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.RemoteSpatialMapProvider",
+                return_value=mock.Mock(),
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.FixedStartSharedMapProvider",
+                return_value=mock.Mock(),
+            ) as shared_type,
+        ):
+            _configured_shared_spatial_map(
+                args,
+                local_map_provider=mock.Mock(),
+            )
+
+        values = shared_type.call_args.kwargs
+        self.assertEqual(
+            (
+                values["local_robot_id"],
+                values["local_controller_id"],
+                values["peer_robot_id"],
+                values["peer_controller_id"],
+            ),
+            (
+                "ev3rstorm-01",
+                "ev3rstorm-01.ev3-main",
+                "blast-01",
+                "blast-01.hub",
+            ),
+        )
+
+    def test_fixed_start_peer_rejects_same_port_and_missing_local_map(self):
+        base = [
+            "--robot-profile",
+            EV3RSTORM_PROFILE_ID,
+            "--robot-target",
+            "robot@ev3dev.local",
+            "--shared-peer-port",
+            "8765",
+            "--shared-peer-access-key-file",
+            "/tmp/peer-key",
+            "--shared-peer-x-mm",
+            "0",
+            "--shared-peer-y-mm",
+            "0",
+            "--shared-peer-yaw-mdeg",
+            "0",
+        ]
+        same_port = _parser().parse_args(base)
+        with self.assertRaisesRegex(ValueError, "geometry is invalid"):
+            _configured_shared_spatial_map(
+                same_port,
+                local_map_provider=mock.Mock(),
+            )
+
+        base[base.index("8765")] = "8766"
+        without_map = _parser().parse_args(base)
+        with self.assertRaisesRegex(ValueError, "local physical map"):
+            _configured_shared_spatial_map(
+                without_map,
+                local_map_provider=None,
+            )
 
     def test_ev3_profile_requires_an_explicit_target(self):
         args = _parser().parse_args(
@@ -333,6 +513,103 @@ class DashboardRobotProfileTests(unittest.TestCase):
             "physical_live",
         )
         map_provider.close.assert_called_once_with(drain=True)
+
+    def test_run_exposes_shared_map_but_keeps_local_map_as_robot_facts(self):
+        adapter = mock.Mock()
+        local_map = mock.Mock()
+        local_map.snapshot = mock.Mock(return_value={})
+        local_map.close = mock.Mock(return_value=True)
+        adapter.spatial_map_provider = local_map
+        peer_map = mock.Mock()
+        shared_map = mock.Mock()
+        shared_map.close = mock.Mock()
+        peer_key = "private-peer-key-" + "p" * 48
+        dashboard_service = mock.Mock()
+        control_service = mock.Mock()
+        server = mock.Mock()
+        router = mock.Mock(session_path="/live/token/")
+        with (
+            mock.patch(
+                "robot_agent.dashboard_cli."
+                "_configured_robot_runtime_adapter",
+                return_value=adapter,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli."
+                "load_or_create_dashboard_access_key",
+                return_value=peer_key,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.RemoteSpatialMapProvider",
+                return_value=peer_map,
+            ) as peer_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.FixedStartSharedMapProvider",
+                return_value=shared_map,
+            ) as shared_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.DashboardService",
+                return_value=dashboard_service,
+            ) as dashboard_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.RobotControlService",
+                return_value=control_service,
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.build_server",
+                return_value=(server, router),
+            ) as server_type,
+            mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            result = _run([
+                "--robot-profile",
+                EV3RSTORM_PROFILE_ID,
+                "--robot-target",
+                "robot@ev3dev.local",
+                "--shared-peer-port",
+                "8766",
+                "--shared-peer-access-key-file",
+                "/tmp/private-peer-key",
+                "--shared-peer-x-mm",
+                "600",
+                "--shared-peer-y-mm",
+                "0",
+                "--shared-peer-yaw-mdeg",
+                "0",
+            ])
+
+        self.assertEqual(result, 0)
+        peer_type.assert_called_once_with(8766, peer_key)
+        self.assertIs(
+            shared_type.call_args.kwargs["local_provider"],
+            local_map,
+        )
+        self.assertIs(
+            shared_type.call_args.kwargs["peer_provider"],
+            peer_map,
+        )
+        self.assertIs(
+            dashboard_type.call_args.kwargs["spatial_map_provider"],
+            local_map,
+        )
+        self.assertIs(
+            dashboard_type.call_args.kwargs[
+                "shared_spatial_map_provider"
+            ],
+            shared_map,
+        )
+        input_service = server_type.call_args.kwargs[
+            "robot_input_service"
+        ]
+        self.assertIs(input_service._map_snapshot, local_map.snapshot)
+        ready_output = stdout.getvalue()
+        self.assertNotIn(peer_key, ready_output)
+        self.assertEqual(
+            json.loads(ready_output)["shared_spatial_map_mode"],
+            "fixed_start_peer",
+        )
+        local_map.close.assert_called_once_with(drain=True)
+        shared_map.close.assert_not_called()
 
     def test_run_keeps_interactive_timeout_independent_of_planner(self):
         adapter = mock.Mock()

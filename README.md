@@ -196,6 +196,38 @@ actions. Use
 only one robot should be configured. All launchers reuse the same application
 entry point and prefer the repository's `.venv` when it exists.
 
+### Show both live paths in one fixed-start map
+
+Run one dashboard process per active robot; each process keeps sole ownership
+of its robot. The dashboard you watch can read the other process's local v1
+map over authenticated loopback and project both pose trails into the existing
+shared v2 map. For example, start the EV3 peer first:
+
+```sh
+ROBOT_LLM_STT_URL='' scripts/start_ev3rstorm_console.sh --port 8766
+```
+
+Then start BLAST on the normal port. Replace the illustrative `600, 0, 0`
+with the measured EV3 start origin `(x mm, y mm, yaw millidegrees)` in BLAST's
+start frame (`+X` forward, `+Y` left, positive yaw left/counter-clockwise):
+
+```sh
+ROBOT_LLM_STT_URL='' scripts/start_blast_console.sh \
+  --port 8765 \
+  --shared-peer-port 8766 \
+  --shared-peer-access-key-file ~/.robot-llm/dashboard-access-key \
+  --shared-peer-x-mm 600 \
+  --shared-peer-y-mm 0 \
+  --shared-peer-yaw-mdeg 0
+```
+
+The first complete local-map generation from each process is bound once.
+Starting a new episode changes that robot's local frame and deliberately makes
+the shared map unavailable instead of silently teleporting it; place both
+robots back on the fixed marks and restart the viewing process to bind again.
+This checkpoint shares pose/path visualization only. It does not yet fuse
+obstacle hypotheses or authorize simultaneous navigation.
+
 ## Running with a physical EV3
 
 The physical path requires an EV3 running ev3dev, a network connection to the
