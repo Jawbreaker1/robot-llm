@@ -479,12 +479,214 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         self.assertGreaterEqual(
             SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
-            9 * SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS + 6,
+            17 * SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS + 6,
         )
         self.assertGreaterEqual(
             SCAN_COMMAND_TIMEOUT_SECONDS,
             SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS + 3,
         )
+        monitor.close()
+
+    def test_scan_retries_one_unsettled_turn_at_the_same_pose(self):
+        class RetryMonitor(BlastObservationMonitor):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.turn_counts_at_settle = []
+
+            async def _observe_until_settled(
+                self,
+                runtime,
+                *,
+                generation,
+                initial_observation,
+                timeout_seconds=None,
+            ):
+                self.turn_counts_at_settle.append(len([
+                    call for call in runtime.calls
+                    if call[0] == "turn_pulse"
+                ]))
+                return (
+                    initial_observation,
+                    len(self.turn_counts_at_settle) != 2,
+                )
+
+        monitor = RetryMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        result = monitor.command(SCAN_COMMAND)
+
+        runtime = FakeRuntime.instances[0]
+        self.assertTrue(result["completed"])
+        self.assertEqual(
+            len([call for call in runtime.calls if call[0] == "turn_pulse"]),
+            8,
+        )
+        self.assertEqual(
+            monitor.turn_counts_at_settle,
+            [0, 1, 1, 2, 3, 4, 5, 6, 7, 8],
+        )
+        monitor.close()
+
+    def test_scan_stops_after_one_retry_when_turn_stays_unsettled(self):
+        class NeverSettledTurnMonitor(BlastObservationMonitor):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.settle_calls = 0
+
+            async def _observe_until_settled(
+                self,
+                runtime,
+                *,
+                generation,
+                initial_observation,
+                timeout_seconds=None,
+            ):
+                self.settle_calls += 1
+                return initial_observation, self.settle_calls == 1
+
+        monitor = NeverSettledTurnMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        with self.assertRaises(BlastControllerError) as raised:
+            monitor.command(SCAN_COMMAND)
+
+        self.assertEqual(
+            raised.exception.code,
+            "scan_sweep_observation_unverified",
+        )
+        runtime = FakeRuntime.instances[0]
+        self.assertEqual(
+            [call for call in runtime.calls if call[0] == "turn_pulse"],
+            [("turn_pulse", "left")],
+        )
+        self.assertEqual(monitor.settle_calls, 3)
+        monitor.close()
+
+    def test_scan_does_not_retry_unsettled_close_or_invalid_evidence(self):
+        for distance in (40, -1):
+            with self.subTest(distance=distance):
+                FakeRuntime.instances = []
+
+                class UnsafeTurnMonitor(BlastObservationMonitor):
+                    def __init__(self, **kwargs):
+                        super().__init__(**kwargs)
+                        self.settle_calls = 0
+
+                    async def _observe_until_settled(
+                        self,
+                        runtime,
+                        *,
+                        generation,
+                        initial_observation,
+                        timeout_seconds=None,
+                    ):
+                        self.settle_calls += 1
+                        if self.settle_calls == 1:
+                            return initial_observation, True
+                        observation = {
+                            **initial_observation,
+                            "distance_mm": distance,
+                        }
+                        return observation, False
+
+                monitor = UnsafeTurnMonitor(
+                    poll_interval_seconds=0.05,
+                    runtime_factory=FakeRuntime,
+                )
+                monitor.start()
+                self.wait_for(monitor, "online")
+
+                with self.assertRaises(BlastControllerError):
+                    monitor.command(SCAN_COMMAND)
+
+                runtime = FakeRuntime.instances[0]
+                self.assertEqual(
+                    [
+                        call for call in runtime.calls
+                        if call[0] == "turn_pulse"
+                    ],
+                    [("turn_pulse", "left")],
+                )
+                self.assertEqual(monitor.settle_calls, 2)
+                monitor.close()
+
+    def test_stop_cancellation_wins_during_scan_settle_retry(self):
+        retry_started = threading.Event()
+
+        class UnstableAfterTurnRuntime(FakeRuntime):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.after_turn = False
+
+            async def turn_pulse(self, direction):
+                receipt = await super().turn_pulse(direction)
+                self.after_turn = True
+                return receipt
+
+            async def observe(self):
+                observation = await super().observe()
+                if self.after_turn:
+                    observation["distance_mm"] = (
+                        300 + self.observe_calls * 20
+                    )
+                return observation
+
+        class RetrySignallingMonitor(BlastObservationMonitor):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.settle_calls = 0
+
+            async def _observe_until_settled(self, *args, **kwargs):
+                self.settle_calls += 1
+                if self.settle_calls == 3:
+                    retry_started.set()
+                return await super()._observe_until_settled(
+                    *args,
+                    **kwargs,
+                )
+
+        monitor = RetrySignallingMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=UnstableAfterTurnRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        scan_failures = []
+
+        def scan():
+            try:
+                monitor.command(SCAN_COMMAND)
+            except BlastControllerError as error:
+                scan_failures.append(error.code)
+
+        with mock.patch(
+            "robot_agent.blast_observation_monitor."
+            "SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS",
+            0.3,
+        ):
+            scan_thread = threading.Thread(target=scan)
+            scan_thread.start()
+            self.assertTrue(retry_started.wait(timeout=1.0))
+            stop_result = monitor.command("stop")
+            scan_thread.join(timeout=1.0)
+
+        self.assertFalse(scan_thread.is_alive())
+        self.assertEqual(scan_failures, ["controller_command_interrupted"])
+        self.assertTrue(stop_result["completed"])
+        runtime = FakeRuntime.instances[0]
+        self.assertEqual(
+            [call for call in runtime.calls if call[0] == "turn_pulse"],
+            [("turn_pulse", "left")],
+        )
+        self.assertIn(("stop",), runtime.calls)
         monitor.close()
 
     def test_scan_stops_after_first_close_settled_turn_pulse(self):

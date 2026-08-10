@@ -25,8 +25,8 @@ DEFAULT_RECONNECT_INTERVAL_SECONDS = 3.0
 DISCONNECT_TIMEOUT_SECONDS = 3.0
 COMMAND_TIMEOUT_SECONDS = 15.0
 INTERNAL_COMMAND_TIMEOUT_SECONDS = 12.0
-SCAN_COMMAND_TIMEOUT_SECONDS = 36.0
-SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS = 33.0
+SCAN_COMMAND_TIMEOUT_SECONDS = 60.0
+SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS = 57.0
 MIN_COMMAND_BUDGET_SECONDS = 2.0
 COMMAND_RESPONSE_MARGIN_SECONDS = 0.25
 MOTION_TIMEOUT_SECONDS = 4.0
@@ -626,15 +626,45 @@ class BlastObservationMonitor:
             )
         )
         distance = observation.get("distance_mm")
+        sensor = (
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+            .range_sensor_extrinsics
+        )
+        range_state = blast_range_state(distance)
+        if (
+            observation_settled is not True
+            and observation.get("motion_active") is False
+            and self._scan_heading(observation) is not None
+            and sensor.matches_navigation_body_angle(
+                _body_motor_angle(observation)
+            )
+            and (
+                range_state == RANGE_STATE_NO_VALID_DISTANCE
+                or (
+                    range_state == RANGE_STATE_MEASURED
+                    and float(distance) > (
+                        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+                        .minimum_rotation_clearance_mm()
+                    )
+                )
+            )
+        ):
+            observation, observation_settled = (
+                await self._observe_until_settled(
+                    runtime,
+                    generation=generation,
+                    initial_observation=observation,
+                    timeout_seconds=(
+                        SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS
+                    ),
+                )
+            )
+            distance = observation.get("distance_mm")
         if observation_settled is not True:
             raise BlastControllerError(
                 "scan_sweep_observation_unverified",
                 "BLAST scan could not settle safely between turn pulses",
             )
-        sensor = (
-            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-            .range_sensor_extrinsics
-        )
         if (
             self._scan_heading(observation) is None
             or not sensor.matches_navigation_body_angle(
