@@ -178,6 +178,8 @@ class BlastEpisodeRuntimeAdapter:
             DEFAULT_MINIMUM_FORWARD_PROGRESS_MM
         ),
         execute_provisional_detour: bool = False,
+        speech_runtime_factory=None,
+        speech_locales=(),
         spatial_map_bridge=None,
         monotonic_ms: Callable[[], int] = (
             lambda: time.monotonic_ns() // 1_000_000
@@ -203,6 +205,17 @@ class BlastEpisodeRuntimeAdapter:
             or type(execute_provisional_detour) is not bool
         ):
             raise ValueError("BLAST episode adapter configuration is invalid")
+        if speech_runtime_factory is not None and not callable(
+            speech_runtime_factory
+        ):
+            raise ValueError("speech runtime factory is invalid")
+        if (
+            not isinstance(speech_locales, tuple)
+            or len(set(speech_locales)) != len(speech_locales)
+            or any(locale not in ("sv", "en") for locale in speech_locales)
+            or speech_locales and speech_runtime_factory is None
+        ):
+            raise ValueError("runtime speech locales are invalid")
         if spatial_map_bridge is None:
             spatial_map_bridge = BlastSpatialMapBridge(
                 robot_id=ROBOT_ID,
@@ -226,6 +239,8 @@ class BlastEpisodeRuntimeAdapter:
         self.minimum_forward_clearance_mm = minimum_forward_clearance_mm
         self.minimum_forward_progress_mm = minimum_forward_progress_mm
         self.execute_provisional_detour = execute_provisional_detour
+        self.speech_runtime_factory = speech_runtime_factory
+        self.speech_locales = speech_locales
         self.spatial_map_provider = spatial_map_bridge
         self.monotonic_ms = monotonic_ms
         self._lock = threading.Lock()

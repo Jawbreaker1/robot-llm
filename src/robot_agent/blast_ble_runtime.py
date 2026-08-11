@@ -12,6 +12,13 @@ PROTOCOL_VERSION = 1
 DEFAULT_HUB_NAME = "BLAST-01"
 DEFAULT_TIMEOUT_SECONDS = 8.0
 DEFAULT_CYCLES = 20
+SAMPLED_AUDIO_CAPABILITY = "sampled_audio_v2"
+SAMPLED_AUDIO_SAMPLE_RATE_HZ = 8000
+SAMPLED_AUDIO_ENCODING = "u16le"
+SAMPLED_AUDIO_MAX_BYTES = 32000
+SAMPLED_AUDIO_MAX_FRAGMENT_BYTES = 252
+SAMPLED_AUDIO_MAX_WRITE_CHUNK_BYTES = 63
+SAMPLED_AUDIO_WRITES_PER_FRAGMENT = 4
 
 DeviceFinder = Callable[[str], Awaitable[Any]]
 HubFactory = Callable[[Any], Any]
@@ -53,7 +60,18 @@ class BlastBLERuntime:
         self._device_finder = device_finder
         self._hub_factory = hub_factory
         self._hub = None
+        self._ready = None
+        self._sampled_audio_desynchronized = False
         self._next_request_id = 1
+
+    @property
+    def sampled_audio_aligned(self) -> bool:
+        """Whether another line request is safe after sampled-audio I/O."""
+
+        return (
+            self._hub is not None
+            and not self._sampled_audio_desynchronized
+        )
 
     async def connect(self) -> Dict[str, object]:
         if self._hub is not None:
@@ -83,6 +101,7 @@ class BlastBLERuntime:
         device = await device_finder(self.hub_name)
         hub = hub_factory(device)
         self._hub = hub
+        self._sampled_audio_desynchronized = False
         try:
             await hub.connect()
             await hub.run(
@@ -101,9 +120,11 @@ class BlastBLERuntime:
                 raise BlastBLERuntimeError(
                     "hub sent an invalid ready message"
                 )
+            self._ready = ready
             return ready
         except BaseException:
             self._hub = None
+            self._ready = None
             try:
                 await asyncio.wait_for(
                     hub.disconnect(),
@@ -154,12 +175,273 @@ class BlastBLERuntime:
             {"direction": direction},
         )
 
+    def _sampled_audio_capability(self):
+        capability = (
+            self._ready.get("capabilities", {}).get(
+                SAMPLED_AUDIO_CAPABILITY
+            )
+            if isinstance(self._ready, dict)
+            else None
+        )
+        expected = {
+            "sample_rate_hz": SAMPLED_AUDIO_SAMPLE_RATE_HZ,
+            "encoding": SAMPLED_AUDIO_ENCODING,
+            "max_bytes": SAMPLED_AUDIO_MAX_BYTES,
+            "max_fragment_bytes": SAMPLED_AUDIO_MAX_FRAGMENT_BYTES,
+        }
+        if capability != expected:
+            raise BlastBLERuntimeError(
+                "BLAST hub does not advertise sampled_audio_v2"
+            )
+        return capability
+
+    def _raw_write_size(self) -> int:
+        hub = self._hub
+        if hub is None:
+            raise BlastBLERuntimeError("session is not connected")
+        maximum_write_size = getattr(hub, "_max_write_size", 20)
+        if not isinstance(maximum_write_size, int):
+            maximum_write_size = 20
+        return min(
+            SAMPLED_AUDIO_MAX_WRITE_CHUNK_BYTES,
+            max(1, maximum_write_size - 1),
+        )
+
+    async def begin_pcm(
+        self,
+        byte_count: int,
+        *,
+        cancel_requested=None,
+    ) -> Dict[str, object]:
+        """Allocate one bounded PCM upload while BLAST's motors are idle."""
+        if (
+            isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or not 2 <= byte_count <= SAMPLED_AUDIO_MAX_BYTES
+            or byte_count % 2
+        ):
+            raise ValueError(
+                "byte_count must be 2..32000 even bytes of u16le PCM"
+            )
+        if cancel_requested is not None and not callable(cancel_requested):
+            raise ValueError("cancel_requested must be callable")
+        self._sampled_audio_capability()
+        if cancel_requested is not None and cancel_requested():
+            raise BlastBLERuntimeError("sampled audio was cancelled")
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        await self._write_sampled_audio_request(
+            request_id,
+            {
+                "phase": "begin",
+                "sample_rate_hz": SAMPLED_AUDIO_SAMPLE_RATE_HZ,
+                "encoding": SAMPLED_AUDIO_ENCODING,
+                "byte_count": byte_count,
+            },
+        )
+        result = self._validate_sampled_audio_message(
+            await self._read_message(),
+            request_id=request_id,
+            phase="begun",
+        )
+        if result != {
+            "transfer_id": request_id,
+            "byte_count": byte_count,
+            "max_fragment_bytes": SAMPLED_AUDIO_MAX_FRAGMENT_BYTES,
+        }:
+            raise BlastBLERuntimeError(
+                "hub sent invalid play_pcm begun metadata: {!r}".format(
+                    result
+                )
+            )
+        fragment_bytes = min(
+            SAMPLED_AUDIO_MAX_FRAGMENT_BYTES,
+            self._raw_write_size() * SAMPLED_AUDIO_WRITES_PER_FRAGMENT,
+        )
+        fragment_bytes -= fragment_bytes % 2
+        return dict(result, fragment_bytes=max(2, fragment_bytes))
+
+    async def write_pcm_fragment(
+        self,
+        transfer_id: int,
+        offset: int,
+        payload: bytes,
+        *,
+        cancel_requested=None,
+    ) -> Dict[str, object]:
+        """Send at most four acknowledged GATT writes, then yield BLE."""
+
+        self._sampled_audio_capability()
+        if (
+            isinstance(transfer_id, bool)
+            or not isinstance(transfer_id, int)
+            or transfer_id < 1
+            or isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+            or offset % 2
+            or type(payload) is not bytes
+            or not 2 <= len(payload) <= SAMPLED_AUDIO_MAX_FRAGMENT_BYTES
+            or len(payload) % 2
+            or cancel_requested is not None
+            and not callable(cancel_requested)
+        ):
+            raise ValueError("sampled audio fragment is invalid")
+        if cancel_requested is not None and cancel_requested():
+            raise BlastBLERuntimeError("sampled audio was cancelled")
+        hub = self._hub
+        if hub is None:
+            raise BlastBLERuntimeError("session is not connected")
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        arguments = {
+            "phase": "fragment",
+            "transfer_id": transfer_id,
+            "offset": offset,
+            "byte_count": len(payload),
+        }
+        # Once this header may have reached the hub, a missing or malformed
+        # response is ambiguous: the hub may already be waiting for raw PCM.
+        # Only a complete received phase restores line-protocol certainty.
+        self._sampled_audio_desynchronized = True
+        await self._write_sampled_audio_request(request_id, arguments)
+        ready = self._validate_sampled_audio_message(
+            await self._read_message(),
+            request_id=request_id,
+            phase="ready",
+        )
+        expected_ready = {
+            "transfer_id": transfer_id,
+            "offset": offset,
+            "byte_count": len(payload),
+        }
+        if ready != expected_ready:
+            raise BlastBLERuntimeError(
+                "hub sent invalid play_pcm ready metadata: {!r}".format(
+                    ready
+                )
+            )
+        chunk_size = self._raw_write_size()
+        for chunk_offset in range(0, len(payload), chunk_size):
+            await hub.write(
+                payload[chunk_offset:chunk_offset + chunk_size]
+            )
+        result = self._validate_sampled_audio_message(
+            await self._read_message(),
+            request_id=request_id,
+            phase="received",
+        )
+        self._sampled_audio_desynchronized = False
+        expected = dict(
+            expected_ready,
+            received_bytes=offset + len(payload),
+        )
+        if result != expected:
+            raise BlastBLERuntimeError(
+                "hub sent invalid play_pcm received metadata: {!r}".format(
+                    result
+                )
+            )
+        return result
+
+    async def start_pcm(
+        self,
+        transfer_id: int,
+        byte_count: int,
+        *,
+        cancel_requested=None,
+    ) -> Dict[str, object]:
+        """Start one uploaded block without waiting for its DMA playback."""
+
+        self._sampled_audio_capability()
+        if (
+            isinstance(transfer_id, bool)
+            or not isinstance(transfer_id, int)
+            or transfer_id < 1
+            or isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or not 2 <= byte_count <= SAMPLED_AUDIO_MAX_BYTES
+            or byte_count % 2
+            or cancel_requested is not None
+            and not callable(cancel_requested)
+        ):
+            raise ValueError("sampled audio start is invalid")
+        if cancel_requested is not None and cancel_requested():
+            raise BlastBLERuntimeError("sampled audio was cancelled")
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        await self._write_sampled_audio_request(
+            request_id,
+            {"phase": "start", "transfer_id": transfer_id},
+        )
+        result = self._validate_sampled_audio_message(
+            await self._read_message(),
+            request_id=request_id,
+            phase="started",
+        )
+        expected = {
+            "transfer_id": transfer_id,
+            "byte_count": byte_count,
+            "sample_rate_hz": SAMPLED_AUDIO_SAMPLE_RATE_HZ,
+            "encoding": SAMPLED_AUDIO_ENCODING,
+            "duration_ms": (
+                (byte_count // 2) * 1000
+                + SAMPLED_AUDIO_SAMPLE_RATE_HZ
+                - 1
+            ) // SAMPLED_AUDIO_SAMPLE_RATE_HZ,
+        }
+        if result != expected:
+            raise BlastBLERuntimeError(
+                "hub sent invalid play_pcm started metadata: {!r}".format(
+                    result
+                )
+            )
+        return result
+
+    async def _write_sampled_audio_request(
+        self, request_id: int, arguments: Dict[str, object]
+    ) -> None:
+        hub = self._hub
+        if hub is None:
+            raise BlastBLERuntimeError("session is not connected")
+        await hub.write_line(
+            json.dumps(
+                {"id": request_id, "op": "play_pcm", "args": arguments},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+
+    @staticmethod
+    def _validate_sampled_audio_message(
+        message,
+        *,
+        request_id: int,
+        phase: str,
+    ) -> Dict[str, object]:
+        if (
+            message.get("id") != request_id
+            or message.get("op") != "play_pcm"
+            or message.get("phase") != phase
+            or message.get("ok") is not True
+            or not isinstance(message.get("result"), dict)
+        ):
+            raise BlastBLERuntimeError(
+                "hub sent an invalid play_pcm {} response: {!r}".format(
+                    phase,
+                    message,
+                )
+            )
+        return message["result"]
+
     async def disconnect(self) -> None:
         """Release BLE without sending a command to the hub program."""
         hub = self._hub
         if hub is None:
             return
         self._hub = None
+        self._ready = None
+        self._sampled_audio_desynchronized = False
         await asyncio.wait_for(
             hub.disconnect(),
             timeout=self.timeout_seconds,
@@ -168,6 +450,9 @@ class BlastBLERuntime:
     async def close(self) -> None:
         hub = self._hub
         if hub is None:
+            return
+        if self._sampled_audio_desynchronized:
+            await self.disconnect()
             return
         try:
             await self._request("shutdown")

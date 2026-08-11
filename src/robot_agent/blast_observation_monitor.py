@@ -12,7 +12,16 @@ import threading
 import time
 from typing import Callable, Mapping, Optional
 
-from .blast_ble_runtime import BlastBLERuntime, DEFAULT_HUB_NAME
+from .blast_ble_runtime import (
+    DEFAULT_HUB_NAME,
+    SAMPLED_AUDIO_CAPABILITY,
+    SAMPLED_AUDIO_ENCODING,
+    SAMPLED_AUDIO_MAX_BYTES,
+    SAMPLED_AUDIO_MAX_FRAGMENT_BYTES,
+    SAMPLED_AUDIO_SAMPLE_RATE_HZ,
+    BlastBLERuntime,
+)
+from .blast_pcm_upload import BlastPCMUpload
 from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
 )
@@ -38,6 +47,8 @@ POST_MOTION_SETTLE_SAMPLE_COUNT = 5
 POST_MOTION_DISTANCE_RANGE_MM = 5.0
 POST_MOTION_TILT_RANGE_DEG = 1.0
 COMMAND_RESULT_SCHEMA = "controller-command-result/v1"
+SAMPLED_AUDIO_RESULT_SCHEMA = "controller-sampled-audio-result/v1"
+SAMPLED_AUDIO_TIMEOUT_SECONDS = 60.0
 SCAN_COMMAND = "scan_front_arc"
 SETTLED_OBSERVATION_COMMAND = "observe_settled"
 SCAN_RESULT_SCHEMA = "blast-scan-front-arc/v3"
@@ -221,9 +232,11 @@ class BlastObservationMonitor:
         self._runtime_generation = 0
         self._settling_samples = ()
         self._pending_command = None
+        self._pending_speech = None
         self._preempt_stop_request = None
         self._issued_scan_permit = None
         self._command_queue = Queue(maxsize=1)
+        self._speech_queue = Queue(maxsize=1)
         self._command_available = threading.Event()
         self._snapshot = {
             "schema": SNAPSHOT_SCHEMA,
@@ -467,6 +480,83 @@ class BlastObservationMonitor:
                 "BLAST command did not finish in time",
             ) from None
 
+    def play_pcm(self, payload: bytes, *, cancel_requested=None):
+        """Queue one best-effort sampled-audio block on the owned session."""
+        if (
+            type(payload) is not bytes
+            or not 2 <= len(payload) <= SAMPLED_AUDIO_MAX_BYTES
+            or len(payload) % 2
+            or (
+                cancel_requested is not None
+                and not callable(cancel_requested)
+            )
+        ):
+            raise ValueError(
+                "payload must be 2..32000 even bytes of u16le PCM"
+            )
+        with self._lock:
+            if self._snapshot["state"] != "online":
+                raise BlastControllerError(
+                    "controller_unavailable",
+                    "BLAST is not connected",
+                )
+            capability = (
+                self._snapshot.get("ready", {})
+                .get("capabilities", {})
+                .get(SAMPLED_AUDIO_CAPABILITY)
+            )
+            if capability != {
+                "sample_rate_hz": SAMPLED_AUDIO_SAMPLE_RATE_HZ,
+                "encoding": SAMPLED_AUDIO_ENCODING,
+                "max_bytes": SAMPLED_AUDIO_MAX_BYTES,
+                "max_fragment_bytes": SAMPLED_AUDIO_MAX_FRAGMENT_BYTES,
+            }:
+                raise BlastControllerError(
+                    "sampled_audio_unavailable",
+                    "BLAST firmware does not support sampled audio",
+                    motion_started=False,
+                )
+            if cancel_requested is not None and cancel_requested():
+                raise BlastControllerError(
+                    "controller_command_interrupted",
+                    "BLAST speech was cancelled before playback",
+                    motion_started=False,
+                )
+            if self._pending_speech is not None:
+                raise BlastControllerError(
+                    "controller_busy",
+                    "BLAST already has pending speech",
+                    motion_started=False,
+                )
+            result = Future()
+            self._pending_speech = result
+            request = (
+                self._runtime_generation,
+                payload,
+                result,
+                time.monotonic() + SAMPLED_AUDIO_TIMEOUT_SECONDS,
+                cancel_requested,
+            )
+            try:
+                self._speech_queue.put_nowait(request)
+            except Full:
+                self._pending_speech = None
+                raise BlastControllerError(
+                    "controller_busy",
+                    "BLAST speech queue is full",
+                    motion_started=False,
+                ) from None
+            self._command_available.set()
+        try:
+            return result.result(timeout=SAMPLED_AUDIO_TIMEOUT_SECONDS)
+        except FutureTimeoutError:
+            result.cancel()
+            raise BlastControllerError(
+                "controller_command_timeout",
+                "BLAST speech did not finish in time",
+                motion_started=False,
+            ) from None
+
     def close(self) -> None:
         with self._lifecycle_lock:
             with self._lock:
@@ -548,6 +638,7 @@ class BlastObservationMonitor:
 
     async def _observe_session(self) -> None:
         runtime = self._runtime_factory(hub_name=self._hub_name)
+        speech_upload = None
         try:
             ready = await runtime.connect()
             if (
@@ -565,6 +656,12 @@ class BlastObservationMonitor:
                     runtime,
                     generation,
                 )
+                if preempted and speech_upload is not None:
+                    self._interrupt_speech_upload(
+                        speech_upload,
+                        "BLAST speech upload was interrupted by stop",
+                    )
+                    speech_upload = None
                 request = self._next_command()
                 if preempted and request is not None:
                     self._finish_command(
@@ -576,19 +673,69 @@ class BlastObservationMonitor:
                         ),
                     )
                 elif request is None:
-                    if not preempted:
-                        self._publish_observation(await runtime.observe())
+                    pass
                 else:
+                    if request[1] == "stop" and speech_upload is not None:
+                        self._interrupt_speech_upload(
+                            speech_upload,
+                            "BLAST speech upload was interrupted by stop",
+                        )
+                        speech_upload = None
                     await self._execute_command(
                         runtime,
                         generation,
                         request,
                     )
+                if request is None and not preempted:
+                    if speech_upload is None:
+                        speech_request = self._next_speech()
+                        if speech_request is not None:
+                            speech_upload = BlastPCMUpload.from_request(
+                                speech_request
+                            )
+                    if speech_upload is not None:
+                        speech_upload, session_usable = (
+                            await self._execute_speech_step(
+                                runtime,
+                                generation,
+                                speech_upload,
+                            )
+                        )
+                        if not session_usable:
+                            break
+                        # One begin/fragment/start step per turn keeps fixed
+                        # commands ahead of the next low-priority fragment.
+                        if speech_upload is not None:
+                            fixed_work_pending = self._fixed_work_pending()
+                            with self._lock:
+                                last_observed_ms = self._snapshot.get(
+                                    "last_observed_at_monotonic_ms"
+                                )
+                            observation_due = (
+                                not isinstance(last_observed_ms, int)
+                                or time.monotonic_ns() // 1_000_000
+                                - last_observed_ms
+                                >= round(
+                                    self._poll_interval_seconds * 1_000
+                                )
+                            )
+                            if not fixed_work_pending and observation_due:
+                                self._publish_observation(
+                                    await runtime.observe()
+                                )
+                        continue
+                    self._publish_observation(await runtime.observe())
                 if await self._wait_for_work(
                     self._poll_interval_seconds
                 ):
                     break
         finally:
+            if speech_upload is not None:
+                self._interrupt_speech_upload(
+                    speech_upload,
+                    "BLAST connection ended during speech upload",
+                    code="controller_unavailable",
+                )
             self._reject_commands(
                 BlastControllerError(
                     "controller_unavailable",
@@ -609,6 +756,151 @@ class BlastObservationMonitor:
         except Empty:
             return None
 
+    def _next_speech(self):
+        # Fixed commands are always claimed before low-priority speech.
+        with self._lock:
+            if (
+                self._pending_command is not None
+                or self._preempt_stop_request is not None
+            ):
+                return None
+            try:
+                return self._speech_queue.get_nowait()
+            except Empty:
+                return None
+
+    def _fixed_work_pending(self):
+        with self._lock:
+            return (
+                self._pending_command is not None
+                or self._preempt_stop_request is not None
+            )
+
+    def _interrupt_speech_upload(
+        self,
+        upload,
+        message,
+        *,
+        code="controller_command_interrupted",
+    ):
+        self._finish_speech(
+            upload.result,
+            error=BlastControllerError(
+                code,
+                message,
+                motion_started=False,
+            ),
+        )
+
+    async def _execute_speech_step(
+        self, runtime, generation, upload,
+    ):
+        if upload.result.cancelled() or time.monotonic() >= upload.expires_at:
+            self._finish_speech(upload.result)
+            return None, True
+        if upload.cancel_requested is not None and upload.cancel_requested():
+            self._finish_speech(
+                upload.result,
+                error=BlastControllerError(
+                    "controller_command_interrupted",
+                    "BLAST speech was cancelled before playback",
+                    motion_started=False,
+                ),
+            )
+            return None, True
+        try:
+            if upload.requested_generation != generation:
+                raise BlastControllerError(
+                    "stale_controller_command",
+                    "BLAST reconnected before speech playback",
+                    motion_started=False,
+                )
+            if upload.needs_idle_observation:
+                observation = await runtime.observe()
+                self._publish_observation(observation)
+                if observation.get("motion_active") is not False:
+                    self._finish_speech(
+                        upload.result,
+                        error=BlastControllerError(
+                            "controller_busy",
+                            "BLAST motors must be idle before speech upload",
+                            motion_started=False,
+                        ),
+                    )
+                    return None, True
+            receipt = await upload.advance(runtime)
+            if receipt is None:
+                return upload, True
+            self._finish_speech(
+                upload.result,
+                value={
+                    "schema": SAMPLED_AUDIO_RESULT_SCHEMA,
+                    "robot_id": ROBOT_ID,
+                    "controller_id": CONTROLLER_ID,
+                    "accepted": True,
+                    "started": True,
+                    "completed": False,
+                    "sample_rate_hz": SAMPLED_AUDIO_SAMPLE_RATE_HZ,
+                    "encoding": SAMPLED_AUDIO_ENCODING,
+                    "byte_count": len(upload.payload),
+                    "duration_ms": receipt["duration_ms"],
+                    "receipt": receipt,
+                },
+            )
+            return None, True
+        except asyncio.CancelledError:
+            self._finish_speech(
+                upload.result,
+                error=BlastControllerError(
+                    "controller_unavailable",
+                    "BLAST controller stopped",
+                    motion_started=False,
+                ),
+            )
+            raise
+        except Exception as error:
+            failure = BlastControllerError(
+                (
+                    "controller_command_interrupted"
+                    if upload.cancel_requested is not None
+                    and upload.cancel_requested()
+                    else "controller_command_failed"
+                ),
+                (
+                    "BLAST speech was cancelled during playback"
+                    if upload.cancel_requested is not None
+                    and upload.cancel_requested()
+                    else "BLAST sampled-audio transport failed"
+                ),
+                motion_started=False,
+            )
+            aligned = getattr(runtime, "sampled_audio_aligned", False) is True
+            if aligned:
+                try:
+                    observation = await asyncio.wait_for(
+                        runtime.observe(),
+                        timeout=min(
+                            2.0,
+                            max(
+                                0.1,
+                                upload.expires_at - time.monotonic(),
+                            ),
+                        ),
+                    )
+                    self._publish_observation(observation)
+                except Exception:
+                    pass
+                else:
+                    self._finish_speech(upload.result, error=failure)
+                    return None, True
+            # A partial raw PCM exchange makes this BLE session unusable.
+            # Close admission before releasing the speech caller, and carry
+            # already-admitted motor commands into the fresh session.
+            self._set_state("offline", "sampled_audio_transport_failed")
+            self._defer_commands_for_speech_reconnect()
+            self._finish_speech(upload.result, error=failure)
+            return None, False
+
     async def _execute_command(self, runtime, generation, request) -> None:
         requested_generation, command, result, expires_at, permit = request
         if result.cancelled() or time.monotonic() >= expires_at:
@@ -625,7 +917,7 @@ class BlastObservationMonitor:
             )
             return
         try:
-            if requested_generation != generation:
+            if requested_generation not in (None, generation):
                 raise BlastControllerError(
                     "stale_controller_command",
                     "BLAST reconnected before the command ran",
@@ -1332,7 +1624,7 @@ class BlastObservationMonitor:
             )
             return False
         try:
-            if requested_generation != generation:
+            if requested_generation not in (None, generation):
                 raise BlastControllerError(
                     "stale_controller_command",
                     "BLAST reconnected before stop ran",
@@ -1387,6 +1679,16 @@ class BlastObservationMonitor:
             else:
                 result.set_exception(error)
 
+    def _finish_speech(self, result, *, value=None, error=None):
+        with self._lock:
+            if self._pending_speech is result:
+                self._pending_speech = None
+        if not result.done():
+            if error is None:
+                result.set_result(value)
+            else:
+                result.set_exception(error)
+
     def _finish_preempt_stop(self, result, *, value=None, error=None):
         with self._lock:
             request = self._preempt_stop_request
@@ -1398,19 +1700,62 @@ class BlastObservationMonitor:
             else:
                 result.set_exception(error)
 
+    def _defer_commands_for_speech_reconnect(self) -> None:
+        """Retain unstarted fixed commands across a PCM-desynced session."""
+
+        with self._lock:
+            stop_request = self._preempt_stop_request
+            if stop_request is not None:
+                self._preempt_stop_request = (None,) + stop_request[1:]
+            try:
+                request = self._command_queue.get_nowait()
+            except Empty:
+                return
+            generation, command, result, expires_at, permit = request
+            if permit is None:
+                request = (None, command, result, expires_at, permit)
+            self._command_queue.put_nowait(request)
+            self._command_available.set()
+
     def _reject_commands(self, error) -> None:
         with self._lock:
             stop_request = self._preempt_stop_request
         if stop_request is not None:
-            self._finish_preempt_stop(stop_request[1], error=error)
+            if (
+                stop_request[0] is None
+                and not self._stop_requested.is_set()
+                and not stop_request[1].cancelled()
+                and time.monotonic() < stop_request[2]
+            ):
+                stop_request = None
+            else:
+                self._finish_preempt_stop(stop_request[1], error=error)
+        deferred = None
         while True:
             request = self._next_command()
             if request is None:
-                return
+                break
+            if (
+                request[0] is None
+                and not self._stop_requested.is_set()
+                and not request[2].cancelled()
+                and time.monotonic() < request[3]
+            ):
+                deferred = request
+                continue
             self._finish_command(
                 request[2],
                 error=error,
             )
+        if deferred is not None:
+            self._command_queue.put_nowait(deferred)
+            self._command_available.set()
+        while True:
+            try:
+                request = self._speech_queue.get_nowait()
+            except Empty:
+                return
+            self._finish_speech(request[2], error=error)
 
     async def _wait_for_work(self, seconds: float) -> bool:
         await asyncio.to_thread(self._command_available.wait, seconds)

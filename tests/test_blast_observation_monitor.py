@@ -17,6 +17,7 @@ from robot_agent.blast_observation_monitor import (
     SETTLED_OBSERVATION_COMMAND,
     BlastControllerError,
     BlastObservationMonitor,
+    _BlastNoReturnScanPermit,
     blast_range_state,
     validate_blast_scan_ray_contract,
 )
@@ -35,6 +36,10 @@ class FakeRuntime:
         self.motion_observations = 0
         self.__class__.instances.append(self)
 
+    @property
+    def sampled_audio_aligned(self):
+        return True
+
     async def connect(self):
         self.connected = True
         return {
@@ -43,6 +48,14 @@ class FakeRuntime:
             "motion_enabled": True,
             "robot_id": "blast-01",
             "controller_id": "blast-01.hub",
+            "capabilities": {
+                "sampled_audio_v2": {
+                    "sample_rate_hz": 8000,
+                    "encoding": "u16le",
+                    "max_bytes": 32000,
+                    "max_fragment_bytes": 252,
+                }
+            },
         }
 
     async def observe(self):
@@ -100,6 +113,33 @@ class FakeRuntime:
         self.calls.append(("body_pulse", direction))
         self.motion_observations = 1
         return {"accepted": True, "direction": direction}
+
+    async def begin_pcm(self, byte_count, *, cancel_requested=None):
+        self.calls.append(("begin_pcm", byte_count))
+        return {
+            "transfer_id": 1,
+            "byte_count": byte_count,
+            "max_fragment_bytes": 252,
+            "fragment_bytes": 8,
+        }
+
+    async def write_pcm_fragment(
+        self, transfer_id, offset, payload, *, cancel_requested=None,
+    ):
+        self.calls.append(("write_pcm_fragment", offset, payload))
+        return {"received_bytes": offset + len(payload)}
+
+    async def start_pcm(
+        self, transfer_id, byte_count, *, cancel_requested=None,
+    ):
+        self.calls.append(("start_pcm", byte_count))
+        return {
+            "transfer_id": transfer_id,
+            "byte_count": byte_count,
+            "sample_rate_hz": 8000,
+            "encoding": "u16le",
+            "duration_ms": ((byte_count // 2) * 1000 + 7999) // 8000,
+        }
 
 
 class FailingRuntime(FakeRuntime):
@@ -200,6 +240,711 @@ class BlastObservationMonitorTests(unittest.TestCase):
             FakeRuntime.instances[0].calls,
         )
         monitor.close()
+
+    def test_play_pcm_uses_owned_runtime_and_advertised_capability(self):
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        snapshot = self.wait_for(monitor, "online")
+        payload = b"\x00\x80\xff\x7f"
+
+        result = monitor.play_pcm(payload)
+
+        self.assertIn(
+            "sampled_audio_v2",
+            snapshot["ready"]["capabilities"],
+        )
+        self.assertEqual(result["schema"], "controller-sampled-audio-result/v1")
+        self.assertTrue(result["started"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["byte_count"], len(payload))
+        self.assertEqual(result["duration_ms"], 1)
+        self.assertEqual(len(FakeRuntime.instances), 1)
+        self.assertIn(("begin_pcm", len(payload)), FakeRuntime.instances[0].calls)
+        self.assertIn(("start_pcm", len(payload)), FakeRuntime.instances[0].calls)
+        monitor.close()
+
+    def test_navigation_command_wins_while_speech_waits(self):
+        claim_open = threading.Event()
+        release_claim = threading.Event()
+
+        class ClaimMonitor(BlastObservationMonitor):
+            def _next_command(self):
+                if not claim_open.is_set():
+                    claim_open.set()
+                    release_claim.wait(timeout=2.0)
+                return super()._next_command()
+
+        monitor = ClaimMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        self.assertTrue(claim_open.wait(timeout=1.0))
+        failures = []
+
+        def speak():
+            try:
+                monitor.play_pcm(b"\x00\x80")
+            except Exception as error:
+                failures.append(error)
+
+        def navigate():
+            try:
+                monitor.command("drive_forward")
+            except Exception as error:
+                failures.append(error)
+
+        speech_thread = threading.Thread(target=speak)
+        command_thread = threading.Thread(target=navigate)
+        speech_thread.start()
+        command_thread.start()
+        deadline = time.monotonic() + 1.0
+        while (
+            (monitor._pending_speech is None or monitor._pending_command is None)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        release_claim.set()
+        speech_thread.join(timeout=3.0)
+        command_thread.join(timeout=3.0)
+
+        self.assertFalse(speech_thread.is_alive())
+        self.assertFalse(command_thread.is_alive())
+        self.assertEqual(failures, [])
+        calls = FakeRuntime.instances[0].calls
+        self.assertLess(
+            calls.index(("drive_pulse", "forward")),
+            calls.index(("begin_pcm", 2)),
+        )
+        monitor.close()
+
+    def test_navigation_runs_between_pcm_fragments_then_upload_resumes(self):
+        first_fragment_started = threading.Event()
+        release_first_fragment = threading.Event()
+
+        class FragmentRuntime(FakeRuntime):
+            async def write_pcm_fragment(
+                self, transfer_id, offset, payload, *, cancel_requested=None,
+            ):
+                self.calls.append(("write_pcm_fragment", offset, payload))
+                if offset == 0:
+                    first_fragment_started.set()
+                    await __import__("asyncio").to_thread(
+                        release_first_fragment.wait,
+                        2.0,
+                    )
+                return {"received_bytes": offset + len(payload)}
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FragmentRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        outcomes = []
+        speech_thread = threading.Thread(
+            target=lambda: outcomes.append(
+                monitor.play_pcm(b"\x00\x80" * 9)
+            )
+        )
+        speech_thread.start()
+        self.assertTrue(first_fragment_started.wait(1.0))
+        command_thread = threading.Thread(
+            target=lambda: outcomes.append(
+                monitor.command("drive_forward")
+            )
+        )
+        command_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._pending_command is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        release_first_fragment.set()
+        speech_thread.join(3.0)
+        command_thread.join(3.0)
+
+        self.assertFalse(speech_thread.is_alive())
+        self.assertFalse(command_thread.is_alive())
+        self.assertEqual(len(outcomes), 2)
+        calls = FakeRuntime.instances[0].calls
+        first = calls.index(("write_pcm_fragment", 0, b"\x00\x80" * 4))
+        navigation = calls.index(("drive_pulse", "forward"))
+        second = calls.index(("write_pcm_fragment", 8, b"\x00\x80" * 4))
+        self.assertLess(first, navigation)
+        self.assertLess(navigation, second)
+        self.assertNotIn(("observe",), calls[first + 1:navigation])
+        self.assertIn(("start_pcm", 18), calls)
+        monitor.close()
+
+    def test_multi_fragment_upload_keeps_observation_snapshot_fresh(self):
+        class SlowFragmentRuntime(FakeRuntime):
+            async def write_pcm_fragment(
+                self, transfer_id, offset, payload, *, cancel_requested=None,
+            ):
+                await __import__("asyncio").sleep(0.02)
+                return await super().write_pcm_fragment(
+                    transfer_id,
+                    offset,
+                    payload,
+                    cancel_requested=cancel_requested,
+                )
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=SlowFragmentRuntime,
+        )
+        monitor.start()
+        first_snapshot = self.wait_for(monitor, "online")
+        while first_snapshot["observation"] is None:
+            time.sleep(0.005)
+            first_snapshot = monitor.snapshot()
+        observed_before = first_snapshot["last_observed_at_monotonic_ms"]
+
+        result = monitor.play_pcm(b"\x00\x80" * 41)
+
+        calls = FakeRuntime.instances[0].calls
+        fragment_indexes = [
+            index for index, call in enumerate(calls)
+            if call[0] == "write_pcm_fragment"
+        ]
+        self.assertGreater(len(fragment_indexes), 1)
+        start_index = calls.index(("start_pcm", 82))
+        upload_observations = calls[
+            fragment_indexes[0] + 1:start_index
+        ].count(("observe",))
+        self.assertGreaterEqual(upload_observations, 1)
+        self.assertLess(upload_observations, len(fragment_indexes))
+        self.assertTrue(result["started"])
+        self.assertGreater(
+            monitor.snapshot()["last_observed_at_monotonic_ms"],
+            observed_before,
+        )
+        monitor.close()
+
+    def test_stop_between_pcm_fragments_drops_speech_upload(self):
+        first_fragment_started = threading.Event()
+        release_first_fragment = threading.Event()
+
+        class FragmentRuntime(FakeRuntime):
+            async def write_pcm_fragment(
+                self, transfer_id, offset, payload, *, cancel_requested=None,
+            ):
+                self.calls.append(("write_pcm_fragment", offset, payload))
+                if offset == 0:
+                    first_fragment_started.set()
+                    await __import__("asyncio").to_thread(
+                        release_first_fragment.wait,
+                        2.0,
+                    )
+                return {"received_bytes": offset + len(payload)}
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FragmentRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        speech_failure = []
+        speech_thread = threading.Thread(
+            target=lambda: self._capture_failure(
+                speech_failure,
+                lambda: monitor.play_pcm(b"\x00\x80" * 9),
+            )
+        )
+        speech_thread.start()
+        self.assertTrue(first_fragment_started.wait(1.0))
+        stop_result = []
+        stop_thread = threading.Thread(
+            target=lambda: stop_result.append(monitor.command("stop"))
+        )
+        stop_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._pending_command is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        release_first_fragment.set()
+        speech_thread.join(3.0)
+        stop_thread.join(3.0)
+
+        self.assertEqual(len(speech_failure), 1)
+        self.assertEqual(
+            speech_failure[0].code,
+            "controller_command_interrupted",
+        )
+        self.assertEqual(len(stop_result), 1)
+        calls = FakeRuntime.instances[0].calls
+        self.assertIn(("stop",), calls)
+        self.assertNotIn(("start_pcm", 18), calls)
+        self.assertFalse(any(
+            call[0] == "write_pcm_fragment" and call[1] > 0
+            for call in calls
+        ))
+        monitor.close()
+
+    def test_started_pcm_does_not_hold_ble_until_declared_duration(self):
+        class ActiveAudioRuntime(FakeRuntime):
+            audio_active = False
+            drive_during_audio = False
+
+            async def start_pcm(
+                self, transfer_id, byte_count, *, cancel_requested=None,
+            ):
+                self.calls.append(("start_pcm", byte_count))
+                self.audio_active = True
+                return {
+                    "transfer_id": transfer_id,
+                    "byte_count": byte_count,
+                    "sample_rate_hz": 8000,
+                    "encoding": "u16le",
+                    "duration_ms": 2_000,
+                }
+
+            async def drive_pulse(self, direction):
+                self.drive_during_audio = self.audio_active
+                return await super().drive_pulse(direction)
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=ActiveAudioRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        started_at = time.monotonic()
+        speech = monitor.play_pcm(b"\x00\x80" * 8)
+        navigation = monitor.command("drive_forward")
+
+        runtime = FakeRuntime.instances[0]
+        self.assertTrue(speech["started"])
+        self.assertFalse(speech["completed"])
+        self.assertTrue(navigation["completed"])
+        self.assertTrue(runtime.audio_active)
+        self.assertTrue(runtime.drive_during_audio)
+        self.assertLess(time.monotonic() - started_at, 2.0)
+        monitor.close()
+
+    def test_sampled_audio_motor_idle_guard_does_not_reconnect(self):
+        class MovingRuntime(FakeRuntime):
+            force_motion = False
+
+            async def observe(self):
+                observation = await super().observe()
+                if self.force_motion:
+                    observation["motion_active"] = True
+                return observation
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=MovingRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        runtime = FakeRuntime.instances[0]
+        runtime.force_motion = True
+
+        with self.assertRaises(BlastControllerError) as rejected:
+            monitor.play_pcm(b"\x00\x80")
+
+        self.assertEqual(rejected.exception.code, "controller_busy")
+        self.assertNotIn(("begin_pcm", 2), runtime.calls)
+        self.assertEqual(len(FakeRuntime.instances), 1)
+        monitor.close()
+
+    def test_sampled_audio_transport_failure_reconnects(self):
+        class BrokenSpeechRuntime(FakeRuntime):
+            sampled_audio_aligned = False
+
+            async def write_pcm_fragment(
+                self, transfer_id, offset, payload, *, cancel_requested=None,
+            ):
+                raise RuntimeError("write failed")
+
+        class Factory:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, *, hub_name):
+                self.calls += 1
+                runtime_type = BrokenSpeechRuntime if self.calls == 1 else FakeRuntime
+                return runtime_type(hub_name=hub_name)
+
+        factory = Factory()
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            reconnect_interval_seconds=0.05,
+            runtime_factory=factory,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        with self.assertRaises(BlastControllerError) as rejected:
+            monitor.play_pcm(b"\x00\x80")
+
+        self.assertEqual(rejected.exception.code, "controller_command_failed")
+        deadline = time.monotonic() + 2.0
+        while factory.calls < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertGreaterEqual(factory.calls, 2)
+        monitor.close()
+
+    def test_aligned_speech_phase_failure_keeps_live_session(self):
+        class PhaseErrorRuntime(FakeRuntime):
+            async def start_pcm(
+                self, transfer_id, byte_count, *, cancel_requested=None,
+            ):
+                self.calls.append(("start_pcm_error", byte_count))
+                raise RuntimeError("invalid started reply")
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=PhaseErrorRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        runtime = FakeRuntime.instances[0]
+        runtime.calls.clear()
+
+        with self.assertRaises(BlastControllerError) as rejected:
+            monitor.play_pcm(b"\x00\x80")
+        navigation = monitor.command("drive_forward")
+
+        self.assertEqual(rejected.exception.code, "controller_command_failed")
+        self.assertEqual(len(FakeRuntime.instances), 1)
+        phase_error = runtime.calls.index(("start_pcm_error", 2))
+        navigation_start = runtime.calls.index(("drive_pulse", "forward"))
+        self.assertIn(("observe",), runtime.calls[phase_error:navigation_start])
+        self.assertTrue(navigation["completed"])
+        monitor.close()
+
+    def test_aligned_speech_disconnect_defers_queued_navigation(self):
+        start_reached = threading.Event()
+        release_failure = threading.Event()
+
+        class DisconnectedPhaseRuntime(FakeRuntime):
+            connection_lost = False
+
+            async def start_pcm(
+                self, transfer_id, byte_count, *, cancel_requested=None,
+            ):
+                self.calls.append(("start_pcm_error", byte_count))
+                self.connection_lost = True
+                start_reached.set()
+                await __import__("asyncio").to_thread(
+                    release_failure.wait,
+                    2.0,
+                )
+                raise RuntimeError("connection lost before started reply")
+
+            async def observe(self):
+                if self.connection_lost:
+                    self.calls.append(("observe_failed",))
+                    raise RuntimeError("connection lost")
+                return await super().observe()
+
+        class Factory:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, *, hub_name):
+                self.calls += 1
+                runtime_type = (
+                    DisconnectedPhaseRuntime
+                    if self.calls == 1
+                    else FakeRuntime
+                )
+                return runtime_type(hub_name=hub_name)
+
+        factory = Factory()
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            reconnect_interval_seconds=0.05,
+            runtime_factory=factory,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        speech_failure = []
+        navigation_result = []
+        speech_thread = threading.Thread(
+            target=lambda: self._capture_failure(
+                speech_failure,
+                lambda: monitor.play_pcm(b"\x00\x80"),
+            )
+        )
+        speech_thread.start()
+        self.assertTrue(start_reached.wait(1.0))
+        navigation_thread = threading.Thread(
+            target=lambda: navigation_result.append(
+                monitor.command("drive_forward")
+            )
+        )
+        navigation_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._pending_command is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        release_failure.set()
+        speech_thread.join(3.0)
+        navigation_thread.join(3.0)
+
+        self.assertEqual(len(speech_failure), 1)
+        self.assertEqual(
+            speech_failure[0].code,
+            "controller_command_failed",
+        )
+        self.assertEqual(len(navigation_result), 1)
+        self.assertTrue(navigation_result[0]["completed"])
+        self.assertGreaterEqual(factory.calls, 2)
+        self.assertIn(("observe_failed",), FakeRuntime.instances[0].calls)
+        self.assertNotIn(
+            ("drive_pulse", "forward"),
+            FakeRuntime.instances[0].calls,
+        )
+        self.assertIn(
+            ("drive_pulse", "forward"),
+            FakeRuntime.instances[-1].calls,
+        )
+        monitor.close()
+
+    def test_speech_failure_reconnects_before_queued_navigation_runs(self):
+        speech_started = threading.Event()
+        release_failure = threading.Event()
+
+        class BrokenSpeechRuntime(FakeRuntime):
+            sampled_audio_aligned = False
+
+            async def write_pcm_fragment(
+                self, transfer_id, offset, payload, *, cancel_requested=None,
+            ):
+                self.calls.append(("write_pcm_fragment", offset, payload))
+                speech_started.set()
+                await __import__("asyncio").to_thread(
+                    release_failure.wait,
+                    2.0,
+                )
+                raise RuntimeError("write failed")
+
+        class Factory:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, *, hub_name):
+                self.calls += 1
+                runtime_type = (
+                    BrokenSpeechRuntime if self.calls == 1 else FakeRuntime
+                )
+                return runtime_type(hub_name=hub_name)
+
+        factory = Factory()
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            reconnect_interval_seconds=0.05,
+            runtime_factory=factory,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        speech_failure = []
+        navigation_result = []
+
+        def speak():
+            try:
+                monitor.play_pcm(b"\x00\x80")
+            except Exception as error:
+                speech_failure.append(error)
+
+        def navigate():
+            try:
+                navigation_result.append(monitor.command("drive_forward"))
+            except Exception as error:
+                navigation_result.append(error)
+
+        speech_thread = threading.Thread(target=speak)
+        speech_thread.start()
+        self.assertTrue(speech_started.wait(1.0))
+        navigation_thread = threading.Thread(target=navigate)
+        navigation_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._pending_command is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(monitor._pending_command, "drive_forward")
+        release_failure.set()
+        speech_thread.join(3.0)
+        navigation_thread.join(3.0)
+
+        self.assertFalse(speech_thread.is_alive())
+        self.assertFalse(navigation_thread.is_alive())
+        self.assertEqual(len(speech_failure), 1)
+        self.assertEqual(
+            speech_failure[0].code,
+            "controller_command_failed",
+        )
+        self.assertEqual(len(navigation_result), 1)
+        self.assertIsInstance(navigation_result[0], dict)
+        self.assertTrue(navigation_result[0]["completed"])
+        self.assertGreaterEqual(factory.calls, 2)
+        self.assertIn(
+            ("drive_pulse", "forward"),
+            FakeRuntime.instances[-1].calls,
+        )
+        monitor.close()
+
+    def test_speech_failure_does_not_drop_a_queued_stop(self):
+        speech_started = threading.Event()
+        release_failure = threading.Event()
+
+        class BrokenSpeechRuntime(FakeRuntime):
+            sampled_audio_aligned = False
+
+            async def write_pcm_fragment(
+                self, transfer_id, offset, payload, *, cancel_requested=None,
+            ):
+                speech_started.set()
+                await __import__("asyncio").to_thread(
+                    release_failure.wait,
+                    2.0,
+                )
+                raise RuntimeError("write failed")
+
+        class Factory:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, *, hub_name):
+                self.calls += 1
+                runtime_type = (
+                    BrokenSpeechRuntime if self.calls == 1 else FakeRuntime
+                )
+                return runtime_type(hub_name=hub_name)
+
+        factory = Factory()
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            reconnect_interval_seconds=0.05,
+            runtime_factory=factory,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        speech_thread = threading.Thread(
+            target=lambda: self._ignore_failure(
+                lambda: monitor.play_pcm(b"\x00\x80")
+            )
+        )
+        stop_result = []
+        speech_thread.start()
+        self.assertTrue(speech_started.wait(1.0))
+        stop_thread = threading.Thread(
+            target=lambda: stop_result.append(monitor.command("stop"))
+        )
+        stop_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._pending_command is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        release_failure.set()
+        speech_thread.join(3.0)
+        stop_thread.join(3.0)
+
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(len(stop_result), 1)
+        self.assertTrue(stop_result[0]["completed"])
+        self.assertIn(("stop",), FakeRuntime.instances[-1].calls)
+        monitor.close()
+
+    def test_speech_failure_does_not_replay_permit_bound_scan(self):
+        fragment_started = threading.Event()
+        release_failure = threading.Event()
+
+        class BrokenSpeechRuntime(FakeRuntime):
+            sampled_audio_aligned = False
+
+            async def write_pcm_fragment(
+                self, transfer_id, offset, payload, *, cancel_requested=None,
+            ):
+                fragment_started.set()
+                await __import__("asyncio").to_thread(
+                    release_failure.wait,
+                    2.0,
+                )
+                raise RuntimeError("raw write failed")
+
+        class Factory:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, *, hub_name):
+                self.calls += 1
+                runtime_type = (
+                    BrokenSpeechRuntime if self.calls == 1 else FakeRuntime
+                )
+                return runtime_type(hub_name=hub_name)
+
+        factory = Factory()
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            reconnect_interval_seconds=0.05,
+            runtime_factory=factory,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        speech_thread = threading.Thread(
+            target=lambda: self._ignore_failure(
+                lambda: monitor.play_pcm(b"\x00\x80" * 8)
+            )
+        )
+        speech_thread.start()
+        self.assertTrue(fragment_started.wait(1.0))
+        with monitor._lock:
+            permit = _BlastNoReturnScanPermit(
+                runtime_generation=monitor._runtime_generation,
+                expires_at_monotonic_ns=time.monotonic_ns() + 5_000_000_000,
+                drive_angles_deg=(10.0, 10.0),
+                heading_deg=12.0,
+            )
+            monitor._issued_scan_permit = permit
+        scan_result = []
+
+        def scan():
+            try:
+                scan_result.append(
+                    monitor.command(SCAN_COMMAND, action_permit=permit)
+                )
+            except Exception as error:
+                scan_result.append(error)
+
+        scan_thread = threading.Thread(target=scan)
+        scan_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._pending_command is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        release_failure.set()
+        speech_thread.join(3.0)
+        scan_thread.join(3.0)
+
+        self.assertEqual(len(scan_result), 1)
+        self.assertIsInstance(scan_result[0], BlastControllerError)
+        self.assertEqual(scan_result[0].code, "controller_unavailable")
+        deadline = time.monotonic() + 2.0
+        while factory.calls < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertGreaterEqual(factory.calls, 2)
+        self.assertFalse(any(
+            call[0] == "turn_pulse"
+            for call in FakeRuntime.instances[-1].calls
+        ))
+        monitor.close()
+
+    @staticmethod
+    def _ignore_failure(callback):
+        try:
+            callback()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _capture_failure(target, callback):
+        try:
+            callback()
+        except Exception as error:
+            target.append(error)
 
     def test_settled_observation_command_is_motorless(self):
         class RecordingMonitor(BlastObservationMonitor):

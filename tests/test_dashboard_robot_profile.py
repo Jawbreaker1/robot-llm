@@ -282,6 +282,10 @@ class DashboardRobotProfileTests(unittest.TestCase):
         monitor = object()
         adapter = object()
         planner = object()
+        synthesizer = object()
+        speaker = object()
+        speech_runtime = object()
+        event_sink = mock.Mock()
         with (
             mock.patch(
                 "robot_agent.dashboard_cli.BlastEpisodeRuntimeAdapter",
@@ -291,6 +295,26 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 "robot_agent.dashboard_cli.LMStudioControllerActionPlanner",
                 return_value=planner,
             ) as planner_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.LocaleSpeechSynthesizer",
+                return_value=synthesizer,
+            ) as synthesizer_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.PiperLoopbackSynthesizer",
+                return_value="piper",
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.MacOSSayWAVSynthesizer",
+                return_value="say-wav",
+            ),
+            mock.patch(
+                "robot_agent.dashboard_cli.BlastHubSpeaker",
+                return_value=speaker,
+            ) as speaker_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.RobotSpeechRuntime",
+                return_value=speech_runtime,
+            ) as speech_runtime_type,
         ):
             result = _configured_robot_runtime_adapter(
                 args,
@@ -310,6 +334,33 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 base_url=args.lm_studio_url,
                 model="model-b",
                 timeout_seconds=6.5,
+            )
+            self.assertEqual(
+                adapter_type.call_args.kwargs["speech_locales"],
+                ("sv", "en"),
+            )
+            self.assertNotIn(
+                "speech_navigation_gate",
+                adapter_type.call_args.kwargs,
+            )
+            runtime_factory = adapter_type.call_args.kwargs[
+                "speech_runtime_factory"
+            ]
+            self.assertIs(
+                runtime_factory(event_sink=event_sink),
+                speech_runtime,
+            )
+            synthesizer_type.assert_called_once_with(
+                {"sv": "piper", "en": "say-wav"}
+            )
+            speaker_type.assert_called_once_with(
+                synthesizer,
+                monitor,
+            )
+            speech_runtime_type.assert_called_once_with(
+                speaker=speaker,
+                event_sink=event_sink,
+                thread_name="blast-01-speech",
             )
 
     def test_run_binds_blast_profile_to_the_observed_controller(self):

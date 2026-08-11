@@ -1,0 +1,5 @@
+decode True
+concurrent True
+completed True
+cancelled True
+legacy ok

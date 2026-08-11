@@ -29,6 +29,7 @@ from .blast_episode_adapter import (
     BLAST_PROFILE_ID,
     BlastEpisodeRuntimeAdapter,
 )
+from .blast_hub_speech import BlastHubSpeaker
 from .ev3rstorm_profile import (
     DEFAULT_EV3RSTORM_MEMORY_PATH,
     EV3RSTORM_PROFILE_ID,
@@ -42,10 +43,16 @@ from .lm_studio_robot_input import (
     LMStudioRobotInputModel,
     REQUEST_TIMEOUT_SECONDS as ROBOT_INPUT_TIMEOUT_SECONDS,
 )
+from .host_piper_speech import (
+    LocaleSpeechSynthesizer,
+    MacOSSayWAVSynthesizer,
+    PiperLoopbackSynthesizer,
+)
 from .robot_control_contract import RobotControlSettings
 from .robot_control_http import EV3_CONTROLLER_ID, RobotControlHTTPRouter
 from .robot_control_service import RobotControlService
 from .robot_input_service import RobotInputService
+from .robot_speech_runtime import RobotSpeechRuntime
 from .robot_turn_speech import RobotTurnSpeechSink
 from .remote_spatial_map import RemoteSpatialMapProvider
 from .shared_fixed_start_map import FixedStartSharedMapProvider
@@ -523,11 +530,29 @@ def _configured_robot_runtime_adapter(args, *, blast_monitor=None):
                 timeout_seconds=args.robot_planner_timeout_seconds,
             )
 
+        def speech_runtime_factory(*, event_sink):
+            synthesizer = LocaleSpeechSynthesizer(
+                {
+                    "sv": PiperLoopbackSynthesizer(),
+                    "en": MacOSSayWAVSynthesizer(),
+                }
+            )
+            return RobotSpeechRuntime(
+                speaker=BlastHubSpeaker(
+                    synthesizer,
+                    blast_monitor,
+                ),
+                event_sink=event_sink,
+                thread_name="blast-01-speech",
+            )
+
         return BlastEpisodeRuntimeAdapter(
             controller=blast_monitor,
             planner_factory=planner_factory,
             max_decisions=64,
             execute_provisional_detour=True,
+            speech_runtime_factory=speech_runtime_factory,
+            speech_locales=("sv", "en"),
         )
     if args.robot_profile != EV3RSTORM_PROFILE_ID:
         raise ValueError("physical robot profile is unsupported")

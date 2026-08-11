@@ -350,6 +350,24 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             **changes,
         )
 
+    def test_speech_configuration_is_explicit_composition_metadata(self):
+        factory = lambda **_kwargs: object()
+        adapter = self.adapter(
+            FakeController(500),
+            Planner([]),
+            speech_runtime_factory=factory,
+            speech_locales=("sv", "en"),
+        )
+
+        self.assertIs(adapter.speech_runtime_factory, factory)
+        self.assertEqual(adapter.speech_locales, ("sv", "en"))
+        with self.assertRaisesRegex(ValueError, "speech locales"):
+            self.adapter(
+                FakeController(500),
+                Planner([]),
+                speech_locales=("sv",),
+            )
+
     def test_replans_after_each_bounded_action_and_completes(self):
         controller = FakeController(500)
         planner = Planner([
