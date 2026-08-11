@@ -482,9 +482,11 @@ class BlastObservationMonitorTests(unittest.TestCase):
             monitor.settle_timeouts[-2:],
             [SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS, None],
         )
+        # Hardware needs transport and scheduling headroom beyond all nine
+        # settle windows while issuing the eight bounded turn pulses.
         self.assertGreaterEqual(
             SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
-            9 * SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS + 6,
+            9 * SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS + 15,
         )
         self.assertGreaterEqual(
             SCAN_COMMAND_TIMEOUT_SECONDS,
