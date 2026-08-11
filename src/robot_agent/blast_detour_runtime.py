@@ -26,6 +26,7 @@ from .physical_navigation_contract import (
     TURN_LEFT_90,
     TURN_RIGHT_90,
 )
+from .physical_odometry import normalize_heading_mdeg
 
 
 class BlastDetourRuntimeBlocked(RuntimeError):
@@ -109,7 +110,9 @@ def blast_local_detour_step(
     )
     side_sign = 1 if route.detour_side == "LEFT_OF_GOAL" else -1
     if pass_advance and (
-        not mission.heading_aligned(pose)
+        abs(normalize_heading_mdeg(
+            pose.heading_mdeg - route.goal_heading_mdeg
+        )) > route.heading_tolerance_mdeg
         or side_sign * (
             mission.lateral_offset_mm(pose)
             - route.route_lateral_offset_mm
