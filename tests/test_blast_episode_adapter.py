@@ -22,6 +22,9 @@ from robot_agent.blast_observation_monitor import (
     SCAN_RESULT_SCHEMA,
     SETTLED_OBSERVATION_COMMAND,
 )
+from robot_agent.blast_navigation_motion_execution import (
+    BlastNavigationMotionExecutor,
+)
 from robot_agent.blast_turn_safety import (
     blast_turn_slice_allows_continuation,
 )
@@ -199,6 +202,67 @@ class FakeScanController(FakeController):
         )
         if command == "scan_front_arc":
             result["scan"] = scan_result()
+        return result
+
+
+class ScanStartRetryController(FakeScanController):
+    def __init__(
+        self,
+        *,
+        distance_mm=500,
+        scan_failures=1,
+        failure_code="scan_start_clearance_unverified",
+        motion_started=False,
+        after_failure=None,
+        settled_observation=None,
+        settled_result=None,
+        settled_timestamp_delta=1,
+        after_observe=None,
+    ):
+        super().__init__(distance_mm)
+        self.snapshot_value["last_observed_at_monotonic_ms"] = 998
+        self.scan_failures = scan_failures
+        self.failure_code = failure_code
+        self.motion_started = motion_started
+        self.after_failure = after_failure
+        self.settled_observation = dict(settled_observation or {})
+        self.settled_result = dict(settled_result or {})
+        self.settled_timestamp_delta = settled_timestamp_delta
+        self.after_observe = after_observe
+        self.scan_attempts = 0
+        self.scan_permits = []
+
+    def command(
+        self, command, *, cancel_requested=None, action_permit=None,
+    ):
+        if command == "scan_front_arc":
+            self.scan_attempts += 1
+            self.scan_permits.append(action_permit)
+            if self.scan_attempts <= self.scan_failures:
+                self.commands.append(command)
+                if self.after_failure is not None:
+                    self.after_failure(self)
+                raise BlastControllerError(
+                    self.failure_code,
+                    "injected scan failure",
+                    motion_started=self.motion_started,
+                )
+        result = super().command(
+            command, cancel_requested=cancel_requested,
+        )
+        if command == SETTLED_OBSERVATION_COMMAND:
+            observation = {
+                **result["observation"],
+                **self.settled_observation,
+            }
+            result["observation"] = observation
+            result.update(self.settled_result)
+            self.snapshot_value["observation"] = observation
+            self.snapshot_value["last_observed_at_monotonic_ms"] += (
+                self.settled_timestamp_delta
+            )
+            if self.after_observe is not None:
+                self.after_observe(self)
         return result
 
 
@@ -1772,6 +1836,197 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(controller.commands[2:6], ["turn_left"] * 4)
         self.assertEqual(len(planner.contexts), 2)
 
+    def test_side_turn_quality_retry_is_bounded(self):
+        class SideQualityController(FakeScanController):
+            def __init__(
+                self, settled, after_first=None,
+                first_distance=2_000, first_timestamp_delta=1,
+            ):
+                super().__init__(500)
+                self.snapshot_value[
+                    "last_observed_at_monotonic_ms"
+                ] = 998
+                self.settled = list(settled)
+                self.after_first = after_first
+                self.first_distance = first_distance
+                self.first_timestamp_delta = first_timestamp_delta
+                self.observe_count = 0
+
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == SETTLED_OBSERVATION_COMMAND:
+                    settled = self.settled[self.observe_count]
+                    self.observe_count += 1
+                    distance = (
+                        self.first_distance
+                        if self.observe_count == 1
+                        else 500 if settled else 2_000
+                    )
+                    result["observation_settled"] = settled
+                    result["observation"]["distance_mm"] = distance
+                    self.snapshot_value["observation"] = result[
+                        "observation"
+                    ]
+                    self.snapshot_value[
+                        "last_observed_at_monotonic_ms"
+                    ] += (
+                        self.first_timestamp_delta
+                        if self.observe_count == 1 else 1
+                    )
+                    if self.observe_count == 1 and self.after_first:
+                        self.after_first()
+                return result
+
+        class NoReturnDuringSideChoice(Planner):
+            def __init__(self, controller):
+                super().__init__([
+                    decision(SCAN_FRONT_ARC),
+                    decision(TURN_LEFT_90),
+                ])
+                self.controller = controller
+
+            def decide(self, context):
+                result = super().decide(context)
+                if len(self.contexts) == 2:
+                    self.controller.snapshot_value["observation"][
+                        "distance_mm"
+                    ] = 2_000
+                return result
+
+        controller = SideQualityController((False, True))
+        planner = NoReturnDuringSideChoice(controller)
+
+        result = self.adapter(
+            controller, planner, max_decisions=16,
+        ).run(episode_context()[0])
+
+        self.assertEqual(
+            result.terminal_reason, "side_search_observation_collected"
+        )
+        self.assertEqual(
+            controller.commands[:3],
+            [
+                "scan_front_arc",
+                SETTLED_OBSERVATION_COMMAND,
+                SETTLED_OBSERVATION_COMMAND,
+            ],
+        )
+        self.assertEqual(controller.commands.count("turn_left"), 4)
+
+        controller = SideQualityController((False, False))
+        planner = NoReturnDuringSideChoice(controller)
+
+        with self.assertRaises(BlastEpisodeError) as raised:
+            self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertEqual(raised.exception.code, "blast_side_search_blocked")
+        self.assertEqual(
+            controller.commands,
+            [
+                "scan_front_arc",
+                SETTLED_OBSERVATION_COMMAND,
+                SETTLED_OBSERVATION_COMMAND,
+            ],
+        )
+
+        for name, distance, timestamp_delta in (
+            ("close", 40, 1),
+            ("invalid", None, 1),
+            ("stale", 2_000, 0),
+        ):
+            with self.subTest(name=name):
+                controller = SideQualityController(
+                    (False, True),
+                    first_distance=distance,
+                    first_timestamp_delta=timestamp_delta,
+                )
+                planner = NoReturnDuringSideChoice(controller)
+
+                with self.assertRaises(BlastEpisodeError) as raised:
+                    self.adapter(controller, planner).run(
+                        episode_context()[0]
+                    )
+
+                self.assertEqual(
+                    raised.exception.code, "blast_side_search_blocked"
+                )
+                self.assertEqual(
+                    controller.commands,
+                    ["scan_front_arc", SETTLED_OBSERVATION_COMMAND],
+                )
+
+    def test_side_turn_quality_retry_preserves_control_precedence(self):
+        for control, terminal_reason in (
+            ("stop", "stopped"),
+            ("deadline", "episode_deadline_elapsed"),
+        ):
+            with self.subTest(control=control):
+                clock = [1_000]
+                context, _updates = episode_context()
+                context.settings.max_episode_ms = 60_000
+
+                def trigger():
+                    if control == "stop":
+                        context.stop_requested.set()
+                    else:
+                        clock[0] = 61_000
+
+                class SideControlController(FakeScanController):
+                    def __init__(self):
+                        super().__init__(500)
+                        self.snapshot_value[
+                            "last_observed_at_monotonic_ms"
+                        ] = 998
+
+                    def command(self, command, *, cancel_requested=None):
+                        result = super().command(
+                            command, cancel_requested=cancel_requested,
+                        )
+                        if command == SETTLED_OBSERVATION_COMMAND:
+                            result["observation_settled"] = False
+                            result["observation"][
+                                "distance_mm"
+                            ] = 2_000
+                            self.snapshot_value["observation"] = result[
+                                "observation"
+                            ]
+                            self.snapshot_value[
+                                "last_observed_at_monotonic_ms"
+                            ] += 1
+                            trigger()
+                        return result
+
+                controller = SideControlController()
+
+                class NoReturnPlanner(Planner):
+                    def decide(self, planner_context):
+                        result = super().decide(planner_context)
+                        if len(self.contexts) == 2:
+                            controller.snapshot_value["observation"][
+                                "distance_mm"
+                            ] = 2_000
+                        return result
+
+                planner = NoReturnPlanner([
+                    decision(SCAN_FRONT_ARC),
+                    decision(TURN_LEFT_90),
+                ])
+
+                result = self.adapter(
+                    controller,
+                    planner,
+                    monotonic_ms=lambda: clock[0],
+                ).run(context)
+
+                self.assertFalse(result.completed)
+                self.assertEqual(result.terminal_reason, terminal_reason)
+                self.assertEqual(
+                    controller.commands,
+                    ["scan_front_arc", SETTLED_OBSERVATION_COMMAND],
+                )
+
     def test_side_search_waypoint_uses_pre_turn_pose_frame(self):
         pose = PhysicalPose(x_mm=100, y_mm=-50, heading_mdeg=90_000)
 
@@ -2725,6 +2980,349 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(result.completed)
         self.assertEqual(controller.commands, ["scan_front_arc"])
         self.assertEqual(len(planner.contexts), 2)
+
+    def test_scan_start_quality_failure_gets_exactly_one_retry(self):
+        controller = ScanStartRetryController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(COMPLETE, assessment="Scan collected."),
+        ])
+
+        result = self.adapter(controller, planner).run(
+            episode_context()[0]
+        )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(
+            controller.commands,
+            [
+                "scan_front_arc",
+                SETTLED_OBSERVATION_COMMAND,
+                "scan_front_arc",
+            ],
+        )
+        self.assertEqual(controller.scan_attempts, 2)
+        self.assertEqual(len(planner.contexts), 2)
+        self.assertEqual(len(planner.contexts[1].history), 1)
+
+        controller = ScanStartRetryController(scan_failures=2)
+        planner = Planner([decision(SCAN_FRONT_ARC)])
+
+        result = self.adapter(controller, planner).run(
+            episode_context()[0]
+        )
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "no_safe_blast_action")
+        self.assertEqual(
+            controller.commands,
+            [
+                "scan_front_arc",
+                SETTLED_OBSERVATION_COMMAND,
+                "scan_front_arc",
+            ],
+        )
+        self.assertEqual(controller.scan_attempts, 2)
+        self.assertEqual(len(planner.contexts), 1)
+
+    def test_scan_start_retry_requires_safe_stationary_anchor(self):
+        cases = (
+            ("close", "distance_mm", 40),
+            ("invalid", "distance_mm", None),
+            ("body", "body", 0),
+            ("heading", "heading_deg", None),
+            ("encoder drift", "left_drive", 2),
+            ("moving", "motion_active", True),
+            ("stale", "timestamp", -3_001),
+        )
+        for name, field, value in cases:
+            with self.subTest(name=name):
+                def change_snapshot(controller):
+                    observation = controller.snapshot_value["observation"]
+                    if field == "timestamp":
+                        controller.snapshot_value[
+                            "last_observed_at_monotonic_ms"
+                        ] = value
+                    elif field == "body":
+                        observation["motor_angles_deg"]["body"] = value
+                    elif field == "heading_deg":
+                        observation["imu"][field] = value
+                    elif field in ("left_drive", "right_drive"):
+                        observation["motor_angles_deg"][field] = value
+                    else:
+                        observation[field] = value
+
+                controller = ScanStartRetryController(
+                    after_failure=change_snapshot,
+                )
+                planner = Planner([decision(SCAN_FRONT_ARC)])
+
+                result = self.adapter(controller, planner).run(
+                    episode_context()[0]
+                )
+
+                self.assertFalse(result.completed)
+                self.assertEqual(
+                    result.terminal_reason, "no_safe_blast_action"
+                )
+                self.assertEqual(controller.commands, ["scan_front_arc"])
+                self.assertEqual(controller.scan_attempts, 1)
+
+        class SettledObservationTimeout(ScanStartRetryController):
+            def command(
+                self, command, *, cancel_requested=None,
+                action_permit=None,
+            ):
+                if command == SETTLED_OBSERVATION_COMMAND:
+                    self.commands.append(command)
+                    raise BlastControllerError(
+                        "controller_command_timeout",
+                        "injected settled observation timeout",
+                        motion_started=False,
+                    )
+                return super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                    action_permit=action_permit,
+                )
+
+        controller = SettledObservationTimeout()
+        planner = Planner([decision(SCAN_FRONT_ARC)])
+
+        with self.assertRaises(BlastControllerError) as raised:
+            self.adapter(controller, planner).run(episode_context()[0])
+
+        self.assertEqual(
+            raised.exception.code, "controller_command_timeout"
+        )
+        self.assertEqual(
+            controller.commands,
+            ["scan_front_arc", SETTLED_OBSERVATION_COMMAND],
+        )
+        self.assertEqual(controller.scan_attempts, 1)
+
+    def test_scan_retry_observation_must_be_fresh_settled_and_valid(self):
+        drive_angles = {
+            "left_drive": 0,
+            "right_drive": 0,
+            "claw": 0,
+            "body": 158,
+        }
+        cases = (
+            ("unsettled", {}, {"observation_settled": False}, 1),
+            ("stale", {}, {}, 0),
+            ("rejected", {}, {"accepted": False}, 1),
+            ("incomplete", {}, {"completed": False}, 1),
+            ("missing settled", {}, {"observation_settled": None}, 1),
+            ("close", {"distance_mm": 40}, {}, 1),
+            ("invalid", {"distance_mm": None}, {}, 1),
+            (
+                "body",
+                {"motor_angles_deg": {**drive_angles, "body": 0}},
+                {},
+                1,
+            ),
+            (
+                "heading",
+                {"imu": {"ready": True, "heading_deg": None}},
+                {},
+                1,
+            ),
+            (
+                "encoder drift",
+                {"motor_angles_deg": {**drive_angles, "left_drive": 2}},
+                {},
+                1,
+            ),
+        )
+        for name, observation, result_update, timestamp_delta in cases:
+            with self.subTest(name=name):
+                controller = ScanStartRetryController(
+                    settled_observation=observation,
+                    settled_result=result_update,
+                    settled_timestamp_delta=timestamp_delta,
+                )
+                planner = Planner([decision(SCAN_FRONT_ARC)])
+
+                result = self.adapter(controller, planner).run(
+                    episode_context()[0]
+                )
+
+                self.assertFalse(result.completed)
+                self.assertEqual(
+                    result.terminal_reason, "no_safe_blast_action"
+                )
+                self.assertEqual(
+                    controller.commands,
+                    ["scan_front_arc", SETTLED_OBSERVATION_COMMAND],
+                )
+                self.assertEqual(controller.scan_attempts, 1)
+
+    def test_scan_retry_excludes_motion_or_non_start_failures(self):
+        cases = (
+            ("scan_sweep_clearance_lost", False, False),
+            ("scan_sweep_observation_unverified", False, False),
+            ("scan_start_clearance_unverified", None, False),
+            ("scan_start_clearance_unverified", True, False),
+            ("controller_command_timeout", False, True),
+        )
+        for error_code, motion_started, raises in cases:
+            with self.subTest(
+                error_code=error_code, motion_started=motion_started,
+            ):
+                controller = ScanStartRetryController(
+                    failure_code=error_code,
+                    motion_started=motion_started,
+                )
+                planner = Planner([decision(SCAN_FRONT_ARC)])
+
+                if raises:
+                    with self.assertRaises(BlastControllerError) as raised:
+                        self.adapter(controller, planner).run(
+                            episode_context()[0]
+                        )
+                    self.assertEqual(raised.exception.code, error_code)
+                else:
+                    result = self.adapter(controller, planner).run(
+                        episode_context()[0]
+                    )
+                    self.assertFalse(result.completed)
+                self.assertEqual(controller.commands, ["scan_front_arc"])
+                self.assertEqual(controller.scan_attempts, 1)
+
+    def test_scan_retry_preserves_stop_and_deadline_precedence(self):
+        for control, after_observe, expected_commands in (
+            ("stop", False, ["scan_front_arc"]),
+            (
+                "stop",
+                True,
+                ["scan_front_arc", SETTLED_OBSERVATION_COMMAND],
+            ),
+            ("deadline", False, ["scan_front_arc"]),
+            (
+                "deadline",
+                True,
+                ["scan_front_arc", SETTLED_OBSERVATION_COMMAND],
+            ),
+        ):
+            with self.subTest(control=control, after_observe=after_observe):
+                clock = [1_000]
+                context, _updates = episode_context()
+                context.settings.max_episode_ms = 60_000
+
+                def trigger(_controller):
+                    if control == "stop":
+                        context.stop_requested.set()
+                    else:
+                        clock[0] = 61_000
+
+                controller = ScanStartRetryController(**{
+                    "after_observe" if after_observe else "after_failure": (
+                        trigger
+                    ),
+                })
+                planner = Planner([decision(SCAN_FRONT_ARC)])
+
+                result = self.adapter(
+                    controller,
+                    planner,
+                    monotonic_ms=lambda: clock[0],
+                ).run(context)
+
+                self.assertFalse(result.completed)
+                self.assertEqual(
+                    result.terminal_reason,
+                    "stopped"
+                    if control == "stop"
+                    else "episode_deadline_elapsed",
+                )
+                self.assertEqual(controller.commands, expected_commands)
+                self.assertEqual(controller.scan_attempts, 1)
+
+    def test_planner_no_return_scan_cannot_gain_retry_permit(self):
+        def lose_echo(controller):
+            controller.snapshot_value["observation"][
+                "distance_mm"
+            ] = 2_000
+
+        controller = ScanStartRetryController(
+            after_failure=lose_echo,
+            settled_observation={"distance_mm": 2_000},
+        )
+        planner = Planner([decision(SCAN_FRONT_ARC)])
+
+        result = self.adapter(controller, planner).run(
+            episode_context()[0]
+        )
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "no_safe_blast_action")
+        self.assertEqual(
+            controller.commands,
+            ["scan_front_arc", SETTLED_OBSERVATION_COMMAND],
+        )
+        self.assertEqual(controller.scan_attempts, 1)
+        self.assertEqual(controller.scan_permits, [None])
+
+    def test_host_no_return_scan_retry_reissues_geometry_permit(self):
+        class HostRetryController(ScanStartRetryController):
+            def __init__(self):
+                super().__init__(
+                    distance_mm=2_000,
+                    settled_observation={"distance_mm": 2_000},
+                )
+                self.issued_permits = []
+
+            def issue_no_return_scan_permit(self, **_values):
+                permit = object()
+                self.issued_permits.append(permit)
+                return permit
+
+        controller = HostRetryController()
+        planner = Planner([])
+        adapter = self.adapter(controller, planner)
+        motion_executor = BlastNavigationMotionExecutor(
+            controller=controller,
+            initial_observation=controller.snapshot_value["observation"],
+        )
+        context, _updates = episode_context()
+        deadline = SimpleNamespace(outcome=lambda **_values: None)
+
+        command_result, execution, _observation, outcome = (
+            adapter._dispatch_episode_action(
+                action=SCAN_FRONT_ARC,
+                action_source="HOST_SIDE_SEARCH_ACTION",
+                observation=adapter._observation(),
+                geometry_checked=True,
+                route=None,
+                motion_executor=motion_executor,
+                prior_receipt={},
+                allow_turn_no_valid_with_bounded_evidence=False,
+                context=context,
+                deadline_ms=deadline,
+                side_search_rescan=True,
+                detour_verification=False,
+            )
+        )
+
+        self.assertIsNone(outcome)
+        self.assertIsNone(execution)
+        self.assertEqual(command_result["command"], "scan_front_arc")
+        self.assertEqual(
+            controller.commands,
+            [
+                "scan_front_arc",
+                SETTLED_OBSERVATION_COMMAND,
+                "scan_front_arc",
+            ],
+        )
+        self.assertEqual(len(controller.issued_permits), 2)
+        self.assertIsNot(
+            controller.issued_permits[0], controller.issued_permits[1]
+        )
+        self.assertEqual(
+            controller.scan_permits, controller.issued_permits
+        )
 
     def test_settled_scan_refusal_is_safe_noncomplete(self):
         for error_code in (

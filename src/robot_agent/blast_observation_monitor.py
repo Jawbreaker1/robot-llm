@@ -42,6 +42,9 @@ SCAN_COMMAND = "scan_front_arc"
 SETTLED_OBSERVATION_COMMAND = "observe_settled"
 SCAN_RESULT_SCHEMA = "blast-scan-front-arc/v3"
 SCAN_RESTORATION_TOLERANCE_DEG = 5.0
+# A repeated near-ray observation belongs to the same angular bin only while
+# its measured gyro heading remains this close to the outbound observation.
+SCAN_REPEATED_RAY_MAX_DELTA_DEG = 5.0
 PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM = 2_000
 RANGE_STATE_MEASURED = "MEASURED"
 RANGE_STATE_NO_VALID_DISTANCE = "NO_VALID_DISTANCE"
@@ -745,6 +748,61 @@ class BlastObservationMonitor:
             "observed_at_ms": observed_at_ms,
         }
 
+    @classmethod
+    def _aggregate_repeated_scan_ray(
+        cls,
+        side,
+        start_heading,
+        primary,
+        repeated,
+    ):
+        """Use a settled same-heading retry only when the primary is weak."""
+
+        primary_observation, primary_settled, _primary_evidence = primary
+        repeated_observation, repeated_settled, _repeated_evidence = repeated
+        primary_state = blast_range_state(primary_observation.get(
+            "distance_mm"
+        ))
+        repeated_state = blast_range_state(repeated_observation.get(
+            "distance_mm"
+        ))
+        primary_heading = cls._scan_heading(primary_observation)
+        repeated_heading = cls._scan_heading(repeated_observation)
+        repeated_delta = cls._scan_heading_delta(
+            repeated_heading,
+            primary_heading,
+        )
+        primary_is_usable = (
+            primary_settled is True
+            and primary_state == RANGE_STATE_MEASURED
+        )
+        repeated_improves_evidence = (
+            repeated_settled is True
+            and repeated_delta is not None
+            and abs(repeated_delta) <= SCAN_REPEATED_RAY_MAX_DELTA_DEG
+            and (
+                repeated_state == RANGE_STATE_MEASURED
+                or (
+                    primary_settled is not True
+                    and repeated_state == RANGE_STATE_NO_VALID_DISTANCE
+                )
+            )
+        )
+        selected = (
+            repeated
+            if not primary_is_usable and repeated_improves_evidence
+            else primary
+        )
+
+        observation, observation_settled, evidence_use = selected
+        return cls._scan_ray(
+            side,
+            observation,
+            start_heading,
+            observation_settled,
+            evidence_use,
+        )
+
     def _scan_sweep_window_allows_continuation(self, observation) -> bool:
         samples = self._settling_samples
         if (
@@ -919,6 +977,7 @@ class BlastObservationMonitor:
                 "scan_start_clearance_unverified",
                 "BLAST scan cannot rotate without a settled measured "
                 "front clearance and navigation sensor pose",
+                motion_started=False,
             )
 
         (
@@ -945,16 +1004,13 @@ class BlastObservationMonitor:
                 "left",
             )
         )
-        await self._scan_turn(
-            runtime,
-            generation,
-            "right",
-        )
-        await self._scan_turn(
-            runtime,
-            generation,
-            "right",
-        )
+        (
+            _left_near_return_receipt,
+            left_near_return,
+            left_near_return_settled,
+            left_near_return_evidence,
+        ) = await self._scan_turn(runtime, generation, "right")
+        await self._scan_turn(runtime, generation, "right")
         (
             _right_near_receipt,
             right_near,
@@ -979,11 +1035,12 @@ class BlastObservationMonitor:
                 "right",
             )
         )
-        await self._scan_turn(
-            runtime,
-            generation,
-            "left",
-        )
+        (
+            _right_near_return_receipt,
+            right_near_return,
+            right_near_return_settled,
+            right_near_return_evidence,
+        ) = await self._scan_turn(runtime, generation, "left")
         (
             _return_receipt,
             final,
@@ -1000,6 +1057,26 @@ class BlastObservationMonitor:
             restoration_error is not None
             and abs(restoration_error) <= SCAN_RESTORATION_TOLERANCE_DEG
         )
+        left_near_ray = self._aggregate_repeated_scan_ray(
+            "left_near",
+            start_heading,
+            (left_near, left_near_settled, left_near_evidence),
+            (
+                left_near_return,
+                left_near_return_settled,
+                left_near_return_evidence,
+            ),
+        )
+        right_near_ray = self._aggregate_repeated_scan_ray(
+            "right_near",
+            start_heading,
+            (right_near, right_near_settled, right_near_evidence),
+            (
+                right_near_return,
+                right_near_return_settled,
+                right_near_return_evidence,
+            ),
+        )
         scan = {
             "schema": SCAN_RESULT_SCHEMA,
             "state": "complete",
@@ -1014,9 +1091,9 @@ class BlastObservationMonitor:
             "restoration_verified": restoration_verified,
             "all_observations_settled": all((
                 center_settled,
-                left_near_settled,
+                left_near_ray["observation_settled"],
                 left_far_settled,
-                right_near_settled,
+                right_near_ray["observation_settled"],
                 right_far_settled,
             )),
             "rays": [
@@ -1026,13 +1103,7 @@ class BlastObservationMonitor:
                     start_heading,
                     center_settled,
                 ),
-                self._scan_ray(
-                    "left_near",
-                    left_near,
-                    start_heading,
-                    left_near_settled,
-                    left_near_evidence,
-                ),
+                left_near_ray,
                 self._scan_ray(
                     "left_far",
                     left_far,
@@ -1040,13 +1111,7 @@ class BlastObservationMonitor:
                     left_far_settled,
                     left_far_evidence,
                 ),
-                self._scan_ray(
-                    "right_near",
-                    right_near,
-                    start_heading,
-                    right_near_settled,
-                    right_near_evidence,
-                ),
+                right_near_ray,
                 self._scan_ray(
                     "right_far",
                     right_far,
