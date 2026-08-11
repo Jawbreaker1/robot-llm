@@ -13,8 +13,11 @@ from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
 )
 from .blast_observation_monitor import (
+    RANGE_STATE_INVALID,
     RANGE_STATE_MEASURED,
     RANGE_STATE_NO_VALID_DISTANCE,
+    SCAN_RAY_EVIDENCE_SWEEP_ONLY,
+    SCAN_RAY_SIDES,
     validate_blast_scan_ray_contract,
 )
 from .blast_side_search_geometry import (
@@ -135,7 +138,9 @@ def _side_radius(mission, origin_view, selected_side):
     return center, radius
 
 
-def _side_view_covers_pass(mission, side_view, route, current_pose):
+def _side_view_covers_pass(
+    mission, side_view, route, current_pose, side_waypoint,
+):
     scan_pose = side_view.get("scan_pose") if isinstance(
         side_view, Mapping
     ) else None
@@ -145,6 +150,22 @@ def _side_view_covers_pass(mission, side_view, route, current_pose):
         current_pose.heading_mdeg - mission.reference_heading_mdeg
     )) > route.heading_tolerance_mdeg:
         return False
+    selected_left = route.detour_side == "LEFT_OF_GOAL"
+    if _target_side_no_return_search(
+        side_view, "LEFT" if selected_left else "RIGHT"
+    ):
+        target_x = side_waypoint.get("target_x_mm")
+        target_y = side_waypoint.get("target_y_mm")
+        tolerance = side_waypoint.get("position_tolerance_mm")
+        return (
+            type(target_x) is int
+            and type(target_y) is int
+            and type(tolerance) is int
+            and math.hypot(
+                current_pose.x_mm - target_x,
+                current_pose.y_mm - target_y,
+            ) <= tolerance
+        )
     values = _points(side_view)
     center = _center(values)
     echo_longitudinal, _echo_lateral = _axes(
@@ -154,7 +175,6 @@ def _side_view_covers_pass(mission, side_view, route, current_pose):
     if echo_longitudinal < route.pass_longitudinal_offset_mm + footprint:
         return False
 
-    selected_left = route.detour_side == "LEFT_OF_GOAL"
     if target_side_has_only_settled_no_return(
         side_view, "LEFT" if selected_left else "RIGHT"
     ):
@@ -274,6 +294,105 @@ def _target_side_mixed_far_view(view, route, selected_side):
     )
 
 
+def _target_side_no_return_search(view, selected_side):
+    """Recognize a restored search view with no stable target return."""
+
+    try:
+        scan = validate_blast_scan_ray_contract(view.get("scan"))
+        projected_sides = {value[0] for value in _points(view)}
+    except (AttributeError, ValueError):
+        return False
+    if not (
+        scan.get("state") == "complete"
+        and scan.get("result") == "restored"
+        and scan.get("restoration_verified") is True
+    ):
+        return False
+    rotation_clearance = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+        .minimum_rotation_clearance_mm()
+    )
+    if any(
+        ray.get("range_state") == RANGE_STATE_INVALID
+        or (
+            ray.get("range_state") == RANGE_STATE_MEASURED
+            and (
+                not _finite_number(ray.get("distance_mm"))
+                or float(ray["distance_mm"]) <= rotation_clearance
+            )
+        )
+        for ray in scan["rays"]
+    ):
+        return False
+    prefix = "right_" if selected_side == "LEFT" else "left_"
+    center = [ray for ray in scan["rays"] if ray["side"] == "center"]
+    target = [
+        ray for ray in scan["rays"] if ray["side"].startswith(prefix)
+    ]
+
+    def settled_no_return(ray):
+        return (
+            ray.get("observation_settled") is True
+            and ray.get("range_state") == RANGE_STATE_NO_VALID_DISTANCE
+            and float(ray["distance_mm"]) == 2_000.0
+        )
+
+    def unresolved_without_close(ray):
+        if settled_no_return(ray):
+            return True
+        distance = ray.get("distance_mm")
+        return (
+            ray.get("observation_settled") is False
+            and ray.get("evidence_use") == SCAN_RAY_EVIDENCE_SWEEP_ONLY
+            and (
+                ray.get("range_state") == RANGE_STATE_NO_VALID_DISTANCE
+                or (
+                    ray.get("range_state") == RANGE_STATE_MEASURED
+                    and _finite_number(distance)
+                    and float(distance) > rotation_clearance
+                )
+            )
+        )
+
+    return (
+        len(center) == 1
+        and settled_no_return(center[0])
+        and len(target) == 2
+        and projected_sides <= set(SCAN_RAY_SIDES)
+        and projected_sides.isdisjoint({
+            "center", f"{prefix}near", f"{prefix}far",
+        })
+        and any(settled_no_return(ray) for ray in target)
+        and all(unresolved_without_close(ray) for ray in target)
+    )
+
+
+def _no_return_pass_pose_matches(view, route):
+    scan_pose = view.get("scan_pose") if isinstance(view, Mapping) else None
+    try:
+        pose = PhysicalPose.from_mapping(scan_pose)
+    except (TypeError, ValueError):
+        return False
+    active = route.active_waypoint
+    if active is None or active.kind != MERGE_GOAL_AXIS:
+        return False
+    longitudinal = _route_longitudinal(route, pose.x_mm, pose.y_mm)
+    lateral = _route_lateral(route, pose.x_mm, pose.y_mm)
+    side_sign = 1 if route.detour_side == "LEFT_OF_GOAL" else -1
+    return (
+        longitudinal >= (
+            route.pass_longitudinal_offset_mm
+            + PASS_BUFFER_MM
+            - route.position_tolerance_mm
+        )
+        and side_sign * (lateral - route.route_lateral_offset_mm)
+        >= -route.position_tolerance_mm
+        and abs(normalize_heading_mdeg(
+            pose.heading_mdeg - route.goal_heading_mdeg
+        )) <= route.heading_tolerance_mdeg
+    )
+
+
 def bind_blast_detour_route(
     *,
     origin_view: Mapping[str, object],
@@ -337,7 +456,9 @@ def bind_blast_detour_route(
             "LEFT_OF_GOAL" if selected_side == "LEFT" else "RIGHT_OF_GOAL"
         ),
     )
-    if not _side_view_covers_pass(mission, side_view, route, current_pose):
+    if not _side_view_covers_pass(
+        mission, side_view, route, current_pose, side_waypoint,
+    ):
         raise ValueError("BLAST side view does not cover the pass waypoint")
     lateral = mission.lateral_offset_mm(current_pose)
     if abs(lateral - route.route_lateral_offset_mm) > route.position_tolerance_mm:
@@ -417,10 +538,6 @@ def blast_detour_needs_pass_buffer(route, pose):
 def blast_detour_scan_allows_progress(
     view, *, role, selected_side, minimum_clearance_mm, route=None,
 ):
-    try:
-        _center(_points(view))
-    except ValueError:
-        return False
     scan = view.get("scan") if isinstance(view, Mapping) else None
     rays = scan.get("rays") if isinstance(scan, Mapping) else None
     if (
@@ -430,6 +547,17 @@ def blast_detour_scan_allows_progress(
         or minimum_clearance_mm < 1
         or not isinstance(rays, list)
     ):
+        return False
+    if (
+        role == "PASS"
+        and route is not None
+        and _target_side_no_return_search(view, selected_side)
+        and _no_return_pass_pose_matches(view, route)
+    ):
+        return True
+    try:
+        _center(_points(view))
+    except ValueError:
         return False
 
     def measured(ray):
