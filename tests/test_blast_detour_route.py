@@ -52,15 +52,134 @@ def mission():
     )
 
 
-def waypoint(side):
+def waypoint(side, origin_pose=PhysicalPose()):
     return {
         "search_basis": "PROVISIONAL_SAME_DEPTH_ECHO_REACH",
         "search_target_capped": False,
         "selected_side": side,
+        "origin_pose": origin_pose.to_dict(),
     }
 
 
+def with_settled_scan(value, distances):
+    headings = {
+        "center": 0.0,
+        "left_near": -22.0,
+        "left_far": -45.0,
+        "right_near": 24.0,
+        "right_far": 47.0,
+    }
+    measured = {
+        side: distance for side, distance in distances if distance != 2_000
+    }
+    for point in value["planar_projection"]["points"]:
+        point["measured_range_mm"] = measured[point["side"]]
+    value["scan"] = {
+        "schema": "blast-scan-front-arc/v3",
+        "state": "complete",
+        "result": "restored",
+        "start_heading_deg": 0.0,
+        "final_heading_deg": 0.0,
+        "restoration_error_deg": 0.0,
+        "restoration_verified": True,
+        "all_observations_settled": True,
+        "rays": [
+            {
+                "side": side,
+                "distance_mm": distance,
+                "range_state": (
+                    "NO_VALID_DISTANCE" if distance == 2_000
+                    else "MEASURED"
+                ),
+                "body_motor_angle_deg": 158,
+                "heading_deg": headings[side],
+                "relative_heading_deg": headings[side],
+                "observation_settled": True,
+            }
+            for side, distance in distances
+        ],
+    }
+    return value
+
+
+def live_mixed_views(*, near_echo_x=709, far_settled=True):
+    detour_origin = PhysicalPose(x_mm=137, y_mm=-2, heading_mdeg=-1_715)
+    current = PhysicalPose(x_mm=121, y_mm=276, heading_mdeg=1_225)
+    origin = with_settled_scan(view(detour_origin, (
+        ("center", 329, 72),
+        ("left_near", 329, 156),
+        ("right_near", 333, -5),
+    )), (
+        ("center", 80),
+        ("left_near", 125),
+        ("left_far", 2_000),
+        ("right_near", 69),
+        ("right_far", 2_000),
+    ))
+    side = with_settled_scan(view(current, (
+        ("center", 1_497, 385),
+        ("left_near", 1_377, 916),
+        ("left_far", 718, 1_026),
+        ("right_near", near_echo_x, 108),
+    )), (
+        ("center", 1_268),
+        ("left_near", 1_298),
+        ("left_far", 845),
+        ("right_near", 496 if near_echo_x == 709 else 390),
+        ("right_far", 2_000),
+    ))
+    if not far_settled:
+        side["scan"]["all_observations_settled"] = False
+        side["scan"]["rays"][4]["observation_settled"] = False
+    return detour_origin, current, origin, side
+
+
 class BlastDetourRouteTests(unittest.TestCase):
+    def test_live_moved_origin_and_mixed_far_view_bind_provisional_route(self):
+        detour_origin, current, origin, side = live_mixed_views()
+
+        route = bind_blast_detour_route(
+            origin_view=origin,
+            side_view=side,
+            selected_side="LEFT",
+            side_waypoint=waypoint("LEFT", detour_origin),
+            mission=mission(),
+            current_pose=current,
+        )
+
+        self.assertEqual(route.created_pose, detour_origin)
+        self.assertEqual((route.goal_origin_x_mm, route.goal_origin_y_mm), (0, 0))
+        self.assertEqual(route.route_lateral_offset_mm, 301)
+        self.assertEqual(route.pass_longitudinal_offset_mm, 611)
+        self.assertTrue(blast_detour_scan_allows_progress(
+            side,
+            role="PASS",
+            selected_side="LEFT",
+            minimum_clearance_mm=120,
+            route=route,
+        ))
+
+    def test_mixed_far_view_requires_settled_no_return_and_echo_past_pass(self):
+        cases = (live_mixed_views(far_settled=False), live_mixed_views(
+            near_echo_x=600,
+        ))
+        malformed = live_mixed_views()
+        malformed[3]["planar_projection"]["points"][3][
+            "measured_range_mm"
+        ] = None
+        cases += (malformed,)
+        for detour_origin, current, origin, failed_side in cases:
+            with self.subTest(failed_side=failed_side):
+                with self.assertRaises(ValueError):
+                    bind_blast_detour_route(
+                        origin_view=origin,
+                        side_view=failed_side,
+                        selected_side="LEFT",
+                        side_waypoint=waypoint("LEFT", detour_origin),
+                        mission=mission(),
+                        current_pose=current,
+                    )
+
     def test_scan_sweep_uses_live_two_pulse_excursion_geometry(self):
         route = SimpleNamespace(
             target_centroid_x_mm=396,
