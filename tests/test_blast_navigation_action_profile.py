@@ -3,11 +3,13 @@ import unittest
 from robot_agent.blast_navigation_action_profile import (
     BLAST_NAVIGATION_COMMANDS,
     DRIVE_ENCODER_DEGREES,
+    SCAN_TURN_PULSES_PER_SIDE,
     TURN_ENCODER_DEGREES_PER_PULSE,
     TURN_ENCODER_DEGREES_PER_QUARTER_TURN,
     TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN,
     TURN_PULSES_PER_QUARTER_TURN,
     blast_navigation_action_specs,
+    blast_scan_turn_maximum_pose,
 )
 from robot_agent.blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
@@ -88,6 +90,28 @@ class BlastNavigationActionProfileTests(unittest.TestCase):
         self.assertEqual((reverse.x_mm, reverse.y_mm), (-45, 0))
         self.assertEqual(left.heading_mdeg, 94_570)
         self.assertEqual(right.heading_mdeg, -94_570)
+
+    def test_scan_sweep_uses_two_pulses_with_a_conservative_endpoint(self):
+        origin = PhysicalPose()
+
+        left = blast_scan_turn_maximum_pose(origin, TURN_LEFT_90)
+        right = blast_scan_turn_maximum_pose(origin, TURN_RIGHT_90)
+        _nominal, full_turn_maximum = nominal_effect(
+            origin,
+            TURN_LEFT_90,
+            blast_navigation_action_specs(),
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+        )
+
+        self.assertEqual(SCAN_TURN_PULSES_PER_SIDE, 2)
+        self.assertEqual(left.heading_mdeg, 83_300)
+        self.assertEqual(right.heading_mdeg, -83_300)
+        self.assertLess(
+            abs(left.heading_mdeg),
+            abs(full_turn_maximum.heading_mdeg),
+        )
+        with self.assertRaises(ValueError):
+            blast_scan_turn_maximum_pose(origin, ADVANCE)
 
     def test_callers_cannot_mutate_the_checked_in_profile(self):
         changed = blast_navigation_action_specs()

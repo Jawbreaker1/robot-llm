@@ -16,6 +16,7 @@ from robot_agent.blast_side_search_geometry import (
     TARGET_REACQUISITION_SEARCH_BASIS,
     side_search_progress,
     side_search_required_slots,
+    side_search_scan_sweep_is_clear,
     target_reacquisition_resolved,
     target_reacquisition_waypoint,
 )
@@ -137,6 +138,17 @@ class BlastTargetReacquisitionGeometryTests(unittest.TestCase):
         self.assertGreaterEqual(waypoint["frozen_target_radius_mm"], 149)
         for fact in ("clearance_proven", "passage_proven", "route_eligible"):
             self.assertFalse(waypoint[fact])
+
+    def test_live_reacquisition_pose_clears_two_pulse_scan_sweep(self):
+        self.assertTrue(side_search_scan_sweep_is_clear(
+            self.origin, self.current
+        ))
+
+    def test_scan_sweep_rejects_remembered_target_intersection(self):
+        self.assertFalse(side_search_scan_sweep_is_clear(
+            self.origin,
+            PhysicalPose(x_mm=40, y_mm=40),
+        ))
 
     def test_progress_orients_retraces_restores_and_rescans(self):
         waypoint = target_reacquisition_waypoint(

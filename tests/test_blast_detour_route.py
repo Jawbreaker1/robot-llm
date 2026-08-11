@@ -9,6 +9,7 @@ from robot_agent.blast_detour_route import (
     blast_detour_needs_pass_buffer,
     blast_detour_required_slots,
     blast_detour_scan_allows_progress,
+    blast_detour_scan_sweep_is_clear,
 )
 from robot_agent.local_detour_route import (
     LATERAL_CLEARANCE,
@@ -60,6 +61,22 @@ def waypoint(side):
 
 
 class BlastDetourRouteTests(unittest.TestCase):
+    def test_scan_sweep_uses_live_two_pulse_excursion_geometry(self):
+        route = SimpleNamespace(
+            target_centroid_x_mm=396,
+            target_centroid_y_mm=80,
+            target_radius_mm=166,
+        )
+
+        self.assertTrue(blast_detour_scan_sweep_is_clear(
+            route,
+            PhysicalPose(x_mm=-21, y_mm=369, heading_mdeg=-980),
+        ))
+        self.assertFalse(blast_detour_scan_sweep_is_clear(
+            route,
+            PhysicalPose(x_mm=60, y_mm=80),
+        ))
+
     def test_pass_and_final_scans_require_measured_clearance(self):
         pose = PhysicalPose(x_mm=850, y_mm=391)
 

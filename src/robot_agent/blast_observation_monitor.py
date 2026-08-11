@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from copy import deepcopy
+from dataclasses import dataclass
 import math
 from queue import Empty, Full, Queue
 import threading
@@ -84,6 +85,16 @@ class BlastControllerError(RuntimeError):
         self.code = code
         self.motion_started = motion_started
         super().__init__(message)
+
+
+@dataclass(frozen=True)
+class _BlastNoReturnScanPermit:
+    """One short-lived host permit for a geometry-checked scan."""
+
+    runtime_generation: int
+    expires_at_monotonic_ns: int
+    drive_angles_deg: tuple[float, float]
+    heading_deg: float
 
 
 def blast_range_state(distance_mm):
@@ -208,6 +219,7 @@ class BlastObservationMonitor:
         self._settling_samples = ()
         self._pending_command = None
         self._preempt_stop_request = None
+        self._issued_scan_permit = None
         self._command_queue = Queue(maxsize=1)
         self._command_available = threading.Event()
         self._snapshot = {
@@ -269,10 +281,98 @@ class BlastObservationMonitor:
         with self._lock:
             return deepcopy(self._snapshot)
 
-    def command(self, command: str, *, cancel_requested=None):
+    def issue_no_return_scan_permit(
+        self, *, pose, prior_receipt, geometry_checked,
+    ):
+        """Issue one short-lived token from exact same-pose host evidence."""
+
+        with self._lock:
+            snapshot = deepcopy(self._snapshot)
+            runtime_generation = self._runtime_generation
+        observation = snapshot.get("observation")
+        previous = prior_receipt.get("result_observation") if isinstance(
+            prior_receipt, Mapping
+        ) else None
+        motors = observation.get("motor_angles_deg") if isinstance(
+            observation, Mapping
+        ) else None
+        previous_motors = previous.get("motor_angles_deg") if isinstance(
+            previous, Mapping
+        ) else None
+        imu = observation.get("imu") if isinstance(observation, Mapping) else None
+        heading = imu.get("heading_deg") if isinstance(imu, Mapping) else None
+        now_ns = time.monotonic_ns()
+        observed_ms = snapshot.get("last_observed_at_monotonic_ms")
+        roles = ("left_drive", "right_drive")
+        valid_pose = isinstance(pose, Mapping) and all(
+            type(pose.get(key)) is int
+            for key in ("x_mm", "y_mm", "heading_mdeg")
+        )
+        if not (
+            geometry_checked is True
+            and snapshot.get("state") == "online"
+            and valid_pose
+            and isinstance(observed_ms, int)
+            and 0 <= now_ns // 1_000_000 - observed_ms <= 3_000
+            and isinstance(prior_receipt, Mapping)
+            and prior_receipt.get("observation_settled") is True
+            and prior_receipt.get("pose") == dict(pose)
+            and (
+                not isinstance(prior_receipt.get("motion"), Mapping)
+                or prior_receipt["motion"].get("command_completed") is True
+            )
+            and isinstance(previous, Mapping)
+            and previous.get("motion_active") is False
+            and blast_range_state(previous.get("distance_mm"))
+            == RANGE_STATE_NO_VALID_DISTANCE
+            and isinstance(observation, Mapping)
+            and observation.get("motion_active") is False
+            and blast_range_state(observation.get("distance_mm"))
+            == RANGE_STATE_NO_VALID_DISTANCE
+            and isinstance(motors, Mapping)
+            and isinstance(previous_motors, Mapping)
+            and all(
+                isinstance(motors.get(role), (int, float))
+                and not isinstance(motors.get(role), bool)
+                and math.isfinite(float(motors[role]))
+                and isinstance(previous_motors.get(role), (int, float))
+                and not isinstance(previous_motors.get(role), bool)
+                and math.isfinite(float(previous_motors[role]))
+                and float(motors[role]) == float(previous_motors[role])
+                for role in roles
+            )
+            and isinstance(heading, (int, float))
+            and not isinstance(heading, bool)
+            and math.isfinite(float(heading))
+        ):
+            return None
+        permit = _BlastNoReturnScanPermit(
+            runtime_generation=runtime_generation,
+            expires_at_monotonic_ns=now_ns + 5_000_000_000,
+            drive_angles_deg=tuple(float(motors[role]) for role in roles),
+            heading_deg=float(heading),
+        )
+        with self._lock:
+            if (
+                self._runtime_generation != runtime_generation
+                or self._snapshot.get("state") != "online"
+            ):
+                return None
+            self._issued_scan_permit = permit
+        return permit
+
+    def command(
+        self, command: str, *, cancel_requested=None, action_permit=None,
+    ):
         if command not in COMMANDS or (
             cancel_requested is not None
             and not callable(cancel_requested)
+        ) or (
+            action_permit is not None
+            and not (
+                command == SCAN_COMMAND
+                and isinstance(action_permit, _BlastNoReturnScanPermit)
+            )
         ):
             raise ValueError("unsupported BLAST command")
         timeout_seconds = (
@@ -281,6 +381,22 @@ class BlastObservationMonitor:
             else COMMAND_TIMEOUT_SECONDS
         )
         with self._lock:
+            issued_permit = (
+                self._issued_scan_permit
+                if isinstance(action_permit, _BlastNoReturnScanPermit)
+                else None
+            )
+            if action_permit is not None and (
+                issued_permit is not action_permit
+                or action_permit.runtime_generation
+                != self._runtime_generation
+                or action_permit.expires_at_monotonic_ns < time.monotonic_ns()
+            ):
+                raise BlastControllerError(
+                    "scan_start_clearance_unverified",
+                    "BLAST scan permit is stale or was not issued here",
+                    motion_started=False,
+                )
             if self._snapshot["state"] != "online":
                 raise BlastControllerError(
                     "controller_unavailable",
@@ -326,7 +442,10 @@ class BlastObservationMonitor:
                     command,
                     result,
                     time.monotonic() + timeout_seconds,
+                    action_permit,
                 )
+                if action_permit is not None:
+                    self._issued_scan_permit = None
                 try:
                     self._command_queue.put_nowait(request)
                 except Full:
@@ -349,6 +468,7 @@ class BlastObservationMonitor:
         with self._lifecycle_lock:
             with self._lock:
                 thread = self._thread
+                self._issued_scan_permit = None
             if thread is None:
                 self._set_state("stopped", "observer_stopped")
                 return
@@ -435,6 +555,7 @@ class BlastObservationMonitor:
             with self._lock:
                 self._runtime_generation += 1
                 generation = self._runtime_generation
+                self._issued_scan_permit = None
             self._set_state("online", None, ready=ready)
             while not self._stop_requested.is_set():
                 preempted = await self._service_preempt_stop(
@@ -486,7 +607,7 @@ class BlastObservationMonitor:
             return None
 
     async def _execute_command(self, runtime, generation, request) -> None:
-        requested_generation, command, result, expires_at = request
+        requested_generation, command, result, expires_at, permit = request
         if result.cancelled() or time.monotonic() >= expires_at:
             self._finish_command(result)
             return
@@ -528,7 +649,9 @@ class BlastObservationMonitor:
                 else INTERNAL_COMMAND_TIMEOUT_SECONDS
             )
             value = await asyncio.wait_for(
-                self._perform_command(runtime, generation, command),
+                self._perform_command(
+                    runtime, generation, command, action_permit=permit,
+                ),
                 timeout=min(
                     internal_timeout,
                     remaining - COMMAND_RESPONSE_MARGIN_SECONDS,
@@ -729,7 +852,9 @@ class BlastObservationMonitor:
             ),
         )
 
-    async def _perform_scan_front_arc(self, runtime, generation):
+    async def _perform_scan_front_arc(
+        self, runtime, generation, *, action_permit=None,
+    ):
         center = await self._observe_until_idle(
             runtime,
             generation=generation,
@@ -747,17 +872,48 @@ class BlastObservationMonitor:
             .range_sensor_extrinsics
         )
         center_distance = center.get("distance_mm")
+        center_motors = center.get("motor_angles_deg")
+        center_drive = tuple(
+            center_motors.get(role)
+            if isinstance(center_motors, Mapping) else None
+            for role in ("left_drive", "right_drive")
+        )
+        permit_allows_no_return = (
+            isinstance(action_permit, _BlastNoReturnScanPermit)
+            and time.monotonic_ns()
+            <= action_permit.expires_at_monotonic_ns
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and float(value) == expected
+                for value, expected in zip(
+                    center_drive, action_permit.drive_angles_deg
+                )
+            )
+            and start_heading is not None
+            and abs(
+                (start_heading - action_permit.heading_deg + 180.0)
+                % 360.0 - 180.0
+            ) <= SCAN_RESTORATION_TOLERANCE_DEG
+        )
+        center_state = blast_range_state(center_distance)
+        range_allows_start = (
+            center_state == RANGE_STATE_MEASURED
+            and float(center_distance) > (
+                BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+                .minimum_rotation_clearance_mm()
+            )
+        ) or (
+            permit_allows_no_return
+            and center_state == RANGE_STATE_NO_VALID_DISTANCE
+        )
         if not (
             center_settled
             and start_heading is not None
             and sensor.matches_navigation_body_angle(
                 _body_motor_angle(center)
             )
-            and blast_range_state(center_distance) == RANGE_STATE_MEASURED
-            and float(center_distance) > (
-                BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-                .minimum_rotation_clearance_mm()
-            )
+            and range_allows_start
         ):
             raise BlastControllerError(
                 "scan_start_clearance_unverified",
@@ -913,9 +1069,13 @@ class BlastObservationMonitor:
             "scan": scan,
         }
 
-    async def _perform_command(self, runtime, generation, command: str):
+    async def _perform_command(
+        self, runtime, generation, command: str, *, action_permit=None,
+    ):
         if command == SCAN_COMMAND:
-            return await self._perform_scan_front_arc(runtime, generation)
+            return await self._perform_scan_front_arc(
+                runtime, generation, action_permit=action_permit,
+            )
         if command == SETTLED_OBSERVATION_COMMAND:
             receipt = {"motion_started": False}
         else:

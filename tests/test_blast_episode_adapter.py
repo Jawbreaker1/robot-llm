@@ -1123,6 +1123,97 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             for update in updates
         ))
 
+    def test_settled_no_return_keeps_provisional_detour_goal_directed(self):
+        class NoReturnDetourController(FullDetourController):
+            def __init__(self):
+                super().__init__()
+                self.scan_permits = []
+
+            def issue_no_return_scan_permit(self, **values):
+                self.scan_permits.append(values)
+                return object()
+
+            def command(
+                self, command, *, cancel_requested=None,
+                action_permit=None,
+            ):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if (
+                    command == "scan_front_arc"
+                    and self.scan_count in (2, 3)
+                ):
+                    for index in (3, 4):
+                        result["scan"]["rays"][index].update({
+                            "distance_mm": 2_000.0,
+                            "range_state": RANGE_STATE_NO_VALID_DISTANCE,
+                        })
+                if self.scan_count in (2, 3):
+                    result["observation"]["distance_mm"] = 2_000
+                    self.snapshot_value["observation"][
+                        "distance_mm"
+                    ] = 2_000
+                return result
+
+        controller = NoReturnDetourController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+        context, updates = episode_context()
+
+        result = self.adapter(
+            controller,
+            planner,
+            max_decisions=51,
+            execute_provisional_detour=True,
+        ).run(context)
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.terminal_reason, "completed")
+        self.assertEqual(len(planner.contexts), 2)
+        self.assertGreaterEqual(len(controller.scan_permits), 2)
+        evidence = next(
+            update["scan"]["multi_view_observations"]
+            for update in updates
+            if "multi_view_observations" in update.get("scan", {})
+        )
+        self.assertTrue(evidence["route_eligible"])
+        self.assertFalse(evidence["clearance_proven"])
+        self.assertFalse(evidence["passage_proven"])
+
+    def test_no_return_final_scan_never_completes_detour(self):
+        class NoReturnFinalController(FullDetourController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc" and self.scan_count == 4:
+                    result["observation"]["distance_mm"] = 2_000
+                    self.snapshot_value["observation"][
+                        "distance_mm"
+                    ] = 2_000
+                return result
+
+        controller = NoReturnFinalController()
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+
+        result = self.adapter(
+            controller,
+            planner,
+            max_decisions=51,
+            execute_provisional_detour=True,
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(
+            result.terminal_reason, "detour_verification_unavailable",
+        )
+
     def test_close_pass_or_final_scan_never_completes_detour(self):
         cases = (
             ({3: 54.0}, 1_500.0, {}, 3),
@@ -1415,7 +1506,9 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     scan["rays"][1]["distance_mm"] = 286.0
                     scan["rays"][3]["distance_mm"] = 232.0
                 elif self.scan_count == 2:
-                    scan = scan_result(center_distance_mm=1_352.0)
+                    # Keep this legacy retrace below route-depth admission;
+                    # the NVD-route policy has its own end-to-end test.
+                    scan = scan_result(center_distance_mm=500.0)
                     outer = 1 if self.selected_side == "LEFT" else 3
                     target = (3, 4) if self.selected_side == "LEFT" else (1, 2)
                     scan["rays"][outer]["distance_mm"] = 1_420.0
@@ -1960,8 +2053,8 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(controller.commands.count("turn_right"), 4)
         self.assertNotIn("scan_front_arc", controller.commands[1:])
 
-    def test_side_search_rechecks_range_after_reorientation(self):
-        for distance in (2_000, None, 40):
+    def test_side_search_rechecks_invalid_or_close_after_reorientation(self):
+        for distance in (None, 40):
             with self.subTest(distance=distance):
                 class BlockedAfterTurnController(FakeScanController):
                     def command(self, command, *, cancel_requested=None):
@@ -1998,12 +2091,39 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     1,
                 )
 
-    def test_host_reorient_no_return_finishes_then_scan_rechecks_range(self):
+    def test_host_reorient_no_return_uses_one_geometry_checked_rescan(self):
         class NoReturnDuringHostReorient(FakeScanController):
-            def command(self, command, *, cancel_requested=None):
+            def __init__(self, distance_mm):
+                super().__init__(distance_mm)
+                self.scan_permits = []
+
+            def issue_no_return_scan_permit(self, **values):
+                self.scan_permits.append(values)
+                return object()
+
+            def command(
+                self, command, *, cancel_requested=None,
+                action_permit=None,
+            ):
                 result = super().command(
                     command, cancel_requested=cancel_requested,
                 )
+                if (
+                    command == "scan_front_arc"
+                    and self.commands.count("scan_front_arc") == 1
+                ):
+                    scan = scan_result(center_distance_mm=310.0)
+                    scan["rays"][1].update({
+                        "distance_mm": 368.0,
+                        "heading_deg": -23.322266,
+                        "relative_heading_deg": -23.322266,
+                    })
+                    scan["rays"][3].update({
+                        "distance_mm": 286.0,
+                        "heading_deg": 25.093086,
+                        "relative_heading_deg": 25.093086,
+                    })
+                    result["scan"] = scan
                 if command == "turn_right":
                     result["observation"]["distance_mm"] = 2_000
                     if self.commands.count("turn_right") == 4:
@@ -2016,16 +2136,17 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         planner = Planner([
             decision(SCAN_FRONT_ARC),
             decision(TURN_LEFT_90),
-            *(decision("ADVANCE") for _index in range(5)),
-            decision(TURN_RIGHT_90),
         ])
 
-        with self.assertRaises(BlastEpisodeError) as raised:
-            self.adapter(controller, planner).run(episode_context()[0])
+        result = self.adapter(controller, planner).run(episode_context()[0])
 
-        self.assertEqual(raised.exception.code, "blast_side_search_blocked")
+        self.assertEqual(
+            result.terminal_reason, "side_search_observation_collected",
+        )
         self.assertEqual(controller.commands.count("turn_right"), 4)
-        self.assertEqual(controller.commands.count("scan_front_arc"), 1)
+        self.assertEqual(controller.commands.count("scan_front_arc"), 2)
+        self.assertEqual(len(controller.scan_permits), 1)
+        self.assertTrue(controller.scan_permits[0]["geometry_checked"])
 
     def test_side_search_requires_projection_ready_second_scan(self):
         class UnsettledSecondScanController(FakeScanController):

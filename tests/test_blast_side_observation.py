@@ -2,11 +2,39 @@ import unittest
 
 from robot_agent.blast_side_observation import (
     build_blast_multi_view_observation,
+    side_search_action_admission,
 )
+from robot_agent.physical_navigation_contract import SCAN_FRONT_ARC
 from robot_agent.physical_odometry import PhysicalPose
 
 
 class BlastSideObservationTests(unittest.TestCase):
+    def test_uncorrelated_no_return_never_admits_rescan(self):
+        pose = PhysicalPose(y_mm=360)
+        prior = {
+            "observation_settled": True,
+            "pose": pose.to_dict(),
+            "result_observation": {
+                "distance_mm": 2_000,
+                "motion_active": False,
+            },
+        }
+
+        actions, reason = side_search_action_admission(
+            {"phase": "RESCAN", "required_action": SCAN_FRONT_ARC},
+            {},
+            {"distance_mm": 2_000},
+            (),
+            False,
+            False,
+            current_pose=pose,
+            prior_receipt=prior,
+            no_return_scan_geometry_checked=True,
+        )
+
+        self.assertEqual(actions, ())
+        self.assertEqual(reason, "blast_side_search_blocked")
+
     def test_payload_is_detached_and_never_claims_navigation_proof(self):
         origin = {"scan_pose": PhysicalPose().to_dict(), "scan": {}}
         pose = PhysicalPose(y_mm=100)

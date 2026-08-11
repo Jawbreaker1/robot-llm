@@ -1,6 +1,7 @@
 """Physical meaning of BLAST's bounded semantic motion actions."""
 
 from copy import deepcopy
+import math
 
 from .blast_navigation_calibration import (
     BLAST_NAVIGATION_EVIDENCE_ID,
@@ -12,6 +13,7 @@ from .physical_navigation_contract import (
     TURN_LEFT_90,
     TURN_RIGHT_90,
 )
+from .physical_odometry import PhysicalPose, nominal_effect
 
 
 DRIVE_SPEED_DPS = 120
@@ -25,6 +27,9 @@ TURN_DURATION_MS_PER_PULSE = 250
 # Four bounded pulses are the closest existing semantic quarter turn. The
 # encoder-derived 93.96-degree result remains authoritative over the label.
 TURN_PULSES_PER_QUARTER_TURN = 4
+# SCAN_FRONT_ARC reaches each outer observation after two of the same bounded
+# motor pulses.  It then returns through centre before sweeping the other side.
+SCAN_TURN_PULSES_PER_SIDE = 2
 TURN_ENCODER_DEGREES_PER_QUARTER_TURN = (
     TURN_ENCODER_DEGREES_PER_PULSE * TURN_PULSES_PER_QUARTER_TURN
 )
@@ -146,13 +151,44 @@ def blast_navigation_action_specs():
     return deepcopy(BLAST_NAVIGATION_ACTION_SPECS)
 
 
+def blast_scan_turn_maximum_pose(
+    pose: PhysicalPose,
+    action: str,
+) -> PhysicalPose:
+    """Return the conservative endpoint of one two-pulse scan excursion."""
+
+    if action not in (TURN_LEFT_90, TURN_RIGHT_90):
+        raise ValueError("BLAST scan turn direction is invalid")
+    scan_spec = deepcopy(BLAST_NAVIGATION_ACTION_SPECS[action])
+    expected_encoder_degrees = math.ceil(
+        TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN
+        * SCAN_TURN_PULSES_PER_SIDE
+        / TURN_PULSES_PER_QUARTER_TURN
+    )
+    scan_spec.update({
+        "total_duration_ms": (
+            TURN_DURATION_MS_PER_PULSE * SCAN_TURN_PULSES_PER_SIDE
+        ),
+        "target_mean_abs_encoder_degrees": expected_encoder_degrees,
+    })
+    _nominal, maximum = nominal_effect(
+        pose,
+        action,
+        {action: scan_spec},
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+    )
+    return maximum
+
+
 __all__ = (
     "BLAST_NAVIGATION_ACTION_SPECS",
     "BLAST_NAVIGATION_COMMANDS",
     "DRIVE_ENCODER_DEGREES",
+    "SCAN_TURN_PULSES_PER_SIDE",
     "TURN_ENCODER_DEGREES_PER_PULSE",
     "TURN_ENCODER_DEGREES_PER_QUARTER_TURN",
     "TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN",
     "TURN_PULSES_PER_QUARTER_TURN",
     "blast_navigation_action_specs",
+    "blast_scan_turn_maximum_pose",
 )

@@ -5,7 +5,10 @@ from __future__ import annotations
 import math
 from typing import Mapping
 
-from .blast_navigation_action_profile import BLAST_NAVIGATION_ACTION_SPECS
+from .blast_navigation_action_profile import (
+    BLAST_NAVIGATION_ACTION_SPECS,
+    blast_scan_turn_maximum_pose,
+)
 from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
 )
@@ -165,7 +168,7 @@ def _sensor_target_geometry(pose, scan_heading_mdeg, support):
     ))
 
 
-def _target_side_has_only_no_valid_rays(view, selected_side):
+def target_side_has_only_settled_no_return(view, selected_side):
     if not isinstance(view, Mapping):
         return False
     try:
@@ -187,6 +190,33 @@ def _target_side_has_only_no_valid_rays(view, selected_side):
             for ray in rays
         )
     )
+
+
+def side_search_scan_sweep_is_clear(origin_view, pose) -> bool:
+    """Whether the remembered target is outside either scan-turn sweep."""
+
+    if not isinstance(pose, PhysicalPose):
+        return False
+    try:
+        support = _frozen_target_support(origin_view)
+    except ValueError:
+        return False
+    footprint, _sensor = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    )
+    for action in (TURN_LEFT_90, TURN_RIGHT_90):
+        maximum = blast_scan_turn_maximum_pose(pose, action)
+        _start, intersects = footprint_sweep_intersects(
+            obstacle_x_mm=support["center_x_mm"],
+            obstacle_y_mm=support["center_y_mm"],
+            obstacle_radius_mm=support["radius_mm"],
+            start=pose,
+            end=maximum,
+            footprint=footprint,
+        )
+        if intersects:
+            return False
+    return True
 
 
 def _reacquisition_action_is_clear(pose, waypoint, action):
@@ -400,7 +430,7 @@ def target_reacquisition_waypoint(
         abs(normalize_heading_mdeg(
             current_pose.heading_mdeg - support["origin"].heading_mdeg
         )) <= _TARGET_OBSERVATION_HEADING_TOLERANCE_MDEG
-        and _target_side_has_only_no_valid_rays(
+        and target_side_has_only_settled_no_return(
             failed_side_view, selected_side
         )
     ):
@@ -648,7 +678,9 @@ __all__ = (
     "side_search_followup_slots",
     "side_search_progress",
     "side_search_required_slots",
+    "side_search_scan_sweep_is_clear",
     "side_search_waypoint",
+    "target_side_has_only_settled_no_return",
     "target_reacquisition_resolved",
     "target_reacquisition_waypoint",
 )

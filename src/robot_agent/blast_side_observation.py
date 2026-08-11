@@ -13,6 +13,7 @@ from .blast_side_search_geometry import (
     target_reacquisition_waypoint,
 )
 from .blast_observation_monitor import RANGE_STATE_MEASURED, blast_range_state
+from .blast_navigation_policy import settled_no_return_at_pose
 from .physical_navigation_contract import (
     ADVANCE, SCAN_FRONT_ARC, TURN_LEFT_90, TURN_RIGHT_90,
 )
@@ -21,23 +22,35 @@ from .physical_odometry import PhysicalPose
 
 def side_search_action_admission(
     progress, waypoint, sensors, available_actions, evidence_correlated,
-    rotation_allowed,
+    rotation_allowed, *, current_pose=None, prior_receipt=None,
+    no_return_scan_geometry_checked=False,
 ):
     """Return one admitted host action and an optional typed block reason."""
 
     action = progress.get("required_action")
+    no_return_scan = (
+        progress.get("phase") == "RESCAN"
+        and action == SCAN_FRONT_ARC
+        and no_return_scan_geometry_checked is True
+        and settled_no_return_at_pose(
+            sensors.get("distance_mm"), current_pose, prior_receipt,
+        )
+    )
     if not evidence_correlated:
         action = None
+        no_return_scan = False
     if action == ADVANCE and (
         blast_range_state(sensors.get("distance_mm"))
         != RANGE_STATE_MEASURED or ADVANCE not in available_actions
     ):
         action = None
     if action in (TURN_LEFT_90, TURN_RIGHT_90, SCAN_FRONT_ARC) and not (
-        rotation_allowed
+        rotation_allowed or no_return_scan
     ):
         action = None
-    if action in available_actions:
+    if action is not None and (
+        action in available_actions or no_return_scan
+    ):
         return (action,), None
     reason = (
         "target_reacquisition_blocked"

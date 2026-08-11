@@ -5,11 +5,17 @@ from __future__ import annotations
 import math
 from typing import Mapping
 
-from .blast_navigation_action_profile import BLAST_NAVIGATION_ACTION_SPECS
+from .blast_navigation_action_profile import (
+    BLAST_NAVIGATION_ACTION_SPECS,
+    blast_scan_turn_maximum_pose,
+)
 from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
 )
 from .blast_observation_monitor import RANGE_STATE_MEASURED
+from .blast_side_search_geometry import (
+    target_side_has_only_settled_no_return,
+)
 from .local_detour_collision_snapshot import LocalDetourCollisionSnapshot
 from .local_detour_controller import (
     build_local_detour_route_from_collision_snapshot,
@@ -128,12 +134,17 @@ def _side_view_covers_pass(mission, side_view, route, current_pose):
     if echo_longitudinal < route.pass_longitudinal_offset_mm + footprint:
         return False
 
+    selected_left = route.detour_side == "LEFT_OF_GOAL"
+    if target_side_has_only_settled_no_return(
+        side_view, "LEFT" if selected_left else "RIGHT"
+    ):
+        return True
+
     # The straight-ahead ray can pass beside a wider obstacle while BLAST's
     # inner body edge still overlaps it.  Require one measured ray aimed back
     # toward the goal axis to traverse the inferred front plane and continue
     # beyond the pass plane.  This is intentionally a provisional corridor
     # sample, not an object-boundary or free-space claim.
-    selected_left = route.detour_side == "LEFT_OF_GOAL"
     merge_prefix = "right_" if selected_left else "left_"
     current_lateral = mission.lateral_offset_mm(current_pose)
     robot_footprint, _sensor = (
@@ -222,7 +233,9 @@ def bind_blast_detour_route(
     ):
         raise ValueError("BLAST detour origin frame is invalid")
     center, radius = _side_radius(mission, origin_view, selected_side)
-    footprint, _sensor = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    footprint, _sensor = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    )
     centroid = (center[1], center[2])
     snapshot = LocalDetourCollisionSnapshot(
         frame_id="EPISODE_LOCAL_ODOMETRY",
@@ -291,6 +304,25 @@ def blast_detour_action_sweep_is_clear(route, pose, action):
     return not sweep_intersects
 
 
+def blast_detour_scan_sweep_is_clear(route, pose):
+    """Conservatively cover both two-pulse scan excursions."""
+
+    footprint, _sensor = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    for action in (TURN_LEFT_90, TURN_RIGHT_90):
+        maximum = blast_scan_turn_maximum_pose(pose, action)
+        _start_intersects, sweep_intersects = footprint_sweep_intersects(
+            obstacle_x_mm=route.target_centroid_x_mm,
+            obstacle_y_mm=route.target_centroid_y_mm,
+            obstacle_radius_mm=route.target_radius_mm,
+            start=pose,
+            end=maximum,
+            footprint=footprint,
+        )
+        if sweep_intersects:
+            return False
+    return True
+
+
 def blast_detour_needs_pass_buffer(route, pose):
     fresh = route.advance_reached(pose)
     if (
@@ -347,6 +379,8 @@ def blast_detour_scan_allows_progress(
         return True
     if route is None:
         return False
+    if target_side_has_only_settled_no_return(view, selected_side):
+        return True
     merge_prefix = "right_" if selected_side == "LEFT" else "left_"
     merge_rays = [
         ray for ray in rays
@@ -453,4 +487,5 @@ __all__ = (
     "blast_detour_needs_pass_buffer",
     "blast_detour_required_slots",
     "blast_detour_scan_allows_progress",
+    "blast_detour_scan_sweep_is_clear",
 )

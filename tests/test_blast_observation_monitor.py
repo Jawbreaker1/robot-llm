@@ -57,7 +57,11 @@ class FakeRuntime:
                 "heading_deg": 12,
                 "raw_tilt_deg": [0.0, 0.0],
             },
-            "motor_angles_deg": {"left_drive": 10, "body": 158},
+            "motor_angles_deg": {
+                "left_drive": 10,
+                "right_drive": 10,
+                "body": 158,
+            },
             "motion_active": moving,
             "color": "Color.WHITE",
             "distance_mm": 321,
@@ -890,6 +894,109 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 self.assertEqual(len(FakeRuntime.instances), runtime_count)
                 self.assertIs(FakeRuntime.instances[-1], runtime)
                 monitor.close()
+
+    def test_host_no_return_scan_permit_is_geometry_bound_and_single_use(self):
+        class NoReturnRuntime(FakeRuntime):
+            async def observe(self):
+                observation = await super().observe()
+                observation["distance_mm"] = 2_000
+                return observation
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=NoReturnRuntime,
+        )
+        monitor.start()
+        snapshot = self.wait_for(monitor, "online")
+        while snapshot["observation"] is None:
+            time.sleep(0.005)
+            snapshot = monitor.snapshot()
+        runtime = FakeRuntime.instances[-1]
+        runtime.calls.clear()
+
+        with self.assertRaises(BlastControllerError) as unpermitted:
+            monitor.command(SCAN_COMMAND)
+        self.assertEqual(
+            unpermitted.exception.code,
+            "scan_start_clearance_unverified",
+        )
+        self.assertEqual(
+            [call for call in runtime.calls if call[0] == "turn_pulse"],
+            [],
+        )
+
+        pose = {"x_mm": 24, "y_mm": 373, "heading_mdeg": 980}
+        prior = {
+            "observation_settled": True,
+            "pose": pose,
+            "motion": {"command_completed": True},
+            "result_observation": snapshot["observation"],
+        }
+        self.assertIsNone(monitor.issue_no_return_scan_permit(
+            pose=pose,
+            prior_receipt=prior,
+            geometry_checked=False,
+        ))
+        missing_encoder = {
+            **prior,
+            "result_observation": {
+                **prior["result_observation"],
+                "motor_angles_deg": {
+                    "left_drive": prior["result_observation"][
+                        "motor_angles_deg"
+                    ]["left_drive"],
+                },
+            },
+        }
+        self.assertIsNone(monitor.issue_no_return_scan_permit(
+            pose=pose,
+            prior_receipt=missing_encoder,
+            geometry_checked=True,
+        ))
+        permit = monitor.issue_no_return_scan_permit(
+            pose=pose,
+            prior_receipt=prior,
+            geometry_checked=True,
+        )
+        self.assertIsNotNone(permit)
+
+        result = monitor.command(SCAN_COMMAND, action_permit=permit)
+
+        self.assertTrue(result["completed"])
+        self.assertEqual(
+            len([call for call in runtime.calls if call[0] == "turn_pulse"]),
+            8,
+        )
+        with self.assertRaises(BlastControllerError) as reused:
+            monitor.command(SCAN_COMMAND, action_permit=permit)
+        self.assertEqual(
+            reused.exception.code,
+            "scan_start_clearance_unverified",
+        )
+        refreshed = monitor.snapshot()["observation"]
+        stale_after_reconnect = monitor.issue_no_return_scan_permit(
+            pose=pose,
+            prior_receipt={
+                "observation_settled": True,
+                "pose": pose,
+                "result_observation": refreshed,
+            },
+            geometry_checked=True,
+        )
+        self.assertIsNotNone(stale_after_reconnect)
+        monitor.close()
+        monitor.start()
+        self.wait_for(monitor, "online")
+        with self.assertRaises(BlastControllerError) as stale:
+            monitor.command(
+                SCAN_COMMAND,
+                action_permit=stale_after_reconnect,
+            )
+        self.assertEqual(
+            stale.exception.code,
+            "scan_start_clearance_unverified",
+        )
+        monitor.close()
 
     def test_scan_settling_recovers_after_one_no_valid_center_sample(self):
         class TransientCenterRuntime(FakeRuntime):
