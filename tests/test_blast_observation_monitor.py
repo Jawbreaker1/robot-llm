@@ -472,7 +472,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         monitor.close()
 
-    def test_navigation_runs_between_pcm_batches_then_upload_resumes(self):
+    def test_navigation_waits_until_pcm_burst_has_started(self):
         first_batch_started = threading.Event()
         release_first_batch = threading.Event()
 
@@ -522,12 +522,14 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(len(outcomes), 2)
         calls = FakeRuntime.instances[0].calls
         first = calls.index(("write_pcm_batch", 0, speech_payload[:8]))
-        navigation = calls.index(("drive_pulse", "forward"))
         second = calls.index(("write_pcm_batch", 8, speech_payload[8:16]))
+        started = calls.index(("start_pcm", 18))
+        navigation = calls.index(("drive_pulse", "forward"))
         self.assertLess(first, navigation)
-        self.assertLess(navigation, second)
-        self.assertNotIn(("observe",), calls[first + 1:navigation])
-        self.assertIn(("start_pcm", 18), calls)
+        self.assertLess(first, second)
+        self.assertLess(second, started)
+        self.assertLess(started, navigation)
+        self.assertNotIn(("observe",), calls[first + 1:started])
         monitor.close()
 
     def test_over_sixty_second_navigation_stream_cannot_starve_v5_speech(self):
@@ -674,10 +676,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(len(navigation_outcomes), command_count)
         runtime = FakeRuntime.instances[0]
         self.assertGreater(runtime.simulated_navigation_seconds, 60)
-        self.assertGreater(
-            runtime.speech_started_at_simulated_seconds,
-            60,
-        )
+        self.assertEqual(runtime.speech_started_at_simulated_seconds, 5)
         calls = runtime.calls
         drive_indexes = [
             index for index, call in enumerate(calls)
@@ -697,11 +696,12 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(len(audio_indexes), 13)
         self.assertLess(
             calls.index(("start_pcm", len(payload))),
-            drive_indexes[13],
+            drive_indexes[1],
         )
-        for position, audio_index in enumerate(audio_indexes):
-            self.assertLess(drive_indexes[position], audio_index)
-            self.assertLess(audio_index, drive_indexes[position + 1])
+        self.assertTrue(all(
+            drive_indexes[0] < audio_index < drive_indexes[1]
+            for audio_index in audio_indexes
+        ))
         monitor.close()
 
     def test_pcm_progress_never_extends_absolute_lifetime_ceiling(self):
@@ -1138,7 +1138,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         monitor.close()
 
-    def test_multi_batch_upload_keeps_observation_snapshot_fresh(self):
+    def test_multi_batch_burst_does_not_insert_observations(self):
         class SlowFragmentRuntime(FakeRuntime):
             async def write_pcm_batch(
                 self, offset, payload, *, cancel_requested=None,
@@ -1155,11 +1155,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
             runtime_factory=SlowFragmentRuntime,
         )
         monitor.start()
-        first_snapshot = self.wait_for(monitor, "online")
-        while first_snapshot["observation"] is None:
-            time.sleep(0.005)
-            first_snapshot = monitor.snapshot()
-        observed_before = first_snapshot["last_observed_at_monotonic_ms"]
+        self.wait_for(monitor, "online")
 
         result = monitor.play_pcm(adpcm_block_for_size(82))
 
@@ -1170,16 +1166,8 @@ class BlastObservationMonitorTests(unittest.TestCase):
         ]
         self.assertGreater(len(batch_indexes), 1)
         start_index = calls.index(("start_pcm", 82))
-        upload_observations = calls[
-            batch_indexes[0] + 1:start_index
-        ].count(("observe",))
-        self.assertGreaterEqual(upload_observations, 1)
-        self.assertLess(upload_observations, len(batch_indexes))
+        self.assertNotIn(("observe",), calls[batch_indexes[0] + 1:start_index])
         self.assertTrue(result["started"])
-        self.assertGreater(
-            monitor.snapshot()["last_observed_at_monotonic_ms"],
-            observed_before,
-        )
         monitor.close()
 
     def test_stop_between_pcm_batches_drops_speech_upload(self):

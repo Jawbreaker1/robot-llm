@@ -63,12 +63,13 @@ Small `begin` and `start` control messages bind the transfer id, rate,
 encoding, sample count, byte count, and checksum. The compressed payload uses
 Pybricks AppData. Each low-priority upload step contains at most eight
 MTU-sized writes, and its final write is acknowledged. Stop is checked between
-steps and always has priority. After each verified navigation command, the
-scheduler admits at most one bounded upload step before the next non-stop
-command, so neither navigation nor speech can starve the other on the shared
-BLE session. A speech request times out after 60 seconds without acknowledged
-audio progress, with a separate 15-minute absolute admission ceiling. A final
-start exchange that was claimed before that ceiling gets at most 8.5 seconds
+steps and always has priority. After one already-admitted navigation command,
+the scheduler drains a claimed utterance through consecutive bounded upload
+steps before admitting the next non-stop command. Native playback releases the
+BLE session immediately. A speech request times out after 60 seconds without
+acknowledged audio progress, with a separate 15-minute absolute admission
+ceiling. A final start exchange that was claimed before that ceiling gets at
+most 8.5 seconds
 to return its authoritative playback receipt. Neither upload nor playback
 requires idle drive motors.
 

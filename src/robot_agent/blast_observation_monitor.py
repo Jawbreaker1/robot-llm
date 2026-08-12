@@ -686,56 +686,45 @@ class BlastObservationMonitor:
                                 speech_request
                             )
                     if speech_upload is not None:
-                        stopped_before_speech = (
-                            await self._service_preempt_stop(
-                                runtime,
-                                generation,
-                            )
-                        )
-                        if stopped_before_speech:
-                            self._interrupt_speech_upload(
-                                speech_upload,
-                                "BLAST speech upload was interrupted by stop",
-                            )
-                            speech_upload = None
-                            continue
-                        if not self._claim_speech_step():
-                            continue
-                        try:
-                            speech_upload, session_usable = (
-                                await self._execute_speech_step(
+                        session_usable = True
+                        while speech_upload is not None:
+                            stopped_before_speech = (
+                                await self._service_preempt_stop(
                                     runtime,
                                     generation,
-                                    speech_upload,
                                 )
                             )
-                        finally:
-                            self._release_speech_step()
+                            if stopped_before_speech:
+                                self._interrupt_speech_upload(
+                                    speech_upload,
+                                    "BLAST speech upload was interrupted by stop",
+                                )
+                                speech_upload = None
+                                break
+                            if not self._claim_speech_step():
+                                break
+                            try:
+                                speech_upload, session_usable = (
+                                    await self._execute_speech_step(
+                                        runtime,
+                                        generation,
+                                        speech_upload,
+                                    )
+                                )
+                            finally:
+                                self._release_speech_step()
+                            if not session_usable:
+                                break
                         if not session_usable:
                             break
-                        # Initial arbitration favours a fixed command. After
-                        # that command completes, exactly one bounded audio
-                        # step gets a turn even if more navigation is already
-                        # queued. This prevents either workload from starving
-                        # the other on BLAST's single BLE channel.
+                        # Initial arbitration favours one already-queued fixed
+                        # command. A claimed utterance then drains in bounded
+                        # phases so its start receipt precedes later motion;
+                        # stop is still serviced between every phase.
                         if speech_upload is not None:
-                            fixed_work_pending = self._fixed_work_pending()
-                            with self._lock:
-                                last_observed_ms = self._snapshot.get(
-                                    "last_observed_at_monotonic_ms"
-                                )
-                            observation_due = (
-                                not isinstance(last_observed_ms, int)
-                                or time.monotonic_ns() // 1_000_000
-                                - last_observed_ms
-                                >= round(
-                                    self._poll_interval_seconds * 1_000
-                                )
-                            )
-                            if not fixed_work_pending and observation_due:
-                                self._publish_observation(
-                                    await runtime.observe()
-                                )
+                            # A stop raced the atomic step claim. Return to the
+                            # outer loop so it wins before any further audio.
+                            continue
                         continue
                     if request is None:
                         self._publish_observation(await runtime.observe())
