@@ -39,9 +39,8 @@ from .blast_observation_monitor import (
     blast_range_state,
     validate_blast_scan_ray_contract,
 )
-from .blast_scan_planar_projection import (
-    project_blast_scan_planar_surfaces,
-)
+from .blast_scan_observation import current_side_scan
+from .blast_scan_planar_projection import project_blast_scan_planar_surfaces
 from .blast_side_observation import (
     build_blast_multi_view_observation, finish_target_reacquisition,
     plan_target_reacquisition, side_search_action_admission)
@@ -898,6 +897,7 @@ class BlastEpisodeRuntimeAdapter:
                 observation=observation,
                 history=tuple(history[-12:]),
                 completion_allowed=completion_allowed,
+                robot_relative_side_scan=current_side_scan(history, latest_scan_view),
             ))
         except Exception:
             outcome = self._control_outcome(context, deadline_ms)

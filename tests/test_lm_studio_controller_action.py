@@ -16,7 +16,11 @@ from robot_agent.lm_studio_controller_action import (
     LMStudioControllerActionPlanner,
     MAX_UTTERANCE_CHARS,
 )
-from robot_agent.physical_navigation_contract import SCAN_FRONT_ARC
+from robot_agent.physical_navigation_contract import (
+    SCAN_FRONT_ARC,
+    TURN_LEFT_90,
+    TURN_RIGHT_90,
+)
 
 
 MODEL = "local/controller-model"
@@ -110,6 +114,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         self.assertEqual(supplied["observation"]["distance_mm"], 480)
         self.assertEqual(supplied["goal"], context().goal)
         self.assertTrue(supplied["completion_allowed"])
+        self.assertNotIn("robot_relative_side_scan", supplied)
         action_schema = request["response_format"]["json_schema"][
             "schema"
         ]["properties"]["action"]
@@ -338,6 +343,75 @@ class ControllerActionPlannerTests(unittest.TestCase):
         self.assertIn(SCAN_FRONT_ARC, system_prompt)
         self.assertIn("both sides", system_prompt)
         self.assertIn("returns near its starting heading", system_prompt)
+
+    def test_side_scan_context_and_prompt_preserve_gemmas_side_choice(self):
+        side_scan = {
+            "schema": "blast-robot-relative-side-scan/v1",
+            "frame": "ROBOT_RELATIVE_AT_SCAN_START",
+            "physical_side_labels_authoritative": True,
+            "rays": {
+                "left_near": {
+                    "range_state": "MEASURED",
+                    "distance_mm": 246,
+                    "absolute_bearing_deg": 23.0,
+                },
+                "left_far": {
+                    "range_state": "MEASURED",
+                    "distance_mm": 347,
+                    "absolute_bearing_deg": 70.0,
+                },
+                "right_near": {
+                    "range_state": "MEASURED",
+                    "distance_mm": 202,
+                    "absolute_bearing_deg": 23.0,
+                },
+                "right_far": {
+                    "range_state": "MEASURED",
+                    "distance_mm": 1_002,
+                    "absolute_bearing_deg": 70.0,
+                },
+            },
+        }
+        planner, transport = self.planner(completion({
+            "action": TURN_RIGHT_90,
+            "confidence_milli": 900,
+            "assessment": "Jag jämför båda sidornas hela scanmönster.",
+            "plan": [TURN_RIGHT_90],
+            "utterance": None,
+        }))
+
+        planner.decide(context(
+            available_actions=(TURN_LEFT_90, TURN_RIGHT_90),
+            robot_relative_side_scan=side_scan,
+        ))
+
+        request = json.loads(transport.calls[0][1])
+        supplied = json.loads(request["messages"][1]["content"])
+        self.assertEqual(supplied["robot_relative_side_scan"], side_scan)
+        self.assertEqual(
+            supplied["available_actions"],
+            [TURN_LEFT_90, TURN_RIGHT_90],
+        )
+        self.assertNotIn(
+            "heading",
+            json.dumps(supplied["robot_relative_side_scan"]),
+        )
+        system_prompt = request["messages"][0]["content"]
+        for instruction in (
+            "physical side labels are authoritative",
+            "left_near and left_far",
+            "right_near and right_far",
+            "Ignore conflicting raw heading signs",
+            "absolute_bearing_deg",
+            "nonnegative angular coverage magnitude",
+            "complete near/far pattern on both sides",
+            "larger distance_mm means a farther return",
+            "far-angle measured opening",
+            "NO_VALID_DISTANCE",
+            "mean unknown",
+            "host does not rank or choose the turn side",
+        ):
+            self.assertIn(instruction, system_prompt)
 
     def test_nonterminal_plan_must_start_with_selected_action(self):
         planner, _ = self.planner(completion({

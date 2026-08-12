@@ -42,6 +42,18 @@ _SYSTEM_PROMPT = (
     "when obstacle boundaries or a clear side are unknown instead of guessing "
     "through repeated turns. Clear range while facing away from a navigation "
     "reference identifies an opening, not proof that an obstacle was passed. "
+    "When robot_relative_side_scan is present, its physical side labels are "
+    "authoritative: left_near and left_far are the robot's physical left, and "
+    "right_near and right_far are its physical right. Ignore conflicting raw "
+    "heading signs when identifying those sides; absolute_bearing_deg is only "
+    "the nonnegative angular coverage magnitude. Compare the complete near/far "
+    "pattern on both sides before choosing a turn. For MEASURED rays, a larger "
+    "distance_mm means a farther return and more open space along that ray. A "
+    "far-angle measured opening "
+    "matters even when that side's near range is shorter; repeated short measured "
+    "ranges on the other side can show a broad obstacle. NO_VALID_DISTANCE and "
+    "UNRESOLVED_SWEEP_ONLY mean unknown, never clear or long-range clearance. "
+    "The host does not rank or choose the turn side. "
     "After scan-guided motion, use a fresh scan from the resulting pose before "
     "claiming passage complete. "
     "Pick "
@@ -171,6 +183,7 @@ class ControllerActionContext:
     observation: Mapping[str, object]
     history: tuple[Mapping[str, object], ...] = ()
     completion_allowed: bool = True
+    robot_relative_side_scan: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         _safe_text("Controller goal", self.goal, MAX_GOAL_CHARS)
@@ -190,13 +203,18 @@ class ControllerActionContext:
             or len(self.history) > MAX_HISTORY_ITEMS
             or any(not isinstance(item, Mapping) for item in self.history)
             or type(self.completion_allowed) is not bool
+            or (
+                self.robot_relative_side_scan is not None
+                and not isinstance(self.robot_relative_side_scan, Mapping)
+            )
         ):
             raise _lm.LMStudioInputError("Controller history is invalid")
         _strict_value(self.observation)
         _strict_value(self.history)
+        _strict_value(self.robot_relative_side_scan)
 
     def to_dict(self):
-        return {
+        value = {
             "goal": self.goal,
             "locale": self.locale,
             "robot_id": self.robot_id,
@@ -206,6 +224,11 @@ class ControllerActionContext:
             "history": _strict_value(self.history),
             "completion_allowed": self.completion_allowed,
         }
+        if self.robot_relative_side_scan is not None:
+            value["robot_relative_side_scan"] = _strict_value(
+                self.robot_relative_side_scan
+            )
+        return value
 
 
 @dataclass(frozen=True)

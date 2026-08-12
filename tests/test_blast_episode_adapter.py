@@ -755,6 +755,14 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             planner.contexts[1].available_actions,
             (TURN_LEFT_90, TURN_RIGHT_90),
         )
+        side_scan = planner.contexts[1].robot_relative_side_scan
+        self.assertIsNone(
+            side_scan["rays"]["left_far"]["distance_mm"]
+        )
+        self.assertEqual(
+            side_scan["rays"]["left_far"]["range_state"],
+            RANGE_STATE_NO_VALID_DISTANCE,
+        )
         self.assertEqual(
             planner.contexts[1].observation["navigation_reference"],
             {
@@ -768,6 +776,79 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             runtime_update = RobotRuntimeUpdate.from_mapping(
                 update,
                 runtime_update,
+            )
+
+    def test_live_scan_vector_is_summarized_by_physical_side_for_gemma(self):
+        class LiveVectorScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    for ray, distance in zip(
+                        result["scan"]["rays"],
+                        (209, 246, 347, 202, 1_002),
+                    ):
+                        ray["distance_mm"] = distance
+                        ray["range_state"] = RANGE_STATE_MEASURED
+                return result
+
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(COMPLETE, assessment="Scan evidence captured."),
+        ])
+
+        result = self.adapter(
+            LiveVectorScanController(), planner,
+        ).run(episode_context()[0])
+
+        self.assertTrue(result.completed)
+        self.assertIsNone(planner.contexts[0].robot_relative_side_scan)
+        self.assertEqual(
+            planner.contexts[1].available_actions,
+            (TURN_LEFT_90, TURN_RIGHT_90),
+        )
+        side_scan = planner.contexts[1].robot_relative_side_scan
+        self.assertEqual(
+            side_scan,
+            {
+                "schema": "blast-robot-relative-side-scan/v1",
+                "frame": "ROBOT_RELATIVE_AT_SCAN_START",
+                "physical_side_labels_authoritative": True,
+                "rays": {
+                    "left_near": {
+                        "range_state": RANGE_STATE_MEASURED,
+                        "distance_mm": 246,
+                        "absolute_bearing_deg": 22.0,
+                    },
+                    "left_far": {
+                        "range_state": RANGE_STATE_MEASURED,
+                        "distance_mm": 347,
+                        "absolute_bearing_deg": 45.0,
+                    },
+                    "right_near": {
+                        "range_state": RANGE_STATE_MEASURED,
+                        "distance_mm": 202,
+                        "absolute_bearing_deg": 24.0,
+                    },
+                    "right_far": {
+                        "range_state": RANGE_STATE_MEASURED,
+                        "distance_mm": 1_002,
+                        "absolute_bearing_deg": 47.0,
+                    },
+                },
+            },
+        )
+        self.assertNotIn("center", side_scan["rays"])
+        for ray in side_scan["rays"].values():
+            self.assertEqual(
+                set(ray),
+                {
+                    "range_state",
+                    "distance_mm",
+                    "absolute_bearing_deg",
+                },
             )
 
     def test_legacy_scan_schema_is_rejected_before_replanning(self):
@@ -902,6 +983,13 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(
             planner_ray["range_state"], "UNRESOLVED_SWEEP_ONLY",
         )
+        summarized_ray = planner.contexts[1].robot_relative_side_scan[
+            "rays"
+        ]["left_near"]
+        self.assertEqual(
+            summarized_ray["range_state"], "UNRESOLVED_SWEEP_ONLY"
+        )
+        self.assertIsNone(summarized_ray["distance_mm"])
         runtime_scan = [
             update["scan"] for update in updates if "scan" in update
         ][0]

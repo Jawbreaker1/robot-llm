@@ -6,6 +6,8 @@ from copy import deepcopy
 import math
 from typing import Mapping
 
+from .physical_navigation_contract import MOTION_ACTIONS, SCAN_FRONT_ARC
+
 
 SCAN_RESULT_SCHEMA = "blast-scan-front-arc/v3"
 SCAN_RESTORATION_TOLERANCE_DEG = 5.0
@@ -18,6 +20,13 @@ SCAN_RAY_EVIDENCE_SETTLED = "SETTLED_RANGE"
 SCAN_RAY_EVIDENCE_SWEEP_ONLY = "SWEEP_CONTINUATION_ONLY"
 SCAN_RAY_SIDES = (
     "center",
+    "left_near",
+    "left_far",
+    "right_near",
+    "right_far",
+)
+ROBOT_RELATIVE_SIDE_SCAN_SCHEMA = "blast-robot-relative-side-scan/v1"
+ROBOT_RELATIVE_SIDE_RAYS = (
     "left_near",
     "left_far",
     "right_near",
@@ -114,6 +123,56 @@ def validate_blast_scan_ray_contract(scan):
     return deepcopy(scan)
 
 
+def summarize_robot_relative_side_scan(scan):
+    """Return concise physical-side evidence without raw heading signs."""
+
+    checked = validate_blast_scan_ray_contract(scan)
+    rays = {}
+    for ray in checked["rays"]:
+        side = ray["side"]
+        if side not in ROBOT_RELATIVE_SIDE_RAYS:
+            continue
+        state = ray["range_state"]
+        settled = ray["observation_settled"] is True
+        relative_heading = finite_number(ray.get("relative_heading_deg"))
+        if relative_heading is None:
+            raise ValueError("BLAST side-scan bearing is invalid")
+        rays[side] = {
+            "range_state": state if settled else "UNRESOLVED_SWEEP_ONLY",
+            "distance_mm": (
+                ray["distance_mm"]
+                if settled and state == RANGE_STATE_MEASURED
+                else None
+            ),
+            "absolute_bearing_deg": abs(relative_heading),
+        }
+    return {
+        "schema": ROBOT_RELATIVE_SIDE_SCAN_SCHEMA,
+        "frame": "ROBOT_RELATIVE_AT_SCAN_START",
+        "physical_side_labels_authoritative": True,
+        "rays": rays,
+    }
+
+
+def current_side_scan(history, latest_scan_view):
+    """Summarize the latest view only while its scan is still current."""
+
+    if not isinstance(latest_scan_view, Mapping):
+        return None
+    for item in reversed(history):
+        action = item.get("action")
+        if action == SCAN_FRONT_ARC:
+            scan = latest_scan_view.get("scan")
+            return (
+                summarize_robot_relative_side_scan(scan)
+                if isinstance(scan, Mapping)
+                else None
+            )
+        if action in MOTION_ACTIONS:
+            return None
+    return None
+
+
 def scan_heading(observation):
     imu = observation.get("imu")
     return finite_number(
@@ -203,6 +262,8 @@ __all__ = (
     "RANGE_STATE_INVALID",
     "RANGE_STATE_MEASURED",
     "RANGE_STATE_NO_VALID_DISTANCE",
+    "ROBOT_RELATIVE_SIDE_RAYS",
+    "ROBOT_RELATIVE_SIDE_SCAN_SCHEMA",
     "SCAN_RAY_EVIDENCE_SETTLED",
     "SCAN_RAY_EVIDENCE_SWEEP_ONLY",
     "SCAN_RAY_SIDES",
@@ -212,9 +273,11 @@ __all__ = (
     "aggregate_repeated_scan_ray",
     "blast_range_state",
     "body_motor_angle",
+    "current_side_scan",
     "finite_number",
     "scan_heading",
     "scan_heading_delta",
     "scan_ray",
+    "summarize_robot_relative_side_scan",
     "validate_blast_scan_ray_contract",
 )
