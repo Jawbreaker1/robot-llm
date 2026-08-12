@@ -851,6 +851,68 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 },
             )
 
+    def test_no_valid_live_scan_distance_is_withheld_from_planner_history(self):
+        class LiveNoValidScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    values = (
+                        (259, RANGE_STATE_MEASURED, 0.0),
+                        (300, RANGE_STATE_MEASURED, -22.9793309),
+                        (2_000, RANGE_STATE_NO_VALID_DISTANCE, -45.8837289),
+                        (251, RANGE_STATE_MEASURED, 24.8248911),
+                        (1_029, RANGE_STATE_MEASURED, 49.0489911),
+                    )
+                    for ray, (distance, state, heading) in zip(
+                        result["scan"]["rays"], values,
+                    ):
+                        ray.update({
+                            "distance_mm": distance,
+                            "range_state": state,
+                            "heading_deg": heading,
+                            "relative_heading_deg": heading,
+                        })
+                return result
+
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(COMPLETE, assessment="Live scan evidence captured."),
+        ])
+        context, updates = episode_context()
+
+        result = self.adapter(
+            LiveNoValidScanController(), planner,
+        ).run(context)
+
+        self.assertTrue(result.completed)
+        planner_rays = planner.contexts[1].history[0]["scan"]["rays"]
+        self.assertEqual(
+            [ray["distance_mm"] for ray in planner_rays],
+            [259, 300, None, 251, 1_029],
+        )
+        self.assertEqual(
+            planner_rays[2]["range_state"],
+            RANGE_STATE_NO_VALID_DISTANCE,
+        )
+        side_scan = planner.contexts[1].robot_relative_side_scan["rays"]
+        self.assertIsNone(side_scan["left_far"]["distance_mm"])
+        self.assertEqual(
+            side_scan["left_far"]["range_state"],
+            RANGE_STATE_NO_VALID_DISTANCE,
+        )
+        self.assertEqual(side_scan["right_far"]["distance_mm"], 1_029)
+        runtime_scan = [
+            update["scan"] for update in updates if "scan" in update
+        ][0]
+        self.assertEqual(runtime_scan["rays"][2]["distance_mm"], 2_000)
+        self.assertEqual(
+            runtime_scan["rays"][2]["range_state"],
+            RANGE_STATE_NO_VALID_DISTANCE,
+        )
+
     def test_legacy_scan_schema_is_rejected_before_replanning(self):
         class LegacyScanController(FakeScanController):
             def command(self, command, *, cancel_requested=None):

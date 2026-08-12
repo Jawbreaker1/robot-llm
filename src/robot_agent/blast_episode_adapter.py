@@ -1639,10 +1639,10 @@ class BlastEpisodeRuntimeAdapter:
                         if ray["observation_settled"] is not True:
                             ray["distance_mm"] = None
                             ray["range_state"] = "UNRESOLVED_SWEEP_ONLY"
+                        elif ray["range_state"] != RANGE_STATE_MEASURED:
+                            ray["distance_mm"] = None
                     history_item["scan"] = planner_scan
-                    if (
-                        planar_projection is not None
-                    ):
+                    if planar_projection is not None:
                         latest_scan_view = {
                             "scan_pose": scan_pose.to_dict(),
                             "scan": copy.deepcopy(scan),
