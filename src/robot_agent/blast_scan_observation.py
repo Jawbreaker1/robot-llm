@@ -25,7 +25,18 @@ SCAN_RAY_SIDES = (
     "right_near",
     "right_far",
 )
-ROBOT_RELATIVE_SIDE_SCAN_SCHEMA = "blast-robot-relative-side-scan/v1"
+SCAN_ANGULAR_RAY_SIDES = (
+    "center",
+    "left_1",
+    "left_2",
+    "left_3",
+    "left_4",
+    "right_1",
+    "right_2",
+    "right_3",
+    "right_4",
+)
+ROBOT_RELATIVE_SIDE_SCAN_SCHEMA = "blast-robot-relative-side-scan/v2"
 ROBOT_RELATIVE_SIDE_RAYS = (
     "left_near",
     "left_far",
@@ -80,6 +91,74 @@ def validate_blast_scan_ray_contract(scan):
     ):
         raise ValueError("BLAST scan result is invalid")
     rays = scan.get("rays")
+    angular_rays = scan.get("angular_rays")
+    evidence_rays = angular_rays if isinstance(angular_rays, list) else rays
+
+    def ray_invalid(ray):
+        return (
+            not isinstance(ray, Mapping)
+            or type(ray.get("observation_settled")) is not bool
+            or (
+                ray.get("observation_settled") is True
+                and ray.get(
+                    "evidence_use", SCAN_RAY_EVIDENCE_SETTLED
+                ) != SCAN_RAY_EVIDENCE_SETTLED
+            )
+            or (
+                ray.get("observation_settled") is False
+                and ray.get("evidence_use")
+                != SCAN_RAY_EVIDENCE_SWEEP_ONLY
+            )
+            or ray.get("range_state") != blast_range_state(
+                ray.get("distance_mm")
+            )
+            or "body_motor_angle_deg" not in ray
+            or (
+                ray.get("body_motor_angle_deg") is not None
+                and type(ray.get("body_motor_angle_deg")) is not int
+            )
+        )
+
+    def same_ray(first, second):
+        if not isinstance(first, Mapping) or not isinstance(second, Mapping):
+            return False
+        return {
+            key: value for key, value in first.items() if key != "side"
+        } == {
+            key: value for key, value in second.items() if key != "side"
+        }
+
+    angular_invalid = False
+    if angular_rays is not None:
+        relative = tuple(
+            finite_number(ray.get("relative_heading_deg"))
+            if isinstance(ray, Mapping) else None
+            for ray in angular_rays
+        ) if isinstance(angular_rays, list) else ()
+        angular_invalid = (
+            not isinstance(angular_rays, list)
+            or tuple(
+                ray.get("side") if isinstance(ray, Mapping) else None
+                for ray in angular_rays
+            ) != SCAN_ANGULAR_RAY_SIDES
+            or any(ray_invalid(ray) for ray in angular_rays)
+            or len(relative) != 9
+            or any(value is None for value in relative)
+            or not (
+                relative[0] == 0.0
+                and 0.0 > relative[1] > relative[2]
+                > relative[3] > relative[4] >= -90.0
+                and 0.0 < relative[5] < relative[6]
+                < relative[7] < relative[8] <= 90.0
+            )
+            or not isinstance(rays, list)
+            or len(rays) != 5
+            or not all(
+                same_ray(rays[canonical], angular_rays[dense])
+                for canonical, dense in ((0, 0), (1, 2), (2, 4),
+                                         (3, 6), (4, 8))
+            )
+        )
     if (
         not isinstance(rays, list)
         or tuple(
@@ -91,33 +170,10 @@ def validate_blast_scan_ray_contract(scan):
         or scan.get("all_observations_settled") != all(
             isinstance(ray, Mapping)
             and ray.get("observation_settled") is True
-            for ray in rays
+            for ray in evidence_rays
         )
-        or any(
-            (
-                type(ray.get("observation_settled")) is not bool
-                or (
-                    ray.get("observation_settled") is True
-                    and ray.get(
-                        "evidence_use", SCAN_RAY_EVIDENCE_SETTLED
-                    ) != SCAN_RAY_EVIDENCE_SETTLED
-                )
-                or (
-                    ray.get("observation_settled") is False
-                    and ray.get("evidence_use")
-                    != SCAN_RAY_EVIDENCE_SWEEP_ONLY
-                )
-                or ray.get("range_state") != blast_range_state(
-                    ray.get("distance_mm")
-                )
-                or "body_motor_angle_deg" not in ray
-                or (
-                    ray.get("body_motor_angle_deg") is not None
-                    and type(ray.get("body_motor_angle_deg")) is not int
-                )
-            )
-            for ray in rays
-        )
+        or any(ray_invalid(ray) for ray in rays)
+        or angular_invalid
     ):
         raise ValueError("BLAST scan result is invalid")
     return deepcopy(scan)
@@ -127,17 +183,23 @@ def summarize_robot_relative_side_scan(scan):
     """Return concise physical-side evidence without raw heading signs."""
 
     checked = validate_blast_scan_ray_contract(scan)
-    rays = {}
-    for ray in checked["rays"]:
+    rays = {"left": [], "right": []}
+    source = checked.get("angular_rays", checked["rays"])
+    for ray in source:
         side = ray["side"]
-        if side not in ROBOT_RELATIVE_SIDE_RAYS:
+        physical_side = (
+            "left" if side.startswith("left_")
+            else "right" if side.startswith("right_")
+            else None
+        )
+        if physical_side is None:
             continue
         state = ray["range_state"]
         settled = ray["observation_settled"] is True
         relative_heading = finite_number(ray.get("relative_heading_deg"))
         if relative_heading is None:
             raise ValueError("BLAST side-scan bearing is invalid")
-        rays[side] = {
+        rays[physical_side].append({
             "range_state": state if settled else "UNRESOLVED_SWEEP_ONLY",
             "distance_mm": (
                 ray["distance_mm"]
@@ -145,7 +207,7 @@ def summarize_robot_relative_side_scan(scan):
                 else None
             ),
             "absolute_bearing_deg": abs(relative_heading),
-        }
+        })
     return {
         "schema": ROBOT_RELATIVE_SIDE_SCAN_SCHEMA,
         "frame": "ROBOT_RELATIVE_AT_SCAN_START",
@@ -264,6 +326,7 @@ __all__ = (
     "RANGE_STATE_NO_VALID_DISTANCE",
     "ROBOT_RELATIVE_SIDE_RAYS",
     "ROBOT_RELATIVE_SIDE_SCAN_SCHEMA",
+    "SCAN_ANGULAR_RAY_SIDES",
     "SCAN_RAY_EVIDENCE_SETTLED",
     "SCAN_RAY_EVIDENCE_SWEEP_ONLY",
     "SCAN_RAY_SIDES",

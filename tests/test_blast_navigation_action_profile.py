@@ -3,6 +3,7 @@ import unittest
 from robot_agent.blast_navigation_action_profile import (
     BLAST_NAVIGATION_COMMANDS,
     DRIVE_ENCODER_DEGREES,
+    SCAN_TURN_ENCODER_DEGREES_PER_PULSE,
     SCAN_TURN_PULSES_PER_SIDE,
     TURN_ENCODER_DEGREES_PER_PULSE,
     TURN_ENCODER_DEGREES_PER_QUARTER_TURN,
@@ -91,7 +92,7 @@ class BlastNavigationActionProfileTests(unittest.TestCase):
         self.assertEqual(left.heading_mdeg, 94_570)
         self.assertEqual(right.heading_mdeg, -94_570)
 
-    def test_scan_sweep_uses_two_pulses_with_a_conservative_endpoint(self):
+    def test_scan_sweep_uses_four_small_pulses_inside_old_endpoint(self):
         origin = PhysicalPose()
 
         left = blast_scan_turn_maximum_pose(origin, TURN_LEFT_90)
@@ -103,9 +104,10 @@ class BlastNavigationActionProfileTests(unittest.TestCase):
             BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
         )
 
-        self.assertEqual(SCAN_TURN_PULSES_PER_SIDE, 2)
-        self.assertEqual(left.heading_mdeg, 83_300)
-        self.assertEqual(right.heading_mdeg, -83_300)
+        self.assertEqual(SCAN_TURN_PULSES_PER_SIDE, 4)
+        self.assertEqual(SCAN_TURN_ENCODER_DEGREES_PER_PULSE, 21)
+        self.assertEqual(left.heading_mdeg, 77_910)
+        self.assertEqual(right.heading_mdeg, -77_910)
         self.assertLess(
             abs(left.heading_mdeg),
             abs(full_turn_maximum.heading_mdeg),

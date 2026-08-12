@@ -27,9 +27,11 @@ TURN_DURATION_MS_PER_PULSE = 250
 # Four bounded pulses are the closest existing semantic quarter turn. The
 # encoder-derived 93.96-degree result remains authoritative over the label.
 TURN_PULSES_PER_QUARTER_TURN = 4
-# SCAN_FRONT_ARC reaches each outer observation after two of the same bounded
-# motor pulses.  It then returns through centre before sweeping the other side.
-SCAN_TURN_PULSES_PER_SIDE = 2
+# SCAN_FRONT_ARC uses its own smaller fixed hub pulse. Four scan pulses stay
+# inside the previous two navigation-pulse excursion (84 < 90 wheel
+# encoder degrees) while providing four distinct bearings on each side.
+SCAN_TURN_ENCODER_DEGREES_PER_PULSE = 21
+SCAN_TURN_PULSES_PER_SIDE = 4
 TURN_ENCODER_DEGREES_PER_QUARTER_TURN = (
     TURN_ENCODER_DEGREES_PER_PULSE * TURN_PULSES_PER_QUARTER_TURN
 )
@@ -155,15 +157,16 @@ def blast_scan_turn_maximum_pose(
     pose: PhysicalPose,
     action: str,
 ) -> PhysicalPose:
-    """Return the conservative endpoint of one two-pulse scan excursion."""
+    """Return the conservative endpoint of one fixed scan excursion."""
 
     if action not in (TURN_LEFT_90, TURN_RIGHT_90):
         raise ValueError("BLAST scan turn direction is invalid")
     scan_spec = deepcopy(BLAST_NAVIGATION_ACTION_SPECS[action])
     expected_encoder_degrees = math.ceil(
         TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN
+        * SCAN_TURN_ENCODER_DEGREES_PER_PULSE
         * SCAN_TURN_PULSES_PER_SIDE
-        / TURN_PULSES_PER_QUARTER_TURN
+        / TURN_ENCODER_DEGREES_PER_QUARTER_TURN
     )
     scan_spec.update({
         "total_duration_ms": (
@@ -184,6 +187,7 @@ __all__ = (
     "BLAST_NAVIGATION_ACTION_SPECS",
     "BLAST_NAVIGATION_COMMANDS",
     "DRIVE_ENCODER_DEGREES",
+    "SCAN_TURN_ENCODER_DEGREES_PER_PULSE",
     "SCAN_TURN_PULSES_PER_SIDE",
     "TURN_ENCODER_DEGREES_PER_PULSE",
     "TURN_ENCODER_DEGREES_PER_QUARTER_TURN",

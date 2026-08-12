@@ -1602,10 +1602,9 @@ class BlastEpisodeRuntimeAdapter:
                         if isinstance(result_observation, Mapping)
                         else None
                     )
-                    body_angles = [
-                        ray["body_motor_angle_deg"]
-                        for ray in scan["rays"]
-                    ] + [
+                    body_angles = [ray["body_motor_angle_deg"] for ray in (
+                        scan.get("angular_rays", scan["rays"])
+                    )] + [
                         final_motors.get("body")
                         if isinstance(final_motors, Mapping)
                         else None
@@ -1635,7 +1634,8 @@ class BlastEpisodeRuntimeAdapter:
                     except ValueError:
                         planar_projection = None
                     planner_scan = copy.deepcopy(scan)
-                    for ray in planner_scan["rays"]:
+                    planner_rays = planner_scan["rays"] + planner_scan.get("angular_rays", [])
+                    for ray in planner_rays:
                         if ray["observation_settled"] is not True:
                             ray["distance_mm"] = None
                             ray["range_state"] = "UNRESOLVED_SWEEP_ONLY"

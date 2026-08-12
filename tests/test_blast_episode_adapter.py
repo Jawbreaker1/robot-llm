@@ -757,10 +757,10 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         side_scan = planner.contexts[1].robot_relative_side_scan
         self.assertIsNone(
-            side_scan["rays"]["left_far"]["distance_mm"]
+            side_scan["rays"]["left"][1]["distance_mm"]
         )
         self.assertEqual(
-            side_scan["rays"]["left_far"]["range_state"],
+            side_scan["rays"]["left"][1]["range_state"],
             RANGE_STATE_NO_VALID_DISTANCE,
         )
         self.assertEqual(
@@ -813,35 +813,129 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(
             side_scan,
             {
-                "schema": "blast-robot-relative-side-scan/v1",
+                "schema": "blast-robot-relative-side-scan/v2",
                 "frame": "ROBOT_RELATIVE_AT_SCAN_START",
                 "physical_side_labels_authoritative": True,
                 "rays": {
-                    "left_near": {
+                    "left": [{
                         "range_state": RANGE_STATE_MEASURED,
                         "distance_mm": 246,
                         "absolute_bearing_deg": 22.0,
-                    },
-                    "left_far": {
+                    }, {
                         "range_state": RANGE_STATE_MEASURED,
                         "distance_mm": 347,
                         "absolute_bearing_deg": 45.0,
-                    },
-                    "right_near": {
+                    }],
+                    "right": [{
                         "range_state": RANGE_STATE_MEASURED,
                         "distance_mm": 202,
                         "absolute_bearing_deg": 24.0,
-                    },
-                    "right_far": {
+                    }, {
                         "range_state": RANGE_STATE_MEASURED,
                         "distance_mm": 1_002,
                         "absolute_bearing_deg": 47.0,
-                    },
+                    }],
                 },
             },
         )
-        self.assertNotIn("center", side_scan["rays"])
-        for ray in side_scan["rays"].values():
+        for side_rays in side_scan["rays"].values():
+            self.assertEqual(len(side_rays), 2)
+            for ray in side_rays:
+                self.assertEqual(
+                    set(ray),
+                    {
+                        "range_state",
+                        "distance_mm",
+                        "absolute_bearing_deg",
+                    },
+                )
+
+    def test_dense_live_scan_gives_gemma_four_rays_per_physical_side(self):
+        class DenseScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command != "scan_front_arc":
+                    return result
+                scan = result["scan"]
+                values = (
+                    ("center", 247, 0.0),
+                    ("left_1", 307, -11.0),
+                    ("left_2", 2_000, -22.0),
+                    ("left_3", 210, -33.0),
+                    ("left_4", 156, -44.0),
+                    ("right_1", 226, 11.0),
+                    ("right_2", 400, 22.0),
+                    ("right_3", 700, 33.0),
+                    ("right_4", 1_000, 44.0),
+                )
+                scan["angular_rays"] = [{
+                    "side": side,
+                    "distance_mm": distance,
+                    "range_state": (
+                        RANGE_STATE_NO_VALID_DISTANCE
+                        if distance == 2_000
+                        else RANGE_STATE_MEASURED
+                    ),
+                    "body_motor_angle_deg": 158,
+                    "heading_deg": heading,
+                    "relative_heading_deg": heading,
+                    "observation_settled": True,
+                } for side, distance, heading in values]
+                scan["rays"] = [
+                    dict(scan["angular_rays"][index], side=side)
+                    for index, side in (
+                        (0, "center"),
+                        (2, "left_near"),
+                        (4, "left_far"),
+                        (6, "right_near"),
+                        (8, "right_far"),
+                    )
+                ]
+                return result
+
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(COMPLETE, assessment="Dense scan captured."),
+        ])
+
+        context, updates = episode_context()
+        result = self.adapter(DenseScanController(), planner).run(context)
+
+        self.assertTrue(result.completed)
+        side_rays = planner.contexts[1].robot_relative_side_scan["rays"]
+        self.assertEqual(
+            [ray["distance_mm"] for ray in side_rays["left"]],
+            [307, None, 210, 156],
+        )
+        self.assertEqual(
+            [ray["distance_mm"] for ray in side_rays["right"]],
+            [226, 400, 700, 1_000],
+        )
+        self.assertEqual(
+            [ray["absolute_bearing_deg"] for ray in side_rays["left"]],
+            [11.0, 22.0, 33.0, 44.0],
+        )
+        planner_dense = planner.contexts[1].history[0]["scan"][
+            "angular_rays"
+        ]
+        self.assertIsNone(planner_dense[2]["distance_mm"])
+        self.assertEqual(
+            planner_dense[2]["range_state"],
+            RANGE_STATE_NO_VALID_DISTANCE,
+        )
+        runtime_dense = next(
+            update["scan"]["angular_rays"]
+            for update in updates if "scan" in update
+        )
+        self.assertEqual(runtime_dense[2]["distance_mm"], 2_000)
+        self.assertEqual(
+            runtime_dense[2]["range_state"],
+            RANGE_STATE_NO_VALID_DISTANCE,
+        )
+        for ray in (*side_rays["left"], *side_rays["right"]):
             self.assertEqual(
                 set(ray),
                 {
@@ -898,12 +992,12 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             RANGE_STATE_NO_VALID_DISTANCE,
         )
         side_scan = planner.contexts[1].robot_relative_side_scan["rays"]
-        self.assertIsNone(side_scan["left_far"]["distance_mm"])
+        self.assertIsNone(side_scan["left"][1]["distance_mm"])
         self.assertEqual(
-            side_scan["left_far"]["range_state"],
+            side_scan["left"][1]["range_state"],
             RANGE_STATE_NO_VALID_DISTANCE,
         )
-        self.assertEqual(side_scan["right_far"]["distance_mm"], 1_029)
+        self.assertEqual(side_scan["right"][1]["distance_mm"], 1_029)
         runtime_scan = [
             update["scan"] for update in updates if "scan" in update
         ][0]
@@ -930,6 +1024,44 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         with self.assertRaises(BlastEpisodeError) as rejected:
             self.adapter(LegacyScanController(), planner).run(
+                episode_context()[0]
+            )
+
+        self.assertEqual(rejected.exception.code, "blast_scan_result_invalid")
+        self.assertEqual(len(planner.contexts), 1)
+
+    def test_malformed_canonical_ray_with_dense_scan_fails_closed(self):
+        class MalformedDenseScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command,
+                    cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    scan = result["scan"]
+                    canonical = scan["rays"]
+                    scan["angular_rays"] = [
+                        dict(canonical[0], side="center"),
+                        dict(canonical[1], side="left_1",
+                             relative_heading_deg=-11.0),
+                        dict(canonical[1], side="left_2"),
+                        dict(canonical[2], side="left_3",
+                             relative_heading_deg=-33.0),
+                        dict(canonical[2], side="left_4"),
+                        dict(canonical[3], side="right_1",
+                             relative_heading_deg=11.0),
+                        dict(canonical[3], side="right_2"),
+                        dict(canonical[4], side="right_3",
+                             relative_heading_deg=35.0),
+                        dict(canonical[4], side="right_4"),
+                    ]
+                    scan["rays"][1] = 7
+                return result
+
+        planner = Planner([decision(SCAN_FRONT_ARC)])
+
+        with self.assertRaises(BlastEpisodeError) as rejected:
+            self.adapter(MalformedDenseScanController(), planner).run(
                 episode_context()[0]
             )
 
@@ -1047,7 +1179,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         summarized_ray = planner.contexts[1].robot_relative_side_scan[
             "rays"
-        ]["left_near"]
+        ]["left"][0]
         self.assertEqual(
             summarized_ray["range_state"], "UNRESOLVED_SWEEP_ONLY"
         )
@@ -1773,7 +1905,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             with self.subTest(control=control):
                 clock = [1_000]
                 context, updates = episode_context()
-                context.settings.max_episode_ms = 60_000
+                context.settings.max_episode_ms = 90_000
                 controller = FullDetourController()
                 planner = Planner([
                     decision(SCAN_FRONT_ARC),
@@ -1792,7 +1924,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     verified = original(**values)
                     if values["role"] == "FINAL":
                         if control == "deadline":
-                            clock[0] = 61_000
+                            clock[0] = 91_000
                         else:
                             context.stop_requested.set()
                     return verified
@@ -2291,13 +2423,13 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             with self.subTest(control=control):
                 clock = [1_000]
                 context, _updates = episode_context()
-                context.settings.max_episode_ms = 60_000
+                context.settings.max_episode_ms = 90_000
 
                 def trigger():
                     if control == "stop":
                         context.stop_requested.set()
                     else:
-                        clock[0] = 61_000
+                        clock[0] = 91_000
 
                 class SideControlController(FakeScanController):
                     def __init__(self):
@@ -3559,13 +3691,13 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             with self.subTest(control=control, after_observe=after_observe):
                 clock = [1_000]
                 context, _updates = episode_context()
-                context.settings.max_episode_ms = 60_000
+                context.settings.max_episode_ms = 90_000
 
                 def trigger(_controller):
                     if control == "stop":
                         context.stop_requested.set()
                     else:
-                        clock[0] = 61_000
+                        clock[0] = 91_000
 
                 controller = ScanStartRetryController(**{
                     "after_observe" if after_observe else "after_failure": (

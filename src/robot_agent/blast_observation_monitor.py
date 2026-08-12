@@ -61,14 +61,15 @@ DEFAULT_RECONNECT_INTERVAL_SECONDS = 3.0
 DISCONNECT_TIMEOUT_SECONDS = 3.0
 COMMAND_TIMEOUT_SECONDS = 15.0
 INTERNAL_COMMAND_TIMEOUT_SECONDS = 12.0
-SCAN_COMMAND_TIMEOUT_SECONDS = 60.0
-SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS = 57.0
+SCAN_COMMAND_TIMEOUT_SECONDS = 90.0
+SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS = 75.0
 MIN_COMMAND_BUDGET_SECONDS = 2.0
 COMMAND_RESPONSE_MARGIN_SECONDS = 0.25
 MOTION_TIMEOUT_SECONDS = 4.0
 MOTION_POLL_INTERVAL_SECONDS = 0.05
 POST_MOTION_SETTLE_TIMEOUT_SECONDS = 1.5
 SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS = 3.0
+SCAN_PULSE_POST_MOTION_SETTLE_TIMEOUT_SECONDS = 1.5
 POST_MOTION_SETTLE_SAMPLE_COUNT = 5
 POST_MOTION_DISTANCE_RANGE_MM = 5.0
 POST_MOTION_TILT_RANGE_DEG = 1.0
@@ -1116,6 +1117,8 @@ class BlastObservationMonitor:
         runtime,
         generation,
         direction,
+        *,
+        retry_unsettled=False,
     ):
         if await self._service_preempt_stop(runtime, generation):
             raise BlastControllerError(
@@ -1123,29 +1126,33 @@ class BlastObservationMonitor:
                 "BLAST scan was interrupted by stop",
                 motion_started=False,
             )
-        receipt = await runtime.turn_pulse(direction)
+        receipt = await runtime.scan_turn_pulse(direction)
         observation = await self._observe_until_idle(
             runtime,
             generation=generation,
             stop_only=False,
         )
-        observation, observation_settled = (
-            await self._observe_until_settled(
-                runtime,
-                generation=generation,
-                initial_observation=observation,
-                timeout_seconds=SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
+        settle_attempts = 2 if retry_unsettled else 1
+        for _attempt in range(settle_attempts):
+            observation, observation_settled = (
+                await self._observe_until_settled(
+                    runtime,
+                    generation=generation,
+                    initial_observation=observation,
+                    timeout_seconds=(
+                        SCAN_PULSE_POST_MOTION_SETTLE_TIMEOUT_SECONDS
+                    ),
+                )
             )
-        )
+            if observation_settled is True:
+                break
+            if not self._scan_sweep_window_allows_continuation(observation):
+                raise BlastControllerError(
+                    "scan_sweep_observation_unverified",
+                    "BLAST scan could not settle safely between turn pulses",
+                )
         distance = observation.get("distance_mm")
         sweep_only = observation_settled is not True
-        if sweep_only and not self._scan_sweep_window_allows_continuation(
-            observation
-        ):
-            raise BlastControllerError(
-                "scan_sweep_observation_unverified",
-                "BLAST scan could not settle safely between turn pulses",
-            )
         sensor = (
             BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
             .range_sensor_extrinsics
@@ -1255,67 +1262,36 @@ class BlastObservationMonitor:
                 motion_started=False,
             )
 
-        (
-            _left_near_receipt,
-            left_near,
-            left_near_settled,
-            left_near_evidence,
-        ) = (
-            await self._scan_turn(
+        left_outbound = []
+        for index in range(4):
+            left_outbound.append(await self._scan_turn(
                 runtime,
                 generation,
                 "left",
-            )
-        )
-        (
-            _left_far_receipt,
-            left_far,
-            left_far_settled,
-            left_far_evidence,
-        ) = (
-            await self._scan_turn(
-                runtime,
-                generation,
-                "left",
-            )
-        )
-        (
-            _left_near_return_receipt,
-            left_near_return,
-            left_near_return_settled,
-            left_near_return_evidence,
-        ) = await self._scan_turn(runtime, generation, "right")
+                retry_unsettled=index == 3,
+            ))
+
+        left_return = []
+        for _index in range(3):
+            left_return.append(await self._scan_turn(
+                runtime, generation, "right",
+            ))
         await self._scan_turn(runtime, generation, "right")
-        (
-            _right_near_receipt,
-            right_near,
-            right_near_settled,
-            right_near_evidence,
-        ) = (
-            await self._scan_turn(
+
+        right_outbound = []
+        for index in range(4):
+            right_outbound.append(await self._scan_turn(
                 runtime,
                 generation,
                 "right",
-            )
-        )
-        (
-            _right_far_receipt,
-            right_far,
-            right_far_settled,
-            right_far_evidence,
-        ) = (
-            await self._scan_turn(
-                runtime,
-                generation,
-                "right",
-            )
-        )
-        (
-            _right_near_return_receipt,
-            right_near_return,
-            right_near_return_settled,
-            right_near_return_evidence,
-        ) = await self._scan_turn(runtime, generation, "left")
+                retry_unsettled=index == 3,
+            ))
+
+        right_return = []
+        for _index in range(3):
+            right_return.append(await self._scan_turn(
+                runtime, generation, "left",
+            ))
         (
             _return_receipt,
             final,
@@ -1332,26 +1308,51 @@ class BlastObservationMonitor:
             restoration_error is not None
             and abs(restoration_error) <= SCAN_RESTORATION_TOLERANCE_DEG
         )
-        left_near_ray = self._aggregate_repeated_scan_ray(
-            "left_near",
-            start_heading,
-            (left_near, left_near_settled, left_near_evidence),
-            (
-                left_near_return,
-                left_near_return_settled,
-                left_near_return_evidence,
-            ),
+        left_rays = []
+        right_rays = []
+        for index in range(4):
+            left_primary = left_outbound[index][1:]
+            right_primary = right_outbound[index][1:]
+            left_rays.append(
+                self._scan_ray(
+                    "left_{}".format(index + 1),
+                    left_primary[0],
+                    start_heading,
+                    left_primary[1],
+                    left_primary[2],
+                )
+                if index == 3
+                else self._aggregate_repeated_scan_ray(
+                    "left_{}".format(index + 1),
+                    start_heading,
+                    left_primary,
+                    left_return[2 - index][1:],
+                )
+            )
+            right_rays.append(
+                self._scan_ray(
+                    "right_{}".format(index + 1),
+                    right_primary[0],
+                    start_heading,
+                    right_primary[1],
+                    right_primary[2],
+                )
+                if index == 3
+                else self._aggregate_repeated_scan_ray(
+                    "right_{}".format(index + 1),
+                    start_heading,
+                    right_primary,
+                    right_return[2 - index][1:],
+                )
+            )
+        center_ray = self._scan_ray(
+            "center", center, start_heading, center_settled,
         )
-        right_near_ray = self._aggregate_repeated_scan_ray(
-            "right_near",
-            start_heading,
-            (right_near, right_near_settled, right_near_evidence),
-            (
-                right_near_return,
-                right_near_return_settled,
-                right_near_return_evidence,
-            ),
-        )
+        angular_rays = [center_ray, *left_rays, *right_rays]
+        left_near_ray = {**left_rays[1], "side": "left_near"}
+        left_far_ray = {**left_rays[3], "side": "left_far"}
+        right_near_ray = {**right_rays[1], "side": "right_near"}
+        right_far_ray = {**right_rays[3], "side": "right_far"}
         scan = {
             "schema": SCAN_RESULT_SCHEMA,
             "state": "complete",
@@ -1365,36 +1366,16 @@ class BlastObservationMonitor:
             "restoration_error_deg": restoration_error,
             "restoration_verified": restoration_verified,
             "all_observations_settled": all((
-                center_settled,
-                left_near_ray["observation_settled"],
-                left_far_settled,
-                right_near_ray["observation_settled"],
-                right_far_settled,
+                ray["observation_settled"] for ray in angular_rays
             )),
             "rays": [
-                self._scan_ray(
-                    "center",
-                    center,
-                    start_heading,
-                    center_settled,
-                ),
+                center_ray,
                 left_near_ray,
-                self._scan_ray(
-                    "left_far",
-                    left_far,
-                    start_heading,
-                    left_far_settled,
-                    left_far_evidence,
-                ),
+                left_far_ray,
                 right_near_ray,
-                self._scan_ray(
-                    "right_far",
-                    right_far,
-                    start_heading,
-                    right_far_settled,
-                    right_far_evidence,
-                ),
+                right_far_ray,
             ],
+            "angular_rays": angular_rays,
         }
         return {
             "schema": COMMAND_RESULT_SCHEMA,
@@ -1403,7 +1384,7 @@ class BlastObservationMonitor:
             "command": SCAN_COMMAND,
             "accepted": True,
             "completed": True,
-            "receipt": {"turn_count": 8},
+            "receipt": {"turn_count": 16},
             "observation": final,
             "observation_settled": final_settled,
             "scan": scan,

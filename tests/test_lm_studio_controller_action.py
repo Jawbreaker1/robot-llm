@@ -346,30 +346,28 @@ class ControllerActionPlannerTests(unittest.TestCase):
 
     def test_side_scan_context_and_prompt_preserve_gemmas_side_choice(self):
         side_scan = {
-            "schema": "blast-robot-relative-side-scan/v1",
+            "schema": "blast-robot-relative-side-scan/v2",
             "frame": "ROBOT_RELATIVE_AT_SCAN_START",
             "physical_side_labels_authoritative": True,
             "rays": {
-                "left_near": {
+                "left": [{
                     "range_state": "MEASURED",
                     "distance_mm": 246,
                     "absolute_bearing_deg": 23.0,
-                },
-                "left_far": {
+                }, {
                     "range_state": "MEASURED",
                     "distance_mm": 347,
                     "absolute_bearing_deg": 70.0,
-                },
-                "right_near": {
+                }],
+                "right": [{
                     "range_state": "MEASURED",
                     "distance_mm": 202,
                     "absolute_bearing_deg": 23.0,
-                },
-                "right_far": {
+                }, {
                     "range_state": "MEASURED",
                     "distance_mm": 1_002,
                     "absolute_bearing_deg": 70.0,
-                },
+                }],
             },
         }
         planner, transport = self.planner(completion({
@@ -398,13 +396,11 @@ class ControllerActionPlannerTests(unittest.TestCase):
         )
         system_prompt = request["messages"][0]["content"]
         for instruction in (
-            "physical side labels are authoritative",
-            "left_near and left_far",
-            "right_near and right_far",
+            "left and right arrays",
+            "authoritative physical sides",
+            "smallest to largest absolute_bearing_deg",
             "Ignore conflicting raw heading signs",
-            "absolute_bearing_deg",
-            "nonnegative angular coverage magnitude",
-            "complete near/far pattern on both sides",
+            "complete angular pattern on both sides",
             "larger distance_mm means a farther return",
             "far-angle measured opening",
             "NO_VALID_DISTANCE",

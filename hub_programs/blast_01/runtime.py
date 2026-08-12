@@ -44,6 +44,7 @@ DRIVE_PULSE_SPEED_DPS = 120
 DRIVE_PULSE_ANGLE_DEG = 90
 TURN_PULSE_SPEED_DPS = 180
 TURN_PULSE_ANGLE_DEG = 45
+SCAN_TURN_PULSE_ANGLE_DEG = 21
 CLAW_PULSE_SPEED_DPS = 180
 CLAW_PULSE_DURATION_MS = 500
 BODY_PULSE_SPEED_DPS = 120
@@ -319,7 +320,7 @@ def drive_pulse(direction):
     }
 
 
-def turn_pulse(direction):
+def fixed_turn_pulse(direction, wheel_angle_deg):
     if direction not in ("left", "right"):
         raise ValueError("direction must be left or right")
     if (
@@ -329,9 +330,9 @@ def turn_pulse(direction):
         raise ValueError("drive motors are busy")
 
     right_angle = (
-        TURN_PULSE_ANGLE_DEG
+        wheel_angle_deg
         if direction == "left"
-        else -TURN_PULSE_ANGLE_DEG
+        else -wheel_angle_deg
     )
     left_angle = -right_angle
     before = {
@@ -358,9 +359,17 @@ def turn_pulse(direction):
         "accepted": True,
         "direction": direction,
         "speed_dps": TURN_PULSE_SPEED_DPS,
-        "wheel_angle_deg": TURN_PULSE_ANGLE_DEG,
+        "wheel_angle_deg": wheel_angle_deg,
         "before_angles_deg": before,
     }
+
+
+def turn_pulse(direction):
+    return fixed_turn_pulse(direction, TURN_PULSE_ANGLE_DEG)
+
+
+def scan_turn_pulse(direction):
+    return fixed_turn_pulse(direction, SCAN_TURN_PULSE_ANGLE_DEG)
 
 
 def claw_pulse(direction):
@@ -463,6 +472,9 @@ while True:
         elif operation == "turn_pulse":
             arguments = request.get("args", {})
             result = turn_pulse(arguments.get("direction"))
+        elif operation == "scan_turn_pulse":
+            arguments = request.get("args", {})
+            result = scan_turn_pulse(arguments.get("direction"))
         elif operation == "claw_pulse":
             arguments = request.get("args", {})
             result = claw_pulse(arguments.get("direction"))
