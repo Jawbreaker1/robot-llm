@@ -9,6 +9,7 @@ import socket
 from typing import Callable, Mapping
 
 from . import lm_studio as _lm
+from .blast_personality import normalize_persona_by_locale
 
 
 CONVERSE = "CONVERSE"
@@ -61,6 +62,14 @@ _SYSTEM_PROMPT = (
     "move or propose moving to obtain evidence. For CLARIFY ask one concise question. "
     "Never call tools, authorize motion in reply_text, claim an action was performed, or "
     "provide executable commands."
+)
+
+_REPLY_PERSONA_PROMPT = (
+    " Host-authored reply persona for this locale: {persona} Apply it only to the "
+    "wording and tone of reply_text when reply_text is allowed. For CONVERSE it "
+    "replaces the generic tired/grumpy style above. It must never influence intent, "
+    "confidence_milli, action, plan, assessment, sensor facts, factual claims, safety, "
+    "completion, or whether reply_text must be null."
 )
 
 _FALLBACKS = {
@@ -209,6 +218,7 @@ class LMStudioRobotInputModel:
         model: str = _lm.DEFAULT_MODEL,
         transport: Transport = _lm._stdlib_post,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+        reply_persona_by_locale: Mapping[str, str] | None = None,
     ):
         if not callable(transport) or (
             isinstance(timeout_seconds, bool)
@@ -216,6 +226,14 @@ class LMStudioRobotInputModel:
             or not 0.1 <= timeout_seconds <= 60.0
         ):
             raise _lm.LMStudioConfigurationError("LM Studio robot input dependency is invalid")
+        try:
+            self._reply_persona_by_locale = normalize_persona_by_locale(
+                reply_persona_by_locale
+            )
+        except (KeyError, TypeError, ValueError):
+            raise _lm.LMStudioConfigurationError(
+                "LM Studio robot input persona is invalid"
+            ) from None
         self._base_url = _lm._safe_base_url(base_url)
         self._model = _lm._safe_model(model)
         self._transport = transport
@@ -242,10 +260,15 @@ class LMStudioRobotInputModel:
                 ]
             },
         }
+        system_prompt = _SYSTEM_PROMPT
+        if self._reply_persona_by_locale is not None:
+            system_prompt += _REPLY_PERSONA_PROMPT.format(
+                persona=self._reply_persona_by_locale[input.locale]
+            )
         payload = {
             "model": self._model,
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": _json({
                     "request_id": input.request_id,
                     "text": input.text,

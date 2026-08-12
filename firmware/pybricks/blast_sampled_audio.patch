@@ -1,5 +1,41 @@
+diff --git a/lib/pbio/drv/bluetooth/bluetooth_btstack.c b/lib/pbio/drv/bluetooth/bluetooth_btstack.c
+index f23bdc7..75691f0 100644
+--- a/lib/pbio/drv/bluetooth/bluetooth_btstack.c
++++ b/lib/pbio/drv/bluetooth/bluetooth_btstack.c
+@@ -403,6 +403,18 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
+                 }
+                 host->con_handle = handle;
+
++                #if PBDRV_CONFIG_BLUETOOTH_BTSTACK_HOST_CONNECTION_INTERVAL
++                // Request a 15 ms host interval (units are 1.25 ms). Keep the
++                // central's existing supervision timeout to avoid changing
++                // disconnect behavior as a side effect of this request.
++                gap_request_connection_parameter_update(
++                    handle,
++                    PBDRV_CONFIG_BLUETOOTH_BTSTACK_HOST_CONNECTION_INTERVAL,
++                    PBDRV_CONFIG_BLUETOOTH_BTSTACK_HOST_CONNECTION_INTERVAL,
++                    0,
++                    hci_subevent_le_connection_complete_get_supervision_timeout(packet));
++                #endif
++
+                 // don't start advertising again on disconnect
+                 gap_advertisements_enable(false);
+                 pbdrv_bluetooth_advertising_state = PBDRV_BLUETOOTH_ADVERTISING_STATE_NONE;
+diff --git a/lib/pbio/drv/bluetooth/pybricks_service.gatt b/lib/pbio/drv/bluetooth/pybricks_service.gatt
+index fc30a4f..ef37b0b 100644
+--- a/lib/pbio/drv/bluetooth/pybricks_service.gatt
++++ b/lib/pbio/drv/bluetooth/pybricks_service.gatt
+@@ -9,7 +9,7 @@ CHARACTERISTIC, ORG_BLUETOOTH_CHARACTERISTIC_PNP_ID, DYNAMIC | READ,
+
+ // Pybricks service
+ PRIMARY_SERVICE, C5F50001-8280-46DA-89F4-6D8051E4AEEF
+-CHARACTERISTIC,  C5F50002-8280-46DA-89F4-6D8051E4AEEF, NOTIFY | WRITE | DYNAMIC,
++CHARACTERISTIC,  C5F50002-8280-46DA-89F4-6D8051E4AEEF, NOTIFY | WRITE | WRITE_WITHOUT_RESPONSE | DYNAMIC,
+ CHARACTERISTIC,  C5F50003-8280-46DA-89F4-6D8051E4AEEF, READ | DYNAMIC,
+
+ #import <nordic_spp_service.gatt>
 diff --git a/lib/pbio/drv/sound/sound_stm32_hal_dac.c b/lib/pbio/drv/sound/sound_stm32_hal_dac.c
-index 28742ba..040120b 100644
+index 28742ba..fcf90ad 100644
 --- a/lib/pbio/drv/sound/sound_stm32_hal_dac.c
 +++ b/lib/pbio/drv/sound/sound_stm32_hal_dac.c
 @@ -4,6 +4,7 @@
@@ -10,12 +46,19 @@ index 28742ba..040120b 100644
 
  #if PBDRV_CONFIG_SOUND_STM32_HAL_DAC
 
-@@ -16,6 +17,16 @@
+@@ -16,6 +17,23 @@
  static DMA_HandleTypeDef pbdrv_sound_hdma;
  static DAC_HandleTypeDef pbdrv_sound_hdac;
  static TIM_HandleTypeDef pbdrv_sound_htim;
 +static volatile bool pbdrv_sound_active;
 +static volatile bool pbdrv_sound_once;
++static volatile bool pbdrv_sound_stream;
++static volatile bool pbdrv_sound_cleanup_pending;
++static volatile uint32_t pbdrv_sound_stream_chunks_remaining;
++static uint16_t *pbdrv_sound_stream_data;
++static uint32_t pbdrv_sound_stream_chunk_size;
++static pbdrv_sound_refill_t pbdrv_sound_stream_refill;
++static void *pbdrv_sound_stream_context;
 +
 +static void pbdrv_sound_set_amplifier(bool enabled) {
 +    const pbdrv_sound_stm32_hal_dac_platform_data_t *pdata = &pbdrv_sound_stm32_hal_dac_platform_data;
@@ -27,7 +70,7 @@ index 28742ba..040120b 100644
 
  void pbdrv_sound_init(void) {
      const pbdrv_sound_stm32_hal_dac_platform_data_t *pdata = &pbdrv_sound_stm32_hal_dac_platform_data;
-@@ -26,7 +37,7 @@ void pbdrv_sound_init(void) {
+@@ -26,7 +44,7 @@ void pbdrv_sound_init(void) {
      gpio_init.Pull = GPIO_NOPULL;
      gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
      HAL_GPIO_Init(pdata->enable_gpio_bank, &gpio_init);
@@ -36,7 +79,7 @@ index 28742ba..040120b 100644
 
      pbdrv_sound_hdma.Instance = pdata->dma;
      pbdrv_sound_hdma.Init.Channel = pdata->dma_ch;
-@@ -71,20 +82,78 @@ void pbdrv_sound_init(void) {
+@@ -71,20 +89,166 @@ void pbdrv_sound_init(void) {
      HAL_NVIC_EnableIRQ(pdata->dma_irq);
  }
 
@@ -52,6 +95,8 @@ index 28742ba..040120b 100644
 +    HAL_DMA_Init(&pbdrv_sound_hdma);
 +
 +    pbdrv_sound_once = mode == DMA_NORMAL;
++    pbdrv_sound_stream = false;
++    pbdrv_sound_cleanup_pending = false;
 +    pbdrv_sound_active = true;
 +    pbdrv_sound_set_amplifier(true);
      pbdrv_sound_htim.Init.Period = pdata->tim_clock_rate / sample_rate - 1;
@@ -67,6 +112,40 @@ index 28742ba..040120b 100644
 +    pbdrv_sound_start_with_mode(data, length, sample_rate, DMA_NORMAL);
 +}
 +
++void pbdrv_sound_start_stream(
++    uint16_t *data,
++    uint32_t chunk_size,
++    uint32_t chunk_count,
++    uint32_t sample_rate,
++    pbdrv_sound_refill_t refill,
++    void *context) {
++
++    const pbdrv_sound_stm32_hal_dac_platform_data_t *pdata = &pbdrv_sound_stm32_hal_dac_platform_data;
++
++    pbdrv_sound_stop();
++    pbdrv_sound_hdma.Init.Mode = DMA_CIRCULAR;
++    HAL_DMA_Init(&pbdrv_sound_hdma);
++
++    pbdrv_sound_once = false;
++    pbdrv_sound_stream = true;
++    pbdrv_sound_cleanup_pending = false;
++    pbdrv_sound_stream_chunks_remaining = chunk_count;
++    pbdrv_sound_stream_data = data;
++    pbdrv_sound_stream_chunk_size = chunk_size;
++    pbdrv_sound_stream_refill = refill;
++    pbdrv_sound_stream_context = context;
++    pbdrv_sound_active = true;
++    pbdrv_sound_set_amplifier(true);
++    pbdrv_sound_htim.Init.Period = pdata->tim_clock_rate / sample_rate - 1;
++    HAL_TIM_Base_Init(&pbdrv_sound_htim);
++    HAL_DAC_Start_DMA(
++        &pbdrv_sound_hdac,
++        pdata->dac_ch,
++        (uint32_t *)data,
++        chunk_size * 2,
++        DAC_ALIGN_12B_L);
++}
++
 +bool pbdrv_sound_is_active(void) {
 +    return pbdrv_sound_active;
 +}
@@ -78,13 +157,17 @@ index 28742ba..040120b 100644
 +    // Prevent the completion callback racing HAL_DAC_Stop_DMA(). The SysTick
 +    // remains enabled, so the HAL's bounded abort wait still works.
 +    HAL_NVIC_DisableIRQ(pdata->dma_irq);
-+    if (!pbdrv_sound_active) {
++    if (!pbdrv_sound_active && !pbdrv_sound_cleanup_pending) {
 +        HAL_NVIC_ClearPendingIRQ(pdata->dma_irq);
 +        HAL_NVIC_EnableIRQ(pdata->dma_irq);
 +        return;
 +    }
 +    pbdrv_sound_active = false;
 +    pbdrv_sound_once = false;
++    pbdrv_sound_stream = false;
++    pbdrv_sound_cleanup_pending = false;
++    pbdrv_sound_stream_refill = NULL;
++    pbdrv_sound_stream_context = NULL;
 +    pbdrv_sound_set_amplifier(false);
      HAL_DAC_Stop_DMA(&pbdrv_sound_hdac, pdata->dac_ch);
 +    HAL_NVIC_ClearPendingIRQ(pdata->dma_irq);
@@ -108,21 +191,69 @@ index 28742ba..040120b 100644
 +    pbdrv_sound_set_amplifier(false);
 +}
 +
++static void pbdrv_sound_finish_stream(DAC_HandleTypeDef *hdac) {
++    const pbdrv_sound_stm32_hal_dac_platform_data_t *pdata = &pbdrv_sound_stm32_hal_dac_platform_data;
++
++    if (hdac != &pbdrv_sound_hdac || !pbdrv_sound_stream) {
++        return;
++    }
++
++    pbdrv_sound_stream = false;
++    pbdrv_sound_active = false;
++    pbdrv_sound_cleanup_pending = true;
++    hdac->Instance->CR &= ~(DAC_CR_DMAEN1 << pdata->dac_ch);
++    __HAL_DAC_DISABLE(hdac, pdata->dac_ch);
++    __HAL_DMA_DISABLE(&pbdrv_sound_hdma);
++    pbdrv_sound_set_amplifier(false);
++}
++
++static void pbdrv_sound_stream_boundary(DAC_HandleTypeDef *hdac, uint16_t *consumed) {
++    if (hdac != &pbdrv_sound_hdac || !pbdrv_sound_stream) {
++        return;
++    }
++
++    pbdrv_sound_stream_chunks_remaining--;
++    if (!pbdrv_sound_stream_chunks_remaining) {
++        pbdrv_sound_finish_stream(hdac);
++        return;
++    }
++
++    // The other half is now playing. Refill this consumed half only when a
++    // future chunk remains beyond the half that is already active.
++    if (pbdrv_sound_stream_chunks_remaining > 1) {
++        pbdrv_sound_stream_refill(
++            consumed,
++            pbdrv_sound_stream_chunk_size,
++            pbdrv_sound_stream_context);
++    }
++}
++
++void HAL_DAC_ConvHalfCpltCallbackCh1(DAC_HandleTypeDef *hdac) {
++    pbdrv_sound_stream_boundary(hdac, pbdrv_sound_stream_data);
++}
++
 +void HAL_DAC_ConvCpltCallbackCh1(DAC_HandleTypeDef *hdac) {
++    if (pbdrv_sound_stream) {
++        pbdrv_sound_stream_boundary(
++            hdac,
++            pbdrv_sound_stream_data + pbdrv_sound_stream_chunk_size);
++        return;
++    }
 +    pbdrv_sound_finish_once(hdac);
 +}
 +
 +void HAL_DAC_ErrorCallbackCh1(DAC_HandleTypeDef *hdac) {
 +    // A failed one-shot must not leave wait=True blocked or the amplifier on.
++    pbdrv_sound_finish_stream(hdac);
 +    pbdrv_sound_finish_once(hdac);
  }
 
  void pbdrv_sound_stm32_hal_dac_handle_dma_irq(void) {
 diff --git a/lib/pbio/include/pbdrv/sound.h b/lib/pbio/include/pbdrv/sound.h
-index 8b88af0..c25cc4f 100644
+index 8b88af0..0c762b0 100644
 --- a/lib/pbio/include/pbdrv/sound.h
 +++ b/lib/pbio/include/pbdrv/sound.h
-@@ -9,6 +9,7 @@
+@@ -9,11 +9,13 @@
  #ifndef _PBDRV_SOUND_H_
  #define _PBDRV_SOUND_H_
 
@@ -130,7 +261,13 @@ index 8b88af0..c25cc4f 100644
  #include <stdint.h>
 
  #include <pbdrv/config.h>
-@@ -34,6 +35,22 @@ void pbdrv_beep_start(uint32_t frequency, uint16_t sample_attenuator);
+ #include <pbio/error.h>
+
++typedef void (*pbdrv_sound_refill_t)(uint16_t *data, uint32_t length, void *context);
+
+ #if PBDRV_CONFIG_SOUND
+
+@@ -34,6 +36,44 @@ void pbdrv_beep_start(uint32_t frequency, uint16_t sample_attenuator);
   * @param [in]  sample_rate The sample rate of @p data in Hz.
   */
  void pbdrv_sound_start(const uint16_t *data, uint32_t length, uint32_t sample_rate);
@@ -145,6 +282,28 @@ index 8b88af0..c25cc4f 100644
 +void pbdrv_sound_start_once(const uint16_t *data, uint32_t length, uint32_t sample_rate);
 +
 +/**
++ * Starts a finite, gapless circular-DMA stream.
++ *
++ * The caller must preload both halves of @p data. At each half-buffer
++ * boundary, @p refill is called from the sound DMA interrupt to refill the
++ * half that was just consumed. Playback stops after @p chunk_count halves.
++ *
++ * @param [in,out] data        Two equally-sized PCM chunks.
++ * @param [in]     chunk_size  Samples per chunk (half the DMA buffer).
++ * @param [in]     chunk_count Number of chunks to play.
++ * @param [in]     sample_rate Sample rate in Hz.
++ * @param [in]     refill      Interrupt-context refill callback.
++ * @param [in]     context     Context passed to @p refill.
++ */
++void pbdrv_sound_start_stream(
++    uint16_t *data,
++    uint32_t chunk_size,
++    uint32_t chunk_count,
++    uint32_t sample_rate,
++    pbdrv_sound_refill_t refill,
++    void *context);
++
++/**
 + * Tests whether a sound is currently playing.
 + *
 + * @return Whether the sound driver is using its current sample buffer.
@@ -153,11 +312,20 @@ index 8b88af0..c25cc4f 100644
  #endif
 
  /**
-@@ -50,6 +67,13 @@ static inline void pbdrv_beep_start(uint32_t frequency, uint16_t sample_attenuat
+@@ -50,6 +90,22 @@ static inline void pbdrv_beep_start(uint32_t frequency, uint16_t sample_attenuat
  static inline void pbdrv_sound_start(const uint16_t *data, uint32_t length, uint32_t sample_rate) {
  }
 
 +static inline void pbdrv_sound_start_once(const uint16_t *data, uint32_t length, uint32_t sample_rate) {
++}
++
++static inline void pbdrv_sound_start_stream(
++    uint16_t *data,
++    uint32_t chunk_size,
++    uint32_t chunk_count,
++    uint32_t sample_rate,
++    pbdrv_sound_refill_t refill,
++    void *context) {
 +}
 +
 +static inline bool pbdrv_sound_is_active(void) {
@@ -167,11 +335,74 @@ index 8b88af0..c25cc4f 100644
  static inline void pbdrv_sound_stop(void) {
  }
 
+diff --git a/lib/pbio/platform/prime_hub/pbdrvconfig.h b/lib/pbio/platform/prime_hub/pbdrvconfig.h
+index f29a153..2cd932e 100644
+--- a/lib/pbio/platform/prime_hub/pbdrvconfig.h
++++ b/lib/pbio/platform/prime_hub/pbdrvconfig.h
+@@ -33,6 +33,7 @@
+ #define PBDRV_CONFIG_BLUETOOTH_BTSTACK_NUM_LE_HOSTS (2)
+ #define PBDRV_CONFIG_BLUETOOTH_BTSTACK_STM32        (1)
+ #define PBDRV_CONFIG_BLUETOOTH_BTSTACK_CC2564C      (1)
++#define PBDRV_CONFIG_BLUETOOTH_BTSTACK_HOST_CONNECTION_INTERVAL (12)
+ #define PBDRV_CONFIG_BLUETOOTH_BTSTACK_HUB_KIND     LWP3_HUB_KIND_TECHNIC_LARGE
+ #define PBDRV_CONFIG_BLUETOOTH_BTSTACK_HUB_VARIANT_ADDR 0x08007d80
+
+diff --git a/lib/pbio/platform/prime_hub/platform.c b/lib/pbio/platform/prime_hub/platform.c
+index 7704342..11adea8 100644
+--- a/lib/pbio/platform/prime_hub/platform.c
++++ b/lib/pbio/platform/prime_hub/platform.c
+@@ -661,7 +661,7 @@ const pbdrv_sound_stm32_hal_dac_platform_data_t pbdrv_sound_stm32_hal_dac_platfo
+     .dma_ch = DMA_CHANNEL_7,
+     .dma_irq = DMA1_Stream5_IRQn,
+     .tim = TIM6,
+-    .tim_clock_rate = 48000000, // APB1: 48MHz
++    .tim_clock_rate = 96000000, // TIM6 is 2 x 48MHz PCLK1
+ };
+
+ void HAL_DAC_MspInit(DAC_HandleTypeDef *hdac) {
 diff --git a/pybricks/common/pb_type_speaker.c b/pybricks/common/pb_type_speaker.c
-index 650d4c5..f163d2e 100644
+index 650d4c5..a7f7925 100644
 --- a/pybricks/common/pb_type_speaker.c
 +++ b/pybricks/common/pb_type_speaker.c
-@@ -41,6 +41,11 @@ typedef struct {
+@@ -25,6 +25,37 @@
+ #include <pybricks/util_mp/pb_obj_helper.h>
+ #include <pybricks/util_pb/pb_error.h>
+
++#if PYBRICKS_HUB_PRIMEHUB && PBDRV_CONFIG_SOUND_SAMPLED
++#define PB_TYPE_SPEAKER_ADPCM_HEADER_SIZE (7)
++#define PB_TYPE_SPEAKER_ADPCM_MAX_SAMPLES (128000)
++#define PB_TYPE_SPEAKER_ADPCM_MAX_BYTES (64007)
++#define PB_TYPE_SPEAKER_ADPCM_CHUNK_SIZE (256)
++
++typedef struct {
++    const uint8_t *data;
++    uint32_t sample_count;
++    uint32_t sample_index;
++    int32_t predictor;
++    uint8_t step_index;
++} pb_type_Speaker_adpcm_state_t;
++
++static const uint16_t pb_type_Speaker_adpcm_steps[] = {
++    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
++    34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
++    130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371,
++    408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166,
++    1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024,
++    3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845,
++    8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500,
++    20350, 22385, 24623, 27086, 29794, 32767,
++};
++
++// Circular DMA plays one half while the interrupt refills the other. This is
++// one KiB of fixed RAM and bounds the final silence padding below 16 ms at
++// 16 kHz, independent of utterance length.
++static uint16_t pb_type_Speaker_adpcm_ring[PB_TYPE_SPEAKER_ADPCM_CHUNK_SIZE * 2];
++#endif
++
+ typedef struct {
+     mp_obj_base_t base;
+
+@@ -41,6 +72,12 @@ typedef struct {
      // The number to multiply the sample amplitude by, to attenuate the amplitude based on the defined speaker volume.
      // The original sample amplitude must be in the -1..1 range.
      uint16_t sample_attenuator;
@@ -179,11 +410,12 @@ index 650d4c5..f163d2e 100644
 +    #if PYBRICKS_HUB_PRIMEHUB && PBDRV_CONFIG_SOUND_SAMPLED
 +    // Keeps the buffer used by the sound DMA alive until playback completes.
 +    mp_obj_t sample_data;
++    pb_type_Speaker_adpcm_state_t adpcm_state;
 +    #endif
  } pb_type_Speaker_obj_t;
 
  static mp_obj_t pb_type_Speaker_volume(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-@@ -72,11 +77,20 @@ static mp_obj_t pb_type_Speaker_make_new(const mp_obj_type_t *type, size_t n_arg
+@@ -72,11 +109,20 @@ static mp_obj_t pb_type_Speaker_make_new(const mp_obj_type_t *type, size_t n_arg
 
      self->iter = NULL;
 
@@ -204,7 +436,7 @@ index 650d4c5..f163d2e 100644
      return mp_const_none;
  }
 
-@@ -100,6 +114,10 @@ static mp_obj_t pb_type_Speaker_beep(size_t n_args, const mp_obj_t *pos_args, mp
+@@ -100,6 +146,10 @@ static mp_obj_t pb_type_Speaker_beep(size_t n_args, const mp_obj_t *pos_args, mp
      mp_int_t duration = pb_obj_get_int(duration_in);
 
      pbdrv_beep_start(frequency, self->sample_attenuator);
@@ -215,7 +447,7 @@ index 650d4c5..f163d2e 100644
 
      if (duration < 0) {
          return mp_const_none;
-@@ -118,6 +136,90 @@ static mp_obj_t pb_type_Speaker_beep(size_t n_args, const mp_obj_t *pos_args, mp
+@@ -118,6 +168,271 @@ static mp_obj_t pb_type_Speaker_beep(size_t n_args, const mp_obj_t *pos_args, mp
  }
  static MP_DEFINE_CONST_FUN_OBJ_KW(pb_type_Speaker_beep_obj, 1, pb_type_Speaker_beep);
 
@@ -226,9 +458,185 @@ index 650d4c5..f163d2e 100644
 +    if (pbdrv_sound_is_active()) {
 +        return PBIO_ERROR_AGAIN;
 +    }
++    // A finite circular stream disables itself in the interrupt and leaves
++    // HAL cleanup for safe thread context here.
++    pbdrv_sound_stop();
 +    self->sample_data = mp_const_none;
 +    return PBIO_SUCCESS;
 +}
++
++static uint16_t pb_type_Speaker_fletcher16(const uint8_t *data, uint32_t byte_count) {
++    uint32_t sum1 = 0;
++    uint32_t sum2 = 0;
++    for (uint32_t i = 0; i < byte_count; i++) {
++        sum1 += data[i];
++        if (sum1 >= 255) {
++            sum1 -= 255;
++        }
++        sum2 += sum1;
++        if (sum2 >= 255) {
++            sum2 -= 255;
++        }
++    }
++    return sum2 << 8 | sum1;
++}
++
++static void pb_type_Speaker_adpcm_start(pb_type_Speaker_adpcm_state_t *state) {
++    const uint8_t *data = state->data;
++    state->predictor = data[0] | data[1] << 8;
++    if (state->predictor >= 0x8000) {
++        state->predictor -= 0x10000;
++    }
++    state->step_index = data[2];
++    state->sample_index = 0;
++}
++
++static void pb_type_Speaker_adpcm_refill(uint16_t *output, uint32_t length, void *context) {
++    pb_type_Speaker_adpcm_state_t *state = context;
++
++    for (uint32_t i = 0; i < length; i++) {
++        if (state->sample_index >= state->sample_count) {
++            output[i] = 32768;
++            continue;
++        }
++
++        if (!state->sample_index) {
++            output[i] = state->predictor + 32768;
++            state->sample_index++;
++            continue;
++        }
++
++        const uint8_t *data = state->data;
++        uint32_t code_index = state->sample_index - 1;
++        uint8_t code = data[PB_TYPE_SPEAKER_ADPCM_HEADER_SIZE + (code_index >> 1)];
++        if (code_index & 1) {
++            code >>= 4;
++        }
++        code &= 0x0f;
++
++        int32_t step = pb_type_Speaker_adpcm_steps[state->step_index];
++        int32_t difference = step >> 3;
++        if (code & 4) {
++            difference += step;
++        }
++        if (code & 2) {
++            difference += step >> 1;
++        }
++        if (code & 1) {
++            difference += step >> 2;
++        }
++        state->predictor += code & 8 ? -difference : difference;
++        if (state->predictor < -32768) {
++            state->predictor = -32768;
++        } else if (state->predictor > 32767) {
++            state->predictor = 32767;
++        }
++
++        uint8_t magnitude = code & 7;
++        int32_t step_index = state->step_index;
++        step_index += magnitude < 4 ? -1 : (magnitude - 3) * 2;
++        if (step_index < 0) {
++            step_index = 0;
++        } else if (step_index > 88) {
++            step_index = 88;
++        }
++        state->step_index = step_index;
++        state->sample_index++;
++        output[i] = state->predictor + 32768;
++    }
++}
++
++/**
++ * Plays one immutable ima_adpcm4_mono_stream_v1 buffer as a gapless DMA stream.
++ * Header: signed predictor LE, step index, uint32 sample count LE.
++ */
++static mp_obj_t pb_type_Speaker_play_adpcm(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
++    PB_PARSE_ARGS_METHOD(n_args, pos_args, kw_args,
++        pb_type_Speaker_obj_t, self,
++        PB_ARG_REQUIRED(payload),
++        PB_ARG_REQUIRED(byte_count),
++        PB_ARG_REQUIRED(sample_count),
++        PB_ARG_REQUIRED(fletcher16),
++        PB_ARG_DEFAULT_INT(sample_rate, 16000),
++        PB_ARG_DEFAULT_TRUE(wait));
++
++    if (pb_obj_get_int(sample_rate_in) != 16000) {
++        mp_raise_ValueError(MP_ERROR_TEXT("sample_rate must be 16000"));
++    }
++    if (!mp_obj_is_type(payload_in, &mp_type_bytes)) {
++        mp_raise_TypeError(MP_ERROR_TEXT("payload must be bytes"));
++    }
++
++    mp_buffer_info_t payload;
++    mp_get_buffer_raise(payload_in, &payload, MP_BUFFER_READ);
++    mp_int_t byte_count = pb_obj_get_int(byte_count_in);
++    mp_int_t expected_sample_count = pb_obj_get_int(sample_count_in);
++    mp_int_t expected_checksum = pb_obj_get_int(fletcher16_in);
++    if (
++        byte_count < PB_TYPE_SPEAKER_ADPCM_HEADER_SIZE
++        || byte_count > PB_TYPE_SPEAKER_ADPCM_MAX_BYTES
++        || byte_count > (mp_int_t)payload.len
++        || expected_sample_count < 1
++        || expected_sample_count > PB_TYPE_SPEAKER_ADPCM_MAX_SAMPLES
++        || expected_checksum < 0
++        || expected_checksum > UINT16_MAX) {
++        mp_raise_ValueError(MP_ERROR_TEXT("ADPCM metadata is invalid"));
++    }
++
++    const uint8_t *data = payload.buf;
++    if (pb_type_Speaker_fletcher16(data, byte_count) != expected_checksum) {
++        mp_raise_ValueError(MP_ERROR_TEXT("ADPCM checksum mismatch"));
++    }
++    uint32_t sample_count = (uint32_t)data[3]
++        | (uint32_t)data[4] << 8
++        | (uint32_t)data[5] << 16
++        | (uint32_t)data[6] << 24;
++    if (
++        data[2] > 88
++        || !sample_count
++        || sample_count > PB_TYPE_SPEAKER_ADPCM_MAX_SAMPLES
++        || sample_count != (uint32_t)expected_sample_count
++        || (uint32_t)byte_count != PB_TYPE_SPEAKER_ADPCM_HEADER_SIZE + sample_count / 2
++        || (!(sample_count & 1) && data[byte_count - 1] & 0xf0)) {
++        mp_raise_ValueError(MP_ERROR_TEXT("invalid ima_adpcm4_mono_stream_v1 payload"));
++    }
++
++    // Validation does not disturb an existing sound. Once known-safe, stop it
++    // before reusing the singleton state and circular PCM ring.
++    pbdrv_sound_stop();
++    self->sample_data = payload_in;
++    self->adpcm_state.data = data;
++    self->adpcm_state.sample_count = sample_count;
++    pb_type_Speaker_adpcm_start(&self->adpcm_state);
++    pb_type_Speaker_adpcm_refill(
++        pb_type_Speaker_adpcm_ring,
++        PB_TYPE_SPEAKER_ADPCM_CHUNK_SIZE * 2,
++        &self->adpcm_state);
++
++    uint32_t chunk_count = (
++        sample_count + PB_TYPE_SPEAKER_ADPCM_CHUNK_SIZE - 1
++        ) / PB_TYPE_SPEAKER_ADPCM_CHUNK_SIZE;
++    pbdrv_sound_start_stream(
++        pb_type_Speaker_adpcm_ring,
++        PB_TYPE_SPEAKER_ADPCM_CHUNK_SIZE,
++        chunk_count,
++        16000,
++        pb_type_Speaker_adpcm_refill,
++        &self->adpcm_state);
++
++    if (!mp_obj_is_true(wait_in)) {
++        pb_type_async_schedule_stop_iteration(self->iter);
++        return mp_const_none;
++    }
++
++    pb_type_async_t config = {
++        .parent_obj = MP_OBJ_FROM_PTR(self),
++        .iter_once = pb_type_Speaker_play_samples_iterate_once,
++        .close = pb_type_Speaker_close,
++    };
++    return pb_type_async_wait_or_await(&config, &self->iter, true);
++}
++static MP_DEFINE_CONST_FUN_OBJ_KW(pb_type_Speaker_play_adpcm_obj, 1, pb_type_Speaker_play_adpcm);
 +
 +/**
 + * Plays one little-endian byte buffer of unsigned 16-bit PCM samples.
@@ -241,6 +649,7 @@ index 650d4c5..f163d2e 100644
 +        pb_type_Speaker_obj_t, self,
 +        PB_ARG_REQUIRED(samples),
 +        PB_ARG_DEFAULT_INT(sample_rate, 8000),
++        PB_ARG_DEFAULT_NONE(sample_count),
 +        PB_ARG_DEFAULT_TRUE(wait));
 +
 +    mp_int_t sample_rate = pb_obj_get_int(sample_rate_in);
@@ -249,8 +658,8 @@ index 650d4c5..f163d2e 100644
 +    }
 +
 +    mp_buffer_info_t sample_buffer;
-+    if (!mp_obj_is_type(samples_in, &mp_type_bytearray)) {
-+        mp_raise_TypeError(MP_ERROR_TEXT("samples must be bytearray u16le"));
++    if (!mp_obj_is_type(samples_in, &mp_type_bytes) && !mp_obj_is_type(samples_in, &mp_type_bytearray)) {
++        mp_raise_TypeError(MP_ERROR_TEXT("samples must be bytes or bytearray u16le"));
 +    }
 +    mp_get_buffer_raise(samples_in, &sample_buffer, MP_BUFFER_READ);
 +    if (sample_buffer.len % sizeof(uint16_t)) {
@@ -260,9 +669,12 @@ index 650d4c5..f163d2e 100644
 +        mp_raise_ValueError(MP_ERROR_TEXT("samples must be 16-bit aligned"));
 +    }
 +
-+    uint32_t sample_count = sample_buffer.len / sizeof(uint16_t);
-+    if (sample_count == 0) {
-+        mp_raise_ValueError(MP_ERROR_TEXT("samples must not be empty"));
++    mp_int_t buffer_sample_count = sample_buffer.len / sizeof(uint16_t);
++    mp_int_t sample_count = sample_count_in == mp_const_none
++        ? buffer_sample_count
++        : pb_obj_get_int(sample_count_in);
++    if (sample_count < 1 || sample_count > buffer_sample_count) {
++        mp_raise_ValueError(MP_ERROR_TEXT("sample_count out of range"));
 +    }
 +    // STM32 DMA NDTR is 16-bit, so one transfer cannot exceed 65535 samples.
 +    if (sample_count > UINT16_MAX) {
@@ -270,7 +682,7 @@ index 650d4c5..f163d2e 100644
 +    }
 +
 +    self->sample_data = samples_in;
-+    pbdrv_sound_start_once(sample_buffer.buf, sample_count, sample_rate);
++    pbdrv_sound_start_once(sample_buffer.buf, (uint32_t)sample_count, sample_rate);
 +
 +    if (!mp_obj_is_true(wait_in)) {
 +        pb_type_async_schedule_stop_iteration(self->iter);
@@ -291,6 +703,7 @@ index 650d4c5..f163d2e 100644
 +    pb_type_Speaker_obj_t *self = MP_OBJ_TO_PTR(self_in);
 +    bool done = !pbdrv_sound_is_active();
 +    if (done) {
++        pbdrv_sound_stop();
 +        self->sample_data = mp_const_none;
 +    }
 +    return mp_obj_new_bool(done);
@@ -306,7 +719,7 @@ index 650d4c5..f163d2e 100644
  static void pb_type_Speaker_get_note(mp_obj_t obj, uint32_t note_ms, uint32_t *frequency, uint32_t *total_ms, uint32_t *on_ms) {
      const char *note = mp_obj_str_get_str(obj);
      int pos = 0;
-@@ -297,6 +399,10 @@ static pbio_error_t pb_type_Speaker_play_notes_iterate_once(pbio_os_state_t *sta
+@@ -297,6 +612,10 @@ static pbio_error_t pb_type_Speaker_play_notes_iterate_once(pbio_os_state_t *sta
 
          // On portion of the note.
          pbdrv_beep_start(frequency, self->sample_attenuator);
@@ -317,12 +730,13 @@ index 650d4c5..f163d2e 100644
          pbio_os_timer_set(&self->timer, beep_time);
          PBIO_OS_AWAIT_UNTIL(state, pbio_os_timer_is_expired(&self->timer));
 
-@@ -331,6 +437,11 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(pb_type_Speaker_play_notes_obj, 1, pb_type_Spe
+@@ -331,6 +650,12 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(pb_type_Speaker_play_notes_obj, 1, pb_type_Spe
  static const mp_rom_map_elem_t pb_type_Speaker_locals_dict_table[] = {
      { MP_ROM_QSTR(MP_QSTR_volume), MP_ROM_PTR(&pb_type_Speaker_volume_obj) },
      { MP_ROM_QSTR(MP_QSTR_beep), MP_ROM_PTR(&pb_type_Speaker_beep_obj) },
 +    #if PYBRICKS_HUB_PRIMEHUB && PBDRV_CONFIG_SOUND_SAMPLED
 +    { MP_ROM_QSTR(MP_QSTR_play_samples), MP_ROM_PTR(&pb_type_Speaker_play_samples_obj) },
++    { MP_ROM_QSTR(MP_QSTR_play_adpcm), MP_ROM_PTR(&pb_type_Speaker_play_adpcm_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_done), MP_ROM_PTR(&pb_type_Speaker_done_obj) },
 +    { MP_ROM_QSTR(MP_QSTR_stop), MP_ROM_PTR(&pb_type_Speaker_stop_obj) },
 +    #endif

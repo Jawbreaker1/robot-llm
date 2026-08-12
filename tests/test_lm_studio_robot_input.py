@@ -6,6 +6,10 @@ from robot_agent.lm_studio import (
     LMStudioConfigurationError,
     LMStudioInputError,
 )
+from robot_agent.blast_personality import (
+    BLAST_PERSONA_BY_LOCALE,
+    MAX_PERSONA_CHARS,
+)
 from robot_agent.lm_studio_robot_input import (
     CHAT_COMPLETIONS_PATH,
     CLARIFY,
@@ -182,6 +186,43 @@ class LMStudioRobotInputTests(unittest.TestCase):
                 )
                 self.assertEqual(len(transport.calls), 1)
 
+    def test_blast_persona_changes_only_the_locale_specific_system_prompt(self):
+        default_model, default_transport = self.model()
+        blast_model, blast_transport = self.model(
+            reply_persona_by_locale=BLAST_PERSONA_BY_LOCALE
+        )
+
+        default_model.interpret(robot_input(), {"distance_mm": 480})
+        blast_model.interpret(robot_input(), {"distance_mm": 480})
+
+        default_payload = json.loads(default_transport.calls[0][1])
+        blast_payload = json.loads(blast_transport.calls[0][1])
+        default_prompt = default_payload["messages"][0]["content"]
+        blast_prompt = blast_payload["messages"][0]["content"]
+        self.assertTrue(blast_prompt.startswith(default_prompt))
+        self.assertIn(BLAST_PERSONA_BY_LOCALE["sv"], blast_prompt)
+        self.assertNotIn(BLAST_PERSONA_BY_LOCALE["en"], blast_prompt)
+        for guardrail in (
+            "only to the wording and tone of reply_text",
+            "never influence intent",
+            "sensor facts",
+            "safety",
+            "whether reply_text must be null",
+        ):
+            self.assertIn(guardrail, blast_prompt)
+        blast_payload["messages"][0]["content"] = default_prompt
+        self.assertEqual(blast_payload, default_payload)
+
+        english_model, english_transport = self.model(
+            reply_persona_by_locale=BLAST_PERSONA_BY_LOCALE
+        )
+        english_model.interpret(robot_input("en", "Hello."), {})
+        english_prompt = json.loads(english_transport.calls[0][1])[
+            "messages"
+        ][0]["content"]
+        self.assertIn(BLAST_PERSONA_BY_LOCALE["en"], english_prompt)
+        self.assertNotIn(BLAST_PERSONA_BY_LOCALE["sv"], english_prompt)
+
     def test_bad_nonphysical_reply_uses_same_intent_localized_fallback(self):
         for locale, marker in (("sv", "låtsas"), ("en", "pretend")):
             with self.subTest(locale=locale):
@@ -246,6 +287,17 @@ class LMStudioRobotInputTests(unittest.TestCase):
             {"transport": None},
             {"timeout_seconds": True},
             {"timeout_seconds": 60.1},
+            {"reply_persona_by_locale": {}},
+            {"reply_persona_by_locale": {"sv": "Bara svenska."}},
+            {"reply_persona_by_locale": {
+                "sv": "Svenska.", "en": "English.", "de": "Deutsch."
+            }},
+            {"reply_persona_by_locale": ("sv", "en")},
+            {"reply_persona_by_locale": {"sv": " Svenska.", "en": "English."}},
+            {"reply_persona_by_locale": {"sv": "Svenska.\n", "en": "English."}},
+            {"reply_persona_by_locale": {
+                "sv": "x" * (MAX_PERSONA_CHARS + 1), "en": "English."
+            }},
         )
         for options in invalid:
             with self.subTest(options=options), self.assertRaises(LMStudioConfigurationError):

@@ -43,14 +43,14 @@ from robot_agent.physical_odometry import PhysicalPose
 from robot_agent.robot_control_contract import RobotRuntimeUpdate
 
 
-def decision(action, *, plan=(), assessment="ok"):
+def decision(action, *, plan=(), assessment="ok", utterance=None):
     return ControllerActionPlannerResult(
         decision=ControllerActionDecision(
             action=action,
             confidence_milli=900,
             assessment=assessment,
             plan=tuple(plan),
-            utterance=None,
+            utterance=utterance,
         ),
         latency_ms=12,
     )
@@ -367,6 +367,164 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 Planner([]),
                 speech_locales=("sv",),
             )
+
+    def test_validated_planner_utterance_overlaps_next_navigation_step(self):
+        controller = FakeController(500)
+        planner = Planner([
+            decision(
+                "ADVANCE",
+                assessment="Move one bounded pulse.",
+                utterance="Jag rullar. Försök att hänga med.",
+            ),
+            decision(COMPLETE, assessment="done"),
+        ])
+        context, updates = episode_context()
+        context.settings.speech_enabled = True
+
+        class SpeechRecorder:
+            def __init__(self):
+                self.started = False
+                self.offers = []
+                self.cancelled = []
+                self.closed = False
+
+            def start(self):
+                self.started = True
+
+            def offer(self, **offer):
+                self.assert_action_was_verified = list(controller.commands)
+                self.offers.append(dict(offer))
+                return len(self.offers)
+
+            def cancel_episode(self, episode_id):
+                self.cancelled.append(episode_id)
+
+            def close(self, **_options):
+                self.closed = True
+                return True
+
+        speech = SpeechRecorder()
+        adapter = self.adapter(
+            controller,
+            planner,
+            speech_runtime_factory=lambda **_kwargs: speech,
+            speech_locales=("sv", "en"),
+        )
+
+        result = adapter.run(context)
+
+        self.assertTrue(result.completed)
+        self.assertTrue(speech.started)
+        self.assertEqual(speech.assert_action_was_verified, ["drive_forward"])
+        self.assertEqual(len(speech.offers), 1)
+        self.assertEqual(
+            speech.offers[0]["text"],
+            "Jag rullar. Försök att hänga med.",
+        )
+        self.assertEqual(speech.offers[0]["progress_revision"], 1)
+        self.assertEqual(speech.cancelled, ["episode-1"])
+        self.assertTrue(speech.closed)
+        self.assertNotIn(
+            "failed",
+            [update.get("speech_status") for update in updates],
+        )
+
+    def test_speech_failure_does_not_invalidate_verified_navigation(self):
+        controller = FakeController(500)
+        planner = Planner([
+            decision("ADVANCE", utterance="Det här går säkert bra."),
+            decision(COMPLETE, assessment="done"),
+        ])
+        context, updates = episode_context()
+        context.settings.speech_enabled = True
+
+        class FailingSpeech:
+            def start(self):
+                return None
+
+            def offer(self, **_offer):
+                raise RuntimeError("injected speech failure")
+
+            def cancel_episode(self, _episode_id):
+                return None
+
+            def close(self, **_options):
+                return True
+
+        result = self.adapter(
+            controller,
+            planner,
+            speech_runtime_factory=lambda **_kwargs: FailingSpeech(),
+            speech_locales=("en",),
+        ).run(context)
+
+        self.assertTrue(result.completed)
+        self.assertEqual(controller.commands, ["drive_forward"])
+        self.assertIn(
+            "failed",
+            [update.get("speech_status") for update in updates],
+        )
+
+    def test_muted_episode_does_not_construct_speech_runtime(self):
+        context, _updates = episode_context()
+        context.settings.speech_enabled = False
+
+        def forbidden_factory(**_kwargs):
+            raise AssertionError("muted episode constructed speech")
+
+        result = self.adapter(
+            FakeController(500),
+            Planner([decision(COMPLETE, assessment="done")]),
+            speech_runtime_factory=forbidden_factory,
+            speech_locales=("en",),
+        ).run(context)
+
+        self.assertTrue(result.completed)
+
+    def test_unreaped_speech_disables_only_speech_not_later_navigation(self):
+        for start_raises in (False, True):
+            with self.subTest(start_raises=start_raises):
+                calls = []
+
+                class UnreapedSpeech:
+                    def start(self):
+                        if start_raises:
+                            raise RuntimeError("injected speech start failure")
+
+                    def offer(self, **_offer):
+                        return 1
+
+                    def cancel_episode(self, _episode_id):
+                        return None
+
+                    def close(self, **_options):
+                        return False
+
+                def factory(**_kwargs):
+                    calls.append(True)
+                    return UnreapedSpeech()
+
+                adapter = self.adapter(
+                    FakeController(500),
+                    Planner([
+                        decision(COMPLETE, assessment="first"),
+                        decision(COMPLETE, assessment="second"),
+                    ]),
+                    speech_runtime_factory=factory,
+                    speech_locales=("en",),
+                )
+                first, _updates = episode_context()
+                first.settings.speech_enabled = True
+                second, _updates = episode_context()
+                second.episode_id = "episode-2"
+                second.settings.speech_enabled = True
+
+                first_result = adapter.run(first)
+                second_result = adapter.run(second)
+
+                self.assertTrue(first_result.completed)
+                self.assertTrue(second_result.completed)
+                self.assertEqual(calls, [True])
 
     def test_replans_after_each_bounded_action_and_completes(self):
         controller = FakeController(500)
@@ -2776,10 +2934,29 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         controller = FakeScanController(1_000)
         planner = Planner([
             decision(SCAN_FRONT_ARC),
-            decision(TURN_LEFT_90),
+            decision(TURN_LEFT_90, utterance="Jag svänger vänster."),
             decision("ABORT"),
         ])
         context, _updates = episode_context()
+        context.settings.speech_enabled = True
+
+        class SpeechRecorder:
+            def __init__(self):
+                self.offers = []
+
+            def start(self):
+                return None
+
+            def offer(self, **offer):
+                self.offers.append(dict(offer))
+
+            def cancel_episode(self, _episode_id):
+                return None
+
+            def close(self, **_options):
+                return True
+
+        speech = SpeechRecorder()
 
         class OneShotPartialTurn:
             def __init__(self):
@@ -2796,7 +2973,12 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         context.stop_requested = OneShotPartialTurn()
 
-        result = self.adapter(controller, planner).run(context)
+        result = self.adapter(
+            controller,
+            planner,
+            speech_runtime_factory=lambda **_kwargs: speech,
+            speech_locales=("en",),
+        ).run(context)
 
         self.assertFalse(result.completed)
         self.assertEqual(
@@ -2808,6 +2990,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             ["scan_front_arc", "turn_left", "turn_left"],
         )
         self.assertEqual(len(planner.contexts), 2)
+        self.assertEqual(speech.offers, [])
 
     def test_unrestored_scan_stops_before_another_planner_turn(self):
         class UnrestoredScanController(FakeScanController):
@@ -3653,6 +3836,59 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(controller.commands, ["stop"])
         self.assertEqual(result[0].terminal_reason, "stopped")
+
+    def test_request_stop_cancels_active_speech_with_same_episode(self):
+        controller = FakeController()
+        entered = threading.Event()
+        release = threading.Event()
+        context, _updates = episode_context()
+        context.settings.speech_enabled = True
+
+        class BlockingPlanner:
+            def decide(self, _context):
+                entered.set()
+                release.wait(2)
+                return decision(COMPLETE, assessment="done")
+
+        class SpeechRecorder:
+            def __init__(self):
+                self.cancelled = []
+
+            def start(self):
+                return None
+
+            def offer(self, **_offer):
+                return 1
+
+            def cancel_episode(self, episode_id):
+                self.cancelled.append(episode_id)
+
+            def close(self, **_options):
+                return True
+
+        speech = SpeechRecorder()
+        adapter = self.adapter(
+            controller,
+            BlockingPlanner(),
+            speech_runtime_factory=lambda **_kwargs: speech,
+            speech_locales=("en",),
+        )
+        results = []
+        worker = threading.Thread(
+            target=lambda: results.append(adapter.run(context))
+        )
+        worker.start()
+        self.assertTrue(entered.wait(1))
+
+        context.stop_requested.set()
+        adapter.request_stop()
+        release.set()
+        worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(controller.commands, ["stop"])
+        self.assertIn("episode-1", speech.cancelled)
+        self.assertEqual(results[0].terminal_reason, "stopped")
 
     def test_rejects_stale_or_nonidle_observation(self):
         for changes, code in (

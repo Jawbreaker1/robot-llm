@@ -2,13 +2,41 @@ import asyncio
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from robot_agent.blast_ble_runtime import (
     BlastBLERuntime,
     BlastBLERuntimeError,
-    default_program_path,
+    PYBRICKS_COMMAND_EVENT_UUID,
+    PYBRICKS_WRITE_APP_DATA_COMMAND,
+    SAMPLED_AUDIO_APP_DATA_READY_POLL_SECONDS,
+    SAMPLED_AUDIO_APP_DATA_READY_WAIT_SECONDS,
+    SAMPLED_AUDIO_MAX_BYTES,
+    SAMPLED_AUDIO_WRITE_PACING_SECONDS,
+    _adpcm_sample_count,
+    _fletcher16,
+    blast_adpcm_duration_ms,
 )
+
+
+def adpcm_block(sample_count, *, predictor=0, step_index=0):
+    payload = bytearray(7 + sample_count // 2)
+    payload[0] = predictor & 0xFF
+    payload[1] = predictor >> 8 & 0xFF
+    payload[2] = step_index
+    payload[3] = sample_count & 0xFF
+    payload[4] = sample_count >> 8 & 0xFF
+    payload[5] = sample_count >> 16 & 0xFF
+    payload[6] = sample_count >> 24
+    return bytes(payload)
+
+
+def adpcm_block_for_size(byte_count):
+    if byte_count == 7:
+        return adpcm_block(1)
+    return adpcm_block((byte_count - 7) * 2)
 
 
 class FakeHub:
@@ -17,11 +45,26 @@ class FakeHub:
         self.connect_count = 0
         self.disconnect_count = 0
         self.run_count = 0
-        self._max_write_size = 100
+        self._max_write_size = 512
+        self.write_without_response_readiness = True
+        self.write_without_response_readiness_calls = 0
+        peripheral = SimpleNamespace(
+            canSendWriteWithoutResponse=(
+                self._can_send_write_without_response
+            )
+        )
+        self._client = SimpleNamespace(
+            _backend=SimpleNamespace(_peripheral=peripheral)
+        )
         self.writes = []
-        self.raw_writes = []
-        self.fragment_write_counts = []
+        self.app_data_writes = []
+        self.sampled_control_write_groups = []
+        self._sampled_control_buffer = bytearray()
+        self._sampled_control_chunks = []
         self.expected_pcm_bytes = None
+        self.expected_pcm_samples = None
+        self.expected_pcm_checksum = None
+        self.app_data = bytearray()
         self.pcm_request = None
         self.lines = asyncio.Queue()
         self.ready = ready or {
@@ -30,14 +73,24 @@ class FakeHub:
             "motion_enabled": True,
             "robot_id": "blast-01",
             "capabilities": {
-                "sampled_audio_v2": {
-                    "sample_rate_hz": 8000,
-                    "encoding": "u16le",
-                    "max_bytes": 32000,
-                    "max_fragment_bytes": 252,
+                "sampled_audio_v5": {
+                    "sample_rate_hz": 16000,
+                    "encoding": "ima_adpcm4_mono_stream_v1",
+                    "max_bytes": 64007,
+                    "transport": "app_data_v1",
+                    "checksum": "fletcher16",
                 }
             },
         }
+
+    def _can_send_write_without_response(self):
+        self.write_without_response_readiness_calls += 1
+        readiness = self.write_without_response_readiness
+        if isinstance(readiness, list):
+            return readiness.pop(0)
+        if isinstance(readiness, BaseException):
+            raise readiness
+        return readiness
 
     async def connect(self):
         self.connected = True
@@ -59,32 +112,30 @@ class FakeHub:
             phase = request["args"]["phase"]
             if phase == "begin":
                 self.expected_pcm_bytes = request["args"]["byte_count"]
+                self.expected_pcm_samples = request["args"]["sample_count"]
+                self.expected_pcm_checksum = request["args"]["fletcher16"]
                 self.pcm_request = request
-                self.received_pcm_bytes = 0
+                self.app_data = bytearray(self.expected_pcm_bytes)
                 result = {
                     "transfer_id": request["id"],
+                    "sample_rate_hz": 16000,
+                    "encoding": "ima_adpcm4_mono_stream_v1",
+                    "sample_count": self.expected_pcm_samples,
                     "byte_count": self.expected_pcm_bytes,
-                    "max_fragment_bytes": 252,
+                    "fletcher16": self.expected_pcm_checksum,
                 }
                 response_phase = "begun"
-            elif phase == "fragment":
-                self.pcm_fragment = request
-                self.fragment_raw_writes = []
-                result = {
-                    "transfer_id": request["args"]["transfer_id"],
-                    "offset": request["args"]["offset"],
-                    "byte_count": request["args"]["byte_count"],
-                }
-                response_phase = "ready"
             else:
                 result = {
                     "transfer_id": request["args"]["transfer_id"],
                     "byte_count": self.expected_pcm_bytes,
-                    "sample_rate_hz": 8000,
-                    "encoding": "u16le",
-                    "duration_ms": (
-                        (self.expected_pcm_bytes // 2) * 1000 + 7999
-                    ) // 8000,
+                    "sample_count": self.expected_pcm_samples,
+                    "sample_rate_hz": 16000,
+                    "encoding": "ima_adpcm4_mono_stream_v1",
+                    "fletcher16": self.expected_pcm_checksum,
+                    "duration_ms": blast_adpcm_duration_ms(
+                        self.expected_pcm_samples
+                    ),
                 }
                 response_phase = "started"
             await self.lines.put(
@@ -139,30 +190,31 @@ class FakeHub:
         )
 
     async def write(self, payload):
-        self.raw_writes.append(bytes(payload))
-        self.fragment_raw_writes.append(bytes(payload))
-        fragment_bytes = self.pcm_fragment["args"]["byte_count"]
-        if sum(map(len, self.fragment_raw_writes)) == fragment_bytes:
-            self.fragment_write_counts.append(len(self.fragment_raw_writes))
-            self.received_pcm_bytes += fragment_bytes
-            await self.lines.put(
-                json.dumps(
-                    {
-                        "id": self.pcm_fragment["id"],
-                        "op": "play_pcm",
-                        "phase": "received",
-                        "ok": True,
-                        "result": {
-                            "transfer_id": self.pcm_fragment["args"][
-                                "transfer_id"
-                            ],
-                            "offset": self.pcm_fragment["args"]["offset"],
-                            "byte_count": fragment_bytes,
-                            "received_bytes": self.received_pcm_bytes,
-                        },
-                    }
-                )
+        payload = bytes(payload)
+        self._sampled_control_chunks.append(payload)
+        self._sampled_control_buffer.extend(payload)
+        if b"\n" not in self._sampled_control_buffer:
+            return
+        line, separator, remainder = self._sampled_control_buffer.partition(
+            b"\n"
+        )
+        if separator != b"\n" or remainder:
+            raise AssertionError(
+                "expected exactly one sampled control line"
             )
+        self.sampled_control_write_groups.append(
+            self._sampled_control_chunks
+        )
+        self._sampled_control_buffer = bytearray()
+        self._sampled_control_chunks = []
+        await self.write_line(line.decode("utf-8"))
+
+    async def write_gatt_char(self, uuid, frame, response):
+        frame = bytes(frame)
+        self.app_data_writes.append((uuid, frame, response))
+        offset = frame[1] | frame[2] << 8
+        payload = frame[3:]
+        self.app_data[offset:offset + len(payload)] = payload
 
     async def read_line(self):
         return await self.lines.get()
@@ -176,22 +228,29 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.program_path = Path(self.temporary.name) / "runtime.py"
         self.program_path.write_text("print('test')\n")
+        self.write_pacer = AsyncMock()
+        self.write_pacer_patch = patch(
+            "robot_agent.blast_ble_runtime._pace_sampled_audio_write",
+            new=self.write_pacer,
+        )
+        self.write_pacer_patch.start()
 
     async def asyncTearDown(self):
+        self.write_pacer_patch.stop()
         self.temporary.cleanup()
 
     async def upload_pcm(self, runtime, payload):
-        begun = await runtime.begin_pcm(len(payload))
-        fragment_bytes = begun["fragment_bytes"]
-        for offset in range(0, len(payload), fragment_bytes):
-            await runtime.write_pcm_fragment(
-                begun["transfer_id"],
+        begun = await runtime.begin_pcm(payload)
+        batch_bytes = begun["batch_bytes"]
+        for offset in range(0, len(payload), batch_bytes):
+            await runtime.write_pcm_batch(
                 offset,
-                payload[offset:offset + fragment_bytes],
+                payload[offset:offset + batch_bytes],
             )
         return await runtime.start_pcm(
             begun["transfer_id"],
             len(payload),
+            begun["fletcher16"],
         )
 
     async def test_reuses_one_connection_for_twenty_cycles(self):
@@ -364,7 +423,7 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
         hub.write_line = FakeHub.write_line.__get__(hub, FakeHub)
         await runtime.close()
 
-    async def test_sampled_audio_v2_uploads_bounded_fragments_then_starts(self):
+    async def test_sampled_audio_v5_uploads_whole_utterance_then_starts(self):
         hub = FakeHub()
 
         async def finder(_name):
@@ -376,48 +435,64 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
             hub_factory=lambda device: hub,
         )
         ready = await runtime.connect()
-        payload = bytes(index % 256 for index in range(32000))
+        payload = adpcm_block(128000)
 
         result = await self.upload_pcm(runtime, payload)
 
-        self.assertIn("sampled_audio_v2", ready["capabilities"])
+        self.assertEqual(
+            ready["capabilities"]["sampled_audio_v5"],
+            {
+                "sample_rate_hz": 16000,
+                "encoding": "ima_adpcm4_mono_stream_v1",
+                "max_bytes": 64007,
+                "transport": "app_data_v1",
+                "checksum": "fletcher16",
+            },
+        )
+        checksum = _fletcher16(payload)
         self.assertEqual(
             hub.pcm_request["args"],
             {
                 "phase": "begin",
-                "sample_rate_hz": 8000,
-                "encoding": "u16le",
-                "byte_count": 32000,
+                "sample_rate_hz": 16000,
+                "encoding": "ima_adpcm4_mono_stream_v1",
+                "sample_count": 128000,
+                "byte_count": 64007,
+                "fletcher16": checksum,
             },
         )
-        self.assertEqual(b"".join(hub.raw_writes), payload)
-        self.assertTrue(all(len(chunk) <= 63 for chunk in hub.raw_writes))
-        fragment_requests = [
-            item for item in hub.writes
-            if item["op"] == "play_pcm"
-            and item["args"]["phase"] == "fragment"
-        ]
-        self.assertTrue(fragment_requests)
+        self.assertEqual(bytes(hub.app_data), payload)
         self.assertTrue(all(
-            item["args"]["byte_count"] <= 252
-            for item in fragment_requests
-        ))
-        self.assertTrue(all(
-            count <= 4 for count in hub.fragment_write_counts
+            item[1][0] == PYBRICKS_WRITE_APP_DATA_COMMAND
+            for item in hub.app_data_writes
         ))
         self.assertEqual(
             result,
             {
                 "transfer_id": 1,
-                "byte_count": 32000,
-                "sample_rate_hz": 8000,
-                "encoding": "u16le",
-                "duration_ms": 2000,
+                "byte_count": 64007,
+                "sample_count": 128000,
+                "sample_rate_hz": 16000,
+                "encoding": "ima_adpcm4_mono_stream_v1",
+                "fletcher16": checksum,
+                "duration_ms": 8000,
+            },
+        )
+        self.assertEqual(
+            hub.writes[-1]["args"],
+            {
+                "phase": "start",
+                "transfer_id": 1,
+                "sample_rate_hz": 16000,
+                "encoding": "ima_adpcm4_mono_stream_v1",
+                "sample_count": 128000,
+                "byte_count": 64007,
+                "fletcher16": checksum,
             },
         )
         await runtime.close()
 
-    async def test_pcm_ctrl_c_byte_is_raw_data_and_hub_restores_interrupt(self):
+    async def test_app_data_batch_has_offsets_and_one_final_barrier(self):
         hub = FakeHub()
 
         async def finder(_name):
@@ -429,31 +504,198 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
             hub_factory=lambda device: hub,
         )
         await runtime.connect()
-        payload = b"\x03\x80\x00\x03"
+        payload = adpcm_block_for_size(509 * 8)
+        begun = await runtime.begin_pcm(payload)
 
-        await self.upload_pcm(runtime, payload)
+        self.write_pacer.reset_mock()
+        receipt = await runtime.write_pcm_batch(0, payload)
 
-        self.assertEqual(b"".join(hub.raw_writes), payload)
-        source = default_program_path().read_text(encoding="utf-8")
-        disabled = source.index("micropython.kbd_intr(-1)")
-        ready_phase = source.index('"ready",', disabled)
-        raw_read = source.index("payload = read_exact(byte_count)", disabled)
-        finally_clause = source.index("    finally:", raw_read)
-        restored = source.index("micropython.kbd_intr(3)", raw_read)
-        playback = source.index("hub.speaker.play_samples(", restored)
-        nonblocking = source.index("wait=False", playback)
-        self.assertNotIn("from array import array", source)
-        self.assertIn('transfer["payload"]', source[playback:nonblocking])
-        self.assertLess(disabled, ready_phase)
-        self.assertLess(ready_phase, raw_read)
-        self.assertLess(raw_read, finally_clause)
-        self.assertLess(finally_clause, restored)
-        self.assertLess(restored, playback)
-        self.assertGreater(nonblocking, playback)
-        self.assertIn("stdin.buffer.read(1)", source)
+        self.assertEqual(begun["batch_bytes"], 509 * 8)
+        self.assertEqual(receipt["received_bytes"], len(payload))
+        self.assertEqual(len(hub.app_data_writes), 8)
+        self.assertEqual(
+            [frame[1] | frame[2] << 8 for _, frame, _ in hub.app_data_writes],
+            [index * 509 for index in range(8)],
+        )
+        self.assertEqual(
+            [response for _, _, response in hub.app_data_writes],
+            [False] * 7 + [True],
+        )
+        self.assertTrue(all(
+            uuid == PYBRICKS_COMMAND_EVENT_UUID
+            for uuid, _, _ in hub.app_data_writes
+        ))
+        self.write_pacer.assert_not_awaited()
         await runtime.close()
 
-    async def test_sampled_audio_respects_negotiated_write_size(self):
+    async def test_control_lines_remain_chunked_and_paced(self):
+        hub = FakeHub()
+
+        async def finder(_name):
+            return "device"
+
+        runtime = BlastBLERuntime(
+            program_path=self.program_path,
+            device_finder=finder,
+            hub_factory=lambda device: hub,
+        )
+        await runtime.connect()
+        payload = adpcm_block_for_size(16)
+
+        await runtime.begin_pcm(payload)
+
+        expected = json.dumps(
+            {
+                "id": 1,
+                "op": "play_pcm",
+                "args": {
+                    "phase": "begin",
+                    "sample_rate_hz": 16000,
+                    "encoding": "ima_adpcm4_mono_stream_v1",
+                    "sample_count": _adpcm_sample_count(payload),
+                    "byte_count": len(payload),
+                    "fletcher16": _fletcher16(payload),
+                },
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8") + b"\n"
+        chunks = hub.sampled_control_write_groups[0]
+        self.assertEqual(b"".join(chunks), expected)
+        self.assertTrue(all(1 <= len(chunk) <= 60 for chunk in chunks))
+        self.assertEqual(self.write_pacer.await_count, len(chunks) - 1)
+        self.assertEqual(SAMPLED_AUDIO_WRITE_PACING_SECONDS, 0.02)
+        await runtime.close()
+
+    async def test_app_data_waits_for_transient_corebluetooth_backpressure(self):
+        hub = FakeHub()
+        hub.write_without_response_readiness = [
+            True,
+            True,
+            False,
+            True,
+            True,
+            True,
+            True,
+            True,
+        ]
+
+        async def finder(_name):
+            return "device"
+
+        runtime = BlastBLERuntime(
+            program_path=self.program_path,
+            device_finder=finder,
+            hub_factory=lambda device: hub,
+        )
+        await runtime.connect()
+        payload = adpcm_block_for_size(509 * 8)
+        await runtime.begin_pcm(payload)
+
+        await runtime.write_pcm_batch(0, payload)
+
+        self.assertEqual(
+            [response for _, _, response in hub.app_data_writes],
+            [False] * 7 + [True],
+        )
+        self.assertEqual(hub.write_without_response_readiness_calls, 8)
+        self.assertEqual(
+            [frame[1] | frame[2] << 8 for _, frame, _ in hub.app_data_writes],
+            [index * 509 for index in range(8)],
+        )
+        await runtime.close()
+
+    async def test_app_data_readiness_wait_is_bounded_then_uses_barrier(self):
+        hub = FakeHub()
+        hub.write_without_response_readiness = False
+
+        async def finder(_name):
+            return "device"
+
+        runtime = BlastBLERuntime(
+            program_path=self.program_path,
+            device_finder=finder,
+            hub_factory=lambda device: hub,
+        )
+        await runtime.connect()
+        payload = adpcm_block_for_size(509 * 2)
+        await runtime.begin_pcm(payload)
+
+        started_at = asyncio.get_running_loop().time()
+        await runtime.write_pcm_batch(0, payload)
+        elapsed = asyncio.get_running_loop().time() - started_at
+
+        self.assertEqual(
+            [response for _, _, response in hub.app_data_writes],
+            [True, True],
+        )
+        self.assertGreaterEqual(
+            hub.write_without_response_readiness_calls,
+            2,
+        )
+        self.assertLess(
+            elapsed,
+            SAMPLED_AUDIO_APP_DATA_READY_WAIT_SECONDS + 0.1,
+        )
+        self.assertEqual(SAMPLED_AUDIO_APP_DATA_READY_WAIT_SECONDS, 0.02)
+        self.assertEqual(SAMPLED_AUDIO_APP_DATA_READY_POLL_SECONDS, 0.001)
+        await runtime.close()
+
+    async def test_cancel_interrupts_app_data_readiness_wait(self):
+        hub = FakeHub()
+        hub.write_without_response_readiness = False
+
+        async def finder(_name):
+            return "device"
+
+        runtime = BlastBLERuntime(
+            program_path=self.program_path,
+            device_finder=finder,
+            hub_factory=lambda device: hub,
+        )
+        await runtime.connect()
+        payload = adpcm_block_for_size(509 * 2)
+        await runtime.begin_pcm(payload)
+
+        with self.assertRaisesRegex(BlastBLERuntimeError, "cancelled"):
+            await runtime.write_pcm_batch(
+                0,
+                payload,
+                cancel_requested=lambda: (
+                    hub.write_without_response_readiness_calls >= 1
+                ),
+            )
+
+        self.assertEqual(hub.write_without_response_readiness_calls, 1)
+        self.assertEqual(hub.app_data_writes, [])
+        self.assertTrue(runtime.sampled_audio_aligned)
+        await runtime.close()
+
+    async def test_app_data_missing_corebluetooth_readiness_uses_barriers(self):
+        hub = FakeHub()
+        hub._client = object()
+
+        async def finder(_name):
+            return "device"
+
+        runtime = BlastBLERuntime(
+            program_path=self.program_path,
+            device_finder=finder,
+            hub_factory=lambda device: hub,
+        )
+        await runtime.connect()
+        payload = adpcm_block_for_size(509 * 8)
+        await runtime.begin_pcm(payload)
+
+        await runtime.write_pcm_batch(0, payload)
+
+        self.assertEqual(
+            [response for _, _, response in hub.app_data_writes],
+            [True] * 8,
+        )
+        await runtime.close()
+
+    async def test_app_data_respects_negotiated_mtu(self):
         hub = FakeHub()
         hub._max_write_size = 20
 
@@ -466,11 +708,63 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
             hub_factory=lambda device: hub,
         )
         await runtime.connect()
+        payload = adpcm_block_for_size(136)
+        begun = await runtime.begin_pcm(payload)
+        self.write_pacer.reset_mock()
 
-        await self.upload_pcm(runtime, b"\x00\x80" * 20)
+        await runtime.write_pcm_batch(0, payload)
 
-        self.assertEqual([len(chunk) for chunk in hub.raw_writes], [19, 19, 2])
+        self.assertEqual(begun["batch_bytes"], 17 * 8)
+        self.assertEqual([len(frame) for _, frame, _ in hub.app_data_writes], [20] * 8)
+        self.assertEqual(
+            [frame[1] | frame[2] << 8 for _, frame, _ in hub.app_data_writes],
+            [index * 17 for index in range(8)],
+        )
+        self.write_pacer.assert_not_awaited()
         await runtime.close()
+
+    async def test_cancel_between_app_data_writes_stays_line_aligned(self):
+        hub = FakeHub()
+
+        async def finder(_name):
+            return "device"
+
+        runtime = BlastBLERuntime(
+            program_path=self.program_path,
+            device_finder=finder,
+            hub_factory=lambda device: hub,
+        )
+        await runtime.connect()
+        payload = adpcm_block_for_size(509 * 8)
+        await runtime.begin_pcm(payload)
+        cancelled = False
+        original_write = hub.write_gatt_char
+
+        async def cancel_after_first(uuid, frame, response):
+            nonlocal cancelled
+            await original_write(uuid, frame, response)
+            cancelled = True
+
+        hub.write_gatt_char = cancel_after_first
+        with self.assertRaisesRegex(BlastBLERuntimeError, "cancelled"):
+            await runtime.write_pcm_batch(
+                0,
+                payload,
+                cancel_requested=lambda: cancelled,
+            )
+
+        self.assertEqual(len(hub.app_data_writes), 1)
+        self.assertFalse(hub.app_data_writes[0][2])
+        self.assertTrue(runtime.sampled_audio_aligned)
+        self.assertEqual(await runtime.ping(), {"echo": "pong"})
+        await runtime.close()
+
+    async def test_fletcher16_known_vector_and_corruption(self):
+        payload = b"abcde"
+        checksum = _fletcher16(payload)
+
+        self.assertEqual(checksum, 0xC8F0)
+        self.assertNotEqual(checksum, _fletcher16(b"abcdf"))
 
     async def test_rejected_begin_remains_line_protocol_aligned(self):
         hub = FakeHub()
@@ -488,142 +782,18 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
         async def invalid_handshake(line):
             request = json.loads(line)
             hub.writes.append(request)
-            await hub.lines.put(
-                json.dumps(
-                    {
-                        "id": request["id"],
-                        "op": "play_pcm",
-                        "ok": False,
-                        "error": "motors busy",
-                    }
-                )
-            )
+            await hub.lines.put(json.dumps({
+                "id": request["id"],
+                "op": "play_pcm",
+                "ok": False,
+                "error": "motors busy",
+            }))
 
         hub.write_line = invalid_handshake
         with self.assertRaisesRegex(BlastBLERuntimeError, "invalid play_pcm"):
-            await runtime.begin_pcm(2)
-        await runtime.close()
-
-        self.assertEqual(
-            [item["op"] for item in hub.writes],
-            ["play_pcm", "shutdown"],
-        )
-        self.assertEqual(hub.disconnect_count, 1)
-
-    async def test_cancel_during_fragment_finishes_atomic_raw_frame(self):
-        hub = FakeHub()
-
-        async def finder(_name):
-            return "device"
-
-        runtime = BlastBLERuntime(
-            program_path=self.program_path,
-            device_finder=finder,
-            hub_factory=lambda device: hub,
-        )
-        await runtime.connect()
-        begun = await runtime.begin_pcm(4)
-        cancelled = False
-        original_write = hub.write
-
-        async def cancel_during_write(payload):
-            nonlocal cancelled
-            cancelled = True
-            await original_write(payload)
-
-        hub.write = cancel_during_write
-        result = await runtime.write_pcm_fragment(
-            begun["transfer_id"],
-            0,
-            b"\x00\x80\x00\x80",
-            cancel_requested=lambda: cancelled,
-        )
+            await runtime.begin_pcm(adpcm_block(1))
         self.assertTrue(runtime.sampled_audio_aligned)
         await runtime.close()
-
-        self.assertEqual(result["received_bytes"], 4)
-        self.assertEqual(b"".join(hub.raw_writes), b"\x00\x80\x00\x80")
-        self.assertEqual(
-            [
-                (item["op"], item.get("args", {}).get("phase"))
-                for item in hub.writes
-            ],
-            [
-                ("play_pcm", "begin"),
-                ("play_pcm", "fragment"),
-                ("shutdown", None),
-            ],
-        )
-        self.assertEqual(hub.disconnect_count, 1)
-
-    async def test_invalid_ready_metadata_disconnects_without_shutdown(self):
-        hub = FakeHub()
-
-        async def finder(_name):
-            return "device"
-
-        runtime = BlastBLERuntime(
-            program_path=self.program_path,
-            device_finder=finder,
-            hub_factory=lambda device: hub,
-        )
-        await runtime.connect()
-        begun = await runtime.begin_pcm(4)
-        original_write_line = hub.write_line
-
-        async def wrong_ready(line):
-            await original_write_line(line)
-            queued = json.loads(await hub.lines.get())
-            queued["result"]["offset"] = 2
-            await hub.lines.put(json.dumps(queued))
-
-        hub.write_line = wrong_ready
-        with self.assertRaisesRegex(BlastBLERuntimeError, "ready metadata"):
-            await runtime.write_pcm_fragment(
-                begun["transfer_id"],
-                0,
-                b"\x00\x80\x00\x80",
-            )
-        await runtime.close()
-
-        self.assertEqual(
-            [item["args"]["phase"] for item in hub.writes],
-            ["begin", "fragment"],
-        )
-        self.assertEqual(hub.disconnect_count, 1)
-
-    async def test_fragment_ready_timeout_disconnects_without_shutdown(self):
-        hub = FakeHub()
-
-        async def finder(_name):
-            return "device"
-
-        runtime = BlastBLERuntime(
-            program_path=self.program_path,
-            timeout_seconds=0.01,
-            device_finder=finder,
-            hub_factory=lambda device: hub,
-        )
-        await runtime.connect()
-        begun = await runtime.begin_pcm(4)
-
-        async def no_ready(line):
-            hub.writes.append(json.loads(line))
-
-        hub.write_line = no_ready
-        with self.assertRaisesRegex(BlastBLERuntimeError, "timed out"):
-            await runtime.write_pcm_fragment(
-                begun["transfer_id"],
-                0,
-                b"\x00\x80\x00\x80",
-            )
-        await runtime.close()
-
-        self.assertEqual(
-            [item["args"]["phase"] for item in hub.writes],
-            ["begin", "fragment"],
-        )
-        self.assertEqual(hub.disconnect_count, 1)
 
     async def test_sampled_audio_rejects_invalid_size_before_writing(self):
         hub = FakeHub()
@@ -638,9 +808,17 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         await runtime.connect()
 
-        for byte_count in (0, 1, 32002):
-            with self.assertRaisesRegex(ValueError, "byte_count"):
-                await runtime.begin_pcm(byte_count)
+        for payload in (
+            b"",
+            b"\x00" * 6,
+            b"\x00" * (SAMPLED_AUDIO_MAX_BYTES + 1),
+            bytes.fromhex("00 00 59 01 00 00 00"),
+            bytes.fromhex("00 00 00 00 00 00 00"),
+            bytes.fromhex("00 00 00 01 f4 01 00"),
+            bytes.fromhex("00 00 00 02 00 00 00 f0"),
+        ):
+            with self.assertRaises(ValueError):
+                await runtime.begin_pcm(payload)
 
         self.assertEqual(hub.writes, [])
         await runtime.close()
@@ -663,7 +841,7 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
             BlastBLERuntimeError,
             "does not advertise",
         ):
-            await runtime.begin_pcm(2)
+            await runtime.begin_pcm(adpcm_block(1))
 
         self.assertEqual(hub.writes, [])
         await runtime.close()

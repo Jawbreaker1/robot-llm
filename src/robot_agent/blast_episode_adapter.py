@@ -28,6 +28,7 @@ from .blast_episode_deadline import (
     SETTLED_OBSERVATION_HEADROOM_MS, BlastEpisodeDeadline,
     blast_action_deadline_headroom_ms)
 from .blast_episode_map_trace import _BlastEpisodeMapTrace
+from .blast_episode_speech import BlastEpisodeSpeech, blast_episode_cancelled
 from .blast_observation_monitor import (
     CONTROLLER_ID,
     RANGE_STATE_MEASURED,
@@ -245,13 +246,8 @@ class BlastEpisodeRuntimeAdapter:
         self.monotonic_ms = monotonic_ms
         self._lock = threading.Lock()
         self._active_episode_id = None
-
-    @staticmethod
-    def _cancelled(context) -> bool:
-        return (
-            context.stop_requested.is_set()
-            or context.emergency_stop_requested.is_set()
-        )
+        self._active_speech = None
+        self._speech_available = True
 
     def _observation(self):
         snapshot = self.controller.snapshot()
@@ -487,7 +483,7 @@ class BlastEpisodeRuntimeAdapter:
 
     def _control_outcome(self, context, deadline, headroom_ms=0):
         value = deadline.outcome(
-            cancelled=self._cancelled(context),
+            cancelled=blast_episode_cancelled(context),
             headroom_ms=headroom_ms,
         )
         if value is None:
@@ -974,6 +970,7 @@ class BlastEpisodeRuntimeAdapter:
         return {
             "action": action,
             "assessment": assessment,
+            "utterance": decision.utterance,
             "plan": list(decision.plan),
             "action_source": _PLANNER_ACTION_SOURCE,
             "observation": observation,
@@ -1044,6 +1041,7 @@ class BlastEpisodeRuntimeAdapter:
         return {
             "action": action,
             "assessment": None,
+            "utterance": None,
             "plan": [],
             "action_source": source,
             "observation": observation,
@@ -1291,9 +1289,17 @@ class BlastEpisodeRuntimeAdapter:
                     "A BLAST episode is already active",
                 )
             self._active_episode_id = context.episode_id
+            speech_factory = self.speech_runtime_factory
+            if not self._speech_available:
+                speech_factory = None
         history, episode_start_heading, motion_executor = [], None, None
         navigation_state = PlannerNavigationState()
         latest_scan_view = None
+        speech = BlastEpisodeSpeech(
+            factory=speech_factory,
+            supported_locales=self.speech_locales,
+            context=context,
+        )
         try:
             deadline_ms = BlastEpisodeDeadline.begin(
                 context.settings, self.monotonic_ms)
@@ -1303,6 +1309,10 @@ class BlastEpisodeRuntimeAdapter:
                     "blast_planner_invalid",
                     "BLAST planner is invalid",
                 )
+            with self._lock:
+                if self._active_episode_id == context.episode_id:
+                    self._active_speech = speech
+            speech.start()
             for _index in range(self.max_decisions):
                 outcome = self._control_outcome(context, deadline_ms)
                 if outcome is not None:
@@ -1478,6 +1488,7 @@ class BlastEpisodeRuntimeAdapter:
                     )
                 action = step["action"]
                 assessment = step["assessment"]
+                utterance = step["utterance"]
                 plan = step["plan"]
                 action_source = step["action_source"]
                 observation = step["observation"]
@@ -1698,6 +1709,7 @@ class BlastEpisodeRuntimeAdapter:
                     )
                 if side_search_setup_outcome is not None:
                     return side_search_setup_outcome
+                speech.offer(utterance, progress_revision=len(history))
                 if is_side_search_rescan:
                     if not isinstance(
                         navigation_state, SideSearchNavigationState,
@@ -1754,18 +1766,35 @@ class BlastEpisodeRuntimeAdapter:
                 "decision_budget_exhausted",
             )
         finally:
+            speech_closed = speech.close()
             with self._lock:
                 if self._active_episode_id == context.episode_id:
                     self._active_episode_id = None
+                    self._active_speech = None
+                    if not speech_closed:
+                        # Never overlap audio; navigation stays available.
+                        self._speech_available = False
 
     def request_stop(self) -> None:
         with self._lock:
-            active = self._active_episode_id is not None
-        if active:
-            self.controller.command("stop")
+            episode_id = self._active_episode_id
+            speech = self._active_speech
+        if episode_id is not None:
+            try:
+                self.controller.command("stop")
+            finally:
+                if speech is not None:
+                    speech.cancel()
 
     def emergency_stop(self) -> None:
-        self.controller.command("stop")
+        with self._lock:
+            episode_id = self._active_episode_id
+            speech = self._active_speech
+        try:
+            self.controller.command("stop")
+        finally:
+            if episode_id is not None and speech is not None:
+                speech.cancel()
 
 
 __all__ = ("ACTION_COMMANDS", "BLAST_PROFILE_ID", "BlastEpisodeError", "BlastEpisodeRuntimeAdapter")

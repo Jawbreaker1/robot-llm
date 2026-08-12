@@ -10,6 +10,7 @@ import time
 from typing import Callable, Mapping, Sequence
 
 from . import lm_studio as _lm
+from .blast_personality import normalize_persona_by_locale
 
 
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
@@ -52,6 +53,14 @@ _SYSTEM_PROMPT = (
     "Assessment and optional utterance must use the requested locale. The "
     "utterance may be expressive, but must never change the physical decision. "
     "Return only the strict JSON object."
+)
+
+_UTTERANCE_PERSONA_PROMPT = (
+    " Host-authored utterance persona for this locale: {persona} Apply it only to "
+    "the wording and tone of utterance. It must never influence action, "
+    "confidence_milli, assessment, plan, observation or sensor facts, safety, or "
+    "COMPLETE/ABORT decisions. The persona supplies no facts, and utterance may remain "
+    "null."
 )
 
 
@@ -224,6 +233,7 @@ class LMStudioControllerActionPlanner:
         transport: Transport = _lm._stdlib_post,
         clock: Callable[[], float] = time.monotonic,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+        utterance_persona_by_locale: Mapping[str, str] | None = None,
     ) -> None:
         if (
             not callable(transport)
@@ -235,6 +245,14 @@ class LMStudioControllerActionPlanner:
             raise _lm.LMStudioConfigurationError(
                 "Controller-action planner configuration is invalid"
             )
+        try:
+            self._utterance_persona_by_locale = normalize_persona_by_locale(
+                utterance_persona_by_locale
+            )
+        except (KeyError, TypeError, ValueError):
+            raise _lm.LMStudioConfigurationError(
+                "Controller-action planner persona is invalid"
+            ) from None
         self._base_url = _lm._safe_base_url(base_url)
         self._model = _lm._safe_model(model)
         self._transport = transport
@@ -284,10 +302,15 @@ class LMStudioControllerActionPlanner:
                 ]
             },
         }
+        system_prompt = _SYSTEM_PROMPT
+        if self._utterance_persona_by_locale is not None:
+            system_prompt += _UTTERANCE_PERSONA_PROMPT.format(
+                persona=self._utterance_persona_by_locale[context.locale]
+            )
         payload = {
             "model": self._model,
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": _json(context.to_dict()).decode("utf-8"),

@@ -29,7 +29,8 @@ from .blast_episode_adapter import (
     BLAST_PROFILE_ID,
     BlastEpisodeRuntimeAdapter,
 )
-from .blast_hub_speech import BlastHubSpeaker
+from .blast_hub_speech import BLAST_PIPER_PROFILE, BlastHubSpeaker
+from .blast_personality import BLAST_PERSONA_BY_LOCALE
 from .ev3rstorm_profile import (
     DEFAULT_EV3RSTORM_MEMORY_PATH,
     EV3RSTORM_PROFILE_ID,
@@ -528,12 +529,15 @@ def _configured_robot_runtime_adapter(args, *, blast_monitor=None):
                 base_url=args.lm_studio_url,
                 model=model,
                 timeout_seconds=args.robot_planner_timeout_seconds,
+                utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
             )
 
         def speech_runtime_factory(*, event_sink):
             synthesizer = LocaleSpeechSynthesizer(
                 {
-                    "sv": PiperLoopbackSynthesizer(),
+                    "sv": PiperLoopbackSynthesizer(
+                        profile=BLAST_PIPER_PROFILE,
+                    ),
                     "en": MacOSSayWAVSynthesizer(),
                 }
             )
@@ -847,10 +851,17 @@ def _run(
             )
 
         def robot_input_model_factory(model):
+            options = {
+                "base_url": args.lm_studio_url,
+                "model": model,
+                "timeout_seconds": args.robot_input_timeout_seconds,
+            }
+            if args.robot_profile == BLAST_PROFILE_ID:
+                options["reply_persona_by_locale"] = (
+                    BLAST_PERSONA_BY_LOCALE
+                )
             return LMStudioRobotInputModel(
-                base_url=args.lm_studio_url,
-                model=model,
-                timeout_seconds=args.robot_input_timeout_seconds,
+                **options,
             )
 
         robot_input_service = RobotInputService(

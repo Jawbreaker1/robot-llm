@@ -15,11 +15,13 @@ from typing import Callable, Mapping, Optional
 from .blast_ble_runtime import (
     DEFAULT_HUB_NAME,
     SAMPLED_AUDIO_CAPABILITY,
+    SAMPLED_AUDIO_CHECKSUM,
     SAMPLED_AUDIO_ENCODING,
     SAMPLED_AUDIO_MAX_BYTES,
-    SAMPLED_AUDIO_MAX_FRAGMENT_BYTES,
     SAMPLED_AUDIO_SAMPLE_RATE_HZ,
+    SAMPLED_AUDIO_TRANSPORT,
     BlastBLERuntime,
+    _adpcm_sample_count,
 )
 from .blast_pcm_upload import BlastPCMUpload
 from .blast_navigation_calibration import (
@@ -481,19 +483,10 @@ class BlastObservationMonitor:
             ) from None
 
     def play_pcm(self, payload: bytes, *, cancel_requested=None):
-        """Queue one best-effort sampled-audio block on the owned session."""
-        if (
-            type(payload) is not bytes
-            or not 2 <= len(payload) <= SAMPLED_AUDIO_MAX_BYTES
-            or len(payload) % 2
-            or (
-                cancel_requested is not None
-                and not callable(cancel_requested)
-            )
-        ):
-            raise ValueError(
-                "payload must be 2..32000 even bytes of u16le PCM"
-            )
+        """Preload one bounded utterance on the owned BLE session."""
+        _adpcm_sample_count(payload)
+        if cancel_requested is not None and not callable(cancel_requested):
+            raise ValueError("cancel_requested must be callable")
         with self._lock:
             if self._snapshot["state"] != "online":
                 raise BlastControllerError(
@@ -509,7 +502,8 @@ class BlastObservationMonitor:
                 "sample_rate_hz": SAMPLED_AUDIO_SAMPLE_RATE_HZ,
                 "encoding": SAMPLED_AUDIO_ENCODING,
                 "max_bytes": SAMPLED_AUDIO_MAX_BYTES,
-                "max_fragment_bytes": SAMPLED_AUDIO_MAX_FRAGMENT_BYTES,
+                "transport": SAMPLED_AUDIO_TRANSPORT,
+                "checksum": SAMPLED_AUDIO_CHECKSUM,
             }:
                 raise BlastControllerError(
                     "sampled_audio_unavailable",
@@ -703,8 +697,8 @@ class BlastObservationMonitor:
                         )
                         if not session_usable:
                             break
-                        # One begin/fragment/start step per turn keeps fixed
-                        # commands ahead of the next low-priority fragment.
+                        # One begin/batch/start step per turn keeps fixed
+                        # commands ahead of the next low-priority batch.
                         if speech_upload is not None:
                             fixed_work_pending = self._fixed_work_pending()
                             with self._lock:
@@ -815,19 +809,6 @@ class BlastObservationMonitor:
                     "BLAST reconnected before speech playback",
                     motion_started=False,
                 )
-            if upload.needs_idle_observation:
-                observation = await runtime.observe()
-                self._publish_observation(observation)
-                if observation.get("motion_active") is not False:
-                    self._finish_speech(
-                        upload.result,
-                        error=BlastControllerError(
-                            "controller_busy",
-                            "BLAST motors must be idle before speech upload",
-                            motion_started=False,
-                        ),
-                    )
-                    return None, True
             receipt = await upload.advance(runtime)
             if receipt is None:
                 return upload, True
@@ -843,6 +824,7 @@ class BlastObservationMonitor:
                     "sample_rate_hz": SAMPLED_AUDIO_SAMPLE_RATE_HZ,
                     "encoding": SAMPLED_AUDIO_ENCODING,
                     "byte_count": len(upload.payload),
+                    "sample_count": receipt["sample_count"],
                     "duration_ms": receipt["duration_ms"],
                     "receipt": receipt,
                 },
@@ -877,10 +859,13 @@ class BlastObservationMonitor:
             aligned = getattr(runtime, "sampled_audio_aligned", False) is True
             if aligned:
                 try:
+                    probe_limit = (
+                        0.25 if self._fixed_work_pending() else 2.0
+                    )
                     observation = await asyncio.wait_for(
                         runtime.observe(),
                         timeout=min(
-                            2.0,
+                            probe_limit,
                             max(
                                 0.1,
                                 upload.expires_at - time.monotonic(),
@@ -893,9 +878,8 @@ class BlastObservationMonitor:
                 else:
                     self._finish_speech(upload.result, error=failure)
                     return None, True
-            # A partial raw PCM exchange makes this BLE session unusable.
-            # Close admission before releasing the speech caller, and carry
-            # already-admitted motor commands into the fresh session.
+            # A transport failure that also lost line-protocol alignment
+            # requires a fresh owner session before admitted motor commands.
             self._set_state("offline", "sampled_audio_transport_failed")
             self._defer_commands_for_speech_reconnect()
             self._finish_speech(upload.result, error=failure)

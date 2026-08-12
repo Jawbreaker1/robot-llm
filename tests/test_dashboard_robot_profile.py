@@ -14,6 +14,8 @@ from robot_agent.dashboard_cli import (
     _run,
 )
 from robot_agent.blast_episode_adapter import BLAST_PROFILE_ID
+from robot_agent.blast_hub_speech import BLAST_PIPER_PROFILE
+from robot_agent.blast_personality import BLAST_PERSONA_BY_LOCALE
 from robot_agent.ev3rstorm_profile import EV3RSTORM_PROFILE_ID, EV3SSHBinding
 
 
@@ -302,7 +304,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
             mock.patch(
                 "robot_agent.dashboard_cli.PiperLoopbackSynthesizer",
                 return_value="piper",
-            ),
+            ) as piper_type,
             mock.patch(
                 "robot_agent.dashboard_cli.MacOSSayWAVSynthesizer",
                 return_value="say-wav",
@@ -334,6 +336,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 base_url=args.lm_studio_url,
                 model="model-b",
                 timeout_seconds=6.5,
+                utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
             )
             self.assertEqual(
                 adapter_type.call_args.kwargs["speech_locales"],
@@ -353,6 +356,9 @@ class DashboardRobotProfileTests(unittest.TestCase):
             synthesizer_type.assert_called_once_with(
                 {"sv": "piper", "en": "say-wav"}
             )
+            piper_type.assert_called_once_with(
+                profile=BLAST_PIPER_PROFILE,
+            )
             speaker_type.assert_called_once_with(
                 synthesizer,
                 monitor,
@@ -370,6 +376,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
         control_service = mock.Mock()
         server = mock.Mock()
         router = mock.Mock(session_path="/live/token/")
+        input_model = object()
         with (
             mock.patch(
                 "robot_agent.dashboard_cli.BlastObservationMonitor",
@@ -388,9 +395,13 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 return_value=control_service,
             ) as control_type,
             mock.patch(
+                "robot_agent.dashboard_cli.LMStudioRobotInputModel",
+                return_value=input_model,
+            ) as input_model_type,
+            mock.patch(
                 "robot_agent.dashboard_cli.build_server",
                 return_value=(server, router),
-            ),
+            ) as server_type,
             mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
         ):
             result = _run([
@@ -399,6 +410,10 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 "--blast-hub-name",
                 "BLAST-TEST",
             ])
+            input_service = server_type.call_args.kwargs[
+                "robot_input_service"
+            ]
+            built_input_model = input_service._model_factory("model-a")
 
         self.assertEqual(result, 0)
         monitor.start.assert_not_called()
@@ -408,6 +423,13 @@ class DashboardRobotProfileTests(unittest.TestCase):
         self.assertEqual(
             service_type.call_args.kwargs["controller_runtime_providers"],
             (monitor,),
+        )
+        self.assertIs(built_input_model, input_model)
+        input_model_type.assert_called_once_with(
+            base_url="http://127.0.0.1:1234",
+            model="model-a",
+            timeout_seconds=10.0,
+            reply_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
         )
         ready = json.loads(stdout.getvalue())
         self.assertEqual(ready["robot_profile"], BLAST_PROFILE_ID)

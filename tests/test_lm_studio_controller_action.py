@@ -2,8 +2,13 @@ import json
 import unittest
 
 from robot_agent.lm_studio import (
+    LMStudioConfigurationError,
     LMStudioInputError,
     LMStudioProtocolError,
+)
+from robot_agent.blast_personality import (
+    BLAST_PERSONA_BY_LOCALE,
+    MAX_PERSONA_CHARS,
 )
 from robot_agent.lm_studio_controller_action import (
     COMPLETE,
@@ -71,13 +76,14 @@ class Transport:
 
 
 class ControllerActionPlannerTests(unittest.TestCase):
-    def planner(self, response, clock_values=(1.0, 1.125)):
+    def planner(self, response, clock_values=(1.0, 1.125), **options):
         transport = Transport(response)
         values = iter(clock_values)
         planner = LMStudioControllerActionPlanner(
             model=MODEL,
             transport=transport,
             clock=lambda: next(values),
+            **options,
         )
         return planner, transport
 
@@ -118,6 +124,53 @@ class ControllerActionPlannerTests(unittest.TestCase):
             ],
         )
         self.assertEqual(request["reasoning_effort"], "none")
+
+    def test_blast_persona_changes_only_the_locale_specific_system_prompt(self):
+        response = completion({
+            "action": "DRIVE_FORWARD",
+            "confidence_milli": 940,
+            "assessment": "Det är fritt framåt.",
+            "plan": ["DRIVE_FORWARD"],
+            "utterance": "Flytta på dig, låda.",
+        })
+        default_planner, default_transport = self.planner(response)
+        blast_planner, blast_transport = self.planner(
+            response,
+            utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
+        )
+
+        default_planner.decide(context())
+        blast_planner.decide(context())
+
+        default_payload = json.loads(default_transport.calls[0][1])
+        blast_payload = json.loads(blast_transport.calls[0][1])
+        default_prompt = default_payload["messages"][0]["content"]
+        blast_prompt = blast_payload["messages"][0]["content"]
+        self.assertTrue(blast_prompt.startswith(default_prompt))
+        self.assertIn(BLAST_PERSONA_BY_LOCALE["sv"], blast_prompt)
+        self.assertNotIn(BLAST_PERSONA_BY_LOCALE["en"], blast_prompt)
+        for guardrail in (
+            "only to the wording and tone of utterance",
+            "never influence action",
+            "assessment",
+            "sensor facts",
+            "safety",
+            "COMPLETE/ABORT decisions",
+        ):
+            self.assertIn(guardrail, blast_prompt)
+        blast_payload["messages"][0]["content"] = default_prompt
+        self.assertEqual(blast_payload, default_payload)
+
+        english_planner, english_transport = self.planner(
+            response,
+            utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
+        )
+        english_planner.decide(context(locale="en"))
+        english_prompt = json.loads(english_transport.calls[0][1])[
+            "messages"
+        ][0]["content"]
+        self.assertIn(BLAST_PERSONA_BY_LOCALE["en"], english_prompt)
+        self.assertNotIn(BLAST_PERSONA_BY_LOCALE["sv"], english_prompt)
 
     def test_terminal_decision_normalizes_one_redundant_terminal_step(self):
         planner, _ = self.planner(completion({
@@ -272,6 +325,24 @@ class ControllerActionPlannerTests(unittest.TestCase):
                 planner, _ = self.planner(response)
                 with self.assertRaises(LMStudioProtocolError):
                     planner.decide(context())
+
+    def test_rejects_invalid_persona_configuration(self):
+        invalid = (
+            {},
+            {"sv": "Bara svenska."},
+            {"sv": "Svenska.", "en": "English.", "de": "Deutsch."},
+            ("sv", "en"),
+            {"sv": " Svenska.", "en": "English."},
+            {"sv": "Svenska.\n", "en": "English."},
+            {"sv": "x" * (MAX_PERSONA_CHARS + 1), "en": "English."},
+        )
+        for persona in invalid:
+            with self.subTest(persona=persona), self.assertRaises(
+                LMStudioConfigurationError
+            ):
+                LMStudioControllerActionPlanner(
+                    utterance_persona_by_locale=persona
+                )
 
 
 if __name__ == "__main__":

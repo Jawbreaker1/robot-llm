@@ -1,10 +1,11 @@
 """Persistent bounded controller runtime for BLAST-01."""
 
+import gc
 import json
 
-import micropython
 import pybricks
 from pybricks.hubs import InventorHub
+from pybricks.messaging import AppData
 from pybricks.parameters import Stop
 from pybricks.pupdevices import ColorSensor, Motor, UltrasonicSensor
 from pybricks.tools import StopWatch, wait
@@ -27,12 +28,18 @@ from wiring import (
 
 PROTOCOL_VERSION = 1
 MAX_INPUT_CHARS = 512
-SAMPLED_AUDIO_CAPABILITY = "sampled_audio_v2"
-SAMPLED_AUDIO_SAMPLE_RATE_HZ = 8000
-SAMPLED_AUDIO_ENCODING = "u16le"
-SAMPLED_AUDIO_MAX_BYTES = 32000
-SAMPLED_AUDIO_MAX_FRAGMENT_BYTES = 252
-SAMPLED_AUDIO_RAW_IDLE_TIMEOUT_MS = 5000
+SAMPLED_AUDIO_CAPABILITY = "sampled_audio_v5"
+SAMPLED_AUDIO_SAMPLE_RATE_HZ = 16000
+SAMPLED_AUDIO_ENCODING = "ima_adpcm4_mono_stream_v1"
+SAMPLED_AUDIO_MAX_SAMPLES = 128000
+SAMPLED_AUDIO_HEADER_BYTES = 7
+SAMPLED_AUDIO_MAX_BYTES = (
+    SAMPLED_AUDIO_HEADER_BYTES + SAMPLED_AUDIO_MAX_SAMPLES // 2
+)
+SAMPLED_AUDIO_DMA_CHUNK_SAMPLES = 256
+SAMPLED_AUDIO_DMA_CHUNK_DURATION_MS = 16
+SAMPLED_AUDIO_TRANSPORT = "app_data_v1"
+SAMPLED_AUDIO_CHECKSUM = "fletcher16"
 DRIVE_PULSE_SPEED_DPS = 120
 DRIVE_PULSE_ANGLE_DEG = 90
 TURN_PULSE_SPEED_DPS = 180
@@ -70,13 +77,10 @@ incoming = poll()
 incoming.register(stdin)
 sampled_audio_supported = all(
     hasattr(hub.speaker, name)
-    for name in ("play_samples", "done", "stop")
+    for name in ("play_adpcm", "done", "stop")
 )
+sampled_audio_app_data = AppData([(0, SAMPLED_AUDIO_MAX_BYTES)])
 sampled_audio_transfer = None
-
-
-class SampledAudioTransportError(Exception):
-    pass
 
 
 def emit(value):
@@ -107,28 +111,6 @@ def read_line():
                 data.extend(character)
             else:
                 too_large = True
-
-
-def read_exact(size):
-    data = bytearray()
-    last_data_at_ms = clock.time()
-    while len(data) < size:
-        while not incoming.poll(0):
-            if clock.time() - last_data_at_ms >= (
-                SAMPLED_AUDIO_RAW_IDLE_TIMEOUT_MS
-            ):
-                raise SampledAudioTransportError(
-                    "sampled audio payload timed out"
-                )
-            wait(10)
-        # Read only the byte proven available by poll(). A larger blocking
-        # read would prevent the no-progress timeout from observing a
-        # truncated payload after its first byte.
-        chunk = stdin.buffer.read(1)
-        if chunk:
-            data.extend(chunk)
-            last_data_at_ms = clock.time()
-    return data
 
 
 def response(request_id, operation, result):
@@ -189,88 +171,52 @@ def stop_all():
 
 def validate_pcm_format(arguments):
     if arguments.get("sample_rate_hz") != SAMPLED_AUDIO_SAMPLE_RATE_HZ:
-        raise ValueError("sample_rate_hz must be 8000")
+        raise ValueError("sample_rate_hz must be 16000")
     if arguments.get("encoding") != SAMPLED_AUDIO_ENCODING:
-        raise ValueError("encoding must be u16le")
+        raise ValueError("encoding must be ima_adpcm4_mono_stream_v1")
 
 
 def begin_pcm(request_id, arguments):
     global sampled_audio_transfer
 
+    sampled_audio_transfer = None
     validate_pcm_format(arguments)
     byte_count = arguments.get("byte_count")
+    sample_count = arguments.get("sample_count")
+    checksum = arguments.get("fletcher16")
     if (
         not isinstance(byte_count, int)
         or isinstance(byte_count, bool)
-        or byte_count < 2
+        or byte_count < SAMPLED_AUDIO_HEADER_BYTES
         or byte_count > SAMPLED_AUDIO_MAX_BYTES
-        or byte_count % 2
     ):
-        raise ValueError("byte_count must be an even value from 2 to 32000")
-    if not all(motor.done() for motor in motors.values()):
-        raise ValueError("motors must be idle before sampled audio")
+        raise ValueError("sampled audio byte_count is invalid")
+    if (
+        not isinstance(sample_count, int)
+        or isinstance(sample_count, bool)
+        or sample_count < 1
+        or sample_count > SAMPLED_AUDIO_MAX_SAMPLES
+        or byte_count != SAMPLED_AUDIO_HEADER_BYTES + sample_count // 2
+    ):
+        raise ValueError("sampled audio sample_count is invalid")
+    if (
+        not isinstance(checksum, int)
+        or isinstance(checksum, bool)
+        or checksum < 0
+        or checksum > 0xFFFF
+    ):
+        raise ValueError("fletcher16 must be a uint16 integer")
     if not sampled_audio_supported or not hub.speaker.done():
         raise ValueError("speaker must be idle before sampled audio")
     sampled_audio_transfer = {
         "transfer_id": request_id,
+        "sample_rate_hz": SAMPLED_AUDIO_SAMPLE_RATE_HZ,
+        "encoding": SAMPLED_AUDIO_ENCODING,
+        "sample_count": sample_count,
         "byte_count": byte_count,
-        "received_bytes": 0,
-        "payload": bytearray(byte_count),
+        "fletcher16": checksum,
     }
-    return {
-        "transfer_id": request_id,
-        "byte_count": byte_count,
-        "max_fragment_bytes": SAMPLED_AUDIO_MAX_FRAGMENT_BYTES,
-    }
-
-
-def receive_pcm_fragment(request_id, arguments):
-    transfer = sampled_audio_transfer
-    transfer_id = arguments.get("transfer_id")
-    offset = arguments.get("offset")
-    byte_count = arguments.get("byte_count")
-    if (
-        not isinstance(transfer, dict)
-        or transfer_id != transfer.get("transfer_id")
-        or offset != transfer.get("received_bytes")
-        or not isinstance(byte_count, int)
-        or isinstance(byte_count, bool)
-        or byte_count < 2
-        or byte_count > SAMPLED_AUDIO_MAX_FRAGMENT_BYTES
-        or byte_count % 2
-        or offset + byte_count > transfer.get("byte_count")
-    ):
-        raise ValueError("sampled audio fragment is invalid")
-    if not all(motor.done() for motor in motors.values()):
-        raise ValueError("motors must be idle during sampled audio upload")
-
-    # Pybricks normally treats raw 0x03 on stdin as Ctrl-C. PCM may contain
-    # any byte value, so suspend interception before inviting the host to send
-    # raw data, then restore normal emergency interruption immediately after.
-    micropython.kbd_intr(-1)
-    try:
-        emit(
-            sampled_audio_response(
-                request_id,
-                "ready",
-                {
-                    "transfer_id": transfer_id,
-                    "offset": offset,
-                    "byte_count": byte_count,
-                },
-            )
-        )
-        payload = read_exact(byte_count)
-    finally:
-        micropython.kbd_intr(3)
-    transfer["payload"][offset:offset + byte_count] = payload
-    transfer["received_bytes"] += byte_count
-    return {
-        "transfer_id": transfer_id,
-        "offset": offset,
-        "byte_count": byte_count,
-        "received_bytes": transfer["received_bytes"],
-    }
+    return dict(sampled_audio_transfer)
 
 
 def start_pcm(arguments):
@@ -281,31 +227,52 @@ def start_pcm(arguments):
     if (
         not isinstance(transfer, dict)
         or transfer_id != transfer.get("transfer_id")
-        or transfer.get("received_bytes") != transfer.get("byte_count")
     ):
-        raise ValueError("sampled audio upload is incomplete")
-    if not all(motor.done() for motor in motors.values()):
-        raise ValueError("motors must be idle before sampled audio starts")
+        raise ValueError("sampled audio transfer is invalid")
+    # A recognized start consumes the transfer even when its remaining
+    # metadata is malformed or decoding runs out of memory.
+    sampled_audio_transfer = None
+    for name in (
+        "sample_rate_hz",
+        "encoding",
+        "sample_count",
+        "byte_count",
+        "fletcher16",
+    ):
+        if arguments.get(name) != transfer.get(name):
+            raise ValueError("sampled audio transfer metadata changed")
     if not sampled_audio_supported or not hub.speaker.done():
         raise ValueError("speaker must be idle before sampled audio starts")
 
     byte_count = transfer["byte_count"]
-    hub.speaker.play_samples(
-        transfer["payload"],
+    sample_count = transfer["sample_count"]
+    checksum = transfer["fletcher16"]
+    # done() releases the native DMA root, but MicroPython does not
+    # necessarily reclaim the previous maximum-sized snapshot before the
+    # next AppData allocation. Collect once at this bounded hand-off so
+    # consecutive utterances cannot exhaust an otherwise healthy heap.
+    gc.collect()
+    payload = sampled_audio_app_data.get_bytes(0)
+    hub.speaker.play_adpcm(
+        payload,
+        byte_count=byte_count,
+        sample_count=sample_count,
+        fletcher16=checksum,
         sample_rate=SAMPLED_AUDIO_SAMPLE_RATE_HZ,
         wait=False,
     )
-    sampled_audio_transfer = None
     return {
         "transfer_id": transfer_id,
         "byte_count": byte_count,
+        "sample_count": sample_count,
         "sample_rate_hz": SAMPLED_AUDIO_SAMPLE_RATE_HZ,
         "encoding": SAMPLED_AUDIO_ENCODING,
         "duration_ms": (
-            (byte_count // 2) * 1000
-            + SAMPLED_AUDIO_SAMPLE_RATE_HZ
-            - 1
-        ) // SAMPLED_AUDIO_SAMPLE_RATE_HZ,
+            (sample_count + SAMPLED_AUDIO_DMA_CHUNK_SAMPLES - 1)
+            // SAMPLED_AUDIO_DMA_CHUNK_SAMPLES
+            * SAMPLED_AUDIO_DMA_CHUNK_DURATION_MS
+        ),
+        "fletcher16": checksum,
     }
 
 
@@ -465,9 +432,8 @@ emit(
                     "sample_rate_hz": SAMPLED_AUDIO_SAMPLE_RATE_HZ,
                     "encoding": SAMPLED_AUDIO_ENCODING,
                     "max_bytes": SAMPLED_AUDIO_MAX_BYTES,
-                    "max_fragment_bytes": (
-                        SAMPLED_AUDIO_MAX_FRAGMENT_BYTES
-                    ),
+                    "transport": SAMPLED_AUDIO_TRANSPORT,
+                    "checksum": SAMPLED_AUDIO_CHECKSUM,
                 }
             }
             if sampled_audio_supported
@@ -509,9 +475,6 @@ while True:
             if phase == "begin":
                 result = begin_pcm(request_id, arguments)
                 emit(sampled_audio_response(request_id, "begun", result))
-            elif phase == "fragment":
-                result = receive_pcm_fragment(request_id, arguments)
-                emit(sampled_audio_response(request_id, "received", result))
             elif phase == "start":
                 result = start_pcm(arguments)
                 emit(sampled_audio_response(request_id, "started", result))
@@ -544,9 +507,6 @@ while True:
                 "error": str(error),
             }
         )
-        if isinstance(error, SampledAudioTransportError):
-            stop_all()
-            break
 
 # Give the final stdout frame time to leave over BLE.
 wait(100)
