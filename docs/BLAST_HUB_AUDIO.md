@@ -97,33 +97,35 @@ been verified. Speech startup, generation, upload, or playback failure is
 fail-open for navigation, while Stop and Emergency Stop cancel the speech
 worker as well as stopping the hub speaker.
 
-## Pinned proof build
+## Pinned v6 proof build
 
 The patch has been applied to exact upstream Pybricks and built from clean
 sources with Arm GNU Toolchain 13.3 and warnings as errors:
 
 ```text
 Pybricks: v4.0.1 / 4104553405decb0384bcfb030fbfcb4b5a9854cc
-firmware patch SHA-256: 208fee24764c74cd55080226eb4545414351118f98765a33f12c91a942b4546c
-firmware.zip SHA-256: 0fa553600afed4884e6113225f81da4f405f98680511af64d129903bafa49b29
-firmware-base.bin SHA-256: b70c62e705f6c172cc826468c4fa5992dc7e27066278159264308ba89eb889d1
+firmware patch SHA-256: 41c8b8d549f0a2ac84e63d25fb5ad8c2757ab372914e11bd865c4f08ee0f0037
+firmware.zip SHA-256: b3428c3d0660742f8ddee47c1ad18b1d6416537dd5425ef9337712f50d530814
+firmware-base.bin SHA-256: e62c1d1da959d30d310607463b551d3738affc89a9b0baab17d10f262e1be88a
 ```
 
 The local build artifact is:
 
 ```text
-/private/tmp/blast-primehub-v4.0.1-v5-adpcm.zip
+/private/tmp/blast-primehub-v4.0.1-v6-adpcm.zip
 ```
 
 The patch also corrects the Prime Hub TIM6 input clock from 48 to 96 MHz. A
 motor-free hardware measurement proved the old value played 8,000 requested
 samples in 501 ms; the correction made the same playback complete in 1,001 ms.
 
-For incoming host connections the patch requests a 15 ms BLE interval while
-preserving the negotiated supervision timeout. macOS accepted the request in
-the observed test but retained an effective 30 ms interval. This optimization
-is therefore not a correctness dependency. The CC2564C controller does not
-support BLE Data Length Extension.
+The v6 patch leaves incoming host connection-parameter negotiation to the
+central. An earlier v5 build requested a 15 ms BLE interval, but macOS retained
+the effective 30 ms interval and then reproducibly ended three persistent
+sessions 39.94 seconds after connection readiness with connection-update status
+734. The request provided no observed throughput benefit, so v6 removes only
+that request and its Prime Hub configuration macro. The CC2564C controller does
+not support BLE Data Length Extension.
 
 Apply and build from a clean recursively initialized checkout with GNU Arm
 Embedded GCC 13:
@@ -139,6 +141,14 @@ v4.0.1 rollback package while validating the custom build. Never flash during
 an active navigation episode.
 
 ## Hardware acceptance
+
+The v6 artifact above was flashed successfully to BLAST-01 through USB DFU on
+2026-08-12. A motor-free production-runtime probe then completed 90/90 paired
+`ping` and `observe` cycles over one uninterrupted 114.9-second session. Every
+observation reported `motion_active=false`, stable motor angles, valid IMU and
+range data, and battery voltage between 8,282 and 8,291 mV. The raw BLE
+disconnect at the end succeeded. This passed well beyond the former
+reproducible 39.94-second failure point without a connection update error.
 
 The v5 firmware was flashed successfully to BLAST-01 through USB DFU on
 2026-08-12. The production runtime then advertised the exact v5 capability and

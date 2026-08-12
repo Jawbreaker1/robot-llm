@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from copy import deepcopy
 from dataclasses import dataclass
+import logging
 import math
 from queue import Empty, Full, Queue
 import threading
@@ -27,6 +28,10 @@ from .blast_pcm_upload import BlastPCMUpload
 from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
 )
+
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 SNAPSHOT_SCHEMA = "controller-runtime-observation/v1"
@@ -614,6 +619,7 @@ class BlastObservationMonitor:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
+                    logger.exception("BLAST observation session failed")
                     previous = self.snapshot()
                     reason = (
                         "observation_failed"

@@ -1,26 +1,3 @@
-diff --git a/lib/pbio/drv/bluetooth/bluetooth_btstack.c b/lib/pbio/drv/bluetooth/bluetooth_btstack.c
-index f23bdc7..75691f0 100644
---- a/lib/pbio/drv/bluetooth/bluetooth_btstack.c
-+++ b/lib/pbio/drv/bluetooth/bluetooth_btstack.c
-@@ -403,6 +403,18 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
-                 }
-                 host->con_handle = handle;
-
-+                #if PBDRV_CONFIG_BLUETOOTH_BTSTACK_HOST_CONNECTION_INTERVAL
-+                // Request a 15 ms host interval (units are 1.25 ms). Keep the
-+                // central's existing supervision timeout to avoid changing
-+                // disconnect behavior as a side effect of this request.
-+                gap_request_connection_parameter_update(
-+                    handle,
-+                    PBDRV_CONFIG_BLUETOOTH_BTSTACK_HOST_CONNECTION_INTERVAL,
-+                    PBDRV_CONFIG_BLUETOOTH_BTSTACK_HOST_CONNECTION_INTERVAL,
-+                    0,
-+                    hci_subevent_le_connection_complete_get_supervision_timeout(packet));
-+                #endif
-+
-                 // don't start advertising again on disconnect
-                 gap_advertisements_enable(false);
-                 pbdrv_bluetooth_advertising_state = PBDRV_BLUETOOTH_ADVERTISING_STATE_NONE;
 diff --git a/lib/pbio/drv/bluetooth/pybricks_service.gatt b/lib/pbio/drv/bluetooth/pybricks_service.gatt
 index fc30a4f..ef37b0b 100644
 --- a/lib/pbio/drv/bluetooth/pybricks_service.gatt
@@ -334,18 +311,6 @@ index 8b88af0..0c762b0 100644
 +
  static inline void pbdrv_sound_stop(void) {
  }
-
-diff --git a/lib/pbio/platform/prime_hub/pbdrvconfig.h b/lib/pbio/platform/prime_hub/pbdrvconfig.h
-index f29a153..2cd932e 100644
---- a/lib/pbio/platform/prime_hub/pbdrvconfig.h
-+++ b/lib/pbio/platform/prime_hub/pbdrvconfig.h
-@@ -33,6 +33,7 @@
- #define PBDRV_CONFIG_BLUETOOTH_BTSTACK_NUM_LE_HOSTS (2)
- #define PBDRV_CONFIG_BLUETOOTH_BTSTACK_STM32        (1)
- #define PBDRV_CONFIG_BLUETOOTH_BTSTACK_CC2564C      (1)
-+#define PBDRV_CONFIG_BLUETOOTH_BTSTACK_HOST_CONNECTION_INTERVAL (12)
- #define PBDRV_CONFIG_BLUETOOTH_BTSTACK_HUB_KIND     LWP3_HUB_KIND_TECHNIC_LARGE
- #define PBDRV_CONFIG_BLUETOOTH_BTSTACK_HUB_VARIANT_ADDR 0x08007d80
 
 diff --git a/lib/pbio/platform/prime_hub/platform.c b/lib/pbio/platform/prime_hub/platform.c
 index 7704342..11adea8 100644
