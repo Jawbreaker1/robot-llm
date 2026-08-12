@@ -529,7 +529,6 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertLess(first, second)
         self.assertLess(second, started)
         self.assertLess(started, navigation)
-        self.assertNotIn(("observe",), calls[first + 1:started])
         monitor.close()
 
     def test_over_sixty_second_navigation_stream_cannot_starve_v5_speech(self):
@@ -1138,7 +1137,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         monitor.close()
 
-    def test_multi_batch_burst_does_not_insert_observations(self):
+    def test_multi_batch_burst_keeps_observation_snapshot_fresh(self):
         class SlowFragmentRuntime(FakeRuntime):
             async def write_pcm_batch(
                 self, offset, payload, *, cancel_requested=None,
@@ -1155,7 +1154,11 @@ class BlastObservationMonitorTests(unittest.TestCase):
             runtime_factory=SlowFragmentRuntime,
         )
         monitor.start()
-        self.wait_for(monitor, "online")
+        first_snapshot = self.wait_for(monitor, "online")
+        while first_snapshot["observation"] is None:
+            time.sleep(0.005)
+            first_snapshot = monitor.snapshot()
+        observed_before = first_snapshot["last_observed_at_monotonic_ms"]
 
         result = monitor.play_pcm(adpcm_block_for_size(82))
 
@@ -1166,9 +1169,96 @@ class BlastObservationMonitorTests(unittest.TestCase):
         ]
         self.assertGreater(len(batch_indexes), 1)
         start_index = calls.index(("start_pcm", 82))
-        self.assertNotIn(("observe",), calls[batch_indexes[0] + 1:start_index])
+        upload_observations = calls[
+            batch_indexes[0] + 1:start_index
+        ].count(("observe",))
+        self.assertGreaterEqual(upload_observations, 1)
+        self.assertLess(upload_observations, len(batch_indexes))
         self.assertTrue(result["started"])
+        self.assertGreater(
+            monitor.snapshot()["last_observed_at_monotonic_ms"],
+            observed_before,
+        )
         monitor.close()
+
+    def test_post_scan_pcm_burst_keeps_snapshot_inside_episode_ttl(self):
+        upload_reached_four_seconds = threading.Event()
+        release_upload = threading.Event()
+
+        class SimulatedMonotonicClock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._milliseconds = 1_000
+
+            def __call__(self):
+                with self._lock:
+                    return self._milliseconds * 1_000_000
+
+            def advance(self, milliseconds):
+                with self._lock:
+                    self._milliseconds += milliseconds
+
+            def milliseconds(self):
+                with self._lock:
+                    return self._milliseconds
+
+        clock = SimulatedMonotonicClock()
+
+        class LongPostScanSpeechRuntime(FakeRuntime):
+            async def write_pcm_batch(
+                self, offset, payload, *, cancel_requested=None,
+            ):
+                clock.advance(1_100)
+                if offset == 24:
+                    upload_reached_four_seconds.set()
+                    await __import__("asyncio").to_thread(
+                        release_upload.wait,
+                        2.0,
+                    )
+                return await super().write_pcm_batch(
+                    offset,
+                    payload,
+                    cancel_requested=cancel_requested,
+                )
+
+        with mock.patch(
+            "robot_agent.blast_observation_monitor.time.monotonic_ns",
+            clock,
+        ):
+            monitor = BlastObservationMonitor(
+                poll_interval_seconds=1.0,
+                runtime_factory=LongPostScanSpeechRuntime,
+            )
+            monitor.start()
+            self.wait_for(monitor, "online")
+            scan = monitor.command(SCAN_COMMAND)
+            self.assertTrue(scan["completed"])
+            failures = []
+            speech_thread = threading.Thread(
+                target=lambda: self._capture_failure(
+                    failures,
+                    lambda: monitor.play_pcm(adpcm_block_for_size(42)),
+                )
+            )
+            speech_thread.start()
+            self.assertTrue(upload_reached_four_seconds.wait(timeout=1.0))
+
+            snapshot = monitor.snapshot()
+            age_ms = (
+                clock.milliseconds()
+                - snapshot["last_observed_at_monotonic_ms"]
+            )
+            self.assertLessEqual(age_ms, 3_000)
+            self.assertNotIn(
+                ("start_pcm", 42),
+                FakeRuntime.instances[0].calls,
+            )
+
+            release_upload.set()
+            speech_thread.join(timeout=3.0)
+            self.assertFalse(speech_thread.is_alive())
+            self.assertEqual(failures, [])
+            monitor.close()
 
     def test_stop_between_pcm_batches_drops_speech_upload(self):
         first_batch_started = threading.Event()
@@ -1222,6 +1312,11 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(len(stop_result), 1)
         calls = FakeRuntime.instances[0].calls
         self.assertIn(("stop",), calls)
+        first_batch = calls.index(
+            ("write_pcm_batch", 0, adpcm_block_for_size(18)[:8])
+        )
+        stop = calls.index(("stop",))
+        self.assertNotIn(("observe",), calls[first_batch + 1:stop])
         self.assertNotIn(("start_pcm", 18), calls)
         self.assertFalse(any(
             call[0] == "write_pcm_batch" and call[1] > 0

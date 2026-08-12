@@ -715,6 +715,38 @@ class BlastObservationMonitor:
                                 self._release_speech_step()
                             if not session_usable:
                                 break
+                            if speech_upload is not None:
+                                with self._lock:
+                                    stop_pending = (
+                                        self._preempt_stop_request is not None
+                                        or self._pending_command == "stop"
+                                    )
+                                    last_observed_ms = self._snapshot.get(
+                                        "last_observed_at_monotonic_ms"
+                                    )
+                                cancel_pending = (
+                                    speech_upload.cancel_requested is not None
+                                    and speech_upload.cancel_requested()
+                                )
+                                observation_due = (
+                                    not isinstance(last_observed_ms, int)
+                                    or time.monotonic_ns() // 1_000_000
+                                    - last_observed_ms
+                                    >= round(
+                                        self._poll_interval_seconds * 1_000
+                                    )
+                                )
+                                # Telemetry carries no motion authority and
+                                # does not admit queued navigation. Keep its
+                                # safety TTL alive without delaying Stop.
+                                if (
+                                    not stop_pending
+                                    and not cancel_pending
+                                    and observation_due
+                                ):
+                                    self._publish_observation(
+                                        await runtime.observe()
+                                    )
                         if not session_usable:
                             break
                         # Initial arbitration favours one already-queued fixed
