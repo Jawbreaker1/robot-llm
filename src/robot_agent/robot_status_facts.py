@@ -66,6 +66,7 @@ def project_robot_status_facts(
             "plan",
             "scan",
             "speech_status",
+            "speech_error_code",
             "message",
         ),
     )

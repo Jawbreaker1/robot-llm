@@ -14,6 +14,7 @@ from robot_agent.lm_studio_controller_action import (
     COMPLETE,
     ControllerActionContext,
     LMStudioControllerActionPlanner,
+    MAX_UTTERANCE_CHARS,
 )
 from robot_agent.physical_navigation_contract import SCAN_FRONT_ARC
 
@@ -124,6 +125,85 @@ class ControllerActionPlannerTests(unittest.TestCase):
             ],
         )
         self.assertEqual(request["reasoning_effort"], "none")
+        utterance_schema = request["response_format"]["json_schema"][
+            "schema"
+        ]["properties"]["utterance"]["oneOf"][0]
+        self.assertEqual(
+            utterance_schema["maxLength"],
+            MAX_UTTERANCE_CHARS,
+        )
+
+    def test_default_utterance_limit_keeps_the_request_byte_identical(self):
+        response = completion({
+            "action": "DRIVE_FORWARD",
+            "confidence_milli": 940,
+            "assessment": "Det är fritt framåt.",
+            "plan": ["DRIVE_FORWARD"],
+            "utterance": "Framåt.",
+        })
+        default_planner, default_transport = self.planner(response)
+        explicit_planner, explicit_transport = self.planner(
+            response,
+            max_utterance_chars=MAX_UTTERANCE_CHARS,
+        )
+
+        default_planner.decide(context())
+        explicit_planner.decide(context())
+
+        self.assertEqual(
+            default_transport.calls[0][1],
+            explicit_transport.calls[0][1],
+        )
+
+    def test_custom_utterance_limit_is_shared_by_schema_and_decoder(self):
+        maximum = 120
+        accepted, accepted_transport = self.planner(
+            completion({
+                "action": "DRIVE_FORWARD",
+                "confidence_milli": 940,
+                "assessment": "Det är fritt framåt.",
+                "plan": ["DRIVE_FORWARD"],
+                "utterance": "x" * maximum,
+            }),
+            max_utterance_chars=maximum,
+        )
+
+        result = accepted.decide(context())
+
+        self.assertEqual(len(result.decision.utterance), maximum)
+        request = json.loads(accepted_transport.calls[0][1])
+        utterance_schema = request["response_format"]["json_schema"][
+            "schema"
+        ]["properties"]["utterance"]["oneOf"][0]
+        self.assertEqual(utterance_schema["maxLength"], maximum)
+
+        rejected, _ = self.planner(
+            completion({
+                "action": "DRIVE_FORWARD",
+                "confidence_milli": 940,
+                "assessment": "Det är fritt framåt.",
+                "plan": ["DRIVE_FORWARD"],
+                "utterance": "x" * (maximum + 1),
+            }),
+            max_utterance_chars=maximum,
+        )
+        with self.assertRaises(LMStudioProtocolError):
+            rejected.decide(context())
+
+    def test_rejects_invalid_utterance_limits(self):
+        for maximum in (
+            False,
+            0,
+            MAX_UTTERANCE_CHARS + 1,
+            120.0,
+            "120",
+        ):
+            with self.subTest(maximum=maximum), self.assertRaises(
+                LMStudioConfigurationError
+            ):
+                LMStudioControllerActionPlanner(
+                    max_utterance_chars=maximum
+                )
 
     def test_blast_persona_changes_only_the_locale_specific_system_prompt(self):
         response = completion({

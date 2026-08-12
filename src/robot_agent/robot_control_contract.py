@@ -67,6 +67,7 @@ RUNTIME_UPDATE_FIELDS = frozenset(
         "completion_tokens",
         "total_tokens",
         "speech_status",
+        "speech_error_code",
         "message",
     )
 )
@@ -266,6 +267,7 @@ class RobotRuntimeUpdate:
     completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
     speech_status: str = "idle"
+    speech_error_code: Optional[str] = None
     message: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -316,6 +318,13 @@ class RobotRuntimeUpdate:
                 "invalid_robot_speech_status",
                 "Robot speech status is invalid",
             )
+        if self.speech_error_code is not None:
+            _identifier("speech_error_code", self.speech_error_code)
+            if self.speech_status != "failed":
+                raise DashboardContractError(
+                    "invalid_robot_speech_error_code",
+                    "Robot speech error code requires failed speech",
+                )
         if self.message is not None:
             _text("message", self.message, 1_000)
 
@@ -339,6 +348,20 @@ class RobotRuntimeUpdate:
         plan = value.get("plan", prior.plan)
         if isinstance(plan, list):
             plan = tuple(plan)
+        speech_status = value.get(
+            "speech_status",
+            prior.speech_status,
+        )
+        speech_error_code = value.get(
+            "speech_error_code",
+            prior.speech_error_code,
+        )
+        if (
+            "speech_status" in value
+            and speech_status != "failed"
+            and "speech_error_code" not in value
+        ):
+            speech_error_code = None
         return cls(
             current_action=value.get(
                 "current_action",
@@ -368,10 +391,8 @@ class RobotRuntimeUpdate:
                 "total_tokens",
                 prior.total_tokens,
             ),
-            speech_status=value.get(
-                "speech_status",
-                prior.speech_status,
-            ),
+            speech_status=speech_status,
+            speech_error_code=speech_error_code,
             message=value.get("message", prior.message),
         )
 
@@ -388,6 +409,7 @@ class RobotRuntimeUpdate:
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
             "speech_status": self.speech_status,
+            "speech_error_code": self.speech_error_code,
             "message": self.message,
         }
 

@@ -153,6 +153,7 @@
           ? runtime.total_tokens
           : null,
         speech_status: safeText(runtime.speech_status, "idle"),
+        speech_error_code: safeText(runtime.speech_error_code, ""),
         message: safeText(runtime.message, ""),
       },
       last_error_code: safeText(source.last_error_code, ""),
@@ -335,9 +336,14 @@
       );
       const speechKey = `robot.speech.${runtime.speech_status}`;
       const speechValue = translate(speechKey);
-      byId("robot-speech-status").textContent = speechValue === speechKey
+      const speechLabel = speechValue === speechKey
         ? runtime.speech_status
         : speechValue;
+      byId("robot-speech-status").textContent = (
+        runtime.speech_status === "failed" && runtime.speech_error_code
+          ? `${speechLabel} · ${runtime.speech_error_code}`
+          : speechLabel
+      );
     }
 
     function renderSettings(force = false) {

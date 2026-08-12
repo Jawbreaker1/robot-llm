@@ -2379,6 +2379,15 @@ const running = api.normalizeControl({
   enabled: true,
   accepting: true,
 });
+const speechFailed = api.normalizeControl({
+  state: "RUNNING",
+  enabled: true,
+  accepting: true,
+  runtime: {
+    speech_status: "failed",
+    speech_error_code: "tts_audio_too_long",
+  },
+});
 const stopping = api.normalizeControl({
   state: "STOPPING",
   enabled: true,
@@ -2396,6 +2405,7 @@ process.stdout.write(JSON.stringify({
   preferredAfterUserChoice: api.preferredInitialTarget(idle, true),
   robotPolicy: api.composerPolicy(idle, "robot", true, false),
   runningRobotPolicy: api.composerPolicy(running, "robot", true, false),
+  speechFailed,
   stoppingRobotPolicy: api.composerPolicy(stopping, "robot", true, false),
   faultedRobotPolicy: api.composerPolicy(faulted, "robot", true, false),
   busyRobotPolicy: api.composerPolicy(running, "robot", true, true),
@@ -2547,6 +2557,14 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(
             contract["idle"]["runtime"]["total_tokens"],
             21_120,
+        )
+        self.assertEqual(
+            contract["speechFailed"]["runtime"]["speech_error_code"],
+            "tts_audio_too_long",
+        )
+        self.assertIn(
+            "`${speechLabel} · ${runtime.speech_error_code}`",
+            self.robot_control,
         )
         self.assertIn(
             "if (!shouldApplySnapshot(control, next))",

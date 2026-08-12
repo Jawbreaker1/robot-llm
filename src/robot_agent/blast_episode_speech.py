@@ -2,7 +2,38 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Mapping
+
+
+logger = logging.getLogger(__name__)
+
+MAX_SPEECH_ERROR_CODE_CHARACTERS = 128
+SPEECH_FAILED_FALLBACK_CODE = "speech_failed"
+
+
+def _bounded_speech_error_code(value) -> str:
+    if (
+        isinstance(value, str)
+        and value
+        and value == value.strip()
+        and len(value) <= MAX_SPEECH_ERROR_CODE_CHARACTERS
+        and all(33 <= ord(character) <= 126 for character in value)
+    ):
+        return value
+    return SPEECH_FAILED_FALLBACK_CODE
+
+
+def _exception_speech_error_code(error: Exception) -> str:
+    try:
+        value = getattr(error, "code", type(error).__name__)
+    except Exception:
+        value = type(error).__name__
+    return _bounded_speech_error_code(value)
+
+
+def _exception_type_name(error: Exception) -> str:
+    return _bounded_speech_error_code(type(error).__name__)
 
 
 def blast_episode_cancelled(context) -> bool:
@@ -24,9 +55,19 @@ class BlastEpisodeSpeech:
     def _cancelled(self) -> bool:
         return blast_episode_cancelled(self._context)
 
-    def _publish_failed(self) -> None:
+    def _publish_failed(self, error: Exception, *, stage: str) -> None:
+        error_code = _exception_speech_error_code(error)
+        logger.warning(
+            "BLAST speech failed stage=%s code=%s error_type=%s",
+            stage,
+            error_code,
+            _exception_type_name(error),
+        )
         try:
-            self._context.publish({"speech_status": "failed"})
+            self._context.publish({
+                "speech_status": "failed",
+                "speech_error_code": error_code,
+            })
         except Exception:
             return
 
@@ -35,8 +76,21 @@ class BlastEpisodeSpeech:
             return
         status = event.get("speech_status")
         if isinstance(status, str):
+            update = {
+                "speech_status": status,
+                "speech_error_code": None,
+            }
+            if status == "failed":
+                error_code = _bounded_speech_error_code(
+                    event.get("reason")
+                )
+                update["speech_error_code"] = error_code
+                logger.warning(
+                    "BLAST speech failed stage=playback code=%s",
+                    error_code,
+                )
             try:
-                self._context.publish({"speech_status": status})
+                self._context.publish(update)
             except Exception:
                 return
 
@@ -57,9 +111,9 @@ class BlastEpisodeSpeech:
                 raise TypeError("invalid speech runtime")
             self._runtime = runtime
             runtime.start()
-        except Exception:
+        except Exception as error:
             self.close()
-            self._publish_failed()
+            self._publish_failed(error, stage="start")
 
     def offer(self, text, *, progress_revision: int) -> None:
         if self._runtime is None or text is None:
@@ -72,16 +126,21 @@ class BlastEpisodeSpeech:
                 progress_revision=progress_revision,
                 cancel_requested=self._cancelled,
             )
-        except Exception:
+        except Exception as error:
             # A rejected utterance cannot invalidate a verified action.
-            self._publish_failed()
+            self._publish_failed(error, stage="offer")
 
     def cancel(self) -> None:
         if self._runtime is None:
             return
         try:
             self._runtime.cancel_episode(self._context.episode_id)
-        except Exception:
+        except Exception as error:
+            logger.warning(
+                "BLAST speech failed stage=cancel code=%s error_type=%s",
+                _exception_speech_error_code(error),
+                _exception_type_name(error),
+            )
             return
 
     def close(self) -> bool:
@@ -96,7 +155,12 @@ class BlastEpisodeSpeech:
             if closed:
                 self._runtime = None
             return closed
-        except Exception:
+        except Exception as error:
+            logger.warning(
+                "BLAST speech failed stage=close code=%s error_type=%s",
+                _exception_speech_error_code(error),
+                _exception_type_name(error),
+            )
             return False
 
 

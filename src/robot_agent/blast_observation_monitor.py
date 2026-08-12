@@ -24,9 +24,28 @@ from .blast_ble_runtime import (
     BlastBLERuntime,
     _adpcm_sample_count,
 )
-from .blast_pcm_upload import BlastPCMUpload
+from .blast_pcm_upload import BlastPCMDeadline, BlastPCMUpload
 from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
+)
+from .blast_scan_observation import (
+    PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM,
+    RANGE_STATE_INVALID,
+    RANGE_STATE_MEASURED,
+    RANGE_STATE_NO_VALID_DISTANCE,
+    SCAN_RAY_EVIDENCE_SETTLED,
+    SCAN_RAY_EVIDENCE_SWEEP_ONLY,
+    SCAN_RAY_SIDES,
+    SCAN_RESTORATION_TOLERANCE_DEG,
+    SCAN_RESULT_SCHEMA,
+    aggregate_repeated_scan_ray,
+    blast_range_state,
+    body_motor_angle as _body_motor_angle,
+    finite_number as _finite_number,
+    scan_heading,
+    scan_heading_delta,
+    scan_ray,
+    validate_blast_scan_ray_contract,
 )
 
 
@@ -56,26 +75,9 @@ POST_MOTION_TILT_RANGE_DEG = 1.0
 COMMAND_RESULT_SCHEMA = "controller-command-result/v1"
 SAMPLED_AUDIO_RESULT_SCHEMA = "controller-sampled-audio-result/v1"
 SAMPLED_AUDIO_TIMEOUT_SECONDS = 60.0
+SAMPLED_AUDIO_MAX_TOTAL_SECONDS = 15.0 * 60.0
 SCAN_COMMAND = "scan_front_arc"
 SETTLED_OBSERVATION_COMMAND = "observe_settled"
-SCAN_RESULT_SCHEMA = "blast-scan-front-arc/v3"
-SCAN_RESTORATION_TOLERANCE_DEG = 5.0
-# A repeated near-ray observation belongs to the same angular bin only while
-# its measured gyro heading remains this close to the outbound observation.
-SCAN_REPEATED_RAY_MAX_DELTA_DEG = 5.0
-PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM = 2_000
-RANGE_STATE_MEASURED = "MEASURED"
-RANGE_STATE_NO_VALID_DISTANCE = "NO_VALID_DISTANCE"
-RANGE_STATE_INVALID = "INVALID"
-SCAN_RAY_EVIDENCE_SETTLED = "SETTLED_RANGE"
-SCAN_RAY_EVIDENCE_SWEEP_ONLY = "SWEEP_CONTINUATION_ONLY"
-SCAN_RAY_SIDES = (
-    "center",
-    "left_near",
-    "left_far",
-    "right_near",
-    "right_far",
-)
 COMMANDS = {
     "drive_forward": ("drive_pulse", "forward"),
     "drive_reverse": ("drive_pulse", "reverse"),
@@ -97,17 +99,6 @@ NAVIGATION_MOTION_COMMANDS = {
 }
 
 
-class BlastControllerError(RuntimeError):
-    """A bounded BLAST command could not be accepted or verified."""
-
-    def __init__(
-        self, code: str, message: str, *, motion_started=None,
-    ) -> None:
-        self.code = code
-        self.motion_started = motion_started
-        super().__init__(message)
-
-
 @dataclass(frozen=True)
 class _BlastNoReturnScanPermit:
     """One short-lived host permit for a geometry-checked scan."""
@@ -118,86 +109,15 @@ class _BlastNoReturnScanPermit:
     heading_deg: float
 
 
-def blast_range_state(distance_mm):
-    """Classify Pybricks ultrasonic output without inventing clearance."""
+class BlastControllerError(RuntimeError):
+    """A bounded BLAST command could not be accepted or verified."""
 
-    if (
-        isinstance(distance_mm, bool)
-        or not isinstance(distance_mm, (int, float))
-        or not math.isfinite(float(distance_mm))
-        or not 0 <= float(distance_mm) <= (
-            PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM
-        )
-    ):
-        return RANGE_STATE_INVALID
-    if float(distance_mm) == PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM:
-        return RANGE_STATE_NO_VALID_DISTANCE
-    return RANGE_STATE_MEASURED
-
-
-def _body_motor_angle(observation):
-    motor_angles = (
-        observation.get("motor_angles_deg")
-        if isinstance(observation, Mapping)
-        else None
-    )
-    value = (
-        motor_angles.get("body")
-        if isinstance(motor_angles, Mapping)
-        else None
-    )
-    return value if type(value) is int else None
-
-
-def validate_blast_scan_ray_contract(scan):
-    """Validate ray order, range state, and body-angle telemetry."""
-
-    if not isinstance(scan, Mapping) or scan.get("schema") != (
-        SCAN_RESULT_SCHEMA
-    ):
-        raise ValueError("BLAST scan result is invalid")
-    rays = scan.get("rays")
-    if (
-        not isinstance(rays, list)
-        or tuple(
-            ray.get("side") if isinstance(ray, Mapping) else None
-            for ray in rays
-        )
-        != SCAN_RAY_SIDES
-        or type(scan.get("all_observations_settled")) is not bool
-        or scan.get("all_observations_settled") != all(
-            isinstance(ray, Mapping)
-            and ray.get("observation_settled") is True
-            for ray in rays
-        )
-        or any(
-            (
-                type(ray.get("observation_settled")) is not bool
-                or (
-                    ray.get("observation_settled") is True
-                    and ray.get(
-                        "evidence_use", SCAN_RAY_EVIDENCE_SETTLED
-                    ) != SCAN_RAY_EVIDENCE_SETTLED
-                )
-                or (
-                    ray.get("observation_settled") is False
-                    and ray.get("evidence_use")
-                    != SCAN_RAY_EVIDENCE_SWEEP_ONLY
-                )
-                or ray.get("range_state") != blast_range_state(
-                    ray.get("distance_mm")
-                )
-                or "body_motor_angle_deg" not in ray
-                or (
-                    ray.get("body_motor_angle_deg") is not None
-                    and type(ray.get("body_motor_angle_deg")) is not int
-                )
-            )
-            for ray in rays
-        )
-    ):
-        raise ValueError("BLAST scan result is invalid")
-    return deepcopy(scan)
+    def __init__(
+        self, code: str, message: str, *, motion_started=None,
+    ) -> None:
+        self.code = code
+        self.motion_started = motion_started
+        super().__init__(message)
 
 
 class BlastObservationMonitor:
@@ -241,6 +161,8 @@ class BlastObservationMonitor:
         self._pending_command = None
         self._pending_speech = None
         self._preempt_stop_request = None
+        self._speech_step_active = False
+        self._stop_epoch = 0
         self._issued_scan_permit = None
         self._command_queue = Queue(maxsize=1)
         self._speech_queue = Queue(maxsize=1)
@@ -433,8 +355,11 @@ class BlastObservationMonitor:
                 )
             preempts_active_command = (
                 command == "stop"
-                and self._pending_command is not None
-                and self._pending_command != "stop"
+                and (
+                    self._pending_command is not None
+                    and self._pending_command != "stop"
+                    or self._speech_step_active
+                )
             )
             if preempts_active_command:
                 if self._preempt_stop_request is not None:
@@ -448,6 +373,7 @@ class BlastObservationMonitor:
                     result,
                     time.monotonic() + timeout_seconds,
                 )
+                self._stop_epoch += 1
                 self._command_available.set()
             elif (
                 self._pending_command is not None
@@ -459,6 +385,8 @@ class BlastObservationMonitor:
                 )
             else:
                 self._pending_command = command
+                if command == "stop":
+                    self._stop_epoch += 1
                 result = Future()
                 request = (
                     self._runtime_generation,
@@ -481,7 +409,8 @@ class BlastObservationMonitor:
         try:
             return result.result(timeout=timeout_seconds)
         except FutureTimeoutError:
-            result.cancel()
+            with self._lock:
+                result.cancel()
             raise BlastControllerError(
                 "controller_command_timeout",
                 "BLAST command did not finish in time",
@@ -529,11 +458,12 @@ class BlastObservationMonitor:
                 )
             result = Future()
             self._pending_speech = result
+            deadline = self._new_speech_deadline()
             request = (
                 self._runtime_generation,
                 payload,
                 result,
-                time.monotonic() + SAMPLED_AUDIO_TIMEOUT_SECONDS,
+                deadline,
                 cancel_requested,
             )
             try:
@@ -546,15 +476,41 @@ class BlastObservationMonitor:
                     motion_started=False,
                 ) from None
             self._command_available.set()
-        try:
-            return result.result(timeout=SAMPLED_AUDIO_TIMEOUT_SECONDS)
-        except FutureTimeoutError:
-            result.cancel()
+        while True:
+            remaining = deadline.remaining()
+            if remaining > 0:
+                try:
+                    return result.result(timeout=remaining)
+                except FutureTimeoutError:
+                    pass
+            elif deadline.start_in_flight():
+                # The bounded final start exchange is already committed. Its
+                # verified receipt must win over the caller's deadline edge;
+                # polling avoids both a tight loop and an unbounded wait.
+                try:
+                    return result.result(timeout=0.05)
+                except FutureTimeoutError:
+                    continue
+            if not deadline.claim_timeout():
+                continue
+            with self._lock:
+                cancelled = result.cancel()
+            if not cancelled:
+                return result.result()
+            self._clear_timed_out_speech(result)
             raise BlastControllerError(
                 "controller_command_timeout",
                 "BLAST speech did not finish in time",
                 motion_started=False,
             ) from None
+
+    @staticmethod
+    def _new_speech_deadline():
+        return BlastPCMDeadline(
+            inactivity_seconds=SAMPLED_AUDIO_TIMEOUT_SECONDS,
+            maximum_seconds=SAMPLED_AUDIO_MAX_TOTAL_SECONDS,
+            clock=time.monotonic,
+        )
 
     def close(self) -> None:
         with self._lifecycle_lock:
@@ -652,6 +608,9 @@ class BlastObservationMonitor:
                 self._issued_scan_permit = None
             self._set_state("online", None, ready=ready)
             while not self._stop_requested.is_set():
+                command_completed = False
+                with self._lock:
+                    stop_epoch = self._stop_epoch
                 preempted = await self._service_preempt_stop(
                     runtime,
                     generation,
@@ -662,6 +621,10 @@ class BlastObservationMonitor:
                         "BLAST speech upload was interrupted by stop",
                     )
                     speech_upload = None
+                if preempted:
+                    self._interrupt_pending_speech(
+                        "BLAST speech was interrupted by stop"
+                    )
                 request = self._next_command()
                 if preempted and request is not None:
                     self._finish_command(
@@ -675,36 +638,86 @@ class BlastObservationMonitor:
                 elif request is None:
                     pass
                 else:
-                    if request[1] == "stop" and speech_upload is not None:
-                        self._interrupt_speech_upload(
-                            speech_upload,
-                            "BLAST speech upload was interrupted by stop",
+                    if request[1] == "stop":
+                        if speech_upload is not None:
+                            self._interrupt_speech_upload(
+                                speech_upload,
+                                "BLAST speech upload was interrupted by stop",
+                            )
+                            speech_upload = None
+                        self._interrupt_pending_speech(
+                            "BLAST speech was interrupted by stop"
                         )
-                        speech_upload = None
-                    await self._execute_command(
+                    command_completed = await self._execute_command(
                         runtime,
                         generation,
                         request,
                     )
-                if request is None and not preempted:
+                    with self._lock:
+                        stop_during_command = self._stop_epoch != stop_epoch
+                    if stop_during_command:
+                        preempted = True
+                        if speech_upload is not None:
+                            self._interrupt_speech_upload(
+                                speech_upload,
+                                "BLAST speech upload was interrupted by stop",
+                            )
+                            speech_upload = None
+                        self._interrupt_pending_speech(
+                            "BLAST speech was interrupted by stop"
+                        )
+                speech_turn = (
+                    not preempted
+                    and (
+                        request is None
+                        or request[1] != "stop"
+                        and command_completed
+                    )
+                )
+                if speech_turn:
                     if speech_upload is None:
-                        speech_request = self._next_speech()
+                        speech_request = (
+                            self._next_speech_after_command()
+                            if request is not None
+                            else self._next_speech()
+                        )
                         if speech_request is not None:
                             speech_upload = BlastPCMUpload.from_request(
                                 speech_request
                             )
                     if speech_upload is not None:
-                        speech_upload, session_usable = (
-                            await self._execute_speech_step(
+                        stopped_before_speech = (
+                            await self._service_preempt_stop(
                                 runtime,
                                 generation,
-                                speech_upload,
                             )
                         )
+                        if stopped_before_speech:
+                            self._interrupt_speech_upload(
+                                speech_upload,
+                                "BLAST speech upload was interrupted by stop",
+                            )
+                            speech_upload = None
+                            continue
+                        if not self._claim_speech_step():
+                            continue
+                        try:
+                            speech_upload, session_usable = (
+                                await self._execute_speech_step(
+                                    runtime,
+                                    generation,
+                                    speech_upload,
+                                )
+                            )
+                        finally:
+                            self._release_speech_step()
                         if not session_usable:
                             break
-                        # One begin/batch/start step per turn keeps fixed
-                        # commands ahead of the next low-priority batch.
+                        # Initial arbitration favours a fixed command. After
+                        # that command completes, exactly one bounded audio
+                        # step gets a turn even if more navigation is already
+                        # queued. This prevents either workload from starving
+                        # the other on BLAST's single BLE channel.
                         if speech_upload is not None:
                             fixed_work_pending = self._fixed_work_pending()
                             with self._lock:
@@ -724,7 +737,8 @@ class BlastObservationMonitor:
                                     await runtime.observe()
                                 )
                         continue
-                    self._publish_observation(await runtime.observe())
+                    if request is None:
+                        self._publish_observation(await runtime.observe())
                 if await self._wait_for_work(
                     self._poll_interval_seconds
                 ):
@@ -757,7 +771,8 @@ class BlastObservationMonitor:
             return None
 
     def _next_speech(self):
-        # Fixed commands are always claimed before low-priority speech.
+        # Fixed commands win the initial arbitration. Fair upload turns after
+        # completed commands are claimed by _next_speech_after_command().
         with self._lock:
             if (
                 self._pending_command is not None
@@ -768,6 +783,49 @@ class BlastObservationMonitor:
                 return self._speech_queue.get_nowait()
             except Empty:
                 return None
+
+    def _next_speech_after_command(self):
+        """Claim one fair upload turn behind stop but ahead of more motion."""
+
+        with self._lock:
+            if (
+                self._preempt_stop_request is not None
+                or self._pending_command == "stop"
+            ):
+                return None
+            try:
+                return self._speech_queue.get_nowait()
+            except Empty:
+                return None
+
+    def _claim_speech_step(self):
+        with self._lock:
+            if (
+                self._preempt_stop_request is not None
+                or self._pending_command == "stop"
+            ):
+                return False
+            self._speech_step_active = True
+            return True
+
+    def _release_speech_step(self):
+        with self._lock:
+            self._speech_step_active = False
+
+    def _interrupt_pending_speech(self, message):
+        with self._lock:
+            try:
+                request = self._speech_queue.get_nowait()
+            except Empty:
+                return
+        self._finish_speech(
+            request[2],
+            error=BlastControllerError(
+                "controller_command_interrupted",
+                message,
+                motion_started=False,
+            ),
+        )
 
     def _fixed_work_pending(self):
         with self._lock:
@@ -795,8 +853,19 @@ class BlastObservationMonitor:
     async def _execute_speech_step(
         self, runtime, generation, upload,
     ):
-        if upload.result.cancelled() or time.monotonic() >= upload.expires_at:
+        if upload.result.cancelled():
             self._finish_speech(upload.result)
+            return None, True
+        if upload.deadline.expired():
+            upload.deadline.claim_timeout()
+            self._finish_speech(
+                upload.result,
+                error=BlastControllerError(
+                    "controller_command_timeout",
+                    "BLAST speech did not make progress in time",
+                    motion_started=False,
+                ),
+            )
             return None, True
         if upload.cancel_requested is not None and upload.cancel_requested():
             self._finish_speech(
@@ -835,8 +904,10 @@ class BlastObservationMonitor:
                     "receipt": receipt,
                 },
             )
+            upload.deadline.finish_start()
             return None, True
         except asyncio.CancelledError:
+            upload.deadline.finish_start()
             self._finish_speech(
                 upload.result,
                 error=BlastControllerError(
@@ -847,6 +918,7 @@ class BlastObservationMonitor:
             )
             raise
         except Exception as error:
+            upload.deadline.finish_start()
             failure = BlastControllerError(
                 (
                     "controller_command_interrupted"
@@ -874,7 +946,7 @@ class BlastObservationMonitor:
                             probe_limit,
                             max(
                                 0.1,
-                                upload.expires_at - time.monotonic(),
+                                upload.deadline.remaining(),
                             ),
                         ),
                     )
@@ -891,11 +963,11 @@ class BlastObservationMonitor:
             self._finish_speech(upload.result, error=failure)
             return None, False
 
-    async def _execute_command(self, runtime, generation, request) -> None:
+    async def _execute_command(self, runtime, generation, request) -> bool:
         requested_generation, command, result, expires_at, permit = request
         if result.cancelled() or time.monotonic() >= expires_at:
             self._finish_command(result)
-            return
+            return False
         remaining = expires_at - time.monotonic()
         if remaining < MIN_COMMAND_BUDGET_SECONDS:
             self._finish_command(
@@ -905,7 +977,7 @@ class BlastObservationMonitor:
                     "BLAST command expired before execution",
                 ),
             )
-            return
+            return False
         try:
             if requested_generation not in (None, generation):
                 raise BlastControllerError(
@@ -927,7 +999,7 @@ class BlastObservationMonitor:
                         motion_started=False,
                     ),
                 )
-                return
+                return False
             internal_timeout = (
                 SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS
                 if command == SCAN_COMMAND
@@ -943,6 +1015,7 @@ class BlastObservationMonitor:
                 ),
             )
             self._finish_command(result, value=value)
+            return True
         except asyncio.CancelledError:
             self._finish_command(
                 result,
@@ -975,115 +1048,14 @@ class BlastObservationMonitor:
                 "scan_sweep_clearance_lost",
                 "scan_sweep_observation_unverified",
             ):
-                return
+                return False
             raise failure
 
-    @staticmethod
-    def _finite_number(value):
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-        ):
-            return None
-        return float(value)
-
-    @classmethod
-    def _scan_heading(cls, observation):
-        imu = observation.get("imu")
-        return cls._finite_number(
-            imu.get("heading_deg") if isinstance(imu, dict) else None
-        )
-
-    @staticmethod
-    def _scan_heading_delta(heading, reference):
-        if heading is None or reference is None:
-            return None
-        return (heading - reference + 180.0) % 360.0 - 180.0
-
-    @classmethod
-    def _scan_ray(
-        cls,
-        side,
-        observation,
-        start_heading,
-        observation_settled,
-        evidence_use=SCAN_RAY_EVIDENCE_SETTLED,
-    ):
-        heading = cls._scan_heading(observation)
-        observed_at_ms = observation.get("observed_at_ms")
-        if type(observed_at_ms) is not int:
-            observed_at_ms = None
-        distance_mm = cls._finite_number(observation.get("distance_mm"))
-        return {
-            "side": side,
-            "distance_mm": distance_mm,
-            "range_state": blast_range_state(distance_mm),
-            "body_motor_angle_deg": _body_motor_angle(observation),
-            "heading_deg": heading,
-            "relative_heading_deg": cls._scan_heading_delta(
-                heading,
-                start_heading,
-            ),
-            "observation_settled": observation_settled,
-            "evidence_use": evidence_use,
-            "observed_at_ms": observed_at_ms,
-        }
-
-    @classmethod
-    def _aggregate_repeated_scan_ray(
-        cls,
-        side,
-        start_heading,
-        primary,
-        repeated,
-    ):
-        """Use a settled same-heading retry only when the primary is weak."""
-
-        primary_observation, primary_settled, _primary_evidence = primary
-        repeated_observation, repeated_settled, _repeated_evidence = repeated
-        primary_state = blast_range_state(primary_observation.get(
-            "distance_mm"
-        ))
-        repeated_state = blast_range_state(repeated_observation.get(
-            "distance_mm"
-        ))
-        primary_heading = cls._scan_heading(primary_observation)
-        repeated_heading = cls._scan_heading(repeated_observation)
-        repeated_delta = cls._scan_heading_delta(
-            repeated_heading,
-            primary_heading,
-        )
-        primary_is_usable = (
-            primary_settled is True
-            and primary_state == RANGE_STATE_MEASURED
-        )
-        repeated_improves_evidence = (
-            repeated_settled is True
-            and repeated_delta is not None
-            and abs(repeated_delta) <= SCAN_REPEATED_RAY_MAX_DELTA_DEG
-            and (
-                repeated_state == RANGE_STATE_MEASURED
-                or (
-                    primary_settled is not True
-                    and repeated_state == RANGE_STATE_NO_VALID_DISTANCE
-                )
-            )
-        )
-        selected = (
-            repeated
-            if not primary_is_usable and repeated_improves_evidence
-            else primary
-        )
-
-        observation, observation_settled, evidence_use = selected
-        return cls._scan_ray(
-            side,
-            observation,
-            start_heading,
-            observation_settled,
-            evidence_use,
-        )
+    _finite_number = staticmethod(_finite_number)
+    _scan_heading = staticmethod(scan_heading)
+    _scan_heading_delta = staticmethod(scan_heading_delta)
+    _scan_ray = staticmethod(scan_ray)
+    _aggregate_repeated_scan_ray = staticmethod(aggregate_repeated_scan_ray)
 
     def _scan_sweep_window_allows_continuation(self, observation) -> bool:
         samples = self._settling_samples
@@ -1663,32 +1635,45 @@ class BlastObservationMonitor:
     def _finish_command(self, result, *, value=None, error=None):
         with self._lock:
             self._pending_command = None
-        if not result.done():
-            if error is None:
-                result.set_result(value)
-            else:
-                result.set_exception(error)
+            if not result.done():
+                if error is None:
+                    result.set_result(value)
+                else:
+                    result.set_exception(error)
 
     def _finish_speech(self, result, *, value=None, error=None):
         with self._lock:
             if self._pending_speech is result:
                 self._pending_speech = None
-        if not result.done():
-            if error is None:
-                result.set_result(value)
-            else:
-                result.set_exception(error)
+            if not result.done():
+                if error is None:
+                    result.set_result(value)
+                else:
+                    result.set_exception(error)
+
+    def _clear_timed_out_speech(self, result) -> None:
+        """Release one timed-out speech slot and discard it if unclaimed."""
+
+        with self._lock:
+            if self._pending_speech is result:
+                self._pending_speech = None
+            try:
+                request = self._speech_queue.get_nowait()
+            except Empty:
+                return
+            if request[2] is not result:
+                self._speech_queue.put_nowait(request)
 
     def _finish_preempt_stop(self, result, *, value=None, error=None):
         with self._lock:
             request = self._preempt_stop_request
             if request is not None and request[1] is result:
                 self._preempt_stop_request = None
-        if not result.done():
-            if error is None:
-                result.set_result(value)
-            else:
-                result.set_exception(error)
+            if not result.done():
+                if error is None:
+                    result.set_result(value)
+                else:
+                    result.set_exception(error)
 
     def _defer_commands_for_speech_reconnect(self) -> None:
         """Retain unstarted fixed commands across a PCM-desynced session."""

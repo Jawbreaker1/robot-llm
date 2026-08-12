@@ -70,6 +70,7 @@ ROBOT_PROFILE_CHOICES = (
     EV3RSTORM_PROFILE_ID,
     BLAST_PROFILE_ID,
 )
+BLAST_MAX_NAVIGATION_UTTERANCE_CHARS = 120
 
 
 class _LoopbackThreadingHTTPServer(ThreadingHTTPServer):
@@ -530,6 +531,9 @@ def _configured_robot_runtime_adapter(args, *, blast_monitor=None):
                 model=model,
                 timeout_seconds=args.robot_planner_timeout_seconds,
                 utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
+                max_utterance_chars=(
+                    BLAST_MAX_NAVIGATION_UTTERANCE_CHARS
+                ),
             )
 
         def speech_runtime_factory(*, event_sink):

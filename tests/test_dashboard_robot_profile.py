@@ -337,6 +337,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 model="model-b",
                 timeout_seconds=6.5,
                 utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
+                max_utterance_chars=120,
             )
             self.assertEqual(
                 adapter_type.call_args.kwargs["speech_locales"],

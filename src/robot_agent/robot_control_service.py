@@ -680,6 +680,9 @@ class RobotControlService:
                     "completion_tokens": self._runtime.completion_tokens,
                     "total_tokens": self._runtime.total_tokens,
                     "speech_status": self._runtime.speech_status,
+                    "speech_error_code": (
+                        self._runtime.speech_error_code
+                    ),
                 },
                 level="debug",
             )

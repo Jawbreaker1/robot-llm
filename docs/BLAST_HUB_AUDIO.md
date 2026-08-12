@@ -62,9 +62,15 @@ middle of a sentence.
 Small `begin` and `start` control messages bind the transfer id, rate,
 encoding, sample count, byte count, and checksum. The compressed payload uses
 Pybricks AppData. Each low-priority upload step contains at most eight
-MTU-sized writes, and its final write is acknowledged. Navigation and stop are
-checked between steps and always take priority over the next speech step.
-Neither upload nor playback requires idle drive motors.
+MTU-sized writes, and its final write is acknowledged. Stop is checked between
+steps and always has priority. After each verified navigation command, the
+scheduler admits at most one bounded upload step before the next non-stop
+command, so neither navigation nor speech can starve the other on the shared
+BLE session. A speech request times out after 60 seconds without acknowledged
+audio progress, with a separate 15-minute absolute admission ceiling. A final
+start exchange that was claimed before that ceiling gets at most 8.5 seconds
+to return its authoritative playback receipt. Neither upload nor playback
+requires idle drive motors.
 
 If speech is cancelled during upload, `start` is never sent. Global Stop and
 Emergency Stop stop both motors and the speaker. This first version does not

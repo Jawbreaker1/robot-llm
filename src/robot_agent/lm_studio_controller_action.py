@@ -234,6 +234,7 @@ class LMStudioControllerActionPlanner:
         clock: Callable[[], float] = time.monotonic,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         utterance_persona_by_locale: Mapping[str, str] | None = None,
+        max_utterance_chars: int = MAX_UTTERANCE_CHARS,
     ) -> None:
         if (
             not callable(transport)
@@ -241,6 +242,9 @@ class LMStudioControllerActionPlanner:
             or isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
             or not 0.1 <= float(timeout_seconds) <= 60.0
+            or isinstance(max_utterance_chars, bool)
+            or not isinstance(max_utterance_chars, int)
+            or not 1 <= max_utterance_chars <= MAX_UTTERANCE_CHARS
         ):
             raise _lm.LMStudioConfigurationError(
                 "Controller-action planner configuration is invalid"
@@ -258,6 +262,7 @@ class LMStudioControllerActionPlanner:
         self._transport = transport
         self._clock = clock
         self._timeout = float(timeout_seconds)
+        self._max_utterance_chars = max_utterance_chars
 
     @property
     def model(self) -> str:
@@ -296,7 +301,7 @@ class LMStudioControllerActionPlanner:
                     {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": MAX_UTTERANCE_CHARS,
+                        "maxLength": self._max_utterance_chars,
                     },
                     {"type": "null"},
                 ]
@@ -449,7 +454,7 @@ class LMStudioControllerActionPlanner:
                 not isinstance(utterance, str)
                 or not utterance.strip()
                 or utterance != utterance.strip()
-                or len(utterance) > MAX_UTTERANCE_CHARS
+                or len(utterance) > self._max_utterance_chars
             )
         ):
             raise _lm.LMStudioProtocolError(

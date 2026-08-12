@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 import threading
 import time
 import unittest
@@ -27,6 +28,7 @@ from robot_agent.blast_observation_monitor import (
     blast_range_state,
     validate_blast_scan_ray_contract,
 )
+from robot_agent.blast_pcm_upload import BlastPCMDeadline
 
 
 def adpcm_block(sample_count):
@@ -294,6 +296,126 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertIn(("start_pcm", len(payload)), FakeRuntime.instances[0].calls)
         monitor.close()
 
+    def test_pcm_timeout_before_claim_releases_slot_and_discards_request(self):
+        claim_open = threading.Event()
+        release_claim = threading.Event()
+
+        class DelayedSpeechClaimMonitor(BlastObservationMonitor):
+            def _next_speech(self):
+                if not release_claim.is_set():
+                    claim_open.set()
+                    release_claim.wait(timeout=2.0)
+                return super()._next_speech()
+
+        monitor = DelayedSpeechClaimMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        self.assertTrue(claim_open.wait(timeout=1.0))
+        payload = adpcm_block(1)
+
+        with mock.patch(
+            "robot_agent.blast_observation_monitor."
+            "SAMPLED_AUDIO_TIMEOUT_SECONDS",
+            0.05,
+        ):
+            with self.assertRaises(BlastControllerError) as timed_out:
+                monitor.play_pcm(payload)
+
+        self.assertEqual(timed_out.exception.code, "controller_command_timeout")
+        self.assertIsNone(monitor._pending_speech)
+        self.assertTrue(monitor._speech_queue.empty())
+
+        release_claim.set()
+        second = monitor.play_pcm(payload)
+
+        self.assertTrue(second["started"])
+        self.assertEqual(
+            FakeRuntime.instances[0].calls.count(("start_pcm", len(payload))),
+            1,
+        )
+        monitor.close()
+
+    def test_pcm_timeout_during_active_batch_allows_next_request(self):
+        first_batch_started = threading.Event()
+        release_first_batch = threading.Event()
+
+        class BlockingFirstBatchRuntime(FakeRuntime):
+            blocked_once = False
+
+            async def write_pcm_batch(
+                self, offset, payload, *, cancel_requested=None,
+            ):
+                self.calls.append(("write_pcm_batch", offset, payload))
+                if not self.blocked_once:
+                    self.blocked_once = True
+                    first_batch_started.set()
+                    await __import__("asyncio").to_thread(
+                        release_first_batch.wait,
+                        2.0,
+                    )
+                return {"received_bytes": offset + len(payload)}
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=BlockingFirstBatchRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        first_payload = adpcm_block_for_size(18)
+        second_payload = adpcm_block_for_size(10)
+        first_failures = []
+        second_outcomes = []
+
+        with mock.patch(
+            "robot_agent.blast_observation_monitor."
+            "SAMPLED_AUDIO_TIMEOUT_SECONDS",
+            0.05,
+        ):
+            first_thread = threading.Thread(
+                target=lambda: self._capture_failure(
+                    first_failures,
+                    lambda: monitor.play_pcm(first_payload),
+                )
+            )
+            first_thread.start()
+            self.assertTrue(first_batch_started.wait(timeout=1.0))
+            first_thread.join(timeout=1.0)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertEqual(len(first_failures), 1)
+        self.assertEqual(
+            first_failures[0].code,
+            "controller_command_timeout",
+        )
+        self.assertIsNone(monitor._pending_speech)
+
+        second_thread = threading.Thread(
+            target=lambda: second_outcomes.append(
+                monitor.play_pcm(second_payload)
+            )
+        )
+        second_thread.start()
+        deadline = time.monotonic() + 1.0
+        while (
+            monitor._pending_speech is None
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        self.assertIsNotNone(monitor._pending_speech)
+        release_first_batch.set()
+        second_thread.join(timeout=3.0)
+
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(len(second_outcomes), 1)
+        self.assertTrue(second_outcomes[0]["started"])
+        calls = FakeRuntime.instances[0].calls
+        self.assertNotIn(("start_pcm", len(first_payload)), calls)
+        self.assertIn(("start_pcm", len(second_payload)), calls)
+        monitor.close()
+
     def test_navigation_command_wins_while_speech_waits(self):
         claim_open = threading.Event()
         release_claim = threading.Event()
@@ -406,6 +528,614 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertLess(navigation, second)
         self.assertNotIn(("observe",), calls[first + 1:navigation])
         self.assertIn(("start_pcm", 18), calls)
+        monitor.close()
+
+    def test_over_sixty_second_navigation_stream_cannot_starve_v5_speech(self):
+        claim_open = threading.Event()
+        release_claim = threading.Event()
+        command_count = 62
+
+        class SimulatedClock:
+            def __init__(self):
+                self.value = 0.0
+                self.lock = threading.Lock()
+
+            def __call__(self):
+                with self.lock:
+                    return self.value
+
+            def advance(self, seconds):
+                with self.lock:
+                    self.value += seconds
+
+        simulated_clock = SimulatedClock()
+
+        class V5Runtime(FakeRuntime):
+            simulated_navigation_seconds = 0
+            speech_started_at_simulated_seconds = None
+
+            async def drive_pulse(self, direction):
+                self.calls.append(("drive_pulse", direction))
+                self.simulated_navigation_seconds += 5
+                simulated_clock.advance(5)
+                return {"accepted": True, "direction": direction}
+
+            async def begin_pcm(self, payload, *, cancel_requested=None):
+                begun = await super().begin_pcm(
+                    payload,
+                    cancel_requested=cancel_requested,
+                )
+                # Eight 509-byte AppData frames, the real v5 batch ceiling.
+                begun["batch_bytes"] = 4_072
+                return begun
+
+            async def start_pcm(
+                self,
+                transfer_id,
+                byte_count,
+                fletcher16,
+                *,
+                cancel_requested=None,
+            ):
+                self.speech_started_at_simulated_seconds = simulated_clock()
+                return await super().start_pcm(
+                    transfer_id,
+                    byte_count,
+                    fletcher16,
+                    cancel_requested=cancel_requested,
+                )
+
+        class ContinuousNavigationMonitor(BlastObservationMonitor):
+            completed_commands = 0
+
+            @staticmethod
+            def _settling_window_is_stable(samples):
+                return bool(samples)
+
+            @staticmethod
+            def _new_speech_deadline():
+                return BlastPCMDeadline(
+                    inactivity_seconds=60.0,
+                    maximum_seconds=15.0 * 60.0,
+                    clock=simulated_clock,
+                )
+
+            def _next_command(self):
+                if not claim_open.is_set():
+                    claim_open.set()
+                    release_claim.wait(timeout=2.0)
+                return super()._next_command()
+
+            async def _execute_command(self, runtime, generation, request):
+                completed = await super()._execute_command(
+                    runtime,
+                    generation,
+                    request,
+                )
+                if request[1] != "drive_forward":
+                    return completed
+                self.completed_commands += 1
+                if self.completed_commands >= command_count:
+                    return completed
+                # Reproduce a continuously fed navigator deterministically:
+                # the next command is already waiting before arbitration.
+                deadline = time.monotonic() + 1.0
+                while (
+                    self._pending_command is None
+                    and time.monotonic() < deadline
+                ):
+                    await __import__("asyncio").sleep(0.001)
+                return completed
+
+        monitor = ContinuousNavigationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=V5Runtime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        self.assertTrue(claim_open.wait(timeout=1.0))
+        # The exact complete five-second v5 reference utterance size. It must
+        # be fully preloaded before start_pcm; no sentence fragments play.
+        payload = adpcm_block_for_size(41_060)
+        speech_outcomes = []
+        navigation_outcomes = []
+        failures = []
+        speech_thread = threading.Thread(
+            target=lambda: speech_outcomes.append(monitor.play_pcm(payload))
+        )
+
+        def navigate_continuously():
+            try:
+                for _ in range(command_count):
+                    navigation_outcomes.append(
+                        monitor.command("drive_forward")
+                    )
+            except Exception as error:
+                failures.append(error)
+
+        navigation_thread = threading.Thread(target=navigate_continuously)
+        speech_thread.start()
+        navigation_thread.start()
+        deadline = time.monotonic() + 1.0
+        while (
+            (monitor._pending_speech is None or monitor._pending_command is None)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        release_claim.set()
+        speech_thread.join(timeout=5.0)
+        navigation_thread.join(timeout=5.0)
+
+        self.assertFalse(speech_thread.is_alive())
+        self.assertFalse(navigation_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(len(speech_outcomes), 1)
+        self.assertTrue(speech_outcomes[0]["started"])
+        self.assertEqual(len(navigation_outcomes), command_count)
+        runtime = FakeRuntime.instances[0]
+        self.assertGreater(runtime.simulated_navigation_seconds, 60)
+        self.assertGreater(
+            runtime.speech_started_at_simulated_seconds,
+            60,
+        )
+        calls = runtime.calls
+        drive_indexes = [
+            index for index, call in enumerate(calls)
+            if call == ("drive_pulse", "forward")
+        ]
+        audio_indexes = [
+            index for index, call in enumerate(calls)
+            if call[0] in {"begin_pcm", "write_pcm_batch", "start_pcm"}
+        ]
+        self.assertEqual(len(drive_indexes), command_count)
+        self.assertEqual(
+            len([
+                call for call in calls if call[0] == "write_pcm_batch"
+            ]),
+            11,
+        )
+        self.assertEqual(len(audio_indexes), 13)
+        self.assertLess(
+            calls.index(("start_pcm", len(payload))),
+            drive_indexes[13],
+        )
+        for position, audio_index in enumerate(audio_indexes):
+            self.assertLess(drive_indexes[position], audio_index)
+            self.assertLess(audio_index, drive_indexes[position + 1])
+        monitor.close()
+
+    def test_pcm_progress_never_extends_absolute_lifetime_ceiling(self):
+        class Clock:
+            value = 0.0
+
+            def __call__(self):
+                return self.value
+
+        clock = Clock()
+        deadline = BlastPCMDeadline(
+            inactivity_seconds=10.0,
+            maximum_seconds=25.0,
+            clock=clock,
+        )
+
+        clock.value = 9.0
+        self.assertTrue(deadline.record_progress())
+        self.assertEqual(deadline.remaining(), 10.0)
+        clock.value = 18.0
+        self.assertTrue(deadline.record_progress())
+        self.assertEqual(deadline.remaining(), 7.0)
+        clock.value = 25.0
+        self.assertTrue(deadline.expired())
+        self.assertTrue(deadline.claim_timeout())
+        self.assertFalse(deadline.record_progress())
+
+    def test_completed_future_wins_timeout_cleanup_race(self):
+        class CompletionWinsDeadline:
+            def remaining(self):
+                return 0.0
+
+            def start_in_flight(self):
+                return False
+
+            def claim_timeout(self):
+                with monitor._lock:
+                    result = monitor._pending_speech
+                result.set_result({"started": True})
+                return True
+
+        class CompletionWinsMonitor(BlastObservationMonitor):
+            @staticmethod
+            def _new_speech_deadline():
+                return CompletionWinsDeadline()
+
+        monitor = CompletionWinsMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        result = monitor.play_pcm(adpcm_block(1))
+
+        self.assertEqual(result, {"started": True})
+        monitor.close()
+
+    def test_speech_completion_and_timeout_cancel_are_atomic(self):
+        done_entered = threading.Event()
+        release_done = threading.Event()
+
+        class PausingFuture(Future):
+            def done(self):
+                done_entered.set()
+                release_done.wait(timeout=2.0)
+                return super().done()
+
+        monitor = BlastObservationMonitor(runtime_factory=FakeRuntime)
+        result = PausingFuture()
+        monitor._pending_speech = result
+        finish_failures = []
+        cancel_results = []
+        finish_thread = threading.Thread(
+            target=lambda: self._capture_failure(
+                finish_failures,
+                lambda: monitor._finish_speech(
+                    result,
+                    value={"started": True},
+                ),
+            )
+        )
+        finish_thread.start()
+        self.assertTrue(done_entered.wait(timeout=1.0))
+
+        def cancel_under_monitor_lock():
+            with monitor._lock:
+                cancel_results.append(result.cancel())
+
+        cancel_thread = threading.Thread(target=cancel_under_monitor_lock)
+        cancel_thread.start()
+        self.assertTrue(cancel_thread.is_alive())
+        release_done.set()
+        finish_thread.join(timeout=2.0)
+        cancel_thread.join(timeout=2.0)
+
+        self.assertEqual(finish_failures, [])
+        self.assertEqual(cancel_results, [False])
+        self.assertEqual(result.result(), {"started": True})
+        self.assertIsNone(monitor._pending_speech)
+
+    def test_queued_stop_stays_ahead_of_fair_speech_turn(self):
+        claim_open = threading.Event()
+        release_claim = threading.Event()
+        first_command_completed = threading.Event()
+        release_first_command = threading.Event()
+        cancel = threading.Event()
+
+        class StopBoundaryMonitor(BlastObservationMonitor):
+            def _next_command(self):
+                if not claim_open.is_set():
+                    claim_open.set()
+                    release_claim.wait(timeout=2.0)
+                return super()._next_command()
+
+            async def _execute_command(self, runtime, generation, request):
+                completed = await super()._execute_command(
+                    runtime,
+                    generation,
+                    request,
+                )
+                if request[1] == "drive_forward":
+                    first_command_completed.set()
+                    await __import__("asyncio").to_thread(
+                        release_first_command.wait,
+                        2.0,
+                    )
+                return completed
+
+        monitor = StopBoundaryMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        self.assertTrue(claim_open.wait(timeout=1.0))
+        speech_failures = []
+        navigation_results = []
+        stop_results = []
+        speech_thread = threading.Thread(
+            target=lambda: self._capture_failure(
+                speech_failures,
+                lambda: monitor.play_pcm(
+                    adpcm_block_for_size(18),
+                    cancel_requested=cancel.is_set,
+                ),
+            )
+        )
+        navigation_thread = threading.Thread(
+            target=lambda: navigation_results.append(
+                monitor.command("drive_forward")
+            )
+        )
+        speech_thread.start()
+        navigation_thread.start()
+        deadline = time.monotonic() + 1.0
+        while (
+            (monitor._pending_speech is None or monitor._pending_command is None)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        release_claim.set()
+        self.assertTrue(first_command_completed.wait(timeout=2.0))
+        cancel.set()
+        stop_thread = threading.Thread(
+            target=lambda: stop_results.append(monitor.command("stop"))
+        )
+        stop_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._pending_command != "stop" and time.monotonic() < deadline:
+            time.sleep(0.005)
+        release_first_command.set()
+        speech_thread.join(timeout=3.0)
+        navigation_thread.join(timeout=3.0)
+        stop_thread.join(timeout=3.0)
+
+        self.assertFalse(speech_thread.is_alive())
+        self.assertFalse(navigation_thread.is_alive())
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(len(navigation_results), 1)
+        self.assertEqual(len(stop_results), 1)
+        self.assertTrue(stop_results[0]["completed"])
+        self.assertEqual(len(speech_failures), 1)
+        self.assertEqual(
+            speech_failures[0].code,
+            "controller_command_interrupted",
+        )
+        calls = FakeRuntime.instances[0].calls
+        self.assertLess(
+            calls.index(("drive_pulse", "forward")),
+            calls.index(("stop",)),
+        )
+        self.assertFalse(any(call[0] == "begin_pcm" for call in calls))
+        monitor.close()
+
+    def test_stop_queued_before_session_loop_discards_older_speech(self):
+        online_published = threading.Event()
+        release_session_loop = threading.Event()
+
+        class PrequeuedStopMonitor(BlastObservationMonitor):
+            def _set_state(self, state, reason_code, **changes):
+                super()._set_state(state, reason_code, **changes)
+                if state == "online" and not online_published.is_set():
+                    online_published.set()
+                    release_session_loop.wait(timeout=2.0)
+
+        monitor = PrequeuedStopMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.assertTrue(online_published.wait(timeout=1.0))
+        speech_failures = []
+        stop_results = []
+        speech_thread = threading.Thread(
+            target=lambda: self._capture_failure(
+                speech_failures,
+                lambda: monitor.play_pcm(adpcm_block_for_size(18)),
+            )
+        )
+        speech_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._pending_speech is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        stop_thread = threading.Thread(
+            target=lambda: stop_results.append(monitor.command("stop"))
+        )
+        stop_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._pending_command != "stop" and time.monotonic() < deadline:
+            time.sleep(0.005)
+        release_session_loop.set()
+        speech_thread.join(timeout=3.0)
+        stop_thread.join(timeout=3.0)
+
+        self.assertFalse(speech_thread.is_alive())
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(len(speech_failures), 1)
+        self.assertEqual(
+            speech_failures[0].code,
+            "controller_command_interrupted",
+        )
+        self.assertEqual(len(stop_results), 1)
+        self.assertTrue(stop_results[0]["completed"])
+        calls = FakeRuntime.instances[0].calls
+        self.assertIn(("stop",), calls)
+        self.assertFalse(any(call[0] == "begin_pcm" for call in calls))
+        self.assertFalse(any(call[0] == "start_pcm" for call in calls))
+        monitor.close()
+
+    def test_stop_serviced_inside_navigation_cancels_queued_speech(self):
+        drive_started = threading.Event()
+        release_drive = threading.Event()
+
+        class PreemptedRuntime(FakeRuntime):
+            async def drive_pulse(self, direction):
+                self.calls.append(("drive_pulse", direction))
+                drive_started.set()
+                await __import__("asyncio").to_thread(
+                    release_drive.wait,
+                    2.0,
+                )
+                self.motion_observations = 1
+                return {"accepted": True, "direction": direction}
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=PreemptedRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        navigation_failures = []
+        speech_failures = []
+        stop_results = []
+        navigation_thread = threading.Thread(
+            target=lambda: self._capture_failure(
+                navigation_failures,
+                lambda: monitor.command("drive_forward"),
+            )
+        )
+        navigation_thread.start()
+        self.assertTrue(drive_started.wait(timeout=1.0))
+        speech_thread = threading.Thread(
+            target=lambda: self._capture_failure(
+                speech_failures,
+                lambda: monitor.play_pcm(adpcm_block_for_size(18)),
+            )
+        )
+        speech_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._pending_speech is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        stop_thread = threading.Thread(
+            target=lambda: stop_results.append(monitor.command("stop"))
+        )
+        stop_thread.start()
+        release_drive.set()
+        navigation_thread.join(timeout=3.0)
+        speech_thread.join(timeout=3.0)
+        stop_thread.join(timeout=3.0)
+
+        self.assertEqual(len(navigation_failures), 1)
+        self.assertEqual(
+            navigation_failures[0].code,
+            "controller_command_interrupted",
+        )
+        self.assertEqual(len(speech_failures), 1)
+        self.assertEqual(
+            speech_failures[0].code,
+            "controller_command_interrupted",
+        )
+        self.assertEqual(len(stop_results), 1)
+        calls = FakeRuntime.instances[0].calls
+        self.assertIn(("stop",), calls)
+        self.assertFalse(any(call[0] == "begin_pcm" for call in calls))
+        monitor.close()
+
+    def test_stop_after_speech_step_claim_waits_only_for_one_bounded_batch(self):
+        batch_started = threading.Event()
+        release_batch = threading.Event()
+
+        class ClaimedBatchRuntime(FakeRuntime):
+            async def write_pcm_batch(
+                self, offset, payload, *, cancel_requested=None,
+            ):
+                self.calls.append(("write_pcm_batch", offset, payload))
+                batch_started.set()
+                await __import__("asyncio").to_thread(
+                    release_batch.wait,
+                    2.0,
+                )
+                return {"received_bytes": offset + len(payload)}
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=ClaimedBatchRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        speech_failures = []
+        stop_results = []
+        payload = adpcm_block_for_size(18)
+        speech_thread = threading.Thread(
+            target=lambda: self._capture_failure(
+                speech_failures,
+                lambda: monitor.play_pcm(payload),
+            )
+        )
+        speech_thread.start()
+        self.assertTrue(batch_started.wait(timeout=1.0))
+        stop_thread = threading.Thread(
+            target=lambda: stop_results.append(monitor.command("stop"))
+        )
+        stop_thread.start()
+        deadline = time.monotonic() + 1.0
+        while monitor._preempt_stop_request is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        release_batch.set()
+        speech_thread.join(timeout=3.0)
+        stop_thread.join(timeout=3.0)
+
+        self.assertEqual(len(stop_results), 1)
+        self.assertEqual(len(speech_failures), 1)
+        calls = FakeRuntime.instances[0].calls
+        batch_index = calls.index(("write_pcm_batch", 0, payload[:8]))
+        stop_index = calls.index(("stop",))
+        self.assertLess(batch_index, stop_index)
+        self.assertFalse(any(
+            call[0] == "write_pcm_batch" and call[1] > 0
+            for call in calls
+        ))
+        self.assertNotIn(("start_pcm", len(payload)), calls)
+        monitor.close()
+
+    def test_timeout_cannot_win_after_final_start_is_in_flight(self):
+        start_entered = threading.Event()
+        release_start = threading.Event()
+
+        class SlowStartRuntime(FakeRuntime):
+            async def start_pcm(
+                self,
+                transfer_id,
+                byte_count,
+                fletcher16,
+                *,
+                cancel_requested=None,
+            ):
+                start_entered.set()
+                await __import__("asyncio").to_thread(
+                    release_start.wait,
+                    2.0,
+                )
+                return await super().start_pcm(
+                    transfer_id,
+                    byte_count,
+                    fletcher16,
+                    cancel_requested=cancel_requested,
+                )
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=SlowStartRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        outcomes = []
+        failures = []
+        with mock.patch(
+            "robot_agent.blast_observation_monitor."
+            "SAMPLED_AUDIO_TIMEOUT_SECONDS",
+            0.05,
+        ):
+            speech_thread = threading.Thread(
+                target=lambda: self._capture_outcome(
+                    outcomes,
+                    failures,
+                    lambda: monitor.play_pcm(adpcm_block(1)),
+                )
+            )
+            speech_thread.start()
+            self.assertTrue(start_entered.wait(timeout=1.0))
+            time.sleep(0.1)
+            self.assertTrue(speech_thread.is_alive())
+            release_start.set()
+            speech_thread.join(timeout=3.0)
+
+        self.assertFalse(speech_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(len(outcomes), 1)
+        self.assertTrue(outcomes[0]["started"])
+        self.assertIn(
+            ("start_pcm", 7),
+            FakeRuntime.instances[0].calls,
+        )
         monitor.close()
 
     def test_multi_batch_upload_keeps_observation_snapshot_fresh(self):
@@ -1133,6 +1863,13 @@ class BlastObservationMonitorTests(unittest.TestCase):
             callback()
         except Exception as error:
             target.append(error)
+
+    @staticmethod
+    def _capture_outcome(outcomes, failures, callback):
+        try:
+            outcomes.append(callback())
+        except Exception as error:
+            failures.append(error)
 
     def test_settled_observation_command_is_motorless(self):
         class RecordingMonitor(BlastObservationMonitor):
