@@ -6488,6 +6488,7 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
                         reason_code="VERIFY_RESULT",
                     )
                     return json.dumps({
+                        "model": "test-model",
                         "choices": [{
                             "message": {
                                 "content": json.dumps(response_decision),
@@ -6572,6 +6573,7 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
                 commitment=commitment,
             )
             return json.dumps({
+                "model": "test-model",
                 "choices": [{
                     "message": {
                         "content": json.dumps(response_decision),
@@ -6654,6 +6656,7 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
                 reason_code="VERIFY_RESULT",
             )
             return json.dumps({
+                "model": "test-model",
                 "choices": [{
                     "message": {
                         "content": json.dumps(response_decision),
@@ -6720,6 +6723,7 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
                 reason_code="VERIFY_RESULT",
             )
             return json.dumps({
+                "model": "test-model",
                 "choices": [{
                     "message": {
                         "content": json.dumps(response_decision),
@@ -6780,6 +6784,7 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
                 target="hazard-1",
             )
             return json.dumps({
+                "model": "test-model",
                 "choices": [{
                     "message": {"content": json.dumps(invalid)},
                 }],
@@ -6843,7 +6848,7 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
                     )
                     return json.dumps(
                         {
-                            "model": "served-model",
+                            "model": "injected-model",
                             "choices": [
                                 {
                                     "message": {
@@ -6915,6 +6920,59 @@ class LMStudioNavigationLocaleTests(unittest.TestCase):
                         "time_to_first_token": 0.11,
                     },
                 )
+
+    def test_served_model_identity_must_match_request(self):
+        for served_model in (None, "wrong-model"):
+            with self.subTest(served_model=served_model):
+                def transport(
+                    _url, _body, _headers, _timeout, _maximum,
+                ):
+                    response = {
+                        "choices": [{
+                            "message": {"content": json.dumps(
+                                decision_mapping(
+                                    episode_id="episode-model-identity",
+                                    turn=1,
+                                    state_version=1,
+                                    action=OBSERVE,
+                                    plan=[OBSERVE],
+                                    reason_code="VERIFY_RESULT",
+                                )
+                            )},
+                        }],
+                    }
+                    if served_model is not None:
+                        response["model"] = served_model
+                    return json.dumps(response).encode("utf-8")
+
+                times = iter((1.0, 1.01))
+                planner = LMStudioNavigationPlanner(
+                    base_url="http://127.0.0.1:1234",
+                    model="requested-model",
+                    transport=transport,
+                    clock=lambda: next(times),
+                )
+
+                with self.assertRaises(
+                    LMStudioNavigationError
+                ) as caught:
+                    planner.decide(
+                        episode_id="episode-model-identity",
+                        turn=1,
+                        locale="en",
+                        observation=observation(1),
+                        mission={"completed": False},
+                        navigation={"navigation_hazard_hypotheses": []},
+                        maneuver_state={"active": None},
+                        available_actions=[OBSERVE],
+                        last_tool_result=None,
+                    )
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "served_model_identity_mismatch",
+                )
+                self.assertEqual(caught.exception.latency_ms, 10)
 
 
 if __name__ == "__main__":

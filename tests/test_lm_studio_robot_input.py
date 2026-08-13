@@ -23,6 +23,7 @@ from robot_agent.lm_studio_robot_input import (
     PHYSICAL_TASK,
     READ_ONLY_TASK,
     STOP_TASK,
+    UNSUPPORTED_PHYSICAL_TASK,
     RobotInput,
     RobotInputDecision,
 )
@@ -82,6 +83,14 @@ class RobotInputContractTests(unittest.TestCase):
             RobotInputDecision(PHYSICAL_TASK, 900, None, False),
         )
         self.assertIsNone(RobotInputDecision(STOP_TASK, 900, None).reply_text)
+        self.assertEqual(
+            RobotInputDecision(
+                UNSUPPORTED_PHYSICAL_TASK,
+                900,
+                "Jag kan bara navigera.",
+            ).intent,
+            UNSUPPORTED_PHYSICAL_TASK,
+        )
         self.assertEqual(RobotInputDecision(CONVERSE, 800, "Jaha.").reply_text, "Jaha.")
 
     def test_rejects_invalid_input_and_decision_invariants(self):
@@ -153,7 +162,8 @@ class LMStudioRobotInputTests(unittest.TestCase):
         for phrase in (
             "never keywords, regex",
             "why the robot is in its current state",
-            "gain new evidence by changing pose or orientation",
+            "gain new evidence is PHYSICAL_TASK",
+            "UNSUPPORTED_PHYSICAL_TASK requests manipulation",
             "unambiguous antecedent",
             "IR/range and map data are not camera vision",
             "tired, grumpy but harmless",
@@ -165,7 +175,12 @@ class LMStudioRobotInputTests(unittest.TestCase):
         self.assertFalse(schema["schema"]["additionalProperties"])
         properties = schema["schema"]["properties"]
         self.assertEqual(properties["intent"]["enum"], [
-            CONVERSE, READ_ONLY_TASK, PHYSICAL_TASK, STOP_TASK, CLARIFY
+            CONVERSE,
+            READ_ONLY_TASK,
+            PHYSICAL_TASK,
+            UNSUPPORTED_PHYSICAL_TASK,
+            STOP_TASK,
+            CLARIFY,
         ])
         self.assertEqual(properties["reply_text"]["oneOf"][1], {"type": "null"})
 
@@ -174,6 +189,11 @@ class LMStudioRobotInputTests(unittest.TestCase):
             (CONVERSE, "Jaså, du vill prata.", False),
             (READ_ONLY_TASK, "IR visar ett hinder.", False),
             (CLARIFY, "Vad menar du?", False),
+            (
+                UNSUPPORTED_PHYSICAL_TASK,
+                "Jag kan navigera, men inte vinka.",
+                False,
+            ),
             (PHYSICAL_TASK, None, False),
             (STOP_TASK, None, False),
         )

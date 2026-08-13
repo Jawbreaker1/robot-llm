@@ -52,6 +52,7 @@ class CapturingTransport:
             state_version=request_context["observation"]["state_version"],
         )
         return json.dumps({
+            "model": self.calls[-1]["payload"]["model"],
             "choices": [{"message": {"content": json.dumps(value)}}],
         }).encode("utf-8")
 

@@ -40,7 +40,7 @@ def _active_episode_reply(locale: str) -> str:
 
 
 class RobotInputService:
-    """Interpret once; only ``PHYSICAL_TASK`` may start a robot episode."""
+    """Interpret once; only supported navigation may start an episode."""
 
     def __init__(
         self,

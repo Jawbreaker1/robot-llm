@@ -420,6 +420,7 @@ class PlannerProjectionIntegrationTests(unittest.TestCase):
                 "maneuver_commitment": empty_commitment(),
             }
             return json.dumps({
+                "model": payload["model"],
                 "choices": [{"message": {"content": json.dumps(decision)}}],
                 "usage": {
                     "prompt_tokens": 123,

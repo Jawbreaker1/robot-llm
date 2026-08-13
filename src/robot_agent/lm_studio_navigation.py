@@ -888,6 +888,13 @@ class LMStudioNavigationPlanner:
                 code="planner_response_invalid",
                 latency_ms=max(0, elapsed_ms),
             ) from error
+        served_model = wire.get("model")
+        if served_model != self.model:
+            raise LMStudioNavigationError(
+                "LM Studio served a different navigation model",
+                code="served_model_identity_mismatch",
+                latency_ms=max(0, elapsed_ms),
+            )
         try:
             decoded = strict_json_loads(
                 content.encode("utf-8"),
@@ -907,9 +914,6 @@ class LMStudioNavigationPlanner:
                 str(error),
                 latency_ms=elapsed_ms,
             ) from error
-        served_model = wire.get("model")
-        if served_model is not None and not isinstance(served_model, str):
-            served_model = None
         usage = wire.get("usage")
         if usage is not None and not isinstance(usage, dict):
             usage = None

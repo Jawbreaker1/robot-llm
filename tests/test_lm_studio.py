@@ -81,8 +81,8 @@ class FixedClock:
 
 
 class NativeLMStudioClientTests(unittest.TestCase):
-    def test_canonical_default_model_is_qat_artifact(self):
-        self.assertEqual(DEFAULT_MODEL, "google/gemma-4-26b-a4b-qat")
+    def test_canonical_default_model_is_non_qat_artifact(self):
+        self.assertEqual(DEFAULT_MODEL, "google/gemma-4-26b-a4b")
 
     def test_comment_uses_fixed_safe_native_request(self):
         transport = RecordingTransport()

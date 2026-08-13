@@ -153,7 +153,7 @@ scripts/start_lab_console.sh
 ```
 
 Den kanoniska runtime-standarden är det exakta LM Studio-ID:t
-`google/gemma-4-26b-a4b-qat`. Startprofilen laddar eller byter inte modell;
+`google/gemma-4-26b-a4b`. Startprofilen laddar eller byter inte modell;
 det ID:t måste redan exponeras av avsedd LM Studio-server. Ett explicit
 alternativ gäller konsekvent för både Workbench- och Robot-inställningen i den
 processen:

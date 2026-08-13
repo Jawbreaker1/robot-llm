@@ -7,6 +7,7 @@ from robot_agent.lm_studio_robot_input import (
     PHYSICAL_TASK,
     READ_ONLY_TASK,
     STOP_TASK,
+    UNSUPPORTED_PHYSICAL_TASK,
     RobotInputDecision,
 )
 from robot_agent.robot_control_service import RobotControlServiceError
@@ -128,7 +129,7 @@ class RobotInputServiceTests(unittest.TestCase):
         service, spoken, _seen = self.service(control, decision)
 
         turn = service.dispatch(
-            "Vinka med höger arm.",
+            "Kör framåt och navigera runt hindret.",
             "sv",
             "request-2",
             3,
@@ -138,9 +139,35 @@ class RobotInputServiceTests(unittest.TestCase):
         self.assertEqual(turn["episode"]["accepted_episode_id"], "episode-1")
         self.assertEqual(
             control.started,
-            [("Vinka med höger arm.", "sv", "request-2", 3)],
+            [(
+                "Kör framåt och navigera runt hindret.",
+                "sv",
+                "request-2",
+                3,
+            )],
         )
         self.assertEqual(spoken, [])
+
+    def test_unsupported_physical_task_never_starts_navigation(self):
+        control = FakeControl()
+        decision = RobotInputDecision(
+            UNSUPPORTED_PHYSICAL_TASK,
+            930,
+            "Jag kan navigera, men jag kan inte vinka med en arm.",
+        )
+        service, spoken, _seen = self.service(control, decision)
+
+        turn = service.dispatch(
+            "Vinka med höger arm.",
+            "sv",
+            "request-unsupported",
+            3,
+        )
+
+        self.assertEqual(turn["intent"], UNSUPPORTED_PHYSICAL_TASK)
+        self.assertIsNone(turn["episode"])
+        self.assertEqual(control.started, [])
+        self.assertEqual(spoken[0][1], decision.reply_text)
 
     def test_nonphysical_intents_never_start_robot(self):
         for intent in (CONVERSE, READ_ONLY_TASK, CLARIFY):

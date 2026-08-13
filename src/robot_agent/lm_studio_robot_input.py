@@ -15,9 +15,17 @@ from .blast_personality import normalize_persona_by_locale
 CONVERSE = "CONVERSE"
 READ_ONLY_TASK = "READ_ONLY_TASK"
 PHYSICAL_TASK = "PHYSICAL_TASK"
+UNSUPPORTED_PHYSICAL_TASK = "UNSUPPORTED_PHYSICAL_TASK"
 STOP_TASK = "STOP_TASK"
 CLARIFY = "CLARIFY"
-_INTENTS = (CONVERSE, READ_ONLY_TASK, PHYSICAL_TASK, STOP_TASK, CLARIFY)
+_INTENTS = (
+    CONVERSE,
+    READ_ONLY_TASK,
+    PHYSICAL_TASK,
+    UNSUPPORTED_PHYSICAL_TASK,
+    STOP_TASK,
+    CLARIFY,
+)
 _ACTION_INTENTS = (PHYSICAL_TASK, STOP_TASK)
 _LOCALES = ("sv", "en")
 
@@ -42,17 +50,23 @@ _SYSTEM_PROMPT = (
     "Questions about how the current task is going, why the robot is in its current state "
     "or position, and what its existing sensors currently report are READ_ONLY_TASK, not "
     "CONVERSE. STOP_TASK requests that the current physical run stop or be cancelled. "
-    "PHYSICAL_TASK requests movement, manipulation, a gesture, active scanning, or another "
-    "physical state change. A request to look, inspect, search, or gain "
-    "new evidence by changing pose or orientation is PHYSICAL_TASK even when the requested "
-    "end result is information; only reporting already supplied observations is read-only. "
-    "A mixed request is physical if any part needs physical action; spoken conversation "
+    "PHYSICAL_TASK requests only supported mobile navigation: driving, turning, travelling, "
+    "exploring, or actively scanning surroundings by changing the robot base pose or "
+    "orientation. UNSUPPORTED_PHYSICAL_TASK requests manipulation, an arm or gripper "
+    "movement, a gesture, unavailable camera action, or another physical effect outside "
+    "mobile navigation. It must never start movement; explain the navigation-only limit in "
+    "reply_text. A request to look, inspect, search, or gain new evidence is PHYSICAL_TASK "
+    "only when mobile navigation or surroundings scanning can provide it. Only reporting "
+    "already supplied observations is read-only. "
+    "A mixed request is PHYSICAL_TASK only when every requested physical effect is supported "
+    "mobile navigation; otherwise it is UNSUPPORTED_PHYSICAL_TASK. Spoken conversation "
     "alone is not physical. CLARIFY means the requested effect is genuinely ambiguous or "
     "incomplete; never choose physical merely to resolve ambiguity. A referential request "
     "such as repeating or doing 'it' again is CLARIFY unless the supplied facts contain an "
     "unambiguous antecedent. confidence_milli is confidence on a 0-to-1000 scale; choose "
     "an action intent only at 700 or higher. For PHYSICAL_TASK and STOP_TASK set "
-    "reply_text to null. "
+    "reply_text to null. For UNSUPPORTED_PHYSICAL_TASK provide a concise explanation and "
+    "never claim motion. "
     "Otherwise write a natural reply in exactly the input locale (sv "
     "is Swedish; en is English), without markdown, at most 160 characters. For CONVERSE, "
     "reply as a tired, grumpy but harmless old LEGO robot, warm under the grumbling, and "
@@ -76,11 +90,17 @@ _FALLBACKS = {
     "sv": {
         CONVERSE: "Jag hör dig, men språkmodellen trilskas just nu.",
         READ_ONLY_TASK: "Jag kan inte läsa den statusen just nu, så jag tänker inte låtsas veta.",
+        UNSUPPORTED_PHYSICAL_TASK: (
+            "Jag kan navigera, men inte utföra den fysiska handlingen."
+        ),
         CLARIFY: "Jag är inte säker på vad du menar. Kan du förtydliga?",
     },
     "en": {
         CONVERSE: "I hear you, but the language model is sulking right now.",
         READ_ONLY_TASK: "I cannot read that status right now, so I will not pretend I know.",
+        UNSUPPORTED_PHYSICAL_TASK: (
+            "I can navigate, but I cannot perform that physical action."
+        ),
         CLARIFY: "I am not sure what you mean. Could you clarify?",
     },
 }

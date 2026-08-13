@@ -19,6 +19,7 @@ from robot_agent.blast_episode_adapter import BLAST_PROFILE_ID
 from robot_agent.blast_hub_speech import BLAST_PIPER_PROFILE
 from robot_agent.blast_personality import BLAST_PERSONA_BY_LOCALE
 from robot_agent.ev3rstorm_profile import EV3RSTORM_PROFILE_ID, EV3SSHBinding
+from robot_agent.lm_studio import DEFAULT_MODEL
 from robot_agent.robot_control_contract import RobotControlTarget
 
 
@@ -27,6 +28,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
         args = _parser().parse_args([])
 
         self.assertEqual(args.robot_profile, ROBOT_PROFILE_DISABLED)
+        self.assertEqual(args.model, DEFAULT_MODEL)
         self.assertIsNone(args.robot_target)
         self.assertEqual(args.robot_planner_timeout_seconds, 30.0)
         self.assertEqual(args.robot_input_timeout_seconds, 10.0)
