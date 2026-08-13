@@ -29,7 +29,14 @@ from robot_agent.blast_observation_monitor import (
     blast_range_state,
     validate_blast_scan_ray_contract,
 )
+from robot_agent.blast_navigation_action_profile import (
+    SCAN_TURN_ENCODER_DEGREES_PER_PULSE,
+    TURN_SPEED_DPS,
+)
+from robot_agent.blast_scan_safety import issue_blast_scan_permit
 from robot_agent.blast_pcm_upload import BlastPCMDeadline
+from robot_agent.physical_navigation_contract import SCAN_FRONT_ARC
+from robot_agent.physical_odometry import PhysicalPose
 
 
 def adpcm_block(sample_count):
@@ -57,6 +64,8 @@ class FakeRuntime:
         self.calls = []
         self.motion_observations = 0
         self.pcm_sample_count = None
+        self.left_drive_angle = 10
+        self.right_drive_angle = 10
         self.__class__.instances.append(self)
 
     @property
@@ -97,8 +106,8 @@ class FakeRuntime:
                 "raw_tilt_deg": [0.0, 0.0],
             },
             "motor_angles_deg": {
-                "left_drive": 10,
-                "right_drive": 10,
+                "left_drive": self.left_drive_angle,
+                "right_drive": self.right_drive_angle,
                 "body": 158,
             },
             "motion_active": moving,
@@ -129,7 +138,25 @@ class FakeRuntime:
         return {"accepted": True, "direction": direction}
 
     async def scan_turn_pulse(self, direction):
-        return await self.turn_pulse(direction)
+        before = {
+            "left_drive": self.left_drive_angle,
+            "right_drive": self.right_drive_angle,
+        }
+        await self.turn_pulse(direction)
+        sign = 1 if direction == "left" else -1
+        self.left_drive_angle -= (
+            sign * SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+        )
+        self.right_drive_angle += (
+            sign * SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+        )
+        return {
+            "accepted": True,
+            "direction": direction,
+            "speed_dps": TURN_SPEED_DPS,
+            "wheel_angle_deg": SCAN_TURN_ENCODER_DEGREES_PER_PULSE,
+            "before_angles_deg": before,
+        }
 
     async def claw_pulse(self, direction):
         self.calls.append(("claw_pulse", direction))
@@ -205,6 +232,27 @@ class BlastObservationMonitorTests(unittest.TestCase):
             time.sleep(0.005)
         raise AssertionError("BLAST monitor did not reach {}".format(state))
 
+    def measured_scan_permit(self, monitor):
+        snapshot = monitor.snapshot()
+        while snapshot["observation"] is None:
+            time.sleep(0.005)
+            snapshot = monitor.snapshot()
+        motors = snapshot["observation"]["motor_angles_deg"]
+        permit = issue_blast_scan_permit(
+            controller=monitor,
+            action=SCAN_FRONT_ARC,
+            distance_mm=snapshot["observation"]["distance_mm"],
+            geometry_checked=False,
+            pose=PhysicalPose(),
+            prior_receipt=None,
+            expected_drive_angles={
+                role: motors[role]
+                for role in ("left_drive", "right_drive")
+            },
+        )
+        self.assertIsNotNone(permit)
+        return permit
+
     def test_reuses_one_runtime_and_publishes_detached_observations(self):
         monitor = BlastObservationMonitor(
             hub_name="BLAST-TEST",
@@ -235,6 +283,23 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertTrue(runtime.disconnected)
         self.assertTrue(runtime.closed)
         self.assertEqual(monitor.snapshot()["state"], "stopped")
+
+    def test_runtime_generation_is_read_only_and_tracks_ble_sessions(self):
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+
+        self.assertEqual(monitor.runtime_generation(), 0)
+        monitor.connect()
+        self.wait_for(monitor, "online")
+        self.assertEqual(monitor.runtime_generation(), 1)
+        monitor.disconnect()
+        self.assertEqual(monitor.runtime_generation(), 1)
+        monitor.retry()
+        self.wait_for(monitor, "online")
+        self.assertEqual(monitor.runtime_generation(), 2)
+        monitor.close()
 
     def test_close_cancels_a_blocked_observation_and_disconnects(self):
         observing = threading.Event()
@@ -476,7 +541,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         monitor.close()
 
-    def test_navigation_waits_until_pcm_burst_has_started(self):
+    def test_navigation_runs_between_pcm_batches_then_upload_resumes(self):
         first_batch_started = threading.Event()
         release_first_batch = threading.Event()
 
@@ -526,13 +591,154 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(len(outcomes), 2)
         calls = FakeRuntime.instances[0].calls
         first = calls.index(("write_pcm_batch", 0, speech_payload[:8]))
-        second = calls.index(("write_pcm_batch", 8, speech_payload[8:16]))
-        started = calls.index(("start_pcm", 18))
         navigation = calls.index(("drive_pulse", "forward"))
+        second = calls.index(("write_pcm_batch", 8, speech_payload[8:16]))
         self.assertLess(first, navigation)
-        self.assertLess(first, second)
+        self.assertLess(navigation, second)
+        self.assertNotIn(("observe",), calls[first + 1:navigation])
+        self.assertIn(("start_pcm", 18), calls)
+        monitor.close()
+
+    def test_upload_over_fifteen_simulated_seconds_does_not_timeout_navigation(
+        self,
+    ):
+        first_batch_started = threading.Event()
+        release_first_batch = threading.Event()
+
+        class LongBoundedPreloadRuntime(FakeRuntime):
+            def __init__(self, *, hub_name):
+                super().__init__(hub_name=hub_name)
+                self.simulated_upload_seconds = 0.0
+
+            async def begin_pcm(self, payload, *, cancel_requested=None):
+                self.simulated_upload_seconds += 4.0
+                return await super().begin_pcm(
+                    payload,
+                    cancel_requested=cancel_requested,
+                )
+
+            async def write_pcm_batch(
+                self, offset, payload, *, cancel_requested=None,
+            ):
+                self.calls.append(("write_pcm_batch", offset, payload))
+                self.simulated_upload_seconds += 4.0
+                if offset == 0:
+                    first_batch_started.set()
+                    await __import__("asyncio").to_thread(
+                        release_first_batch.wait,
+                        2.0,
+                    )
+                else:
+                    # Scale a four-second slow-link phase to keep this
+                    # scheduler regression fast. Consecutive draining would
+                    # still exceed the correspondingly scaled command TTL.
+                    await __import__("asyncio").sleep(0.08)
+                return {"received_bytes": offset + len(payload)}
+
+            async def start_pcm(
+                self,
+                transfer_id,
+                byte_count,
+                fletcher16,
+                *,
+                cancel_requested=None,
+            ):
+                await __import__("asyncio").sleep(0.08)
+                return await super().start_pcm(
+                    transfer_id,
+                    byte_count,
+                    fletcher16,
+                    cancel_requested=cancel_requested,
+                )
+
+        class ImmediatelySettledMonitor(BlastObservationMonitor):
+            @staticmethod
+            def _settling_window_is_stable(samples):
+                return bool(samples)
+
+        monitor = ImmediatelySettledMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=LongBoundedPreloadRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        payload = adpcm_block_for_size(42)
+        speech_results = []
+        command_results = []
+        failures = []
+        speech_thread = threading.Thread(
+            target=lambda: speech_results.append(monitor.play_pcm(payload))
+        )
+        speech_thread.start()
+        self.assertTrue(first_batch_started.wait(timeout=1.0))
+
+        def navigate():
+            try:
+                command_results.append(monitor.command("drive_forward"))
+            except Exception as error:
+                failures.append(error)
+
+        with (
+            mock.patch(
+                "robot_agent.blast_observation_monitor."
+                "COMMAND_TIMEOUT_SECONDS",
+                0.3,
+            ),
+            mock.patch(
+                "robot_agent.blast_observation_monitor."
+                "INTERNAL_COMMAND_TIMEOUT_SECONDS",
+                0.25,
+            ),
+            mock.patch(
+                "robot_agent.blast_observation_monitor."
+                "MIN_COMMAND_BUDGET_SECONDS",
+                0.01,
+            ),
+            mock.patch(
+                "robot_agent.blast_observation_monitor."
+                "COMMAND_RESPONSE_MARGIN_SECONDS",
+                0.01,
+            ),
+        ):
+            command_thread = threading.Thread(target=navigate)
+            command_thread.start()
+            deadline = time.monotonic() + 1.0
+            while (
+                monitor._pending_command is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            self.assertIsNotNone(monitor._pending_command)
+            release_first_batch.set()
+            speech_thread.join(timeout=3.0)
+            command_thread.join(timeout=3.0)
+
+        self.assertFalse(speech_thread.is_alive())
+        self.assertFalse(command_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(len(speech_results), 1)
+        self.assertEqual(len(command_results), 1)
+        runtime = FakeRuntime.instances[0]
+        self.assertGreater(runtime.simulated_upload_seconds, 15.0)
+        calls = runtime.calls
+        first = calls.index(("write_pcm_batch", 0, payload[:8]))
+        navigation = calls.index(("drive_pulse", "forward"))
+        second = calls.index(("write_pcm_batch", 8, payload[8:16]))
+        started = calls.index(("start_pcm", len(payload)))
+        self.assertLess(first, navigation)
+        self.assertLess(navigation, second)
         self.assertLess(second, started)
-        self.assertLess(started, navigation)
+        uploaded_before_start = b"".join(
+            call[2]
+            for call in calls[:started]
+            if call[0] == "write_pcm_batch"
+        )
+        self.assertEqual(uploaded_before_start, payload)
+        self.assertTrue(all(
+            len(call[2]) <= 8
+            for call in calls
+            if call[0] == "write_pcm_batch"
+        ))
         monitor.close()
 
     def test_over_sixty_second_navigation_stream_cannot_starve_v5_speech(self):
@@ -679,7 +885,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(len(navigation_outcomes), command_count)
         runtime = FakeRuntime.instances[0]
         self.assertGreater(runtime.simulated_navigation_seconds, 60)
-        self.assertEqual(runtime.speech_started_at_simulated_seconds, 5)
+        self.assertGreater(
+            runtime.speech_started_at_simulated_seconds,
+            60,
+        )
         calls = runtime.calls
         drive_indexes = [
             index for index, call in enumerate(calls)
@@ -699,12 +908,11 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(len(audio_indexes), 13)
         self.assertLess(
             calls.index(("start_pcm", len(payload))),
-            drive_indexes[1],
+            drive_indexes[13],
         )
-        self.assertTrue(all(
-            drive_indexes[0] < audio_index < drive_indexes[1]
-            for audio_index in audio_indexes
-        ))
+        for position, audio_index in enumerate(audio_indexes):
+            self.assertLess(drive_indexes[position], audio_index)
+            self.assertLess(audio_index, drive_indexes[position + 1])
         monitor.close()
 
     def test_pcm_progress_never_extends_absolute_lifetime_ceiling(self):
@@ -1235,7 +1443,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
             )
             monitor.start()
             self.wait_for(monitor, "online")
-            scan = monitor.command(SCAN_COMMAND)
+            scan = monitor.command(
+                SCAN_COMMAND,
+                action_permit=self.measured_scan_permit(monitor),
+            )
             self.assertTrue(scan["completed"])
             failures = []
             speech_thread = threading.Thread(
@@ -1528,6 +1739,310 @@ class BlastObservationMonitorTests(unittest.TestCase):
         navigation_start = runtime.calls.index(("drive_pulse", "forward"))
         self.assertIn(("observe",), runtime.calls[phase_error:navigation_start])
         self.assertTrue(navigation["completed"])
+        monitor.close()
+
+    def test_hanging_pcm_batch_is_capped_before_fresh_queued_navigation(self):
+        batch_started = threading.Event()
+
+        class HangingBatchRuntime(FakeRuntime):
+            batch_cancelled = False
+            drive_saw_fresh_probe = False
+
+            async def write_pcm_batch(
+                self, offset, payload, *, cancel_requested=None,
+            ):
+                self.calls.append(("write_pcm_batch", offset, payload))
+                batch_started.set()
+                try:
+                    await __import__("asyncio").sleep(10.0)
+                finally:
+                    self.batch_cancelled = True
+
+            async def observe(self):
+                observation = await super().observe()
+                if self.batch_cancelled:
+                    self.calls.append(("fresh_failure_probe",))
+                return observation
+
+            async def drive_pulse(self, direction):
+                self.drive_saw_fresh_probe = (
+                    self.batch_cancelled
+                    and ("fresh_failure_probe",) in self.calls
+                )
+                return await super().drive_pulse(direction)
+
+        class ImmediatelySettledMonitor(BlastObservationMonitor):
+            @staticmethod
+            def _settling_window_is_stable(samples):
+                return bool(samples)
+
+        monitor = ImmediatelySettledMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=HangingBatchRuntime,
+        )
+        monitor.start()
+        snapshot = self.wait_for(monitor, "online")
+        while snapshot["observation"] is None:
+            time.sleep(0.005)
+            snapshot = monitor.snapshot()
+        speech_failure = []
+        navigation_result = []
+        payload = adpcm_block_for_size(18)
+
+        with self.assertLogs(
+            "robot_agent.blast_observation_monitor",
+            level="WARNING",
+        ) as diagnostics, mock.patch(
+            "robot_agent.blast_pcm_upload.PCM_BATCH_TIMEOUT_SECONDS",
+            0.05,
+        ):
+            speech_thread = threading.Thread(
+                target=lambda: self._capture_failure(
+                    speech_failure,
+                    lambda: monitor.play_pcm(payload),
+                )
+            )
+            speech_thread.start()
+            self.assertTrue(batch_started.wait(1.0))
+            observed_before = monitor.snapshot()[
+                "last_observed_at_monotonic_ms"
+            ]
+            navigation_thread = threading.Thread(
+                target=lambda: navigation_result.append(
+                    monitor.command("drive_forward")
+                )
+            )
+            started_at = time.monotonic()
+            navigation_thread.start()
+            speech_thread.join(1.0)
+            navigation_thread.join(2.0)
+            elapsed = time.monotonic() - started_at
+
+        self.assertFalse(speech_thread.is_alive())
+        self.assertFalse(navigation_thread.is_alive())
+        self.assertLess(elapsed, 0.75)
+        self.assertEqual(len(speech_failure), 1)
+        self.assertEqual(
+            speech_failure[0].code,
+            "controller_command_failed",
+        )
+        diagnostic = "\n".join(diagnostics.output)
+        self.assertIn("phase=batch", diagnostic)
+        self.assertIn("offset=0", diagnostic)
+        self.assertIn("byte_count=18", diagnostic)
+        self.assertIn("error_type=TimeoutError", diagnostic)
+        self.assertEqual(len(navigation_result), 1)
+        self.assertTrue(navigation_result[0]["completed"])
+        runtime = FakeRuntime.instances[0]
+        self.assertTrue(runtime.drive_saw_fresh_probe)
+        self.assertGreater(
+            monitor.snapshot()["last_observed_at_monotonic_ms"],
+            observed_before,
+        )
+        batch_index = next(
+            index for index, call in enumerate(runtime.calls)
+            if call[0] == "write_pcm_batch"
+        )
+        probe_index = runtime.calls.index(("fresh_failure_probe",))
+        drive_index = runtime.calls.index(("drive_pulse", "forward"))
+        self.assertLess(batch_index, probe_index)
+        self.assertLess(probe_index, drive_index)
+        self.assertNotIn(("start_pcm", len(payload)), runtime.calls)
+        monitor.close()
+
+    def test_aligned_start_timeout_refreshes_before_queued_navigation(self):
+        start_entered = threading.Event()
+        drive_started = threading.Event()
+
+        class AlignedStartTimeoutRuntime(FakeRuntime):
+            start_request_sent = False
+            drive_saw_fresh_probe = False
+
+            async def start_pcm(
+                self,
+                transfer_id,
+                byte_count,
+                fletcher16,
+                *,
+                cancel_requested=None,
+            ):
+                self.calls.append(("start_pcm_awaiting_reply", byte_count))
+                self.start_request_sent = True
+                start_entered.set()
+                await __import__("asyncio").sleep(10.0)
+
+            async def observe(self):
+                observation = await super().observe()
+                if self.start_request_sent:
+                    self.calls.append(("fresh_start_failure_probe",))
+                return observation
+
+            async def drive_pulse(self, direction):
+                drive_started.set()
+                self.drive_saw_fresh_probe = (
+                    self.start_request_sent
+                    and ("fresh_start_failure_probe",) in self.calls
+                )
+                return await super().drive_pulse(direction)
+
+        class ImmediatelySettledMonitor(BlastObservationMonitor):
+            @staticmethod
+            def _settling_window_is_stable(samples):
+                return bool(samples)
+
+        monitor = ImmediatelySettledMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=AlignedStartTimeoutRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        speech_failure = []
+        navigation_result = []
+
+        with mock.patch(
+            "robot_agent.blast_pcm_upload.PCM_START_REPLY_TIMEOUT_SECONDS",
+            0.2,
+        ):
+            speech_thread = threading.Thread(
+                target=lambda: self._capture_failure(
+                    speech_failure,
+                    lambda: monitor.play_pcm(adpcm_block(1)),
+                )
+            )
+            speech_thread.start()
+            self.assertTrue(start_entered.wait(1.0))
+            navigation_thread = threading.Thread(
+                target=lambda: navigation_result.append(
+                    monitor.command("drive_forward")
+                )
+            )
+            navigation_thread.start()
+            deadline = time.monotonic() + 1.0
+            while (
+                monitor._pending_command is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            self.assertIsNotNone(monitor._pending_command)
+            self.assertFalse(drive_started.wait(0.05))
+            speech_thread.join(1.0)
+            navigation_thread.join(2.0)
+
+        self.assertFalse(speech_thread.is_alive())
+        self.assertFalse(navigation_thread.is_alive())
+        self.assertEqual(len(speech_failure), 1)
+        self.assertEqual(
+            speech_failure[0].code,
+            "sampled_audio_start_timeout",
+        )
+        self.assertEqual(len(navigation_result), 1)
+        self.assertTrue(navigation_result[0]["completed"])
+        self.assertEqual(len(FakeRuntime.instances), 1)
+        runtime = FakeRuntime.instances[0]
+        self.assertTrue(runtime.drive_saw_fresh_probe)
+        start_index = runtime.calls.index(("start_pcm_awaiting_reply", 7))
+        probe_index = runtime.calls.index(("fresh_start_failure_probe",))
+        drive_index = runtime.calls.index(("drive_pulse", "forward"))
+        self.assertLess(start_index, probe_index)
+        self.assertLess(probe_index, drive_index)
+        monitor.close()
+
+    def test_ambiguous_start_timeout_reconnects_before_queued_navigation(self):
+        start_entered = threading.Event()
+
+        class AmbiguousStartRuntime(FakeRuntime):
+            start_request_sent = False
+
+            async def start_pcm(
+                self,
+                transfer_id,
+                byte_count,
+                fletcher16,
+                *,
+                cancel_requested=None,
+            ):
+                self.calls.append(("start_pcm_awaiting_reply", byte_count))
+                self.start_request_sent = True
+                start_entered.set()
+                await __import__("asyncio").sleep(10.0)
+
+            async def observe(self):
+                if self.start_request_sent:
+                    self.calls.append(("observe_out_of_alignment",))
+                    raise RuntimeError("late started reply left in line stream")
+                return await super().observe()
+
+        class Factory:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, *, hub_name):
+                self.calls += 1
+                runtime_type = (
+                    AmbiguousStartRuntime
+                    if self.calls == 1
+                    else FakeRuntime
+                )
+                return runtime_type(hub_name=hub_name)
+
+        class ImmediatelySettledMonitor(BlastObservationMonitor):
+            @staticmethod
+            def _settling_window_is_stable(samples):
+                return bool(samples)
+
+        factory = Factory()
+        monitor = ImmediatelySettledMonitor(
+            poll_interval_seconds=0.05,
+            reconnect_interval_seconds=0.05,
+            runtime_factory=factory,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        speech_failure = []
+        navigation_result = []
+
+        with mock.patch(
+            "robot_agent.blast_pcm_upload.PCM_START_REPLY_TIMEOUT_SECONDS",
+            0.05,
+        ):
+            speech_thread = threading.Thread(
+                target=lambda: self._capture_failure(
+                    speech_failure,
+                    lambda: monitor.play_pcm(adpcm_block(1)),
+                )
+            )
+            speech_thread.start()
+            self.assertTrue(start_entered.wait(1.0))
+            navigation_thread = threading.Thread(
+                target=lambda: navigation_result.append(
+                    monitor.command("drive_forward")
+                )
+            )
+            navigation_thread.start()
+            speech_thread.join(1.0)
+            navigation_thread.join(2.0)
+
+        self.assertFalse(speech_thread.is_alive())
+        self.assertFalse(navigation_thread.is_alive())
+        self.assertEqual(len(speech_failure), 1)
+        self.assertEqual(
+            speech_failure[0].code,
+            "sampled_audio_start_timeout",
+        )
+        self.assertEqual(len(navigation_result), 1)
+        self.assertTrue(navigation_result[0]["completed"])
+        self.assertGreaterEqual(factory.calls, 2)
+        stale_runtime = FakeRuntime.instances[0]
+        fresh_runtime = FakeRuntime.instances[-1]
+        self.assertIn(("observe_out_of_alignment",), stale_runtime.calls)
+        self.assertNotIn(
+            ("drive_pulse", "forward"),
+            stale_runtime.calls,
+        )
+        self.assertIn(
+            ("drive_pulse", "forward"),
+            fresh_runtime.calls,
+        )
         monitor.close()
 
     def test_aligned_speech_disconnect_defers_queued_navigation(self):
@@ -1902,7 +2417,6 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 runtime_generation=monitor._runtime_generation,
                 expires_at_monotonic_ns=time.monotonic_ns() + 5_000_000_000,
                 drive_angles_deg=(10.0, 10.0),
-                heading_deg=12.0,
             )
             monitor._issued_scan_permit = permit
         scan_result = []
@@ -2075,7 +2589,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         ))
         monitor.close()
 
-    def test_scan_front_arc_is_one_atomic_gyro_measured_command(self):
+    def test_scan_front_arc_is_one_atomic_encoder_measured_command(self):
         class ScanningRuntime(FakeRuntime):
             def __init__(self, *, hub_name):
                 super().__init__(hub_name=hub_name)
@@ -2142,7 +2656,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
         monitor.start()
         self.wait_for(monitor, "online")
 
-        result = monitor.command(SCAN_COMMAND)
+        result = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )
 
         runtime = FakeRuntime.instances[0]
         self.assertEqual(
@@ -2201,27 +2718,275 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         self.assertEqual(
             [ray["relative_heading_deg"] for ray in scan["rays"]],
-            [0.0, -22.0, -44.0, 22.0, 44.0],
+            [0.0, -44.1, -88.2, 44.1, 88.2],
         )
         self.assertEqual(scan["restoration_error_deg"], 0.0)
         self.assertTrue(scan["restoration_verified"])
         self.assertTrue(scan["all_observations_settled"])
         self.assertEqual(
             [ray["relative_heading_deg"] for ray in scan["angular_rays"]],
-            [0.0, -11.0, -22.0, -33.0, -44.0,
-             11.0, 22.0, 33.0, 44.0],
+            [0.0, -22.05, -44.1, -66.15, -88.2,
+             22.05, 44.1, 66.15, 88.2],
         )
         validate_blast_scan_ray_contract(scan)
         monitor.close()
+
+    def test_encoder_restoration_ignores_large_imu_drift(self):
+        class DriftingImuRuntime(FakeRuntime):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.turn_count = 0
+
+            async def observe(self):
+                observation = await super().observe()
+                observation["imu"]["heading_deg"] = (
+                    0.0 if self.turn_count == 0 else 38.0
+                )
+                return observation
+
+            async def scan_turn_pulse(self, direction):
+                result = await super().scan_turn_pulse(direction)
+                self.turn_count += 1
+                return result
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=DriftingImuRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        scan = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )["scan"]
+
+        self.assertTrue(scan["restoration_verified"])
+        self.assertEqual(scan["restoration_error_deg"], 0.0)
+        self.assertEqual(
+            scan["imu_heading_diagnostics"],
+            {
+                "authority": "DIAGNOSTIC_ONLY",
+                "start_heading_deg": 0.0,
+                "final_heading_deg": 38.0,
+                "restoration_error_deg": 38.0,
+            },
+        )
+        self.assertEqual(
+            [ray["relative_heading_deg"] for ray in scan["angular_rays"]],
+            [0.0, -22.05, -44.1, -66.15, -88.2,
+             22.05, 44.1, 66.15, 88.2],
+        )
+        monitor.close()
+
+    def test_scan_records_calibrated_ninety_five_degree_edges_bilaterally(self):
+        class CalibratedSweepRuntime(FakeRuntime):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.direction_counts = {"left": 0, "right": 0}
+
+            async def scan_turn_pulse(self, direction):
+                before = {
+                    "left_drive": self.left_drive_angle,
+                    "right_drive": self.right_drive_angle,
+                }
+                await self.turn_pulse(direction)
+                index = self.direction_counts[direction] % 4
+                self.direction_counts[direction] += 1
+                actual_encoder_degrees = (48, 48, 48, 49)[index]
+                sign = 1 if direction == "left" else -1
+                self.left_drive_angle -= sign * actual_encoder_degrees
+                self.right_drive_angle += sign * actual_encoder_degrees
+                return {
+                    "accepted": True,
+                    "direction": direction,
+                    "speed_dps": TURN_SPEED_DPS,
+                    "wheel_angle_deg": (
+                        SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+                    ),
+                    "before_angles_deg": before,
+                }
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=CalibratedSweepRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        scan = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )["scan"]
+
+        self.assertEqual(
+            [ray["relative_heading_deg"] for ray in scan["angular_rays"]],
+            [0.0, -23.52, -47.04, -70.56, -94.57,
+             23.52, 47.04, 70.56, 94.57],
+        )
+        self.assertTrue(scan["restoration_verified"])
+        self.assertEqual(scan["restoration_error_deg"], 0.0)
+        monitor.close()
+
+    def test_encoder_opposed_residue_over_ten_degrees_is_unrestored(self):
+        class OpposedResidueRuntime(FakeRuntime):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.left_scan_pulses = 0
+                self.right_scan_pulses = 0
+
+            async def scan_turn_pulse(self, direction):
+                before = {
+                    "left_drive": self.left_drive_angle,
+                    "right_drive": self.right_drive_angle,
+                }
+                await self.turn_pulse(direction)
+                if direction == "left":
+                    quotient, remainder = divmod(
+                        8 * SCAN_TURN_ENCODER_DEGREES_PER_PULSE - 22,
+                        8,
+                    )
+                    right_delta = quotient + (
+                        self.left_scan_pulses < remainder
+                    )
+                    self.left_scan_pulses += 1
+                    self.left_drive_angle -= (
+                        SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+                    )
+                    self.right_drive_angle += right_delta
+                else:
+                    quotient, remainder = divmod(
+                        8 * SCAN_TURN_ENCODER_DEGREES_PER_PULSE + 22,
+                        8,
+                    )
+                    left_delta = quotient + (
+                        self.right_scan_pulses < remainder
+                    )
+                    self.right_scan_pulses += 1
+                    self.left_drive_angle += left_delta
+                    self.right_drive_angle -= (
+                        SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+                    )
+                return {
+                    "accepted": True,
+                    "direction": direction,
+                    "speed_dps": TURN_SPEED_DPS,
+                    "wheel_angle_deg": (
+                        SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+                    ),
+                    "before_angles_deg": before,
+                }
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=OpposedResidueRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        scan = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )["scan"]
+
+        self.assertFalse(scan["restoration_verified"])
+        self.assertEqual(scan["result"], "restoration_unverified")
+        self.assertGreater(abs(scan["restoration_error_deg"]), 10.0)
+        monitor.close()
+
+    def test_scan_restoration_uses_lego_scale_translation_band(self):
+        for delta, expected_restored, expected_common_mm in (
+            ((24, 20), True, 11.0),
+            ((74, 66), False, 35.0),
+        ):
+            with self.subTest(delta=delta):
+                class CommonResidueRuntime(FakeRuntime):
+                    def __init__(self, **kwargs):
+                        super().__init__(**kwargs)
+                        self.left_scan_pulses = 0
+                        self.right_scan_pulses = 0
+
+                    async def scan_turn_pulse(self, direction):
+                        before = {
+                            "left_drive": self.left_drive_angle,
+                            "right_drive": self.right_drive_angle,
+                        }
+                        await self.turn_pulse(direction)
+                        if direction == "left":
+                            quotient, remainder = divmod(
+                                8 * SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+                                + delta[1],
+                                8,
+                            )
+                            right_delta = quotient + (
+                                self.left_scan_pulses < remainder
+                            )
+                            self.left_scan_pulses += 1
+                            self.left_drive_angle -= (
+                                SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+                            )
+                            self.right_drive_angle += right_delta
+                        else:
+                            quotient, remainder = divmod(
+                                8 * SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+                                + delta[0],
+                                8,
+                            )
+                            left_delta = quotient + (
+                                self.right_scan_pulses < remainder
+                            )
+                            self.right_scan_pulses += 1
+                            self.left_drive_angle += left_delta
+                            self.right_drive_angle -= (
+                                SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+                            )
+                        return {
+                            "accepted": True,
+                            "direction": direction,
+                            "speed_dps": TURN_SPEED_DPS,
+                            "wheel_angle_deg": (
+                                SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+                            ),
+                            "before_angles_deg": before,
+                        }
+
+                monitor = BlastObservationMonitor(
+                    poll_interval_seconds=0.05,
+                    runtime_factory=CommonResidueRuntime,
+                )
+                monitor.start()
+                self.wait_for(monitor, "online")
+
+                scan = monitor.command(
+                    SCAN_COMMAND,
+                    action_permit=self.measured_scan_permit(monitor),
+                )["scan"]
+
+                self.assertIs(
+                    scan["restoration_verified"], expected_restored,
+                )
+                self.assertEqual(
+                    scan["encoder_restoration"][
+                        "common_mode_residue_mm"
+                    ],
+                    expected_common_mm,
+                )
+                monitor.close()
 
     def test_repeated_near_ray_only_replaces_weak_equivalent_evidence(self):
         monitor = BlastObservationMonitor(runtime_factory=FakeRuntime)
 
         def observation(distance, heading, observed_at, body=158):
+            opposed = round(abs(heading) / 0.490)
+            drive = (
+                {"left_drive": -opposed, "right_drive": opposed}
+                if heading < 0
+                else {"left_drive": opposed, "right_drive": -opposed}
+            )
             return {
                 "distance_mm": distance,
                 "imu": {"heading_deg": heading},
-                "motor_angles_deg": {"body": body},
+                "motor_angles_deg": {"body": body, **drive},
                 "observed_at_ms": observed_at,
             }
 
@@ -2232,7 +2997,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
                  SCAN_RAY_EVIDENCE_SETTLED),
                 (observation(180, -21.0, 2, 159), True,
                  SCAN_RAY_EVIDENCE_SETTLED),
-                (180.0, -21.0, 159, 2, True,
+                (180.0, -21.07, 159, 2, True,
                  SCAN_RAY_EVIDENCE_SETTLED),
             ),
             (
@@ -2241,7 +3006,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
                  SCAN_RAY_EVIDENCE_SETTLED),
                 (observation(180, -21.0, 2), True,
                  SCAN_RAY_EVIDENCE_SETTLED),
-                (400.0, -22.0, 158, 1, True,
+                (400.0, -22.05, 158, 1, True,
                  SCAN_RAY_EVIDENCE_SETTLED),
             ),
             (
@@ -2250,7 +3015,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
                  SCAN_RAY_EVIDENCE_SETTLED),
                 (observation(180, -21.0, 2), False,
                  SCAN_RAY_EVIDENCE_SWEEP_ONLY),
-                (2_000.0, -22.0, 158, 1, True,
+                (2_000.0, -22.05, 158, 1, True,
                  SCAN_RAY_EVIDENCE_SETTLED),
             ),
             (
@@ -2259,7 +3024,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
                  SCAN_RAY_EVIDENCE_SETTLED),
                 (observation(180, -16.0, 2), True,
                  SCAN_RAY_EVIDENCE_SETTLED),
-                (2_000.0, -22.0, 158, 1, True,
+                (2_000.0, -22.05, 158, 1, True,
                  SCAN_RAY_EVIDENCE_SETTLED),
             ),
             (
@@ -2268,7 +3033,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
                  SCAN_RAY_EVIDENCE_SWEEP_ONLY),
                 (observation(2_000, -21.0, 2), True,
                  SCAN_RAY_EVIDENCE_SETTLED),
-                (2_000.0, -21.0, 158, 2, True,
+                (2_000.0, -21.07, 158, 2, True,
                  SCAN_RAY_EVIDENCE_SETTLED),
             ),
         )
@@ -2276,7 +3041,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
             with self.subTest(name=name):
                 ray = monitor._aggregate_repeated_scan_ray(
                     "left_near",
-                    0.0,
+                    {"left_drive": 0, "right_drive": 0},
                     primary,
                     repeated,
                 )
@@ -2326,7 +3091,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 self.wait_for(monitor, "online")
 
                 with self.assertRaises(BlastControllerError) as raised:
-                    monitor.command(SCAN_COMMAND)
+                    monitor.command(
+                        SCAN_COMMAND,
+                        action_permit=self.measured_scan_permit(monitor),
+                    )
 
                 self.assertEqual(raised.exception.code, error_code)
                 runtime = FakeRuntime.instances[0]
@@ -2368,7 +3136,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
         monitor.start()
         self.wait_for(monitor, "online")
 
-        monitor.command(SCAN_COMMAND)
+        monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )
         monitor.command("turn_left")
         monitor.command("drive_forward")
 
@@ -2436,7 +3207,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
         monitor.start()
         self.wait_for(monitor, "online")
 
-        result = monitor.command(SCAN_COMMAND)
+        result = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )
 
         runtime = FakeRuntime.instances[0]
         self.assertTrue(result["completed"])
@@ -2502,7 +3276,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
         monitor.start()
         self.wait_for(monitor, "online")
 
-        result = monitor.command(SCAN_COMMAND)
+        result = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )
 
         runtime = FakeRuntime.instances[0]
         self.assertEqual(
@@ -2573,7 +3350,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 monitor.start()
                 self.wait_for(monitor, "online")
 
-                result = monitor.command(SCAN_COMMAND)
+                result = monitor.command(
+                    SCAN_COMMAND,
+                    action_permit=self.measured_scan_permit(monitor),
+                )
 
                 self.assertTrue(
                     result["scan"]["all_observations_settled"]
@@ -2603,7 +3383,6 @@ class BlastObservationMonitorTests(unittest.TestCase):
             ("invalid", ((-1.0, 0.0, 0.0),) * 5, observation),
             ("tilt", safe[:4] + ((1_400.0, 1.1, 0.0),), observation),
             ("moving", safe, {**observation, "motion_active": True}),
-            ("heading", safe, {**observation, "imu": {}}),
             ("body", safe, {
                 **observation,
                 "motor_angles_deg": {"body": 160},
@@ -2615,6 +3394,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 self.assertFalse(
                     monitor._scan_sweep_window_allows_continuation(candidate)
                 )
+        monitor._settling_samples = safe
+        self.assertTrue(monitor._scan_sweep_window_allows_continuation({
+            **observation, "imu": {},
+        }))
 
     def test_scan_stops_when_unsettled_turn_has_no_safe_window(self):
         class NeverSettledTurnMonitor(BlastObservationMonitor):
@@ -2641,7 +3424,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.wait_for(monitor, "online")
 
         with self.assertRaises(BlastControllerError) as raised:
-            monitor.command(SCAN_COMMAND)
+            monitor.command(
+                SCAN_COMMAND,
+                action_permit=self.measured_scan_permit(monitor),
+            )
 
         self.assertEqual(
             raised.exception.code,
@@ -2690,7 +3476,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 self.wait_for(monitor, "online")
 
                 with self.assertRaises(BlastControllerError):
-                    monitor.command(SCAN_COMMAND)
+                    monitor.command(
+                        SCAN_COMMAND,
+                        action_permit=self.measured_scan_permit(monitor),
+                    )
 
                 runtime = FakeRuntime.instances[0]
                 self.assertEqual(
@@ -2745,10 +3534,11 @@ class BlastObservationMonitorTests(unittest.TestCase):
         monitor.start()
         self.wait_for(monitor, "online")
         scan_failures = []
+        scan_permit = self.measured_scan_permit(monitor)
 
         def scan():
             try:
-                monitor.command(SCAN_COMMAND)
+                monitor.command(SCAN_COMMAND, action_permit=scan_permit)
             except BlastControllerError as error:
                 scan_failures.append(error.code)
 
@@ -2780,7 +3570,6 @@ class BlastObservationMonitorTests(unittest.TestCase):
             (-1, 158, 12, "scan_sweep_observation_unverified"),
             (2_001, 158, 12, "scan_sweep_observation_unverified"),
             (321, 156, 12, "scan_sweep_observation_unverified"),
-            (321, 158, None, "scan_sweep_observation_unverified"),
         ):
             with self.subTest(distance=distance, body=body, heading=heading):
                 FakeRuntime.instances = []
@@ -2811,7 +3600,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 self.wait_for(monitor, "online")
 
                 with self.assertRaises(BlastControllerError) as raised:
-                    monitor.command(SCAN_COMMAND)
+                    monitor.command(
+                        SCAN_COMMAND,
+                        action_permit=self.measured_scan_permit(monitor),
+                    )
 
                 self.assertEqual(raised.exception.code, error_code)
                 runtime = FakeRuntime.instances[0]
@@ -2858,7 +3650,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 self.wait_for(monitor, "online")
 
                 with self.assertRaises(BlastControllerError) as raised:
-                    monitor.command(SCAN_COMMAND)
+                    monitor.command(
+                        SCAN_COMMAND,
+                        action_permit=self.measured_scan_permit(monitor),
+                    )
 
                 self.assertEqual(
                     raised.exception.code,
@@ -2879,11 +3674,115 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 self.assertIs(FakeRuntime.instances[-1], runtime)
                 monitor.close()
 
-    def test_host_no_return_scan_permit_is_geometry_bound_and_single_use(self):
+    def test_measured_scan_permit_closes_encoder_drift_before_first_pulse(self):
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        result = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )
+        self.assertTrue(result["completed"])
+        monitor.close()
+
+        for delta in (-2, 2):
+            with self.subTest(delta=delta):
+                monitor = BlastObservationMonitor(
+                    poll_interval_seconds=0.05,
+                    runtime_factory=FakeRuntime,
+                )
+                monitor.start()
+                self.wait_for(monitor, "online")
+                permit = self.measured_scan_permit(monitor)
+                runtime = FakeRuntime.instances[-1]
+                runtime.calls.clear()
+                runtime.left_drive_angle += delta
+
+                with self.assertRaises(BlastControllerError) as raised:
+                    monitor.command(SCAN_COMMAND, action_permit=permit)
+
+                self.assertEqual(
+                    raised.exception.code,
+                    "scan_start_clearance_unverified",
+                )
+                self.assertEqual(
+                    [
+                        call for call in runtime.calls
+                        if call[0] == "turn_pulse"
+                    ],
+                    [],
+                )
+                monitor.close()
+
+    def test_measured_scan_permit_allows_only_one_degree_anchor_settling(self):
+        for delta, accepted in ((-2, False), (-1, True), (1, True), (2, False)):
+            with self.subTest(delta=delta):
+                monitor = BlastObservationMonitor(
+                    poll_interval_seconds=0.05,
+                    runtime_factory=FakeRuntime,
+                )
+                monitor.start()
+                snapshot = self.wait_for(monitor, "online")
+                while snapshot["observation"] is None:
+                    time.sleep(0.005)
+                    snapshot = monitor.snapshot()
+                actual = snapshot["observation"]["motor_angles_deg"]
+                expected = {
+                    "left_drive": actual["left_drive"] + delta,
+                    "right_drive": actual["right_drive"],
+                }
+
+                permit = monitor.issue_no_return_scan_permit(
+                    expected_drive_angles=expected,
+                    allow_no_return=False,
+                )
+                runtime = FakeRuntime.instances[-1]
+                runtime.calls.clear()
+
+                if accepted:
+                    self.assertIsNotNone(permit)
+                    self.assertEqual(
+                        permit.drive_angles_deg,
+                        (
+                            float(actual["left_drive"]),
+                            float(actual["right_drive"]),
+                        ),
+                    )
+                    result = monitor.command(
+                        SCAN_COMMAND,
+                        action_permit=permit,
+                    )
+                    self.assertTrue(result["completed"])
+                else:
+                    self.assertIsNone(permit)
+                    with self.assertRaises(BlastControllerError) as raised:
+                        monitor.command(SCAN_COMMAND)
+                    self.assertEqual(
+                        raised.exception.code,
+                        "scan_start_clearance_unverified",
+                    )
+                self.assertEqual(
+                    len([
+                        call for call in runtime.calls
+                        if call[0] == "turn_pulse"
+                    ]),
+                    16 if accepted else 0,
+                )
+                monitor.close()
+
+    def test_no_return_scan_permit_is_geometry_bound_and_single_use(self):
         class NoReturnRuntime(FakeRuntime):
             async def observe(self):
                 observation = await super().observe()
                 observation["distance_mm"] = 2_000
+                observation["imu"] = {
+                    "ready": False,
+                    "stationary": False,
+                    "raw_tilt_deg": [0.0, 0.0],
+                }
                 return observation
 
         monitor = BlastObservationMonitor(
@@ -2943,6 +3842,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
             geometry_checked=True,
         )
         self.assertIsNotNone(permit)
+        self.assertNotIn("heading_deg", snapshot["observation"]["imu"])
 
         result = monitor.command(SCAN_COMMAND, action_permit=permit)
 
@@ -3003,7 +3903,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
         runtime.calls.clear()
         runtime.center_samples = [2_000] + [500] * 5
 
-        result = monitor.command(SCAN_COMMAND)
+        result = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )
 
         first_turn = next(
             index
@@ -3435,10 +4338,11 @@ class BlastObservationMonitorTests(unittest.TestCase):
         monitor.start()
         self.wait_for(monitor, "online")
         scan_failures = []
+        scan_permit = self.measured_scan_permit(monitor)
 
         def scan():
             try:
-                monitor.command(SCAN_COMMAND)
+                monitor.command(SCAN_COMMAND, action_permit=scan_permit)
             except BlastControllerError as error:
                 scan_failures.append(error.code)
 

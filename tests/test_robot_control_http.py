@@ -1,23 +1,46 @@
 import json
+import threading
+import time
 import unittest
 
+from robot_agent.lm_studio_robot_input import (
+    PHYSICAL_TASK,
+    RobotInputDecision,
+)
+from robot_agent.robot_control_contract import RobotControlTarget
 from robot_agent.robot_control_http import (
+    RobotControlHTTPDirectoryRouter,
     RobotControlHTTPError,
     RobotControlHTTPRouter,
 )
 from robot_agent.robot_control_service import (
     MAX_ROBOT_PAGE_RESPONSE_BYTES,
     RobotControlServiceError,
+    RobotControlService,
+    RobotEpisodeGate,
 )
+from robot_agent.robot_input_service import RobotInputService
 
 
 class FakeRobotControlService:
-    def __init__(self):
+    def __init__(self, robot_id=None, display_name=None):
         self.calls = []
+        self.robot_id = robot_id
+        self.display_name = display_name
 
     def status(self):
         self.calls.append(("status",))
-        return {"state": "IDLE"}
+        return {
+            "state": "IDLE",
+            "target": (
+                None
+                if self.robot_id is None
+                else {
+                    "robot_id": self.robot_id,
+                    "display_name": self.display_name,
+                }
+            ),
+        }
 
     def settings(self):
         self.calls.append(("settings",))
@@ -597,6 +620,346 @@ class RobotControlHTTPRouterTests(unittest.TestCase):
                 b"{}",
             )
         self.assertEqual(raised.exception.status, 404)
+
+
+class RobotControlHTTPDirectoryRouterTests(unittest.TestCase):
+    def setUp(self):
+        self.blast = FakeRobotControlService("blast-01", "BLAST")
+        self.ev3 = FakeRobotControlService(
+            "ev3rstorm-01",
+            "EV3RSTORM",
+        )
+        self.blast_input = FakeRobotInputService()
+        self.ev3_input = FakeRobotInputService()
+        self.blast_router = RobotControlHTTPRouter(
+            self.blast,
+            self.blast_input,
+        )
+        self.ev3_router = RobotControlHTTPRouter(
+            self.ev3,
+            self.ev3_input,
+        )
+        self.router = RobotControlHTTPDirectoryRouter(
+            {
+                "ev3rstorm-01": self.ev3_router,
+                "blast-01": self.blast_router,
+            },
+            default_router=self.ev3_router,
+            default_robot_id="ev3rstorm-01",
+        )
+
+    def test_directory_returns_sorted_full_control_snapshots(self):
+        response = self.router.handle(
+            "GET",
+            "/api/v1/robots",
+            "",
+            b"",
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            response.body["schema"],
+            "robot-control-directory/v1",
+        )
+        self.assertEqual(
+            [
+                control["target"]["robot_id"]
+                for control in response.body["controls"]
+            ],
+            ["blast-01", "ev3rstorm-01"],
+        )
+
+    def test_scoped_routes_delegate_to_only_the_selected_robot(self):
+        response = self.router.handle(
+            "POST",
+            "/api/v1/robots/blast-01/turns",
+            "",
+            encoded({
+                "text": "Hur går det?",
+                "locale": "sv",
+                "client_request_id": "blast-turn-1",
+                "expected_revision": 3,
+            }),
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            self.blast_input.calls,
+            [("Hur går det?", "sv", "blast-turn-1", 3)],
+        )
+        self.assertEqual(self.ev3_input.calls, [])
+
+    def test_singular_routes_remain_aliases_for_the_default_robot(self):
+        response = self.router.handle(
+            "POST",
+            "/api/v1/robot/stop",
+            "",
+            b"{}",
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertIn(("stop",), self.ev3.calls)
+        self.assertNotIn(("stop",), self.blast.calls)
+
+    def test_unknown_robot_and_route_fail_closed(self):
+        self.assertTrue(self.router.handles("/api/v1/robots"))
+        self.assertTrue(
+            self.router.handles("/api/v1/robots/blast-01/status")
+        )
+        with self.assertRaises(RobotControlHTTPError) as unknown:
+            self.router.handle(
+                "GET",
+                "/api/v1/robots/unknown/status",
+                "",
+                b"",
+            )
+        self.assertEqual(unknown.exception.code, "robot_target_not_found")
+        with self.assertRaises(RobotControlHTTPError) as route:
+            self.router.handle(
+                "GET",
+                "/api/v1/robots/blast-01/run-anything",
+                "",
+                b"",
+            )
+        self.assertEqual(route.exception.code, "robot_route_not_found")
+
+    def test_shared_gate_blocks_scoped_episode_and_physical_turn(self):
+        class Runtime:
+            def __init__(self):
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def run(self, _context):
+                self.entered.set()
+                self.release.wait(1.0)
+                return {"current_action": "stop"}
+
+            def request_stop(self):
+                self.release.set()
+
+            def emergency_stop(self):
+                self.release.set()
+
+        class PhysicalModel:
+            def interpret(self, _input, _facts):
+                return RobotInputDecision(PHYSICAL_TASK, 900, None)
+
+        gate = RobotEpisodeGate()
+        ev3_runtime = Runtime()
+        blast_runtime = Runtime()
+        ev3 = RobotControlService(
+            ev3_runtime,
+            target=RobotControlTarget("ev3rstorm-01", "EV3RSTORM"),
+            episode_gate=gate,
+        )
+        blast = RobotControlService(
+            blast_runtime,
+            target=RobotControlTarget("blast-01", "BLAST"),
+            episode_gate=gate,
+        )
+        blast_input = RobotInputService(
+            control_service=blast,
+            model_factory=lambda _model: PhysicalModel(),
+            clock_ms=lambda: 1,
+        )
+        router = RobotControlHTTPDirectoryRouter(
+            {
+                "ev3rstorm-01": RobotControlHTTPRouter(ev3),
+                "blast-01": RobotControlHTTPRouter(
+                    blast,
+                    blast_input,
+                ),
+            },
+            default_router=RobotControlHTTPRouter(ev3),
+            default_robot_id="ev3rstorm-01",
+        )
+        try:
+            started = router.handle(
+                "POST",
+                "/api/v1/robots/ev3rstorm-01/episodes",
+                "",
+                encoded({
+                    "goal": "Explore",
+                    "locale": "en",
+                    "client_request_id": "ev3-start",
+                    "expected_revision": 1,
+                }),
+            )
+            self.assertEqual(started.status, 202)
+            self.assertTrue(ev3_runtime.entered.wait(1.0))
+
+            with self.assertRaises(RobotControlHTTPError) as episode_busy:
+                router.handle(
+                    "POST",
+                    "/api/v1/robots/blast-01/episodes",
+                    "",
+                    encoded({
+                        "goal": "Explore",
+                        "locale": "en",
+                        "client_request_id": "blast-episode",
+                        "expected_revision": 1,
+                    }),
+                )
+            self.assertEqual(episode_busy.exception.status, 409)
+            with self.assertRaises(RobotControlHTTPError) as turn_busy:
+                router.handle(
+                    "POST",
+                    "/api/v1/robots/blast-01/turns",
+                    "",
+                    encoded({
+                        "text": "Kör framåt",
+                        "locale": "sv",
+                        "client_request_id": "blast-turn",
+                        "expected_revision": 1,
+                    }),
+                )
+            self.assertEqual(turn_busy.exception.status, 409)
+
+            ev3_runtime.release.set()
+            deadline = time.monotonic() + 1.0
+            while ev3.status()["state"] != "IDLE":
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.005)
+            accepted = router.handle(
+                "POST",
+                "/api/v1/robots/blast-01/episodes",
+                "",
+                encoded({
+                    "goal": "Explore",
+                    "locale": "en",
+                    "client_request_id": "blast-after-terminal",
+                    "expected_revision": 1,
+                }),
+            )
+            self.assertEqual(accepted.status, 202)
+        finally:
+            blast_runtime.release.set()
+            ev3.shutdown(0.2)
+            blast.shutdown(0.2)
+
+    def test_scoped_spatial_map_uses_only_selected_robot_provider(self):
+        calls = []
+
+        class MapProvider:
+            def __init__(self, robot_id):
+                self.robot_id = robot_id
+
+            def snapshot(self):
+                calls.append(self.robot_id)
+                return {
+                    "schema": "robot-spatial-map/v1",
+                    "read_only": True,
+                    "source_id": self.robot_id,
+                }
+
+        router = RobotControlHTTPDirectoryRouter(
+            {
+                "ev3rstorm-01": self.ev3_router,
+                "blast-01": self.blast_router,
+            },
+            default_router=self.ev3_router,
+            default_robot_id="ev3rstorm-01",
+            spatial_map_providers={
+                "ev3rstorm-01": MapProvider("ev3rstorm-01"),
+                "blast-01": MapProvider("blast-01"),
+            },
+        )
+
+        response = router.handle(
+            "GET",
+            "/api/v1/robots/blast-01/spatial-map",
+            "",
+            b"",
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(set(response.body), {"map"})
+        self.assertEqual(response.body["map"]["source_id"], "blast-01")
+        self.assertEqual(calls, ["blast-01"])
+
+    def test_scoped_spatial_map_fails_safely(self):
+        missing = self.router
+        with self.assertRaises(RobotControlHTTPError) as unavailable:
+            missing.handle(
+                "GET",
+                "/api/v1/robots/blast-01/spatial-map",
+                "",
+                b"",
+            )
+        self.assertEqual(unavailable.exception.status, 503)
+        self.assertEqual(
+            unavailable.exception.code,
+            "spatial_map_unavailable",
+        )
+
+        invalid = RobotControlHTTPDirectoryRouter(
+            {"blast-01": self.blast_router},
+            default_router=self.blast_router,
+            default_robot_id="blast-01",
+            spatial_map_providers={
+                "blast-01": lambda: {
+                    "schema": "wrong-map/v1",
+                    "read_only": True,
+                },
+            },
+        )
+        with self.assertRaises(RobotControlHTTPError) as malformed:
+            invalid.handle(
+                "GET",
+                "/api/v1/robots/blast-01/spatial-map",
+                "",
+                b"",
+            )
+        self.assertEqual(malformed.exception.status, 503)
+        self.assertEqual(malformed.exception.code, "spatial_map_unavailable")
+
+        with self.assertRaises(RobotControlHTTPError) as unknown:
+            missing.handle(
+                "GET",
+                "/api/v1/robots/unknown/spatial-map",
+                "",
+                b"",
+            )
+        self.assertEqual(unknown.exception.status, 404)
+        self.assertEqual(unknown.exception.code, "robot_target_not_found")
+
+    def test_scoped_spatial_map_is_get_only_and_query_free(self):
+        router = RobotControlHTTPDirectoryRouter(
+            {"blast-01": self.blast_router},
+            default_router=self.blast_router,
+            spatial_map_providers={
+                "blast-01": lambda: {
+                    "schema": "robot-spatial-map/v1",
+                    "read_only": True,
+                },
+            },
+        )
+
+        with self.assertRaises(RobotControlHTTPError) as mutation:
+            router.handle(
+                "POST",
+                "/api/v1/robots/blast-01/spatial-map",
+                "",
+                b"{}",
+            )
+        self.assertEqual(mutation.exception.status, 404)
+        with self.assertRaises(RobotControlHTTPError) as queried:
+            router.handle(
+                "GET",
+                "/api/v1/robots/blast-01/spatial-map",
+                "view=shared",
+                b"",
+            )
+        self.assertEqual(queried.exception.status, 400)
+        self.assertEqual(queried.exception.code, "invalid_robot_query")
+
+    def test_spatial_map_provider_ids_must_be_registered(self):
+        with self.assertRaisesRegex(ValueError, "directory is invalid"):
+            RobotControlHTTPDirectoryRouter(
+                {"blast-01": self.blast_router},
+                default_router=self.blast_router,
+                spatial_map_providers={"unknown": lambda: {}},
+            )
 
 
 if __name__ == "__main__":

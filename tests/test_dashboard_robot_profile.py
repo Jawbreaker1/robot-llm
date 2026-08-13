@@ -7,7 +7,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 from robot_agent.dashboard_cli import (
+    BLAST_MAX_NAVIGATION_UTTERANCE_CHARS,
     ROBOT_PROFILE_DISABLED,
+    _configured_robot_control_target,
     _configured_robot_runtime_adapter,
     _configured_shared_spatial_map,
     _parser,
@@ -17,6 +19,7 @@ from robot_agent.blast_episode_adapter import BLAST_PROFILE_ID
 from robot_agent.blast_hub_speech import BLAST_PIPER_PROFILE
 from robot_agent.blast_personality import BLAST_PERSONA_BY_LOCALE
 from robot_agent.ev3rstorm_profile import EV3RSTORM_PROFILE_ID, EV3SSHBinding
+from robot_agent.robot_control_contract import RobotControlTarget
 
 
 class DashboardRobotProfileTests(unittest.TestCase):
@@ -30,6 +33,26 @@ class DashboardRobotProfileTests(unittest.TestCase):
         self.assertIsNone(args.shared_peer_port)
         self.assertIsNone(args.shared_peer_access_key_file)
         self.assertIsNone(_configured_robot_runtime_adapter(args))
+        self.assertIsNone(
+            _configured_robot_control_target(ROBOT_PROFILE_DISABLED)
+        )
+
+    def test_physical_profiles_have_authoritative_control_targets(self):
+        self.assertEqual(
+            _configured_robot_control_target(BLAST_PROFILE_ID).to_dict(),
+            {"robot_id": "blast-01", "display_name": "BLAST"},
+        )
+        self.assertEqual(
+            _configured_robot_control_target(
+                EV3RSTORM_PROFILE_ID
+            ).to_dict(),
+            {
+                "robot_id": "ev3rstorm-01",
+                "display_name": "EV3RSTORM",
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            _configured_robot_control_target("another-robot")
 
     def test_fixed_start_peer_options_are_all_or_none_and_physical(self):
         local_map = mock.Mock()
@@ -267,6 +290,11 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 )
 
     def test_blast_profile_requires_and_reuses_one_monitor(self):
+        # The live 120-character navigation remark in
+        # episode-2e6cc0931db38a0b178ae61f synthesized beyond BLAST's
+        # eight-second PCM envelope. Keep this transport-specific bound
+        # materially below the generic/EV3 utterance limit.
+        self.assertEqual(BLAST_MAX_NAVIGATION_UTTERANCE_CHARS, 72)
         args = _parser().parse_args(
             ["--robot-profile", BLAST_PROFILE_ID]
         )
@@ -337,7 +365,9 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 model="model-b",
                 timeout_seconds=6.5,
                 utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
-                max_utterance_chars=120,
+                max_utterance_chars=(
+                    BLAST_MAX_NAVIGATION_UTTERANCE_CHARS
+                ),
             )
             self.assertEqual(
                 adapter_type.call_args.kwargs["speech_locales"],
@@ -422,6 +452,10 @@ class DashboardRobotProfileTests(unittest.TestCase):
         self.assertIs(adapter_type.call_args.kwargs["controller"], monitor)
         self.assertIs(control_type.call_args.args[0], adapter)
         self.assertEqual(
+            control_type.call_args.kwargs["target"].to_dict(),
+            {"robot_id": "blast-01", "display_name": "BLAST"},
+        )
+        self.assertEqual(
             service_type.call_args.kwargs["controller_runtime_providers"],
             (monitor,),
         )
@@ -474,19 +508,30 @@ class DashboardRobotProfileTests(unittest.TestCase):
         self.assertEqual(result, 0)
         configured.assert_called_once()
         self.assertIs(control_type.call_args.args[0], adapter)
+        self.assertEqual(
+            control_type.call_args.kwargs["target"].to_dict(),
+            {
+                "robot_id": "ev3rstorm-01",
+                "display_name": "EV3RSTORM",
+            },
+        )
         adapter.run.assert_not_called()
         ready = json.loads(stdout.getvalue())
         self.assertTrue(ready["physical_control_enabled"])
         self.assertEqual(ready["robot_profile"], EV3RSTORM_PROFILE_ID)
 
-    def test_run_configures_ev3_and_dormant_blast_together(self):
+    def test_run_configures_ev3_and_blast_as_selectable_targets(self):
         adapter = mock.Mock()
+        blast_adapter = mock.Mock()
         reachability = mock.Mock(spec=("snapshot", "check"))
         adapter.controller_runtime_provider = reachability
         adapter.controller_reachability_service = reachability
         monitor = mock.Mock()
         dashboard_service = mock.Mock()
-        control_service = mock.Mock()
+        ev3_control_service = mock.Mock()
+        blast_control_service = mock.Mock()
+        ev3_input_model = object()
+        blast_input_model = object()
         server = mock.Mock()
         router = mock.Mock(session_path="/live/token/")
         with (
@@ -500,13 +545,25 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 return_value=adapter,
             ),
             mock.patch(
+                "robot_agent.dashboard_cli."
+                "_configured_blast_runtime_adapter",
+                return_value=blast_adapter,
+            ) as blast_configured,
+            mock.patch(
                 "robot_agent.dashboard_cli.DashboardService",
                 return_value=dashboard_service,
             ) as service_type,
             mock.patch(
                 "robot_agent.dashboard_cli.RobotControlService",
-                return_value=control_service,
-            ),
+                side_effect=(
+                    ev3_control_service,
+                    blast_control_service,
+                ),
+            ) as control_type,
+            mock.patch(
+                "robot_agent.dashboard_cli.LMStudioRobotInputModel",
+                side_effect=(ev3_input_model, blast_input_model),
+            ) as input_model_type,
             mock.patch(
                 "robot_agent.dashboard_cli.build_server",
                 return_value=(server, router),
@@ -521,11 +578,29 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 "--blast-hub-name",
                 "BLAST-TEST",
             ])
+            input_services = server_type.call_args.kwargs[
+                "robot_input_services"
+            ]
+            built_ev3_model = input_services[
+                "ev3rstorm-01"
+            ]._model_factory("model-a")
+            built_blast_model = input_services[
+                "blast-01"
+            ]._model_factory("model-b")
 
         self.assertEqual(result, 0)
         monitor_type.assert_called_once_with(hub_name="BLAST-TEST")
         monitor.start.assert_not_called()
         adapter.run.assert_not_called()
+        blast_adapter.run.assert_not_called()
+        blast_configured.assert_called_once_with(
+            mock.ANY,
+            monitor,
+        )
+        self.assertEqual(control_type.call_count, 2)
+        ev3_gate = control_type.call_args_list[0].kwargs["episode_gate"]
+        blast_gate = control_type.call_args_list[1].kwargs["episode_gate"]
+        self.assertIs(ev3_gate, blast_gate)
         self.assertEqual(
             service_type.call_args.kwargs["controller_runtime_providers"],
             (monitor, reachability),
@@ -536,6 +611,39 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 "blast-01.hub": monitor,
                 "ev3rstorm-01.ev3-main": reachability,
             },
+        )
+        self.assertEqual(
+            server_type.call_args.kwargs["robot_control_services"],
+            {
+                "ev3rstorm-01": ev3_control_service,
+                "blast-01": blast_control_service,
+            },
+        )
+        self.assertEqual(
+            set(server_type.call_args.kwargs["robot_input_services"]),
+            {"ev3rstorm-01", "blast-01"},
+        )
+        self.assertEqual(
+            server_type.call_args.kwargs["default_robot_id"],
+            "ev3rstorm-01",
+        )
+        self.assertIs(built_ev3_model, ev3_input_model)
+        self.assertIs(built_blast_model, blast_input_model)
+        self.assertEqual(
+            input_model_type.call_args_list,
+            [
+                mock.call(
+                    base_url="http://127.0.0.1:1234",
+                    model="model-a",
+                    timeout_seconds=10.0,
+                ),
+                mock.call(
+                    base_url="http://127.0.0.1:1234",
+                    model="model-b",
+                    timeout_seconds=10.0,
+                    reply_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
+                ),
+            ],
         )
 
     def test_run_wires_explicit_physical_map_provider(self):
@@ -565,7 +673,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
             mock.patch(
                 "robot_agent.dashboard_cli.build_server",
                 return_value=(server, router),
-            ),
+            ) as server_type,
             mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
         ):
             result = _run(
@@ -581,6 +689,12 @@ class DashboardRobotProfileTests(unittest.TestCase):
         self.assertIs(
             dashboard_type.call_args.kwargs["spatial_map_provider"],
             map_provider,
+        )
+        self.assertEqual(
+            server_type.call_args.kwargs[
+                "robot_spatial_map_providers"
+            ],
+            {"ev3rstorm-01": map_provider},
         )
         self.assertEqual(
             json.loads(stdout.getvalue())["spatial_map_mode"],
@@ -687,6 +801,10 @@ class DashboardRobotProfileTests(unittest.TestCase):
 
     def test_run_keeps_interactive_timeout_independent_of_planner(self):
         adapter = mock.Mock()
+        adapter.robot_control_target = RobotControlTarget(
+            robot_id="injected-robot",
+            display_name="Injected Robot",
+        )
         dashboard_service = mock.Mock()
         control_service = mock.Mock()
         server = mock.Mock()

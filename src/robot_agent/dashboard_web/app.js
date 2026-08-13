@@ -15,11 +15,9 @@
     replaceRenderedItems,
     transitionTurnPoll,
   } = window.RobotDashboardLogic;
-  const EVENT_LIMIT = 100;
-  const MAX_LOCAL_EVENTS = 2000;
-  const MAX_ROBOT_DIALOGUE_MESSAGES = 40;
-  const MAP_POLL_INTERVAL_MS = 2000;
-  let microphoneInput = null;
+  const EVENT_LIMIT = 100, MAX_LOCAL_EVENTS = 2000;
+  const MAX_ROBOT_DIALOGUE_MESSAGES = 40, MAP_POLL_INTERVAL_MS = 2000;
+  let microphoneInput = null, microphoneTarget = null;
   let robotControl = null;
   const i18n = window.RobotI18n.createDefaultI18n();
   const t = (key, args) => i18n.t(key, args);
@@ -80,21 +78,21 @@
     invalid_robot_query: "errors.invalid_robot_request",
     robot_emergency_stop_failed: "errors.robot_emergency_stop_failed",
   });
-
   const state = {
     bootstrap: null,
     settings: null,
     originalSettings: null,
     registry: null,
     spatialMap: null,
-    mapBusy: false,
+    spatialMapByTarget: {},
+    mapBusyTarget: null, mapRequestGeneration: 0,
     mapConnection: "waiting",
     experiments: [],
     conversation: null,
     activeTurn: null,
     optimisticContent: null,
-    robotDialogue: [],
-    robotOptimisticContent: null,
+    robotDialogueByTarget: {},
+    robotOptimisticByTarget: {},
     events: [],
     eventIds: new Set(),
     afterSequence: 0,
@@ -117,7 +115,6 @@
     eventGapActive: false,
     eventGapDroppedTotal: 0,
   };
-
   const byId = (id) => document.getElementById(id);
   const sessionGuard = createSessionGuard();
   sessionGuard.subscribe(() => {
@@ -141,7 +138,6 @@
   const safeInteger = (value, fallback = null) => (
     Number.isSafeInteger(value) ? value : fallback
   );
-
   function createElement(tag, className, text) {
     const node = document.createElement(tag);
     if (className) {
@@ -156,7 +152,6 @@
   function cloneJSON(value) {
     return JSON.parse(JSON.stringify(value));
   }
-
   function randomId(prefix) {
     if (window.crypto && typeof window.crypto.randomUUID === "function") {
       return `${prefix}-${window.crypto.randomUUID()}`;
@@ -175,7 +170,6 @@
       fractionalSecondDigits: 3,
     });
   }
-
   function formatDateTime(unixMs) {
     return i18n.dateTime(unixMs, {
       dateStyle: "medium",
@@ -188,12 +182,10 @@
     const translated = t(key);
     return translated === key ? safeText(value, t("state.unknown")) : translated;
   }
-
   const controllerPanel = window.RobotControllerPanel.create({
     document, request: api, translate: t, humanState, setStatus, showToast, formatDateTime,
     formatNumber: (value, options) => i18n.number(value, options), onCommandComplete: () => refreshBootstrap(true),
   });
-
   function localizedError(error, fallbackKey = "errors.generic") {
     const code = safeText(error && error.code, "");
     const key = ERROR_MESSAGE_KEYS[code] || fallbackKey;
@@ -558,8 +550,9 @@
     }
   }
 
-  function renderSpatialMap(spatialMap, connection = "connected") {
+  function renderSpatialMap(spatialMap, connection = "connected", target = selectedConversationTarget()) {
     state.spatialMap = safeObject(spatialMap);
+    state.spatialMapByTarget[target] = state.spatialMap;
     state.mapConnection = connection;
     spatialMapPresenter.render(state.spatialMap, connection);
   }
@@ -805,12 +798,13 @@
     const keepAtBottom = (
       feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80
     );
-    const robotTarget = selectedConversationTarget() === "robot";
+    const target = selectedConversationTarget();
+    const robotTarget = robotControl?.isRobotTarget(target);
     const messages = robotTarget
-      ? state.robotDialogue
+      ? safeArray(state.robotDialogueByTarget[target])
       : safeArray(safeObject(state.conversation).messages);
     const optimisticContent = robotTarget
-      ? state.robotOptimisticContent
+      ? state.robotOptimisticByTarget[target]
       : state.optimisticContent;
     feed.replaceChildren();
     if (
@@ -1179,31 +1173,28 @@
       TURN_POLL_POLICY.baseDelayMs,
     );
   }
-
   function selectedConversationTarget() {
     return robotControl ? robotControl.selectedTarget() : "workbench";
   }
-
   async function submitCurrentContent(target) {
     const input = byId("message-input");
     const content = input.value.trim();
     if (!content) {
       return;
     }
-    if (target === "robot" && robotControl) {
+    if (robotControl && robotControl.isRobotTarget(target)) {
       if (microphoneInput) {
         microphoneInput.cancel();
       }
-      state.robotOptimisticContent = content;
+      state.robotOptimisticByTarget[target] = content;
       renderConversation();
       const accepted = await robotControl.submitInput(
-        content,
-        i18n.locale,
+        content, i18n.locale, target,
       );
-      if (accepted) {
+      if (accepted && selectedConversationTarget() === target) {
         input.value = "";
       } else {
-        state.robotOptimisticContent = null;
+        state.robotOptimisticByTarget[target] = null;
         renderConversation();
       }
       return;
@@ -1255,7 +1246,6 @@
       showToast(localizedError(error, "chat.send_failed"), true);
     }
   }
-
   async function submitTurn(event) {
     event.preventDefault();
     await submitCurrentContent(selectedConversationTarget());
@@ -1587,26 +1577,27 @@
     }
   }
 
-  async function refreshSpatialMap(silent = true) {
-    if (sessionGuard.isExpired() || state.mapBusy) {
-      return;
-    }
-    state.mapBusy = true;
+  async function refreshSpatialMap(silent = true, target = selectedConversationTarget()) {
+    if (sessionGuard.isExpired() || state.mapBusyTarget === target) return;
+    const generation = ++state.mapRequestGeneration;
+    state.mapBusyTarget = target;
+    const endpoint = robotControl && robotControl.isRobotTarget(target)
+      ? `/api/v1/robots/${encodeURIComponent(target)}/spatial-map`
+      : selectSpatialMapEndpoint(safeObject(state.bootstrap).capabilities);
     try {
-      const payload = await api(selectSpatialMapEndpoint(safeObject(state.bootstrap).capabilities), {
-        timeout: 5000,
-      });
-      renderSpatialMap(payload.map, "connected");
+      const payload = await api(endpoint, { timeout: 5000 });
+      const stale = () => generation !== state.mapRequestGeneration
+        || target !== selectedConversationTarget();
+      if (stale()) return;
+      renderSpatialMap(payload.map, "connected", target);
     } catch (error) {
-      renderSpatialMap(state.spatialMap, "offline");
+      if (generation !== state.mapRequestGeneration || target !== selectedConversationTarget()) return;
+      renderSpatialMap(state.spatialMapByTarget[target], "offline", target);
       if (!silent) {
-        showToast(
-          localizedError(error, "errors.spatial_map_unavailable"),
-          true,
-        );
+        showToast(localizedError(error, "errors.spatial_map_unavailable"), true);
       }
     } finally {
-      state.mapBusy = false;
+      if (generation === state.mapRequestGeneration) state.mapBusyTarget = null;
     }
   }
 
@@ -1728,9 +1719,13 @@
     byId("new-conversation-button").addEventListener("click", startNewConversation);
     byId("composer-form").addEventListener("submit", submitTurn);
     byId("composer-target").addEventListener("change", () => {
+      microphoneTarget = null;
       if (microphoneInput) {
         microphoneInput.cancel();
       }
+    });
+    byId("microphone-button").addEventListener("click", () => {
+      microphoneTarget = selectedConversationTarget();
     });
     byId("message-input").addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
@@ -1808,7 +1803,8 @@
       request: api,
       onTranscript: (text, metadata) => {
         const input = byId("message-input");
-        const target = selectedConversationTarget();
+        const target = microphoneTarget || selectedConversationTarget();
+        microphoneTarget = null;
         input.value = text;
         input.focus();
         if (metadata.autoSend && !input.disabled) {
@@ -1844,14 +1840,10 @@
           enabled,
         );
       },
-      onInputAccepted: (originalText, turn) => {
+      onInputAccepted: (originalText, turn, target) => {
         const acceptedAt = Date.now();
-        const additions = [{
-          role: "user",
-          content: originalText,
-          created_at_unix_ms: acceptedAt,
-          citation_ids: [],
-        }];
+        const additions = [{ role: "user", content: originalText,
+          created_at_unix_ms: acceptedAt, citation_ids: [] }];
         const answerText = safeText(safeObject(turn).answer_text, "");
         if (answerText) {
           additions.push({
@@ -1861,14 +1853,21 @@
             citation_ids: [],
           });
         }
-        state.robotDialogue = state.robotDialogue
+        state.robotDialogueByTarget[target] = safeArray(
+          state.robotDialogueByTarget[target],
+        )
           .concat(additions)
           .slice(-MAX_ROBOT_DIALOGUE_MESSAGES);
-        state.robotOptimisticContent = null;
-        byId("message-input").value = "";
+        state.robotOptimisticByTarget[target] = null;
+        if (selectedConversationTarget() === target) {
+          byId("message-input").value = "";
+        }
         renderConversation();
       },
-      onTargetChanged: renderConversation,
+      onTargetChanged: (target) => {
+        byId("message-input").value = ""; renderConversation();
+        renderSpatialMap(state.spatialMapByTarget[target], "waiting", target); void refreshSpatialMap(true, target);
+      },
     });
     try {
       const [bootstrapPayload, settingsPayload] = await Promise.all([

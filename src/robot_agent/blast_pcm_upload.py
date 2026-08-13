@@ -13,7 +13,24 @@ from .blast_ble_runtime import SAMPLED_AUDIO_MAX_BYTES
 
 
 RESPONSE_MARGIN_SECONDS = 0.25
-START_REPLY_TIMEOUT_SECONDS = 8.5
+# Begin is a small line-protocol exchange. A data batch contains up to eight
+# acknowledged-or-paced AppData writes and needs headroom for normal BLE
+# scheduling jitter. Start may additionally collect the hub heap and snapshot
+# the complete AppData buffer before its authoritative receipt. Navigation now
+# remains stationary until that receipt and then obtains a fresh settled
+# observation, so these phase caps do not consume motor-command freshness.
+PCM_BEGIN_TIMEOUT_SECONDS = 1.5
+PCM_BATCH_TIMEOUT_SECONDS = 3.0
+PCM_START_REPLY_TIMEOUT_SECONDS = 15.0
+
+
+class BlastPCMStartTimeout(TimeoutError):
+    """The bounded final playback-start receipt did not arrive in time."""
+
+    code = "sampled_audio_start_timeout"
+
+    def __init__(self) -> None:
+        super().__init__("BLAST sampled-audio start receipt timed out")
 
 
 class BlastPCMDeadline:
@@ -138,12 +155,29 @@ class BlastPCMUpload:
     def from_request(cls, request):
         return cls(*request)
 
+    @property
+    def current_phase(self) -> str:
+        if self.transfer_id is None:
+            return "begin"
+        if self.offset < len(self.payload):
+            return "batch"
+        return "start"
+
     async def advance(self, runtime):
         """Perform exactly one begin, batch, or nonblocking start step."""
 
-        timeout = max(
-            0.1,
-            self.deadline.remaining() - RESPONSE_MARGIN_SECONDS,
+        phase = self.current_phase
+        phase_timeout = (
+            PCM_BEGIN_TIMEOUT_SECONDS
+            if phase == "begin"
+            else PCM_BATCH_TIMEOUT_SECONDS
+        )
+        timeout = min(
+            phase_timeout,
+            max(
+                0.1,
+                self.deadline.remaining() - RESPONSE_MARGIN_SECONDS,
+            ),
         )
         if self.transfer_id is None:
             begun = await asyncio.wait_for(
@@ -198,11 +232,18 @@ class BlastPCMUpload:
                 self.fletcher16,
                 cancel_requested=self.cancel_requested,
                 ),
-                timeout=START_REPLY_TIMEOUT_SECONDS,
+                timeout=PCM_START_REPLY_TIMEOUT_SECONDS,
             )
+        except asyncio.TimeoutError:
+            self.deadline.finish_start()
+            raise BlastPCMStartTimeout() from None
         except BaseException:
             self.deadline.finish_start()
             raise
 
 
-__all__ = ("BlastPCMDeadline", "BlastPCMUpload")
+__all__ = (
+    "BlastPCMDeadline",
+    "BlastPCMStartTimeout",
+    "BlastPCMUpload",
+)

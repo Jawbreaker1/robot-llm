@@ -17,7 +17,6 @@ from .blast_observation_monitor import (
     RANGE_STATE_MEASURED,
     RANGE_STATE_NO_VALID_DISTANCE,
     SCAN_RAY_EVIDENCE_SWEEP_ONLY,
-    SCAN_RAY_SIDES,
     validate_blast_scan_ray_contract,
 )
 from .blast_side_search_geometry import (
@@ -74,6 +73,11 @@ def _finite_number(value) -> bool:
         and not isinstance(value, bool)
         and math.isfinite(float(value))
     )
+
+
+def _evidence_rays(scan):
+    angular = scan.get("angular_rays") if isinstance(scan, Mapping) else None
+    return angular if isinstance(angular, list) else scan.get("rays", [])
 
 
 def _projection(view):
@@ -151,6 +155,12 @@ def _side_view_covers_pass(
     )) > route.heading_tolerance_mdeg:
         return False
     selected_left = route.detour_side == "LEFT_OF_GOAL"
+    if blast_side_view_associates_frozen_target(
+        side_view,
+        route,
+        "LEFT" if selected_left else "RIGHT",
+    ):
+        return True
     if _target_side_no_return_search(
         side_view, "LEFT" if selected_left else "RIGHT"
     ):
@@ -257,14 +267,34 @@ def _target_side_mixed_far_view(view, route, selected_side):
         return False
     prefix = "right_" if selected_side == "LEFT" else "left_"
     rays = {
-        ray["side"]: ray for ray in scan["rays"]
+        ray["side"]: ray for ray in _evidence_rays(scan)
         if ray["side"].startswith(prefix)
     }
-    near = rays.get(f"{prefix}near")
-    far = rays.get(f"{prefix}far")
+    dense = "angular_rays" in scan
+    near_side = f"{prefix}2" if dense else f"{prefix}near"
+    far_side = f"{prefix}4" if dense else f"{prefix}far"
+    near = rays.get(near_side)
+    far = rays.get(far_side)
+    def merge_ray_clear(ray):
+        if not isinstance(ray, Mapping) or ray.get(
+            "observation_settled"
+        ) is not True:
+            return False
+        state = ray.get("range_state")
+        distance = ray.get("distance_mm")
+        if not _finite_number(distance):
+            return False
+        if state == RANGE_STATE_MEASURED:
+            return float(distance) > route.inflated_pass_clearance_mm
+        return (
+            state == RANGE_STATE_NO_VALID_DISTANCE
+            and float(distance) == 2_000.0
+        )
     if not (
         isinstance(near, Mapping)
         and isinstance(far, Mapping)
+        and len(rays) == (4 if dense else 2)
+        and all(merge_ray_clear(ray) for ray in rays.values())
         and near.get("observation_settled") is True
         and near.get("range_state") == RANGE_STATE_MEASURED
         and float(near["distance_mm"]) > route.inflated_pass_clearance_mm
@@ -273,7 +303,7 @@ def _target_side_mixed_far_view(view, route, selected_side):
         and float(far["distance_mm"]) == 2_000.0
     ):
         return False
-    points = [value for value in values if value[0] == f"{prefix}near"]
+    points = [value for value in values if value[0] == near_side]
     if len(points) != 1:
         return False
     _side, echo_x, echo_y, point = points[0]
@@ -294,6 +324,92 @@ def _target_side_mixed_far_view(view, route, selected_side):
     )
 
 
+def blast_side_view_associates_frozen_target(
+    view, route, selected_side,
+):
+    """Recognize one dense restored side view tied to the frozen envelope.
+
+    No-return remains non-free-space evidence.  This narrow case only binds
+    the new view to the remembered object: center and every outward ray must
+    be settled no-return while all four inward rays are settled measurements,
+    with at least two distinct echoes intersecting the frozen envelope.
+    """
+
+    try:
+        scan = validate_blast_scan_ray_contract(view.get("scan"))
+        values = _points(view)
+    except (AttributeError, ValueError):
+        return False
+    angular = scan.get("angular_rays")
+    if not (
+        isinstance(angular, list)
+        and len(angular) == 9
+        and scan.get("state") == "complete"
+        and scan.get("result") == "restored"
+        and scan.get("restoration_verified") is True
+        and scan.get("all_observations_settled") is True
+        and all(ray.get("observation_settled") is True for ray in angular)
+    ):
+        return False
+    outward_prefix = "left_" if selected_side == "LEFT" else "right_"
+    inward_prefix = "right_" if selected_side == "LEFT" else "left_"
+    center = [ray for ray in angular if ray["side"] == "center"]
+    outward = [
+        ray for ray in angular if ray["side"].startswith(outward_prefix)
+    ]
+    inward = [
+        ray for ray in angular if ray["side"].startswith(inward_prefix)
+    ]
+
+    def exact_no_return(ray):
+        return (
+            ray.get("range_state") == RANGE_STATE_NO_VALID_DISTANCE
+            and _finite_number(ray.get("distance_mm"))
+            and float(ray["distance_mm"]) == 2_000.0
+        )
+
+    rotation_clearance = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+        .minimum_rotation_clearance_mm()
+    )
+    if not (
+        len(center) == 1
+        and len(outward) == 4
+        and len(inward) == 4
+        and exact_no_return(center[0])
+        and all(exact_no_return(ray) for ray in outward)
+        and all(
+            ray.get("range_state") == RANGE_STATE_MEASURED
+            and _finite_number(ray.get("distance_mm"))
+            and float(ray["distance_mm"]) > rotation_clearance
+            for ray in inward
+        )
+    ):
+        return False
+    inward_by_side = {ray["side"]: ray for ray in inward}
+    point_by_side = {}
+    for side, echo_x, echo_y, point in values:
+        if not isinstance(side, str) or side in point_by_side:
+            return False
+        point_by_side[side] = (echo_x, echo_y, point)
+    if set(point_by_side) != set(inward_by_side):
+        return False
+    associated = set()
+    for side, ray in inward_by_side.items():
+        echo_x, echo_y, point = point_by_side[side]
+        point_range = point.get("measured_range_mm")
+        if not _finite_number(point_range) or float(point_range) != float(
+            ray["distance_mm"]
+        ):
+            return False
+        if math.hypot(
+            echo_x - route.target_centroid_x_mm,
+            echo_y - route.target_centroid_y_mm,
+        ) <= route.target_radius_mm + route.position_tolerance_mm:
+            associated.add((echo_x, echo_y))
+    return len(associated) >= 2
+
+
 def _target_side_no_return_search(view, selected_side):
     """Recognize a restored search view with no stable target return."""
 
@@ -312,6 +428,7 @@ def _target_side_no_return_search(view, selected_side):
         BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
         .minimum_rotation_clearance_mm()
     )
+    evidence_rays = _evidence_rays(scan)
     if any(
         ray.get("range_state") == RANGE_STATE_INVALID
         or (
@@ -321,13 +438,13 @@ def _target_side_no_return_search(view, selected_side):
                 or float(ray["distance_mm"]) <= rotation_clearance
             )
         )
-        for ray in scan["rays"]
+        for ray in evidence_rays
     ):
         return False
     prefix = "right_" if selected_side == "LEFT" else "left_"
-    center = [ray for ray in scan["rays"] if ray["side"] == "center"]
+    center = [ray for ray in evidence_rays if ray["side"] == "center"]
     target = [
-        ray for ray in scan["rays"] if ray["side"].startswith(prefix)
+        ray for ray in evidence_rays if ray["side"].startswith(prefix)
     ]
 
     def settled_no_return(ray):
@@ -357,11 +474,10 @@ def _target_side_no_return_search(view, selected_side):
     return (
         len(center) == 1
         and settled_no_return(center[0])
-        and len(target) == 2
-        and projected_sides <= set(SCAN_RAY_SIDES)
-        and projected_sides.isdisjoint({
-            "center", f"{prefix}near", f"{prefix}far",
-        })
+        and len(target) == (4 if "angular_rays" in scan else 2)
+        and projected_sides <= {ray["side"] for ray in evidence_rays}
+        and "center" not in projected_sides
+        and not any(side.startswith(prefix) for side in projected_sides)
         and any(settled_no_return(ray) for ray in target)
         and all(unresolved_without_close(ray) for ray in target)
     )
@@ -539,7 +655,7 @@ def blast_detour_scan_allows_progress(
     view, *, role, selected_side, minimum_clearance_mm, route=None,
 ):
     scan = view.get("scan") if isinstance(view, Mapping) else None
-    rays = scan.get("rays") if isinstance(scan, Mapping) else None
+    rays = _evidence_rays(scan) if isinstance(scan, Mapping) else None
     if (
         role not in ("PASS", "FINAL")
         or selected_side not in ("LEFT", "RIGHT")
@@ -698,4 +814,5 @@ __all__ = (
     "blast_detour_required_slots",
     "blast_detour_scan_allows_progress",
     "blast_detour_scan_sweep_is_clear",
+    "blast_side_view_associates_frozen_target",
 )

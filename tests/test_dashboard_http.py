@@ -297,6 +297,10 @@ def asset_directory():
         '"use strict";',
         encoding="utf-8",
     )
+    (root / "blast_map_semantics.js").write_text(
+        '"use strict";\n/* BLAST map semantics fixture */',
+        encoding="utf-8",
+    )
     (root / "dashboard_logic.js").write_text(
         '"use strict";\n/* dashboard logic fixture */',
         encoding="utf-8",
@@ -798,6 +802,10 @@ class DashboardHTTPTests(unittest.TestCase):
         static_routes = tuple(DashboardRouter._STATIC_ROUTES)
         self.assertLess(
             static_routes.index("assets/i18n.js"),
+            static_routes.index("assets/blast_map_semantics.js"),
+        )
+        self.assertLess(
+            static_routes.index("assets/blast_map_semantics.js"),
             static_routes.index("assets/dashboard_logic.js"),
         )
         self.assertLess(

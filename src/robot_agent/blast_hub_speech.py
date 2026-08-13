@@ -227,7 +227,10 @@ class BlastHubSpeaker:
             else None
         )
         if (
-            isinstance(duration_ms, bool)
+            not isinstance(receipt, dict)
+            or receipt.get("accepted") is not True
+            or receipt.get("started") is not True
+            or isinstance(duration_ms, bool)
             or not isinstance(duration_ms, int)
             or not 1 <= duration_ms <= 8_000
             or duration_ms != audio.duration_ms
@@ -236,6 +239,11 @@ class BlastHubSpeaker:
                 "invalid_blast_pcm_receipt",
                 "BLAST returned an invalid sampled-audio duration",
             )
+        mark_started = getattr(
+            cancel_event, "mark_playback_started", None,
+        )
+        if callable(mark_started):
+            mark_started()
         # The hub has already returned to its BLE command loop. This worker
         # waits only so episode cancellation and speech completion stay exact;
         # navigation continues on the monitor's separate owner thread.

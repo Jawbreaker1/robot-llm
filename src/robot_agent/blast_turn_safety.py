@@ -1,7 +1,6 @@
 """Fail-closed BLAST post-pulse turn continuation policy."""
 
 from collections.abc import Mapping
-import math
 
 from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
@@ -34,17 +33,12 @@ def blast_turn_slice_allows_continuation(
     motors = sensors.get("motor_angles_deg") if isinstance(
         sensors, Mapping
     ) else None
-    imu = sensors.get("imu") if isinstance(sensors, Mapping) else None
-    heading = imu.get("heading_deg") if isinstance(imu, Mapping) else None
     if not (
         sensors.get("motion_active") is False
         and BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
         .range_sensor_extrinsics.matches_navigation_body_angle(
             motors.get("body") if isinstance(motors, Mapping) else None
         )
-        and isinstance(heading, (int, float))
-        and not isinstance(heading, bool)
-        and math.isfinite(float(heading))
     ):
         return False
     distance = sensors.get("distance_mm")

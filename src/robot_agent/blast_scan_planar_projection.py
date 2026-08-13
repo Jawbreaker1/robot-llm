@@ -8,6 +8,7 @@ from typing import Mapping
 
 from . import blast_observation_monitor as scan_contract
 from .blast_navigation_calibration import BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+from .blast_scan_observation import SCAN_MAX_ABSOLUTE_BEARING_DEG
 from .physical_odometry import PhysicalPose, normalize_heading_mdeg
 
 
@@ -27,28 +28,38 @@ def _delta(heading, reference):
 
 def _headings(scan):
     start = _finite(scan.get("start_heading_deg"))
+    rays = scan.get("angular_rays", scan["rays"])
     values = []
-    for ray in scan["rays"]:
-        heading = _finite(ray.get("heading_deg"))
+    for ray in rays:
         relative = _finite(ray.get("relative_heading_deg"))
-        if not math.isclose(relative, _delta(heading, start), abs_tol=1e-9):
-            raise ValueError("BLAST scan heading evidence is inconsistent")
         values.append(relative)
-    center, left_near, left_far, right_near, right_far = values
-    if not (
-        center == 0.0
-        and -90.0 <= left_far < left_near < 0.0
-        and 0.0 < right_near < right_far <= 90.0
+    center = values[0]
+    side_count = (len(values) - 1) // 2
+    left = values[1:1 + side_count]
+    right = values[1 + side_count:]
+    if (
+        len(values) not in (5, 9)
+        or center != 0.0
+        or not all(
+            -SCAN_MAX_ABSOLUTE_BEARING_DEG <= value < 0.0
+            for value in left
+        )
+        or not all(
+            0.0 < value <= SCAN_MAX_ABSOLUTE_BEARING_DEG
+            for value in right
+        )
+        or any(first <= second for first, second in zip(left, left[1:]))
+        or any(first >= second for first, second in zip(right, right[1:]))
     ):
         raise ValueError("BLAST scan heading topology is invalid")
-    final = _finite(scan.get("final_heading_deg"))
-    error = _finite(scan.get("restoration_error_deg"))
-    if (
-        not math.isclose(error, _delta(final, start), abs_tol=1e-9)
-        or abs(error) > scan_contract.SCAN_RESTORATION_TOLERANCE_DEG
-    ):
+    encoder_restoration = scan.get("encoder_restoration")
+    error = _finite(
+        encoder_restoration.get("opposed_residue_deg")
+        if isinstance(encoder_restoration, Mapping) else None
+    )
+    if abs(error) > scan_contract.SCAN_RESTORATION_TOLERANCE_DEG:
         raise ValueError("BLAST scan restoration evidence is inconsistent")
-    return tuple(values)
+    return rays, tuple(values)
 
 
 def project_blast_scan_planar_surfaces(
@@ -67,16 +78,16 @@ def project_blast_scan_planar_surfaces(
         and checked["rays"][0].get("observation_settled") is True
     ):
         raise ValueError("BLAST scan is not projection-ready")
+    projection_rays, raw_headings = _headings(checked)
     sensor = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics
     if not (
         sensor.complete
         and all(
             sensor.matches_navigation_body_angle(ray["body_motor_angle_deg"])
-            for ray in checked["rays"]
+            for ray in projection_rays
         )
     ):
         raise ValueError("BLAST scan sensor pose is not verified")
-    raw_headings = _headings(checked)
     forward, left, yaw = (
         sensor.forward_offset_mm,
         sensor.left_offset_mm,
@@ -85,7 +96,7 @@ def project_blast_scan_planar_surfaces(
     assert forward is not None and left is not None and yaw is not None
 
     points = []
-    for ray, raw_heading in zip(checked["rays"], raw_headings):
+    for ray, raw_heading in zip(projection_rays, raw_headings):
         if (
             ray.get("observation_settled") is not True
             or ray["range_state"] != scan_contract.RANGE_STATE_MEASURED

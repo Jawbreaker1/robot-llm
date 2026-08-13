@@ -10,6 +10,7 @@
   const SVG_WIDTH = 1000;
   const SVG_HEIGHT = 620;
   const MAX_RENDERED_QUALITATIVE_OBSERVATIONS = 100;
+  const blastMapSemantics = global.RobotBlastMapSemantics;
 
   function create(options = {}) {
     const documentApi = options.document;
@@ -24,6 +25,7 @@
       || typeof normalizeSpatialMap !== "function"
       || typeof t !== "function"
       || typeof formatNumber !== "function"
+      || !blastMapSemantics
     ) {
       throw new TypeError("Spatial map presenter dependencies are invalid.");
     }
@@ -151,6 +153,7 @@
           trace.plannedLeg.waypoint.yMm,
         );
       }
+      blastMapSemantics.appendRoutePoints(trace.localDetourRoute, addPoint);
       trace.planarScanViews.forEach((view) => {
         addPoint(view.scanPose.xMm, view.scanPose.yMm);
         view.points.forEach((point) => {
@@ -204,6 +207,7 @@
       });
       appendNavigationTracePoints(map.navigationTrace, addPoint);
       map.objectHypotheses.forEach((hypothesis) => {
+        blastMapSemantics.appendObstaclePoints(hypothesis, addPoint);
         if (
           hypothesis.provisional
           && hypothesis.geometryKind === QUALITATIVE_FORWARD_ENVELOPE
@@ -367,6 +371,10 @@
           });
         }
       });
+      blastMapSemantics.appendSharedObstaclePoints(
+        map.robots,
+        (xMm, yMm) => addPoint({ xMm, yMm }),
+      );
       return Object.freeze({ points: Object.freeze(points) });
     }
 
@@ -414,6 +422,14 @@
         `L ${end.x} ${end.y}`,
         `L ${right.x} ${right.y}`,
       ].join(" ");
+    }
+
+    function blastRenderUi() {
+      return {
+        svg: createSvgElement, title: appendSvgTitle, t,
+        format: formatNumber, heading: headingArrowPath,
+        tooltip: mapTooltipParts,
+      };
     }
 
     function renderNavigationTrace(
@@ -579,6 +595,13 @@
         layer.appendChild(group);
       }
 
+      blastMapSemantics.renderRoute(
+        layer,
+        trace.localDetourRoute,
+        projection,
+        blastRenderUi(),
+      );
+
       trace.planarScanViews.forEach((view, viewIndex) => {
         const group = createSvgElement("g", {
           class: "map-blast-scan-view",
@@ -706,6 +729,12 @@
           : "map.path.title",
       );
       renderNavigationTrace(layer, map, projection);
+      blastMapSemantics.renderObstacles(
+        layer,
+        map.objectHypotheses,
+        projection,
+        blastRenderUi(),
+      );
 
       scene.cues.forEach(({ anchorPose, evidence }) => {
         const anchor = projection.point(
@@ -1211,10 +1240,14 @@
     function renderMapObjects(map) {
       const list = byId("map-object-list");
       const scanCounts = retainedScanCounts(map);
-      byId("map-object-count").textContent = formatNumber(
-        map.objectHypotheses.length,
+      const entries = blastMapSemantics.objectEntries(
+        map,
+        SHARED_SPATIAL_MAP_SCHEMA,
       );
-      if (map.objectHypotheses.length === 0) {
+      byId("map-object-count").textContent = formatNumber(
+        entries.length,
+      );
+      if (entries.length === 0) {
         list.replaceChildren(createElement(
           "p",
           "map-object-empty",
@@ -1222,7 +1255,8 @@
         ));
         return;
       }
-      list.replaceChildren(...map.objectHypotheses.map((hypothesis) => {
+      list.replaceChildren(...entries.map((entry) => {
+        const { hypothesis, sourceRobotId } = entry;
         const item = createElement("article", "map-object-item");
         const hypothesisScans = map.scanEvidenceHistory.filter(
           (scan) => (
@@ -1235,15 +1269,27 @@
         item.appendChild(createElement(
           "strong",
           "",
-          safeText(
-            hypothesis.label,
-            safeText(
-              hypothesis.hypothesisId,
-              t("map.objects.unnamed"),
+          hypothesis.classification
+            === "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER"
+            ? t("map.objects.ultrasonic_obstacle_cluster")
+            : safeText(
+              hypothesis.label,
+              safeText(
+                hypothesis.hypothesisId,
+                t("map.objects.unnamed"),
+              ),
             ),
-          ),
         ));
-        if (hypothesis.provenance) {
+        if (
+          hypothesis.classification
+            === "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER"
+        ) {
+          item.appendChild(createElement(
+            "span",
+            "map-provenance-badge is-provisional-inference",
+            t("map.objects.provisional_inference"),
+          ));
+        } else if (hypothesis.provenance) {
           item.appendChild(createElement(
             "span",
             "map-provenance-badge",
@@ -1253,7 +1299,28 @@
           item.appendChild(createElement("span"));
         }
         const details = [
+          hypothesis.classification
+            === "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER"
+            ? t(`map.objects.ultrasonic_relation.${
+              hypothesis.relation.toLocaleLowerCase("en-US")
+            }`)
+            : "",
+          hypothesis.classification
+            === "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER"
+            ? t("map.objects.ultrasonic_support", {
+              count: formatNumber(hypothesis.evidenceCount),
+              radius: formatNumber(hypothesis.supportRadiusMm),
+            })
+            : "",
+          hypothesis.classification
+            === "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER"
+            ? t("map.objects.source_scans", {
+              scans: hypothesis.sourceScanIds.join(", "),
+            })
+            : "",
           hypothesis.provisional && hypothesis.relation
+            && hypothesis.classification
+              !== "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER"
             ? relationLabel(hypothesis.relation)
             : "",
           hypothesis.provisional && hypothesis.bearing
@@ -1265,6 +1332,9 @@
             ? t("map.tooltip.source", {
               source: hypothesis.sourceId,
             })
+            : "",
+          sourceRobotId
+            ? t("map.tooltip.source", { source: sourceRobotId })
             : "",
           Number.isFinite(hypothesis.ageMs)
             ? t("map.tooltip.age", {
@@ -1721,6 +1791,12 @@
         group.appendChild(label);
         robotLayer.appendChild(group);
       });
+      blastMapSemantics.renderSharedObstacles(
+        objectLayer,
+        map.robots,
+        projection,
+        blastRenderUi(),
+      );
     }
 
     function render(spatialMap, connection = "connected", nowUnixMs) {

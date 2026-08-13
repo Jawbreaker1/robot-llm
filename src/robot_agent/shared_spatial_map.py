@@ -10,7 +10,12 @@ pose or navigation trace.
 from copy import deepcopy
 from typing import Mapping
 
-from .blast_spatial_map import NAVIGATION_TRACE_SCHEMA, _trace_inputs
+from .blast_spatial_map import (
+    MAX_PROVISIONAL_OBSTACLE_HYPOTHESES,
+    NAVIGATION_TRACE_SCHEMA,
+    _provisional_obstacle_hypothesis,
+    _trace_inputs,
+)
 from .shared_frame_transform import (
     CalibratedFrameTransform,
     FrameTransformError,
@@ -39,6 +44,7 @@ _NAVIGATION_TRACE_FIELDS = (
     "planned_leg",
     "planar_scan_views",
 )
+_NAVIGATION_TRACE_ROUTE_FIELD = "local_detour_route"
 
 
 class SharedSpatialMapError(ValueError):
@@ -222,6 +228,45 @@ def _transform_trace_pose(
     }
 
 
+def _transform_provisional_obstacles(
+    values: object,
+    transform: CalibratedFrameTransform,
+    *,
+    captured_at_unix_ms: int,
+):
+    if not isinstance(values, (list, tuple)):
+        raise _SourceUnavailable("source_object_hypotheses_invalid")
+    selected = [
+        value for value in values
+        if isinstance(value, Mapping)
+        and (
+            value.get("classification")
+            == "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER"
+            or value.get("geometry_kind")
+            == "PROVISIONAL_ULTRASONIC_ECHO_CLUSTER"
+        )
+    ]
+    if len(selected) > MAX_PROVISIONAL_OBSTACLE_HYPOTHESES or any(
+        not _provisional_obstacle_hypothesis(value, captured_at_unix_ms)
+        for value in selected
+    ):
+        raise _SourceUnavailable("source_object_hypotheses_invalid")
+    transformed = []
+    for source in selected:
+        value = deepcopy(source)
+        value["x_mm"], value["y_mm"] = _transform_trace_point(
+            source["x_mm"], source["y_mm"], transform
+        )
+        for point, source_point in zip(
+            value["support_points"], source["support_points"]
+        ):
+            point["x_mm"], point["y_mm"] = _transform_trace_point(
+                source_point["x_mm"], source_point["y_mm"], transform
+            )
+        transformed.append(value)
+    return transformed
+
+
 def _transform_navigation_trace(
     value: object,
     transform: CalibratedFrameTransform,
@@ -232,7 +277,10 @@ def _transform_navigation_trace(
         return None
     if (
         not isinstance(value, Mapping)
-        or set(value) != set(_NAVIGATION_TRACE_FIELDS)
+        or set(value) not in (
+            set(_NAVIGATION_TRACE_FIELDS),
+            set((*_NAVIGATION_TRACE_FIELDS, _NAVIGATION_TRACE_ROUTE_FIELD)),
+        )
         or value.get("schema") != NAVIGATION_TRACE_SCHEMA
         or value.get("read_only") is not True
     ):
@@ -250,6 +298,7 @@ def _transform_navigation_trace(
         value.get("imu_heading"),
         value.get("planar_scan_views"),
         captured_at_unix_ms,
+        value.get(_NAVIGATION_TRACE_ROUTE_FIELD),
     ):
         raise _SourceUnavailable("source_navigation_trace_invalid")
 
@@ -291,6 +340,21 @@ def _transform_navigation_trace(
             planned_leg["waypoint"], transform
         )
 
+    local_detour_route = value.get(_NAVIGATION_TRACE_ROUTE_FIELD)
+    if local_detour_route is not None:
+        local_detour_route = deepcopy(local_detour_route)
+        for waypoint in local_detour_route["waypoints"]:
+            x_mm, y_mm = _transform_trace_point(
+                waypoint["x_mm"], waypoint["y_mm"], transform
+            )
+            waypoint.update({
+                "x_mm": x_mm,
+                "y_mm": y_mm,
+                "heading_mdeg": _transform_trace_heading(
+                    waypoint["heading_mdeg"], transform
+                ),
+            })
+
     planar_scan_views = []
     for source_view in value["planar_scan_views"]:
         view = dict(source_view)
@@ -328,7 +392,7 @@ def _transform_navigation_trace(
         view["projection"] = projection
         planar_scan_views.append(view)
 
-    return {
+    result = {
         "schema": value["schema"],
         "read_only": value["read_only"],
         "frame_id": transform.world_frame_id,
@@ -344,6 +408,9 @@ def _transform_navigation_trace(
         "planned_leg": planned_leg,
         "planar_scan_views": planar_scan_views,
     }
+    if _NAVIGATION_TRACE_ROUTE_FIELD in value:
+        result[_NAVIGATION_TRACE_ROUTE_FIELD] = local_detour_route
+    return result
 
 
 class SharedSpatialMapCompositor:
@@ -442,6 +509,7 @@ class SharedSpatialMapCompositor:
             "pose_history_evicted": 0,
             "collision_geometry": None,
             "navigation_trace": None,
+            "object_hypotheses": [],
             "frame_transform": transform.to_dict(),
             "source_map_id": None,
             "source_map_version": None,
@@ -528,6 +596,11 @@ class SharedSpatialMapCompositor:
             transform,
             captured_at_unix_ms=captured_at_unix_ms,
         )
+        object_hypotheses = _transform_provisional_obstacles(
+            snapshot.get("object_hypotheses", ()),
+            transform,
+            captured_at_unix_ms=captured_at_unix_ms,
+        )
 
         return {
             "read_only": True,
@@ -544,6 +617,7 @@ class SharedSpatialMapCompositor:
                 snapshot.get("collision_geometry")
             ),
             "navigation_trace": navigation_trace,
+            "object_hypotheses": object_hypotheses,
             "frame_transform": transform.to_dict(),
             "source_map_id": source_map_id,
             "source_map_version": source_map_version,

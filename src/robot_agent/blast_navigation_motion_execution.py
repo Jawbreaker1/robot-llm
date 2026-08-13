@@ -15,6 +15,11 @@ from .blast_observation_monitor import (
     SCAN_RESTORATION_TOLERANCE_DEG,
     BlastControllerError,
 )
+from .blast_scan_observation import (
+    SCAN_RESTORATION_COMMON_MODE_TOLERANCE_MM,
+    encoder_common_mode_residue_mm,
+    encoder_relative_bearing_deg,
+)
 from .physical_navigation_contract import PhysicalNavigationContractError
 from .physical_odometry import (
     PhysicalPose, VerifiedMotion, apply_verified_motion,
@@ -25,7 +30,8 @@ from .physical_odometry import (
 _DRIVE_ROLES = ("left_drive", "right_drive")
 _MAX_PRE_COMMAND_SETTLING_DEGREES = 1
 MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES = int(round(
-    10 / BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
+    SCAN_RESTORATION_COMMON_MODE_TOLERANCE_MM /
+    BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
     .linear_mm_per_encoder_degree
 ))
 MAX_RESTORED_SCAN_OPPOSED_RESIDUE_DEGREES = int(round(
@@ -98,6 +104,25 @@ class BlastNavigationMotionExecutor:
     def localization_valid(self) -> bool:
         return self._localization_valid
 
+    def observation_matches_anchor(self, observation) -> bool:
+        """Whether exact drive encoders still match the trusted pose anchor."""
+
+        motors = (
+            observation.get("motor_angles_deg")
+            if isinstance(observation, Mapping) else None
+        )
+        return (
+            self._localization_valid
+            and isinstance(motors, Mapping)
+            and all(
+                type(motors.get(role)) is int
+                and abs(
+                    motors[role] - self._expected_start_angles[role]
+                ) <= _MAX_PRE_COMMAND_SETTLING_DEGREES
+                for role in _DRIVE_ROLES
+            )
+        )
+
     def _invalidate(self, code: str, message: str) -> None:
         self._localization_valid = False
         _fail(code, message)
@@ -156,6 +181,43 @@ class BlastNavigationMotionExecutor:
             angles[role] - self._expected_start_angles[role]
             for role in _DRIVE_ROLES
         )
+        scan_start_angles = scan.get("encoder_start_angles_deg")
+        scan_final_angles = scan.get("encoder_final_angles_deg")
+        encoder_restoration = scan.get("encoder_restoration")
+        recomputed_common_mm = encoder_common_mode_residue_mm(
+            scan_final_angles, scan_start_angles,
+        )
+        recomputed_opposed_deg = encoder_relative_bearing_deg(
+            {"motor_angles_deg": scan_final_angles}, scan_start_angles,
+        )
+        encoder_scan_contract_valid = (
+            isinstance(scan_start_angles, Mapping)
+            and isinstance(scan_final_angles, Mapping)
+            and set(scan_start_angles) == set(_DRIVE_ROLES)
+            and all(
+                type(scan_start_angles.get(role)) is int
+                and abs(
+                    scan_start_angles[role]
+                    - self._expected_start_angles[role]
+                ) <= _MAX_PRE_COMMAND_SETTLING_DEGREES
+                for role in _DRIVE_ROLES
+            )
+            and angles == {
+                role: scan_final_angles.get(role) for role in _DRIVE_ROLES
+            }
+            and isinstance(encoder_restoration, Mapping)
+            and recomputed_common_mm is not None
+            and recomputed_opposed_deg is not None
+            and encoder_restoration.get("motion_stopped") is True
+            and encoder_restoration.get("observation_settled") is True
+            and encoder_restoration.get("body_pose_verified") is True
+            and command_result.get("observation_settled") is True
+        )
+        if not encoder_scan_contract_valid:
+            self._invalidate(
+                "blast_scan_restoration_unverified",
+                "BLAST scan did not verify its encoder restoration",
+            )
         if (
             abs(sum(residue))
             > 2 * MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES

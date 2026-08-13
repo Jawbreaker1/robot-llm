@@ -92,7 +92,7 @@ class BlastNavigationActionProfileTests(unittest.TestCase):
         self.assertEqual(left.heading_mdeg, 94_570)
         self.assertEqual(right.heading_mdeg, -94_570)
 
-    def test_scan_sweep_uses_four_small_pulses_inside_old_endpoint(self):
+    def test_scan_sweep_uses_four_calibrated_pulses_per_side(self):
         origin = PhysicalPose()
 
         left = blast_scan_turn_maximum_pose(origin, TURN_LEFT_90)
@@ -105,13 +105,15 @@ class BlastNavigationActionProfileTests(unittest.TestCase):
         )
 
         self.assertEqual(SCAN_TURN_PULSES_PER_SIDE, 4)
-        self.assertEqual(SCAN_TURN_ENCODER_DEGREES_PER_PULSE, 21)
-        self.assertEqual(left.heading_mdeg, 77_910)
-        self.assertEqual(right.heading_mdeg, -77_910)
-        self.assertLess(
-            abs(left.heading_mdeg),
-            abs(full_turn_maximum.heading_mdeg),
+        self.assertEqual(SCAN_TURN_ENCODER_DEGREES_PER_PULSE, 45)
+        self.assertEqual(
+            TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN
+            * BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
+            .turn_mdeg_per_opposed_encoder_degree,
+            94_570,
         )
+        self.assertEqual(left.heading_mdeg, full_turn_maximum.heading_mdeg)
+        self.assertEqual(right.heading_mdeg, -full_turn_maximum.heading_mdeg)
         with self.assertRaises(ValueError):
             blast_scan_turn_maximum_pose(origin, ADVANCE)
 

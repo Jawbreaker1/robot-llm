@@ -95,7 +95,19 @@ class FakeController:
         }
 
 
-def scan_result(controller, *, restored):
+def scan_result(controller, *, restored, start=None):
+    start = (
+        {"left_drive": 100, "right_drive": 200}
+        if start is None else dict(start)
+    )
+    final = {
+        role: controller.angles[role]
+        for role in ("left_drive", "right_drive")
+    }
+    left_delta = final["left_drive"] - start["left_drive"]
+    right_delta = final["right_drive"] - start["right_drive"]
+    common_mm = (left_delta + right_delta) / 2 * 0.5
+    opposed_deg = -((right_delta - left_delta) / 2 * 0.490)
     return {
         "schema": COMMAND_RESULT_SCHEMA,
         "robot_id": ROBOT_ID,
@@ -106,7 +118,18 @@ def scan_result(controller, *, restored):
         "receipt": {"turn_count": 8},
         "observation": controller.observation(),
         "observation_settled": True,
-        "scan": {"restoration_verified": restored},
+        "scan": {
+            "restoration_verified": restored,
+            "encoder_start_angles_deg": start,
+            "encoder_final_angles_deg": final,
+            "encoder_restoration": {
+                "common_mode_residue_mm": common_mm,
+                "opposed_residue_deg": opposed_deg,
+                "motion_stopped": True,
+                "observation_settled": True,
+                "body_pose_verified": True,
+            },
+        },
     }
 
 
@@ -131,6 +154,36 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
             executor.expected_start_angles,
             {"left_drive": 190, "right_drive": 290},
         )
+
+    def test_observation_anchor_match_is_exact_bounded_and_latched(self):
+        controller, executor = self.executor()
+
+        self.assertTrue(executor.observation_matches_anchor(
+            controller.observation(),
+        ))
+        within_tolerance = controller.observation()
+        within_tolerance["motor_angles_deg"].update({
+            "left_drive": 99,
+            "right_drive": 201,
+        })
+        self.assertTrue(executor.observation_matches_anchor(within_tolerance))
+        for invalid in (
+            {"motor_angles_deg": {"left_drive": 98, "right_drive": 200}},
+            {"motor_angles_deg": {"left_drive": 100}},
+            {"motor_angles_deg": {
+                "left_drive": 100.0, "right_drive": 200,
+            }},
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(executor.observation_matches_anchor(invalid))
+
+        controller.angles["left_drive"] += 2
+        with self.assertRaises(PhysicalNavigationContractError):
+            executor.execute(ADVANCE)
+        controller.angles = {"left_drive": 100, "right_drive": 200}
+        self.assertFalse(executor.observation_matches_anchor(
+            controller.observation(),
+        ))
 
     def test_quarter_turn_dispatches_four_pulses_and_uses_calibration(self):
         controller, executor = self.executor()
@@ -476,19 +529,68 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertEqual(pose_after_scan.y_mm, 0)
         self.assertEqual(result.pose.heading_mdeg, 94_570)
 
+    def test_restored_scan_start_allows_only_one_degree_settling(self):
+        for delta, accepted in ((-2, False), (-1, True), (1, True), (2, False)):
+            with self.subTest(delta=delta):
+                controller, executor = self.executor()
+                scan_start = {
+                    "left_drive": 100 + delta,
+                    "right_drive": 200 - delta,
+                }
+                controller.angles = {
+                    role: angle + 8 for role, angle in scan_start.items()
+                }
+                result = scan_result(
+                    controller,
+                    restored=True,
+                    start=scan_start,
+                )
+
+                if accepted:
+                    self.assertTrue(executor.reanchor_after_restored_scan(result))
+                    self.assertEqual(
+                        executor.expected_start_angles,
+                        controller.angles,
+                    )
+                    self.assertTrue(executor.localization_valid)
+                else:
+                    with self.assertRaises(
+                        PhysicalNavigationContractError
+                    ) as raised:
+                        executor.reanchor_after_restored_scan(result)
+                    self.assertEqual(
+                        raised.exception.code,
+                        "blast_scan_restoration_unverified",
+                    )
+                    self.assertFalse(executor.localization_valid)
+
     def test_live_scan_common_mode_residue_reanchors_without_false_pose(self):
-        controller, executor = self.executor()
-        controller.angles["left_drive"] += 16
-        controller.angles["right_drive"] += 10
+        controller = FakeController()
+        controller.angles = {"left_drive": -225, "right_drive": 293}
+        executor = BlastNavigationMotionExecutor(
+            controller=controller,
+            initial_observation=controller.observation(),
+        )
+        # Exact live 2026-08-13 residue: 24/20 encoder degrees = 11 mm
+        # common mode and 0.98 degrees opposed rotation.
+        controller.angles["left_drive"] += 24
+        controller.angles["right_drive"] += 20
 
         reanchored = executor.reanchor_after_restored_scan(
-            scan_result(controller, restored=True)
+            scan_result(
+                controller,
+                restored=True,
+                start={"left_drive": -225, "right_drive": 293},
+            )
         )
 
         self.assertTrue(reanchored)
         self.assertEqual(executor.pose.x_mm, 0)
         self.assertEqual(executor.pose.y_mm, 0)
         self.assertTrue(executor.localization_valid)
+        self.assertEqual(executor.expected_start_angles, {
+            "left_drive": -201, "right_drive": 313,
+        })
 
     def test_unrestored_scan_residue_blocks_motion_before_command(self):
         controller, executor = self.executor()

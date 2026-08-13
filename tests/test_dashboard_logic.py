@@ -19,13 +19,10 @@ class DashboardLogicRuntimeTests(unittest.TestCase):
         script = r"""
 const fs = require("fs");
 const vm = require("vm");
-const source = fs.readFileSync(process.argv[1], "utf8");
 const context = {};
-vm.runInNewContext(
-  source,
-  context,
-  { filename: process.argv[1] },
-);
+for (const filename of process.argv.slice(1)) {
+  vm.runInNewContext(fs.readFileSync(filename, "utf8"), context, { filename });
+}
 const logic = context.RobotDashboardLogic;
 if (
   !logic
@@ -399,6 +396,7 @@ process.stdout.write(JSON.stringify({
                 "--input-type=commonjs",
                 "-e",
                 script,
+                str(LOGIC_ASSET.with_name("blast_map_semantics.js")),
                 str(LOGIC_ASSET),
             ],
             text=True,
@@ -535,9 +533,10 @@ process.stdout.write(JSON.stringify({
         script = r"""
 const fs = require("fs");
 const vm = require("vm");
-const source = fs.readFileSync(process.argv[1], "utf8");
 const context = {};
-vm.runInNewContext(source, context, { filename: process.argv[1] });
+for (const filename of process.argv.slice(1)) {
+  vm.runInNewContext(fs.readFileSync(filename, "utf8"), context, { filename });
+}
 const logic = context.RobotDashboardLogic;
 
 class FakeAbortController {
@@ -654,6 +653,7 @@ function response(status, payload) {
                 "--input-type=commonjs",
                 "-e",
                 script,
+                str(LOGIC_ASSET.with_name("blast_map_semantics.js")),
                 str(LOGIC_ASSET),
             ],
             text=True,
@@ -837,9 +837,10 @@ function response(status, payload) {
         script = r"""
 const fs = require("fs");
 const vm = require("vm");
-const source = fs.readFileSync(process.argv[1], "utf8");
 const context = {};
-vm.runInNewContext(source, context, { filename: process.argv[1] });
+for (const filename of process.argv.slice(1)) {
+  vm.runInNewContext(fs.readFileSync(filename, "utf8"), context, { filename });
+}
 const logic = context.RobotDashboardLogic;
 
 const goal = {
@@ -946,6 +947,7 @@ process.stdout.write(JSON.stringify({
                 "--input-type=commonjs",
                 "-e",
                 script,
+                str(LOGIC_ASSET.with_name("blast_map_semantics.js")),
                 str(LOGIC_ASSET),
             ],
             text=True,
@@ -993,9 +995,10 @@ process.stdout.write(JSON.stringify({
         script = r"""
 const fs = require("fs");
 const vm = require("vm");
-const source = fs.readFileSync(process.argv[1], "utf8");
 const context = {};
-vm.runInNewContext(source, context, { filename: process.argv[1] });
+for (const filename of process.argv.slice(1)) {
+  vm.runInNewContext(fs.readFileSync(filename, "utf8"), context, { filename });
+}
 const logic = context.RobotDashboardLogic;
 
 function pose(robotId, localFrameId, index) {
@@ -1084,7 +1087,29 @@ function shared(robots) {
 }
 const ev3 = robot("ev3rstorm-01", "ev3-controller", "ev3-local", "ev3-gen");
 const blast = robot("blast-01", "blast-controller", "blast-local", "blast-gen");
+const obstacle = {
+  hypothesis_id: "blast-ultrasonic-a",
+  classification: "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+  label: "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+  x_mm: 1000, y_mm: 600,
+  geometry_kind: "PROVISIONAL_ULTRASONIC_ECHO_CLUSTER",
+  support_radius_mm: 35,
+  support_points: [{ side: "center", x_mm: 1000, y_mm: 600,
+    measured_range_mm: 100, relative_bearing_mdeg: 0 }],
+  source_scan_ids: ["dense-scan"], bearing: "FRONT",
+  relation: "FRONT_OF_SCAN", evidence_count: 1, confidence_milli: 200,
+  source_id: "blast-settled-measured-planar-projection",
+  provenance: "SETTLED_MEASURED_ULTRASONIC + PROVISIONAL_YAW_ONLY",
+  quality: "PROVISIONAL_YAW_ONLY", settled_measured_only: true,
+  provisional: true, read_only: true, observed_at_unix_ms: 4900, age_ms: 0,
+};
+blast.object_hypotheses = [obstacle];
+blast.source_status = "qualitative_only";
 const valid = logic.normalizeSpatialMap(shared([ev3, blast]), 6000);
+const badObstacle = logic.normalizeSharedSpatialMap(shared([{
+  ...blast,
+  object_hypotheses: [{ ...obstacle, settled_measured_only: false }],
+}]), 6000);
 const badTransform = logic.normalizeSharedSpatialMap(shared([
   ev3,
   {
@@ -1132,6 +1157,9 @@ process.stdout.write(JSON.stringify({
     poses: valid.robots.map((item) => item.robotPose),
     robotsFrozen: Object.isFrozen(valid.robots),
     poseHistoryFrozen: Object.isFrozen(valid.robots[0].poseHistory),
+    ev3Objects: valid.robots[0].objectHypotheses.length,
+    blastObject: valid.robots[1].objectHypotheses[0],
+    blastObjectsFrozen: Object.isFrozen(valid.robots[1].objectHypotheses),
   },
   badTransform: {
     status: badTransform.status,
@@ -1154,6 +1182,10 @@ process.stdout.write(JSON.stringify({
     contractValid: tooMany.contractValid,
     robotCount: tooMany.robots.length,
   },
+  badObstacle: {
+    pose: badObstacle.robots[0].robotPose,
+    reason: badObstacle.robots[0].reasonCode,
+  },
 }));
 """
         completed = subprocess.run(
@@ -1162,6 +1194,7 @@ process.stdout.write(JSON.stringify({
                 "--input-type=commonjs",
                 "-e",
                 script,
+                str(LOGIC_ASSET.with_name("blast_map_semantics.js")),
                 str(LOGIC_ASSET),
             ],
             text=True,
@@ -1188,6 +1221,12 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(all(result["valid"]["poses"]))
         self.assertTrue(result["valid"]["robotsFrozen"])
         self.assertTrue(result["valid"]["poseHistoryFrozen"])
+        self.assertEqual(result["valid"]["ev3Objects"], 0)
+        self.assertEqual(
+            result["valid"]["blastObject"]["classification"],
+            "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+        )
+        self.assertTrue(result["valid"]["blastObjectsFrozen"])
         self.assertEqual(result["badTransform"]["status"], "degraded")
         self.assertIsNotNone(result["badTransform"]["firstPose"])
         self.assertIsNone(result["badTransform"]["secondPose"])
@@ -1206,14 +1245,19 @@ process.stdout.write(JSON.stringify({
         )
         self.assertFalse(result["tooMany"]["contractValid"])
         self.assertEqual(result["tooMany"]["robotCount"], 0)
+        self.assertIsNone(result["badObstacle"]["pose"])
+        self.assertEqual(
+            result["badObstacle"]["reason"], "source_pose_invalid"
+        )
 
     def test_shared_navigation_trace_is_strict_frozen_and_per_robot(self):
         script = r"""
 const fs = require("fs");
 const vm = require("vm");
-const source = fs.readFileSync(process.argv[1], "utf8");
 const context = {};
-vm.runInNewContext(source, context, { filename: process.argv[1] });
+for (const filename of process.argv.slice(1)) {
+  vm.runInNewContext(fs.readFileSync(filename, "utf8"), context, { filename });
+}
 const logic = context.RobotDashboardLogic;
 
 const identity = {
@@ -1276,7 +1320,7 @@ const trace = {
       points: [{
         side: "left_near",
         measured_range_mm: 100,
-        relative_bearing_mdeg: 90000,
+        relative_bearing_mdeg: 95000,
         sensor_origin_x_mm: 1000,
         sensor_origin_y_mm: 550,
         beam_heading_mdeg: -180000,
@@ -1295,7 +1339,7 @@ function pose() {
     observed_at_unix_ms: 1900, age_ms: 100,
   };
 }
-function robot(navigationTrace) {
+function robot(navigationTrace, objectHypotheses = []) {
   return {
     read_only: true, status: "available", reason_code: "pose_transformed",
     robot_id: identity.robotId,
@@ -1315,12 +1359,15 @@ function robot(navigationTrace) {
       provenance: ["FIXED_START_MEASUREMENT"],
     },
     navigation_trace: navigationTrace,
+    object_hypotheses: objectHypotheses,
     source_map_id: "blast-map", source_map_version: 3,
-    source_status: "pose_only", captured_at_unix_ms: 2000,
+    source_status: objectHypotheses.length > 0
+      ? "qualitative_only" : "pose_only",
+    captured_at_unix_ms: 2000,
     source_age_ms: 100,
   };
 }
-function shared(navigationTrace) {
+function shared(navigationTrace, objectHypotheses = []) {
   return {
     schema: "robot-spatial-map/v2", read_only: true, status: "available",
     reason_code: "all_sources_available", map_id: "shared-map",
@@ -1329,15 +1376,65 @@ function shared(navigationTrace) {
     source_id: "shared-spatial-map-compositor",
     provenance: "CALIBRATED_FIXED_START_SE2_PROJECTION",
     snapshot_semantics: "LATEST_AVAILABLE_NOT_ATOMIC",
-    robots: [robot(navigationTrace)], bounds: null, cells: [],
+    robots: [robot(navigationTrace, objectHypotheses)], bounds: null, cells: [],
     sensor_rays: [], qualitative_observations: [],
     scan_evidence_history: [], object_hypotheses: [],
     navigation_authority: null, captured_at_unix_ms: 2000,
   };
 }
-function normalized(navigationTrace) {
-  return logic.normalizeSharedSpatialMap(shared(navigationTrace), 2100)
+function normalized(navigationTrace, objectHypotheses = []) {
+  return logic.normalizeSharedSpatialMap(
+    shared(navigationTrace, objectHypotheses), 2100,
+  )
     .robots[0];
+}
+function traceAtRange(range) {
+  return {
+    ...trace,
+    planar_scan_views: [{
+      ...trace.planar_scan_views[0],
+      scan_id: `shared-boundary-${range}`,
+      projection: {
+        ...trace.planar_scan_views[0].projection,
+        points: [{
+          ...trace.planar_scan_views[0].projection.points[0],
+          side: "center",
+          measured_range_mm: range,
+          relative_bearing_mdeg: 0,
+          beam_heading_mdeg: -180000,
+          nominal_echo_x_mm: Math.round(1000 - range),
+        }],
+      },
+    }],
+  };
+}
+function obstacleAtRange(range) {
+  return {
+    hypothesis_id: `shared-obstacle-${range}`,
+    classification: "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+    label: "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+    x_mm: Math.round(range),
+    y_mm: 0,
+    geometry_kind: "PROVISIONAL_ULTRASONIC_ECHO_CLUSTER",
+    support_radius_mm: 35,
+    support_points: [{
+      side: "center", x_mm: Math.round(range), y_mm: 0,
+      measured_range_mm: range, relative_bearing_mdeg: 0,
+    }],
+    source_scan_ids: [`shared-boundary-${range}`],
+    bearing: "FRONT",
+    relation: "FRONT_OF_SCAN",
+    evidence_count: 1,
+    confidence_milli: 200,
+    source_id: "blast-settled-measured-planar-projection",
+    provenance: "SETTLED_MEASURED_ULTRASONIC + PROVISIONAL_YAW_ONLY",
+    quality: "PROVISIONAL_YAW_ONLY",
+    settled_measured_only: true,
+    provisional: true,
+    read_only: true,
+    observed_at_unix_ms: 1900,
+    age_ms: 0,
+  };
 }
 const valid = normalized(trace);
 const badGeneration = normalized({
@@ -1383,6 +1480,7 @@ const quantizedTransform = normalized({
     },
   }],
 });
+const boundaryRanges = [0, 1999.999999, 2000, 10000];
 process.stdout.write(JSON.stringify({
   valid: {
     status: valid.status,
@@ -1401,6 +1499,12 @@ process.stdout.write(JSON.stringify({
   })),
   quantizedTransform: quantizedTransform.navigationTrace,
   missing: normalized(null).navigationTrace,
+  traceRangeAccepted: boundaryRanges.map((range) => (
+    normalized(traceAtRange(range)).navigationTrace !== null
+  )),
+  obstacleRangeAccepted: boundaryRanges.map((range) => (
+    normalized(null, [obstacleAtRange(range)]).objectHypotheses.length === 1
+  )),
 }));
 """
         completed = subprocess.run(
@@ -1409,6 +1513,7 @@ process.stdout.write(JSON.stringify({
                 "--input-type=commonjs",
                 "-e",
                 script,
+                str(LOGIC_ASSET.with_name("blast_map_semantics.js")),
                 str(LOGIC_ASSET),
             ],
             text=True,
@@ -1436,6 +1541,12 @@ process.stdout.write(JSON.stringify({
             ],
             900,
         )
+        self.assertEqual(
+            normalized_trace["planarScanViews"][0]["points"][0][
+                "relativeBearingMdeg"
+            ],
+            95_000,
+        )
         self.assertTrue(all(
             item["status"] == "available"
             and item["pose"] is not None
@@ -1444,6 +1555,231 @@ process.stdout.write(JSON.stringify({
         ))
         self.assertIsNotNone(result["quantizedTransform"])
         self.assertIsNone(result["missing"])
+        self.assertEqual(
+            result["traceRangeAccepted"], [True, True, False, False]
+        )
+        self.assertEqual(
+            result["obstacleRangeAccepted"], [True, True, False, False]
+        )
+
+    def test_blast_route_and_ultrasonic_obstacle_semantics_are_strict(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const context = {};
+for (const filename of process.argv.slice(1)) {
+  vm.runInNewContext(fs.readFileSync(filename, "utf8"), context, { filename });
+}
+const logic = context.RobotDashboardLogic;
+const route = {
+  schema: "robot-local-detour-route/v1",
+  read_only: true,
+  provisional: true,
+  route_id: "route-a",
+  version: 2,
+  status: "ACTIVE",
+  detour_side: "RIGHT_OF_GOAL",
+  active_index: 1,
+  waypoints: [
+    { ordinal: 0, kind: "LATERAL_CLEARANCE", x_mm: 0, y_mm: -225,
+      heading_mdeg: -90000, fact_key: null, status: "COMPLETED" },
+    { ordinal: 1, kind: "REACQUIRE_GOAL_HEADING", x_mm: 0, y_mm: -225,
+      heading_mdeg: 0, fact_key: "GOAL_HEADING_ALIGNED", status: "ACTIVE" },
+    { ordinal: 2, kind: "PASS_BEYOND_TARGET", x_mm: 500, y_mm: -225,
+      heading_mdeg: 0, fact_key: "TARGET_BEHIND", status: "UPCOMING" },
+  ],
+};
+const obstacle = {
+  hypothesis_id: "blast-ultrasonic-a",
+  classification: "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+  label: "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+  x_mm: 99,
+  y_mm: 9,
+  geometry_kind: "PROVISIONAL_ULTRASONIC_ECHO_CLUSTER",
+  support_radius_mm: 45,
+  support_points: [
+    { side: "center", x_mm: 100, y_mm: 0, measured_range_mm: 100,
+      relative_bearing_mdeg: 0 },
+    { side: "left_1", x_mm: 98, y_mm: 17, measured_range_mm: 100,
+      relative_bearing_mdeg: 95000 },
+  ],
+  source_scan_ids: ["dense-scan"],
+  bearing: "LEFT",
+  relation: "LEFT_OF_SCAN",
+  evidence_count: 2,
+  confidence_milli: 225,
+  source_id: "blast-settled-measured-planar-projection",
+  provenance: "SETTLED_MEASURED_ULTRASONIC + PROVISIONAL_YAW_ONLY",
+  quality: "PROVISIONAL_YAW_ONLY",
+  settled_measured_only: true,
+  provisional: true,
+  read_only: true,
+  observed_at_unix_ms: 1900,
+  age_ms: 0,
+};
+const trace = {
+  schema: "robot-navigation-trace/v1",
+  read_only: true,
+  frame_id: "blast-frame",
+  provenance: "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY",
+  final_goal: {
+    kind: "DIRECTIONAL_HEADING", navigation_enforced: true,
+    origin_x_mm: 0, origin_y_mm: 0, target_x_mm: 420, target_y_mm: 0,
+    desired_heading_mdeg: 0, minimum_forward_progress_mm: 420,
+    heading_tolerance_mdeg: 5000, current_forward_progress_mm: 45,
+    remaining_forward_progress_mm: 375,
+  },
+  planned_leg: {
+    kind: "REACQUIRE_GOAL_HEADING", scope: "LOCAL_DETOUR_ROUTE",
+    clearance_proven: false, passage_proven: false, route_eligible: true,
+    selected_side: "RIGHT",
+    bind_pose: { x_mm: 0, y_mm: -225, heading_mdeg: -90000 },
+    waypoint: { x_mm: 0, y_mm: -225, heading_mdeg: 0 },
+  },
+  imu_heading: null,
+  local_detour_route: route,
+  planar_scan_views: [],
+};
+function normalize(
+  routeValue = route,
+  obstacleValue = obstacle,
+  traceValue = trace,
+) {
+  return logic.normalizeSpatialMap({
+    schema: "robot-spatial-map/v1", read_only: true,
+    status: "qualitative_only", frame_id: "blast-frame",
+    frame_kind: "LOCAL_ODOMETRY", bounds: null, cells: [], sensor_rays: [],
+    qualitative_observations: [], scan_evidence_history: [],
+    object_hypotheses: [obstacleValue],
+    navigation_trace: { ...traceValue, local_detour_route: routeValue },
+  }, 2000);
+}
+function traceAtRange(range) {
+  return {
+    ...trace,
+    planar_scan_views: [{
+      scan_id: `boundary-scan-${range}`,
+      observed_at_unix_ms: 1900,
+      scan_pose: { x_mm: 0, y_mm: 0, heading_mdeg: 0 },
+      projection: {
+        schema: "blast-planar-scan-projection/v1",
+        frame: "EPISODE_LOCAL_ODOMETRY",
+        quality: "PROVISIONAL_YAW_ONLY",
+        vertical_pitch_compensated: false,
+        ultrasonic_beam_width_modeled: false,
+        scan_turn_translation_compensated: false,
+        points: [{
+          side: "center",
+          measured_range_mm: range,
+          relative_bearing_mdeg: 0,
+          sensor_origin_x_mm: 0,
+          sensor_origin_y_mm: 0,
+          beam_heading_mdeg: 0,
+          nominal_echo_x_mm: Math.round(range),
+          nominal_echo_y_mm: 0,
+        }],
+      },
+    }],
+  };
+}
+function obstacleAtRange(range) {
+  return {
+    ...obstacle,
+    x_mm: Math.round(range),
+    y_mm: 0,
+    support_radius_mm: 35,
+    support_points: [{
+      side: "center", x_mm: Math.round(range), y_mm: 0,
+      measured_range_mm: range, relative_bearing_mdeg: 0,
+    }],
+    bearing: "FRONT",
+    relation: "FRONT_OF_SCAN",
+    evidence_count: 1,
+    confidence_milli: 200,
+  };
+}
+const valid = normalize();
+const badRoute = normalize({
+  ...route,
+  waypoints: route.waypoints.map((item, index) => (
+    index === 2 ? { ...item, status: "COMPLETED" } : item
+  )),
+});
+const badObstacle = normalize(route, {
+  ...obstacle,
+  settled_measured_only: false,
+});
+const extraRoute = normalize({ ...route, future_claim: false });
+const extraWaypoint = normalize({
+  ...route,
+  waypoints: route.waypoints.map((item, index) => (
+    index === 1 ? { ...item, future_claim: false } : item
+  )),
+});
+const oversizedVersion = normalize({ ...route, version: 1_000_001 });
+const boundaryRanges = [0, 1999.999999, 2000, 10000];
+process.stdout.write(JSON.stringify({
+  route: valid.navigationTrace.localDetourRoute,
+  obstacle: valid.objectHypotheses[0],
+  frozen: Object.isFrozen(valid.navigationTrace.localDetourRoute)
+    && Object.isFrozen(valid.navigationTrace.localDetourRoute.waypoints)
+    && Object.isFrozen(valid.objectHypotheses[0])
+    && Object.isFrozen(valid.objectHypotheses[0].supportPoints),
+  badRoute: badRoute.navigationTrace,
+  badObstacleCount: badObstacle.objectHypotheses.length,
+  exactRouteFailures: [
+    extraRoute.navigationTrace,
+    extraWaypoint.navigationTrace,
+    oversizedVersion.navigationTrace,
+  ],
+  traceRangeAccepted: boundaryRanges.map((range) => (
+    normalize(route, obstacle, traceAtRange(range)).navigationTrace !== null
+  )),
+  obstacleRangeAccepted: boundaryRanges.map((range) => (
+    normalize(route, obstacleAtRange(range)).objectHypotheses.length === 1
+  )),
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node", "--input-type=commonjs", "-e", script,
+                str(LOGIC_ASSET.with_name("blast_map_semantics.js")),
+                str(LOGIC_ASSET),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(
+            [item["status"] for item in result["route"]["waypoints"]],
+            ["COMPLETED", "ACTIVE", "UPCOMING"],
+        )
+        self.assertEqual(
+            result["obstacle"]["classification"],
+            "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+        )
+        self.assertEqual(result["obstacle"]["evidenceCount"], 2)
+        self.assertEqual(
+            result["obstacle"]["supportPoints"][1][
+                "relativeBearingMdeg"
+            ],
+            95_000,
+        )
+        self.assertEqual(result["obstacle"]["sourceScanIds"], ["dense-scan"])
+        self.assertTrue(result["frozen"])
+        self.assertIsNone(result["badRoute"])
+        self.assertEqual(result["badObstacleCount"], 0)
+        self.assertEqual(result["exactRouteFailures"], [None, None, None])
+        self.assertEqual(
+            result["traceRangeAccepted"], [True, True, False, False]
+        )
+        self.assertEqual(
+            result["obstacleRangeAccepted"], [True, True, False, False]
+        )
 
 
 if __name__ == "__main__":

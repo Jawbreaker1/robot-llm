@@ -63,15 +63,28 @@ Small `begin` and `start` control messages bind the transfer id, rate,
 encoding, sample count, byte count, and checksum. The compressed payload uses
 Pybricks AppData. Each low-priority upload step contains at most eight
 MTU-sized writes, and its final write is acknowledged. Stop is checked between
-steps and always has priority. After one already-admitted navigation command,
-the scheduler drains a claimed utterance through consecutive bounded upload
-steps before admitting the next non-stop command. Native playback releases the
-BLE session immediately. A speech request times out after 60 seconds without
+steps and always has priority. The scheduler runs at most one bounded audio
+step per outer monitor turn. A normal episode navigation command is not
+admitted while speech is being prepared or uploaded; BLAST remains stationary,
+and due telemetry reads may run between audio steps. The complete payload must
+be acknowledged before `start`, so native playback remains one continuous
+utterance with no partial sentence. Only the correlated, validated `start`
+receipt releases speech admission. The adapter then takes a fresh settled
+observation and reruns its action and encoder safety gates before it submits a
+motor command and starts that command's 15-second timeout. Native playback
+releases the BLE session immediately and may overlap motion. A speech request
+times out after 60 seconds without
 acknowledged audio progress, with a separate 15-minute absolute admission
-ceiling. A final start exchange that was claimed before that ceiling gets at
-most 8.5 seconds
-to return its authoritative playback receipt. Neither upload nor playback
-requires idle drive motors.
+ceiling. Begin has a 1.5-second wall-time cap, each batch of up to eight
+AppData writes gets 3 seconds, and a final start exchange that was claimed
+before the ceiling gets at most 15 seconds to collect/snapshot the hub buffer
+and return its authoritative playback receipt. A failed audio phase is logged
+with its phase, byte offset, and bounded error code. In particular, a missing
+final receipt surfaces as `sampled_audio_start_timeout`, without exposing BLE
+exception text. The failure is isolated to speech; queued navigation resumes
+only after line-protocol alignment has been probed or a fresh BLE session has
+been established. Stop is checked between bounded phases; normal drive motion
+remains idle during episode upload.
 
 If speech is cancelled during upload, `start` is never sent. Global Stop and
 Emergency Stop stop both motors and the speaker. This first version does not
@@ -99,10 +112,11 @@ people and animals. This deliberately contrasts EV3's grumpy pessimism. Its
 prompt scope is explicit:
 it may affect only `reply_text` or `utterance`, never intent, confidence,
 action, plan, assessment, sensor facts, safety, or completion. A navigation
-utterance is queued only after its corresponding physical action result has
-been verified. Speech startup, generation, upload, or playback failure is
-fail-open for navigation, while Stop and Emergency Stop cancel the speech
-worker as well as stopping the hub speaker.
+utterance is admitted after its decision has been validated and before its
+corresponding physical action. Speech startup, generation, upload, or playback
+failure is fail-open for navigation, but still requires a fresh settled safety
+observation before motion. Stop and Emergency Stop cancel the speech worker as
+well as stopping the hub speaker.
 
 ## Pinned v6 proof build
 
@@ -188,9 +202,10 @@ Validate in this order after flashing:
    is rooted, and DMA completion. The reference fixture is 82,106 samples,
    41,060 encoded bytes, Fletcher-16 64,127, and 5,136 ms DMA-padded
    duration.
-5. Run navigation and sensor polling during both upload and playback. Commands
-   must win between upload steps, playback must contain no repeated or missing
-   audio, and drive motion must not become visibly jerky.
+5. Verify that drive motion remains idle throughout upload, then begins only
+   after the authoritative `start` receipt and a fresh settled safety check.
+   Navigation and sensor polling may run during native playback, which must
+   contain no repeated or missing audio or visibly jerky drive motion.
 6. Test cancellation during upload, then global Stop during playback. The
    former must produce no sound; the latter must brake and silence BLAST.
 7. Repeat playback at least 20 times and confirm that the free-heap baseline

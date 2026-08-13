@@ -11,7 +11,24 @@
   ]);
   const ACTIVE_STATES = new Set(["STARTING", "RUNNING", "STOPPING"]);
   const CONVERSATION_VIEWS = Object.freeze(["robot", "workbench"]);
-  const CONVERSATION_TARGETS = Object.freeze(["robot", "workbench"]);
+  const ROBOT_TARGETS = Object.freeze([
+    Object.freeze({
+      robot_id: "ev3rstorm-01",
+      display_name: "EV3RSTORM",
+    }),
+    Object.freeze({
+      robot_id: "blast-01",
+      display_name: "BLAST",
+    }),
+  ]);
+  const ROBOT_TARGET_IDS = Object.freeze(
+    ROBOT_TARGETS.map((target) => target.robot_id),
+  );
+  const DEFAULT_ROBOT_TARGET_ID = ROBOT_TARGET_IDS[0];
+  const CONVERSATION_TARGETS = Object.freeze([
+    ...ROBOT_TARGET_IDS,
+    "workbench",
+  ]);
   const POLL_ACTIVE_MS = 400;
   const POLL_IDLE_MS = 2000;
 
@@ -27,7 +44,7 @@
       view,
       CONVERSATION_VIEWS,
       "Conversation view",
-    ) === "robot" ? "robot" : "workbench";
+    ) === "robot" ? DEFAULT_ROBOT_TARGET_ID : "workbench";
   }
 
   function createConversationTargetState(initialView = "workbench") {
@@ -91,6 +108,67 @@
       : fallback;
   }
 
+  function normalizeTarget(value) {
+    const target = safeObject(value);
+    const robotId = safeText(target.robot_id, "");
+    const displayName = safeText(target.display_name, "");
+    if (!robotId || !displayName) {
+      return null;
+    }
+    return {
+      robot_id: robotId,
+      display_name: displayName,
+    };
+  }
+
+  function isRobotTarget(value) {
+    return ROBOT_TARGET_IDS.includes(value);
+  }
+
+  function targetDescriptor(robotId) {
+    return ROBOT_TARGETS.find((target) => target.robot_id === robotId) || null;
+  }
+
+  function disabledControl(robotId) {
+    return normalizeControl({
+      state: "DISABLED",
+      enabled: false,
+      accepting: false,
+      target: targetDescriptor(robotId),
+    });
+  }
+
+  function normalizeRobotDirectory(value) {
+    const source = safeObject(value);
+    const controls = Object.fromEntries(
+      ROBOT_TARGET_IDS.map((robotId) => [robotId, disabledControl(robotId)]),
+    );
+    const candidates = Array.isArray(source.controls)
+      ? source.controls
+      : safeArray(source.robots).map((item) => {
+        const robot = safeObject(item);
+        return Object.keys(safeObject(robot.control)).length > 0
+          ? robot.control
+          : robot;
+      });
+    candidates.forEach((item) => {
+      const control = normalizeControl(item);
+      const robotId = control.target && control.target.robot_id;
+      if (!isRobotTarget(robotId)) {
+        return;
+      }
+      controls[robotId] = control;
+    });
+    return Object.freeze(controls);
+  }
+
+  function robotEndpoint(robotId, operation) {
+    if (!isRobotTarget(robotId)) {
+      throw new TypeError("Robot target is invalid");
+    }
+    return `/api/v1/robots/${encodeURIComponent(robotId)}/${operation}`;
+  }
+
   function physicalTurnControl(value) {
     const turn = safeObject(value);
     if (turn.intent === "STOP_TASK") {
@@ -118,6 +196,7 @@
       state,
       enabled: source.enabled === true,
       accepting: source.accepting === true,
+      target: normalizeTarget(source.target),
       settings: {
         revision: Number.isSafeInteger(settings.revision) ? settings.revision : 0,
         model: safeText(settings.model, ""),
@@ -161,9 +240,10 @@
   }
 
   function composerPolicy(control, target, chatEnabled, busy = false) {
-    const robotTarget = target === "robot";
+    const robotTarget = isRobotTarget(target);
     const robotReady = (
       control.enabled
+      && control.target !== null
       && control.accepting
       && !busy
     );
@@ -190,11 +270,12 @@
     const candidate = normalizeControl(controlValue);
     const robotReady = (
       candidate.enabled
+      && candidate.target !== null
       && candidate.accepting
       && candidate.state === "IDLE"
     );
     return robotReady && !userSelectedTarget
-      ? "robot"
+      ? candidate.target.robot_id
       : "workbench";
   }
 
@@ -242,8 +323,11 @@
       request,
       translate,
       getLocale,
+      robotId: DEFAULT_ROBOT_TARGET_ID,
     });
-    let control = normalizeControl({});
+    let controlsById = normalizeRobotDirectory({});
+    let currentRobotId = DEFAULT_ROBOT_TARGET_ID;
+    let control = controlsById[currentRobotId];
     let busy = false;
     let interpretingInput = false;
     let settingsDirty = false;
@@ -259,22 +343,56 @@
       return conversationTarget.selected();
     }
 
+    function activateTargetControl(target) {
+      if (!isRobotTarget(target)) {
+        return false;
+      }
+      const changed = currentRobotId !== target;
+      currentRobotId = target;
+      control = controlsById[target];
+      if (changed) {
+        settingsDirty = false;
+      }
+      missionPanel.setRobotId(target);
+      missionPanel.setControl(control);
+      return changed;
+    }
+
     function syncTargetSelector() {
-      byId("composer-target").value = selectedTarget();
+      const selector = byId("composer-target");
+      ROBOT_TARGETS.forEach((fallback) => {
+        const option = selector.querySelector(
+          `option[value="${fallback.robot_id}"]`,
+        );
+        if (!option) {
+          return;
+        }
+        const candidate = controlsById[fallback.robot_id];
+        const name = candidate.target
+          ? candidate.target.display_name
+          : fallback.display_name;
+        option.disabled = false;
+        option.textContent = translate("workbench.target.named_robot", {
+          name,
+        });
+      });
+      selector.value = selectedTarget();
     }
 
     function overrideTarget(target) {
       conversationTarget.override(target);
+      activateTargetControl(target);
       syncTargetSelector();
-      renderComposer();
+      render();
       onTargetChanged(selectedTarget());
       return selectedTarget();
     }
 
     function selectConversationView(view) {
       conversationTarget.selectView(view);
+      activateTargetControl(selectedTarget());
       syncTargetSelector();
-      renderComposer();
+      render();
       onTargetChanged(selectedTarget());
       return selectedTarget();
     }
@@ -447,6 +565,7 @@
     }
 
     function render() {
+      syncTargetSelector();
       const stateNode = byId("robot-control-state");
       stateNode.textContent = control.state;
       stateNode.dataset.state = control.state;
@@ -491,27 +610,71 @@
       renderComposer();
     }
 
-    function setControl(value, forceSettings = false) {
-      const next = normalizeControl(value);
-      if (!shouldApplySnapshot(control, next)) {
+    function setControlFor(robotId, value, forceSettings = false) {
+      if (!isRobotTarget(robotId)) {
         return false;
       }
-      control = next;
-      renderSettings(forceSettings);
-      render();
-      missionPanel.setControl(value);
+      const next = normalizeControl(value);
+      if (
+        next.target !== null
+        && next.target.robot_id !== robotId
+      ) {
+        return false;
+      }
+      const previous = controlsById[robotId];
+      if (!shouldApplySnapshot(previous, next)) {
+        return false;
+      }
+      controlsById = { ...controlsById, [robotId]: next };
+      if (currentRobotId === robotId) {
+        control = next;
+        renderSettings(forceSettings);
+        render();
+        missionPanel.setControl(value);
+      }
       return true;
     }
 
-    async function refresh(silent = true) {
+    function setDirectory(value) {
+      const directory = normalizeRobotDirectory(value);
+      ROBOT_TARGET_IDS.forEach((robotId) => {
+        if (shouldApplySnapshot(controlsById[robotId], directory[robotId])) {
+          controlsById = {
+            ...controlsById,
+            [robotId]: directory[robotId],
+          };
+        }
+      });
+      control = controlsById[currentRobotId];
+      syncTargetSelector();
+      render();
+    }
+
+    async function refreshDirectory(silent = true) {
       if (stopped) {
         return;
       }
       try {
-        const payload = await request("/api/v1/robot/status", {
+        const payload = await request("/api/v1/robots", {
           timeout: 5000,
         });
-        setControl(payload.control);
+        setDirectory(payload);
+      } catch (error) {
+        if (!silent) {
+          showToast(formatError(error), true);
+        }
+      }
+    }
+
+    async function refresh(silent = true, target = selectedTarget()) {
+      if (stopped || !isRobotTarget(target)) {
+        return;
+      }
+      try {
+        const payload = await request(robotEndpoint(target, "status"), {
+          timeout: 5000,
+        });
+        setControlFor(target, payload.control);
       } catch (error) {
         if (!silent) {
           showToast(formatError(error), true);
@@ -530,7 +693,12 @@
         ? POLL_ACTIVE_MS
         : POLL_IDLE_MS;
       pollTimer = global.setTimeout(async () => {
-        await refresh(true);
+        const target = selectedTarget();
+        if (isRobotTarget(target)) {
+          await refresh(true, target);
+        } else {
+          await refreshDirectory(true);
+        }
         schedulePoll();
       }, delay);
     }
@@ -549,18 +717,25 @@
       render();
     }
 
-    async function submitInput(text, locale = getLocale()) {
+    async function submitInput(
+      text,
+      locale = getLocale(),
+      target = selectedTarget(),
+    ) {
       const cleanText = typeof text === "string" ? text.trim() : "";
+      const targetControl = isRobotTarget(target)
+        ? controlsById[target]
+        : disabledControl(DEFAULT_ROBOT_TARGET_ID);
       const policy = composerPolicy(
-        control,
-        "robot",
+        targetControl,
+        target,
         chatEnabled,
         busy || stopped,
       );
       if (!cleanText || !policy.robotInputEnabled) {
         showToast(
           translate("robot.errors.not_ready", {
-            state: stateTranslation(control.state),
+            state: stateTranslation(targetControl.state),
           }),
           true,
         );
@@ -570,13 +745,13 @@
       busy = true;
       render();
       try {
-        const payload = await request("/api/v1/robot/turns", {
+        const payload = await request(robotEndpoint(target, "turns"), {
           method: "POST",
           body: {
             text: cleanText,
             locale,
             client_request_id: randomId("robot-ui"),
-            expected_revision: control.settings.revision,
+            expected_revision: targetControl.settings.revision,
           },
           // The backend gives interactive input its own short deadline. Keep
           // the browser request alive beyond the configurable upper bound so
@@ -586,9 +761,9 @@
         const turn = safeObject(payload.turn);
         const nextControl = physicalTurnControl(turn);
         if (nextControl) {
-          setControl(nextControl);
+          setControlFor(target, nextControl);
         }
-        onInputAccepted(cleanText, turn);
+        onInputAccepted(cleanText, turn, target);
         showToast(translate(
           turn.intent === "PHYSICAL_TASK"
             ? "robot.toasts.started"
@@ -599,7 +774,7 @@
         return true;
       } catch (error) {
         showToast(formatError(error), true);
-        await refresh(true);
+        await refresh(true, target);
         return false;
       } finally {
         interpretingInput = false;
@@ -608,20 +783,24 @@
       }
     }
 
-    async function command(path, successKey) {
+    async function command(operation, successKey) {
+      const target = selectedTarget();
+      if (!isRobotTarget(target)) {
+        return;
+      }
       busy = true;
       render();
       try {
-        const payload = await request(path, {
+        const payload = await request(robotEndpoint(target, operation), {
           method: "POST",
           body: {},
           timeout: 10000,
         });
-        setControl(payload.control);
+        setControlFor(target, payload.control);
         showToast(translate(successKey));
       } catch (error) {
         showToast(formatError(error), true);
-        await refresh(true);
+        await refresh(true, target);
       } finally {
         busy = false;
         render();
@@ -633,6 +812,11 @@
       if (!settingsDirty || control.state !== "IDLE") {
         return;
       }
+      const target = selectedTarget();
+      if (!isRobotTarget(target)) {
+        return;
+      }
+      const targetControl = controlsById[target];
       const changes = {
         model: byId("robot-setting-model").value.trim(),
         max_episode_ms: Number(
@@ -648,19 +832,25 @@
         "robot.settings.saving",
       );
       try {
-        const payload = await request("/api/v1/robot/settings", {
+        const payload = await request(robotEndpoint(target, "settings"), {
           method: "PUT",
           body: {
-            expected_revision: control.settings.revision,
+            expected_revision: targetControl.settings.revision,
             changes,
           },
         });
-        control.settings = normalizeControl({
-          ...control,
+        const updated = normalizeControl({
+          ...targetControl,
           settings: payload.settings,
-        }).settings;
+        });
+        controlsById = { ...controlsById, [target]: updated };
+        if (currentRobotId === target) {
+          control = updated;
+        }
         settingsDirty = false;
-        renderSettings(true);
+        if (selectedTarget() === target) {
+          renderSettings(true);
+        }
         showToast(translate("robot.toasts.settings_saved"));
       } catch (error) {
         showToast(formatError(error), true);
@@ -689,14 +879,14 @@
       byId("robot-stop-button").addEventListener(
         "click",
         () => command(
-          "/api/v1/robot/stop",
+          "stop",
           "robot.toasts.stop_requested",
         ),
       );
       byId("robot-emergency-stop-button").addEventListener(
         "click",
         () => command(
-          "/api/v1/robot/emergency-stop",
+          "emergency-stop",
           "robot.toasts.emergency_stop_sent",
         ),
       );
@@ -712,17 +902,18 @@
         byId(id).addEventListener("input", markSettingsDirty);
         byId(id).addEventListener("change", markSettingsDirty);
       });
-      await refresh(false);
+      await refreshDirectory(false);
       if (stopped) {
         return;
       }
-      if (
-        preferredInitialTarget(control, userSelectedTarget) === "robot"
-      ) {
-        overrideTarget("robot");
+      const preferred = ROBOT_TARGET_IDS.map((robotId) => (
+        preferredInitialTarget(controlsById[robotId], userSelectedTarget)
+      )).find(isRobotTarget);
+      if (preferred) {
+        overrideTarget(preferred);
       }
       renderSettings(true);
-      void missionPanel.initialize();
+      await missionPanel.initialize();
       schedulePoll();
     }
 
@@ -744,7 +935,7 @@
 
     return Object.freeze({
       initialize,
-      isRobotTarget: () => selectedTarget() === "robot",
+      isRobotTarget: (target = selectedTarget()) => isRobotTarget(target),
       overrideTarget,
       reconcileComposer,
       refresh,
@@ -761,13 +952,18 @@
     CONVERSATION_TARGETS,
     CONVERSATION_VIEWS,
     CONTROL_STATES,
+    DEFAULT_ROBOT_TARGET_ID,
+    ROBOT_TARGETS,
     composerPolicy,
     create,
     createConversationTargetState,
     defaultConversationTarget,
+    isRobotTarget,
     normalizeControl,
+    normalizeRobotDirectory,
     physicalTurnControl,
     preferredInitialTarget,
+    robotEndpoint,
     shouldApplySnapshot,
   });
 })(window);

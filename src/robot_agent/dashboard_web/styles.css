@@ -2301,6 +2301,61 @@ textarea:focus-visible,
   stroke-width: 4;
 }
 
+.map-local-detour-route-line {
+  fill: none;
+  stroke: rgb(83 214 140 / 58%);
+  stroke-dasharray: 8 5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 4;
+}
+
+.map-local-detour-waypoint-marker {
+  fill: var(--panel-deep);
+  stroke: var(--model);
+  stroke-width: 3;
+}
+
+.map-local-detour-waypoint-heading {
+  fill: none;
+  stroke: var(--model);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 3;
+}
+
+.map-local-detour-waypoint.is-completed {
+  opacity: 0.52;
+}
+
+.map-local-detour-waypoint.is-completed
+  :is(.map-local-detour-waypoint-marker, .map-local-detour-waypoint-heading) {
+  stroke: var(--muted);
+}
+
+.map-local-detour-waypoint.is-active
+  :is(.map-local-detour-waypoint-marker, .map-local-detour-waypoint-heading) {
+  stroke: var(--ready);
+  stroke-width: 5;
+}
+
+.map-local-detour-waypoint.is-active .map-local-detour-waypoint-marker {
+  fill: rgb(83 214 140 / 24%);
+}
+
+.map-local-detour-waypoint-label {
+  fill: var(--model);
+}
+
+.map-local-detour-waypoint.is-completed .map-local-detour-waypoint-label {
+  fill: var(--muted);
+}
+
+.map-local-detour-waypoint.is-active .map-local-detour-waypoint-label {
+  fill: var(--ready);
+  font-size: 11px;
+}
+
 .map-blast-scan-ray-line {
   stroke: rgb(116 167 255 / 62%);
   stroke-linecap: round;
@@ -2315,6 +2370,25 @@ textarea:focus-visible,
   fill: rgb(255 107 98 / 46%);
   stroke: var(--danger);
   stroke-width: 3;
+}
+
+.map-provisional-ultrasonic-obstacle-envelope {
+  fill: rgb(242 184 75 / 13%);
+  stroke: var(--warning);
+  stroke-dasharray: 7 5;
+  stroke-width: 3;
+}
+
+.map-provisional-ultrasonic-obstacle-center {
+  fill: rgb(242 184 75 / 34%);
+  stroke: var(--warning);
+  stroke-width: 3;
+}
+
+.map-provisional-ultrasonic-obstacle-label {
+  fill: var(--warning);
+  font-size: 11px;
+  font-weight: 750;
 }
 
 .map-navigation-trace-label {
@@ -2581,6 +2655,9 @@ textarea:focus-visible,
     .map-planned-leg-bind,
     .map-planned-waypoint,
     .map-planned-waypoint-heading,
+    .map-local-detour-route-line,
+    .map-local-detour-waypoint-marker,
+    .map-local-detour-waypoint-heading,
     .map-blast-scan-ray-line,
     .map-blast-scan-echo
   ) {
@@ -2592,6 +2669,7 @@ textarea:focus-visible,
     .map-final-goal-target,
     .map-planned-leg-bind,
     .map-planned-waypoint,
+    .map-local-detour-waypoint-marker,
     .map-blast-scan-origin,
     .map-blast-scan-echo
   ) {
@@ -2844,6 +2922,12 @@ textarea:focus-visible,
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 7px;
   letter-spacing: 0.035em;
+}
+
+.map-provenance-badge.is-provisional-inference {
+  color: var(--warning);
+  border-color: rgb(242 184 75 / 34%);
+  background: rgb(242 184 75 / 7%);
 }
 
 .map-provenance-note {

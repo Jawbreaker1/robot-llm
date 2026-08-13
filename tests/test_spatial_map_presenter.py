@@ -13,6 +13,199 @@ WEB_ROOT = (
 
 
 class SpatialMapPresenterRuntimeTests(unittest.TestCase):
+    def test_blast_full_route_and_provisional_obstacle_render_separately(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+class FakeNode {
+  constructor(tag, id = null) {
+    this.tag = tag; this.id = id; this.className = ""; this.hidden = false;
+    this.attributes = {}; this.children = []; this._text = "";
+  }
+  set textContent(value) { this._text = String(value); this.children = []; }
+  get textContent() {
+    return this._text + this.children.map((child) => child.textContent).join("");
+  }
+  appendChild(child) { this.children.push(child); return child; }
+  replaceChildren(...children) { this._text = ""; this.children = children; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+}
+const ids = [
+  "map-connection-status", "map-frame-label", "map-empty-state",
+  "map-empty-title", "map-empty-body", "map-metadata",
+  "map-qualitative-list", "map-qualitative-count", "map-object-list",
+  "map-object-count", "map-local-odometry-layer", "map-cell-layer",
+  "map-path-layer", "map-ray-layer", "map-object-layer", "map-robot-layer",
+];
+const nodes = Object.fromEntries(ids.map((id) => [id, new FakeNode("div", id)]));
+const document = {
+  getElementById(id) { return nodes[id]; },
+  createElement(tag) { return new FakeNode(tag); },
+  createElementNS(_namespace, tag) { return new FakeNode(tag); },
+};
+const context = {};
+for (const filename of process.argv.slice(1)) {
+  vm.runInNewContext(fs.readFileSync(filename, "utf8"), context, { filename });
+}
+const translations = {
+  "common.missing": "—",
+  "map.objects.ultrasonic_obstacle_cluster": "PROVISIONAL ULTRASONIC OBSTACLE",
+  "map.objects.ultrasonic_obstacle_short": "PROVISIONAL OBSTACLE",
+  "map.objects.provisional_inference": "PROVISIONAL INFERENCE",
+  "mission.route.waypoint.LATERAL_CLEARANCE": "LATERAL CLEARANCE",
+  "mission.route.waypoint.REACQUIRE_GOAL_HEADING": "REACQUIRE GOAL HEADING",
+  "mission.route.waypoint.PASS_BEYOND_TARGET": "PASS BEYOND TARGET",
+};
+const translate = (key, args = {}) => {
+  if (key === "map.objects.ultrasonic_support") return `${args.count}/${args.radius}`;
+  if (key === "map.objects.source_scans") return args.scans;
+  if (key === "map.navigation_trace.route_title") return `ROUTE ${args.side}`;
+  if (key === "map.navigation_trace.route_waypoint_pose") return `${args.x}/${args.y}/${args.heading}`;
+  return translations[key] || key;
+};
+const presenter = context.RobotSpatialMapPresenter.create({
+  document,
+  normalizeSpatialMap: context.RobotDashboardLogic.normalizeSpatialMap,
+  translate,
+  formatNumber: (value) => String(value),
+});
+const waypoints = [
+  { ordinal: 0, kind: "LATERAL_CLEARANCE", x_mm: 0, y_mm: -225,
+    heading_mdeg: -90000, fact_key: null, status: "COMPLETED" },
+  { ordinal: 1, kind: "REACQUIRE_GOAL_HEADING", x_mm: 0, y_mm: -225,
+    heading_mdeg: 0, fact_key: "GOAL_HEADING_ALIGNED", status: "ACTIVE" },
+  { ordinal: 2, kind: "PASS_BEYOND_TARGET", x_mm: 500, y_mm: -225,
+    heading_mdeg: 0, fact_key: "TARGET_BEHIND", status: "UPCOMING" },
+];
+const route = {
+  schema: "robot-local-detour-route/v1", read_only: true, provisional: true,
+  route_id: "route-a", version: 2, status: "ACTIVE",
+  detour_side: "RIGHT_OF_GOAL", active_index: 1, waypoints,
+};
+const point = {
+  side: "center", measured_range_mm: 100, relative_bearing_mdeg: 0,
+  sensor_origin_x_mm: 0, sensor_origin_y_mm: 0, beam_heading_mdeg: 0,
+  nominal_echo_x_mm: 100, nominal_echo_y_mm: 0,
+};
+const obstacle = {
+  hypothesis_id: "blast-ultrasonic-a",
+  classification: "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+  label: "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+  x_mm: 100, y_mm: 0,
+  geometry_kind: "PROVISIONAL_ULTRASONIC_ECHO_CLUSTER",
+  support_radius_mm: 35,
+  support_points: [{ side: "center", x_mm: 100, y_mm: 0,
+    measured_range_mm: 100, relative_bearing_mdeg: 0 }],
+  source_scan_ids: ["dense-scan"], bearing: "FRONT",
+  relation: "FRONT_OF_SCAN", evidence_count: 1, confidence_milli: 200,
+  source_id: "blast-settled-measured-planar-projection",
+  provenance: "SETTLED_MEASURED_ULTRASONIC + PROVISIONAL_YAW_ONLY",
+  quality: "PROVISIONAL_YAW_ONLY", settled_measured_only: true,
+  provisional: true, read_only: true, observed_at_unix_ms: 1900, age_ms: 0,
+};
+const map = {
+  schema: "robot-spatial-map/v1", read_only: true,
+  status: "qualitative_only", frame_id: "blast-frame",
+  frame_kind: "LOCAL_ODOMETRY", bounds: null,
+  robot_pose: { x_mm: 0, y_mm: -225, heading_mdeg: 0 },
+  pose_history: [{ x_mm: 0, y_mm: 0, heading_mdeg: 0 }],
+  cells: [], sensor_rays: [], qualitative_observations: [],
+  scan_evidence_history: [], object_hypotheses: [obstacle],
+  navigation_trace: {
+    schema: "robot-navigation-trace/v1", read_only: true,
+    frame_id: "blast-frame",
+    provenance: "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY",
+    final_goal: { kind: "DIRECTIONAL_HEADING", navigation_enforced: true,
+      origin_x_mm: 0, origin_y_mm: 0, target_x_mm: 420, target_y_mm: 0,
+      desired_heading_mdeg: 0, minimum_forward_progress_mm: 420,
+      heading_tolerance_mdeg: 5000, current_forward_progress_mm: 45,
+      remaining_forward_progress_mm: 375 },
+    planned_leg: { kind: "REACQUIRE_GOAL_HEADING",
+      scope: "LOCAL_DETOUR_ROUTE", clearance_proven: false,
+      passage_proven: false, route_eligible: true, selected_side: "RIGHT",
+      bind_pose: { x_mm: 0, y_mm: -225, heading_mdeg: -90000 },
+      waypoint: { x_mm: 0, y_mm: -225, heading_mdeg: 0 } },
+    imu_heading: null, local_detour_route: route,
+    planar_scan_views: [{ scan_id: "dense-scan", observed_at_unix_ms: 1900,
+      scan_pose: { x_mm: 0, y_mm: 0, heading_mdeg: 0 },
+      projection: { schema: "blast-planar-scan-projection/v1",
+        frame: "EPISODE_LOCAL_ODOMETRY", quality: "PROVISIONAL_YAW_ONLY",
+        vertical_pitch_compensated: false,
+        ultrasonic_beam_width_modeled: false,
+        scan_turn_translation_compensated: false, points: [point] } },
+      // NO_VALID_DISTANCE is intentionally absent from validated points.
+      { scan_id: "nvd-only-scan", observed_at_unix_ms: 1951,
+        scan_pose: { x_mm: 0, y_mm: 0, heading_mdeg: 0 },
+        projection: { schema: "blast-planar-scan-projection/v1",
+          frame: "EPISODE_LOCAL_ODOMETRY", quality: "PROVISIONAL_YAW_ONLY",
+          vertical_pitch_compensated: false,
+          ultrasonic_beam_width_modeled: false,
+          scan_turn_translation_compensated: false, points: [] } }],
+  },
+};
+presenter.render(map, "connected", 2000);
+function descendants(root) {
+  return [root, ...root.children.flatMap(descendants)];
+}
+const rendered = descendants(nodes["map-local-odometry-layer"]);
+const withClass = (fragment) => rendered.filter((node) => (
+  String(node.attributes.class || "").includes(fragment)
+));
+const exactClass = (name) => rendered.filter((node) => (
+  String(node.attributes.class || "") === name
+));
+const obstacleItem = nodes["map-object-list"].children[0];
+process.stdout.write(JSON.stringify({
+  route: withClass("map-local-detour-route")[0].attributes,
+  waypointStatuses: withClass("map-local-detour-waypoint ").map((node) => (
+    node.attributes["data-status"]
+  )),
+  waypointLabels: withClass("map-local-detour-waypoint-label").map((node) => (
+    node.textContent
+  )),
+  obstacle: withClass("map-provisional-ultrasonic-obstacle")[0].attributes,
+  obstacleCount: exactClass("map-provisional-ultrasonic-obstacle").length,
+  scanViewCount: exactClass("map-blast-scan-view").length,
+  rawRayCount: exactClass("map-blast-scan-ray").length,
+  obstacleItemText: obstacleItem.textContent,
+}));
+"""
+        completed = subprocess.run(
+            [
+                "node", "--input-type=commonjs", "-e", script,
+                str(WEB_ROOT / "blast_map_semantics.js"),
+                str(WEB_ROOT / "dashboard_logic.js"),
+                str(WEB_ROOT / "spatial_map_presenter.js"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["route"]["data-route-id"], "route-a")
+        self.assertEqual(
+            result["waypointStatuses"],
+            ["COMPLETED", "ACTIVE", "UPCOMING"],
+        )
+        self.assertEqual(len(result["waypointLabels"]), 3)
+        self.assertIn("PASS BEYOND TARGET", result["waypointLabels"][2])
+        self.assertEqual(
+            result["obstacle"]["data-classification"],
+            "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+        )
+        self.assertEqual(
+            result["obstacle"]["data-settled-measured-only"],
+            "true",
+        )
+        self.assertEqual(result["rawRayCount"], 1)
+        self.assertEqual(result["scanViewCount"], 2)
+        self.assertEqual(result["obstacleCount"], 1)
+        self.assertIn("PROVISIONAL INFERENCE", result["obstacleItemText"])
+        self.assertNotIn("nvd-only-scan", result["obstacleItemText"])
+
     def test_asymmetric_footprint_and_pose_based_scan_cues_are_honest(self):
         script = r"""
 const fs = require("fs");
@@ -242,6 +435,7 @@ process.stdout.write(JSON.stringify({
                 "--input-type=commonjs",
                 "-e",
                 script,
+                str(WEB_ROOT / "blast_map_semantics.js"),
                 str(WEB_ROOT / "dashboard_logic.js"),
                 str(WEB_ROOT / "spatial_map_presenter.js"),
             ],
@@ -748,6 +942,7 @@ process.stdout.write(JSON.stringify({
                 "--input-type=commonjs",
                 "-e",
                 script,
+                str(WEB_ROOT / "blast_map_semantics.js"),
                 str(WEB_ROOT / "dashboard_logic.js"),
                 str(WEB_ROOT / "spatial_map_presenter.js"),
             ],
@@ -1097,6 +1292,7 @@ process.stdout.write(JSON.stringify({
                 "--input-type=commonjs",
                 "-e",
                 script,
+                str(WEB_ROOT / "blast_map_semantics.js"),
                 str(WEB_ROOT / "dashboard_logic.js"),
                 str(WEB_ROOT / "spatial_map_presenter.js"),
             ],
@@ -1335,6 +1531,23 @@ blast.navigation_trace = {
     },
   }],
 };
+blast.object_hypotheses = [{
+  hypothesis_id: "blast-ultrasonic-shared",
+  classification: "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+  label: "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+  x_mm: 600, y_mm: 700,
+  geometry_kind: "PROVISIONAL_ULTRASONIC_ECHO_CLUSTER",
+  support_radius_mm: 35,
+  support_points: [{ side: "left_near", x_mm: 600, y_mm: 700,
+    measured_range_mm: 400, relative_bearing_mdeg: 90000 }],
+  source_scan_ids: ["shared-blast-scan"], bearing: "LEFT",
+  relation: "LEFT_OF_SCAN", evidence_count: 1, confidence_milli: 200,
+  source_id: "blast-settled-measured-planar-projection",
+  provenance: "SETTLED_MEASURED_ULTRASONIC + PROVISIONAL_YAW_ONLY",
+  quality: "PROVISIONAL_YAW_ONLY", settled_measured_only: true,
+  provisional: true, read_only: true, observed_at_unix_ms: 1950, age_ms: 0,
+}];
+blast.source_status = "qualitative_only";
 function shared(robots) {
   return {
     schema: "robot-spatial-map/v2",
@@ -1432,6 +1645,11 @@ const firstRender = {
   },
   rayCount: nodes["map-ray-layer"].children.length,
   objectCount: nodes["map-object-layer"].children.length,
+  obstacleGroup: nodes["map-object-layer"].children[0].attributes,
+  obstacleAttributes: nodes["map-object-layer"].children[0]
+    .children[0].attributes,
+  objectListText: nodes["map-object-list"].textContent,
+  objectListCount: nodes["map-object-count"].textContent,
   localCount: nodes["map-local-odometry-layer"].children.length,
 };
 presenter.render(shared([ev3, {
@@ -1475,6 +1693,7 @@ process.stdout.write(JSON.stringify({
                 "--input-type=commonjs",
                 "-e",
                 script,
+                str(WEB_ROOT / "blast_map_semantics.js"),
                 str(WEB_ROOT / "dashboard_logic.js"),
                 str(WEB_ROOT / "spatial_map_presenter.js"),
             ],
@@ -1564,7 +1783,25 @@ process.stdout.write(JSON.stringify({
         self.assertLessEqual(rendered["fittedGoalTarget"]["cy"], 554)
         self.assertEqual(rendered["cellCount"], 0)
         self.assertEqual(rendered["rayCount"], 1)
-        self.assertEqual(rendered["objectCount"], 0)
+        self.assertEqual(rendered["objectCount"], 1)
+        self.assertEqual(
+            rendered["obstacleGroup"]["data-robot-id"], "blast-01"
+        )
+        self.assertEqual(
+            rendered["obstacleAttributes"]["data-classification"],
+            "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+        )
+        self.assertEqual(
+            rendered["obstacleAttributes"]["data-provisional"], "true"
+        )
+        self.assertIn(
+            "map.objects.provisional_inference",
+            rendered["objectListText"],
+        )
+        self.assertGreaterEqual(
+            rendered["objectListText"].count("map.tooltip.source"), 2
+        )
+        self.assertEqual(rendered["objectListCount"], "1")
         self.assertEqual(rendered["localCount"], 0)
         self.assertEqual(
             result["invalidTraceRender"]["robotIds"],

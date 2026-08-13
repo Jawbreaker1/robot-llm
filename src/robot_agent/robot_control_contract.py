@@ -224,6 +224,32 @@ class RobotControlSettings:
 
 
 @dataclass(frozen=True)
+class RobotControlTarget:
+    """The immutable physical robot addressed by one control service."""
+
+    robot_id: str
+    display_name: str
+
+    def __post_init__(self) -> None:
+        _identifier("robot_id", self.robot_id)
+        _text("display_name", self.display_name, 128)
+        if (
+            self.display_name != self.display_name.strip()
+            or self.display_name != " ".join(self.display_name.split())
+        ):
+            raise DashboardContractError(
+                "invalid_robot_control_target",
+                "Robot control target display name is invalid",
+            )
+
+    def to_dict(self):
+        return {
+            "robot_id": self.robot_id,
+            "display_name": self.display_name,
+        }
+
+
+@dataclass(frozen=True)
 class RobotEpisodeStart:
     """The complete and deliberately small request accepted from the GUI."""
 
@@ -421,6 +447,7 @@ class RobotControlSnapshot:
     sequence: int
     state: str
     enabled: bool
+    target: Optional[RobotControlTarget]
     accepting: bool
     settings: RobotControlSettings
     episode_id: Optional[str]
@@ -448,6 +475,15 @@ class RobotControlSnapshot:
             raise DashboardContractError(
                 "invalid_robot_control_flags",
                 "Robot control flags are invalid",
+            )
+        if (
+            self.target is not None
+            and not isinstance(self.target, RobotControlTarget)
+        ) or ((self.target is None) == self.enabled):
+            raise DashboardContractError(
+                "invalid_robot_control_target",
+                "Robot control target must exist exactly when control is "
+                "enabled",
             )
         if not isinstance(self.settings, RobotControlSettings):
             raise DashboardContractError(
@@ -506,6 +542,9 @@ class RobotControlSnapshot:
             "sequence": self.sequence,
             "state": self.state,
             "enabled": self.enabled,
+            "target": (
+                None if self.target is None else self.target.to_dict()
+            ),
             "accepting": self.accepting,
             "settings": self.settings.to_dict(),
             "episode": {

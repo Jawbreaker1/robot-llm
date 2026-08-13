@@ -28,10 +28,13 @@
     "blast-planar-scan-projection/v1"
   );
   const MAX_NAVIGATION_SCAN_VIEWS = 16;
-  const MAX_NAVIGATION_SCAN_POINTS = 5;
+  const MAX_NAVIGATION_SCAN_POINTS = 9;
+  const BLAST_SCAN_MAX_ABSOLUTE_BEARING_MDEG = 100000;
   const MAX_LOCAL_COORDINATE_MM = 1_000_000;
-  const MAX_MEASURED_RANGE_MM = 10_000;
+  const BLAST_NO_VALID_DISTANCE_MM = 2_000;
+  const MAX_ULTRASONIC_SUPPORT_RADIUS_MM = 10_000;
   const SHARED_TRANSFORM_QUANTIZATION_TOLERANCE_MM = 3.5;
+  const blastMapSemantics = global.RobotBlastMapSemantics;
   const LOCAL_DETOUR_WAYPOINT_KINDS = new Set([
     "LATERAL_CLEARANCE",
     "REACQUIRE_GOAL_HEADING",
@@ -39,6 +42,10 @@
     "MERGE_GOAL_AXIS",
     "RESUME_GOAL_HEADING",
   ]);
+  if (!blastMapSemantics) {
+    throw new TypeError("BLAST map semantics are unavailable.");
+  }
+  const BLAST_SCAN_POINT_SIDES = blastMapSemantics.SCAN_SIDES;
   const SESSION_REJECTED_CODE = "session_token_rejected";
   const BODY_RELATIVE_BEARING_CONVENTION = (
     "POSITIVE_LEFT_NEGATIVE_RIGHT"
@@ -278,27 +285,21 @@
 
   function normalizePlanarScanPoint(value, geometryToleranceMm = 1.5) {
     const point = record(value);
-    const measuredRangeMm = positive(point.measured_range_mm);
+    const measuredRangeMm = finite(point.measured_range_mm);
     const relativeBearingMdeg = finite(point.relative_bearing_mdeg);
     const sensorOriginX = localCoordinate(point.sensor_origin_x_mm);
     const sensorOriginY = localCoordinate(point.sensor_origin_y_mm);
     const beamHeadingMdeg = localHeading(point.beam_heading_mdeg);
     const nominalEchoX = localCoordinate(point.nominal_echo_x_mm);
     const nominalEchoY = localCoordinate(point.nominal_echo_y_mm);
-    const allowedSides = new Set([
-      "center",
-      "left_near",
-      "left_far",
-      "right_near",
-      "right_far",
-    ]);
     if (
-      !allowedSides.has(point.side)
+      !BLAST_SCAN_POINT_SIDES.has(point.side)
       || measuredRangeMm === null
-      || measuredRangeMm > MAX_MEASURED_RANGE_MM
+      || measuredRangeMm < 0
+      || measuredRangeMm >= BLAST_NO_VALID_DISTANCE_MM
       || relativeBearingMdeg === null
-      || relativeBearingMdeg < -90000
-      || relativeBearingMdeg > 90000
+      || relativeBearingMdeg < -BLAST_SCAN_MAX_ABSOLUTE_BEARING_MDEG
+      || relativeBearingMdeg > BLAST_SCAN_MAX_ABSOLUTE_BEARING_MDEG
       || sensorOriginX === null
       || sensorOriginY === null
       || beamHeadingMdeg === null
@@ -412,6 +413,10 @@
     );
     const imuHeading = normalizeImuHeading(trace.imu_heading, nowUnixMs);
     const plannedLeg = normalizePlannedLeg(trace.planned_leg);
+    const localDetourRoute = blastMapSemantics.normalizeRoute(
+      trace.local_detour_route,
+      { record, identifier, nonnegativeInteger, normalizeTracePose },
+    );
     const transformProvenance = shared
       ? trace.transform_provenance
       : null;
@@ -444,6 +449,7 @@
       || finalGoal === null
       || imuHeading === undefined
       || plannedLeg === undefined
+      || localDetourRoute === undefined
       || (
         plannedLeg?.scope === "SEARCH_POSITION_ONLY"
         && finalGoal.navigationEnforced !== false
@@ -495,6 +501,7 @@
       finalGoal,
       imuHeading,
       plannedLeg,
+      localDetourRoute,
       planarScanViews: Object.freeze(planarScanViews),
     });
   }
@@ -867,6 +874,7 @@
       poseHistoryEvicted: 0,
       collisionGeometry: null,
       navigationTrace: null,
+      objectHypotheses: Object.freeze([]),
       frameTransform: transform,
       sourceMapId: null,
       sourceMapVersion: null,
@@ -901,6 +909,13 @@
       && Array.isArray(robot.pose_history)
       && robot.pose_history.length === 0
       && robot.collision_geometry === null
+      && (
+        robot.object_hypotheses === undefined
+        || (
+          Array.isArray(robot.object_hypotheses)
+          && robot.object_hypotheses.length === 0
+        )
+      )
       && robot.source_map_id === null
       && robot.source_map_version === null
       && robot.source_status === null
@@ -963,6 +978,26 @@
         transformProvenance: transform.provenance,
       }),
     );
+    const rawObjectHypotheses = robot.object_hypotheses === undefined
+      ? []
+      : robot.object_hypotheses;
+    const objectHypotheses = Array.isArray(rawObjectHypotheses)
+      && rawObjectHypotheses.length <= MAX_OBJECT_HYPOTHESES
+      ? rawObjectHypotheses.map((item) => (
+        blastMapSemantics.normalizeObstacle(item, nowUnixMs, {
+          record,
+          identifier,
+          nonnegativeInteger,
+          coordinate: localCoordinate,
+          positive,
+          finite,
+          noValidDistanceMm: BLAST_NO_VALID_DISTANCE_MM,
+          maxSupportRadiusMm: MAX_ULTRASONIC_SUPPORT_RADIUS_MM,
+          maxPoints: MAX_NAVIGATION_SCAN_POINTS,
+          maxViews: MAX_NAVIGATION_SCAN_VIEWS,
+        })
+      ))
+      : null;
     const sourceStatusValid = [
       "available", "pose_only", "qualitative_only",
     ].includes(robot.source_status);
@@ -988,6 +1023,8 @@
       || capturedAtUnixMs === null
       || sourceAgeMs === null
       || sourceMapId === null
+      || objectHypotheses === null
+      || objectHypotheses.some((item) => item === null)
       || !sourceStatusValid
       || robotPose.observedAtUnixMs > capturedAtUnixMs
       || (
@@ -1012,6 +1049,7 @@
       poseHistoryEvicted,
       collisionGeometry,
       navigationTrace,
+      objectHypotheses: Object.freeze(objectHypotheses),
       frameTransform: transform,
       sourceMapId,
       sourceMapVersion,
@@ -1308,9 +1346,33 @@
       : [];
     const objectHypotheses = rawHypotheses.flatMap((rawHypothesis) => {
       const hypothesis = record(rawHypothesis);
+      const ultrasonicCandidate = (
+        hypothesis.classification
+          === blastMapSemantics.CLASSIFICATION
+        || hypothesis.geometry_kind === blastMapSemantics.GEOMETRY_KIND
+      );
+      if (ultrasonicCandidate) {
+        const normalized = blastMapSemantics.normalizeObstacle(
+          hypothesis,
+          now,
+          {
+            record,
+            identifier,
+            nonnegativeInteger,
+            coordinate: localCoordinate,
+            positive,
+            finite,
+            noValidDistanceMm: BLAST_NO_VALID_DISTANCE_MM,
+            maxSupportRadiusMm: MAX_ULTRASONIC_SUPPORT_RADIUS_MM,
+            maxPoints: MAX_NAVIGATION_SCAN_POINTS,
+            maxViews: MAX_NAVIGATION_SCAN_VIEWS,
+          },
+        );
+        return normalized === null ? [] : [normalized];
+      }
       const xMm = finite(hypothesis.x_mm);
       const yMm = finite(hypothesis.y_mm);
-      const provisional = (
+      const qualitativeProvisional = (
         hypothesis.provisional === true
         && hypothesis.geometry_kind === "QUALITATIVE_FORWARD_ENVELOPE"
       );
@@ -1319,7 +1381,7 @@
       const anchorY = finite(anchor.y_mm);
       const anchorHeading = finite(anchor.heading_mdeg);
       const anchorPose = (
-        provisional
+        qualitativeProvisional
         && anchorX !== null
         && anchorY !== null
         && anchorHeading !== null
@@ -1334,11 +1396,11 @@
       const validUntil = finite(hypothesis.valid_until_unix_ms);
       if (
         (
-          !provisional
+          !qualitativeProvisional
           && (xMm === null || yMm === null)
         )
         || (
-          provisional
+          qualitativeProvisional
           && (
             anchorPose === null
             || confidence === null
@@ -1353,14 +1415,21 @@
       }
       return [Object.freeze({
         hypothesisId: text(hypothesis.hypothesis_id),
+        classification: null,
         label: text(hypothesis.label),
-        xMm: provisional ? null : xMm,
-        yMm: provisional ? null : yMm,
+        xMm: qualitativeProvisional ? null : xMm,
+        yMm: qualitativeProvisional ? null : yMm,
         anchorPose,
         geometryKind: text(hypothesis.geometry_kind),
+        supportRadiusMm: null,
+        supportPoints: Object.freeze([]),
+        sourceScanIds: Object.freeze([]),
         bearing: text(hypothesis.bearing),
         relation: text(hypothesis.relation),
-        provisional,
+        evidenceCount: nonnegativeInteger(hypothesis.evidence_count),
+        settledMeasuredOnly: false,
+        readOnly: false,
+        provisional: qualitativeProvisional,
         confidenceMilli: confidence,
         sourceId: text(hypothesis.source_id),
         provenance: provenance(hypothesis.provenance),

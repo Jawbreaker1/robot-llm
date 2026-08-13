@@ -121,9 +121,12 @@ ger därför `fixed_start_rebind_required`; den gamla transformen återanvänds
 aldrig automatiskt. Placera då tillbaka båda robotarna på startmarkeringarna
 och starta om dashboarden som visar den gemensamma kartan.
 
-Denna version är avsiktligt observation-only: den delar robotarnas beräknade
-odometribana men ännu inga hinderhypoteser och ingen navigationsauktoritet.
-Kör robotarna en i taget under den första frame-valideringen.
+Den gemensamma kartan är avsiktligt observation-only. Den delar robotarnas
+beräknade odometribana och kan visa BLASTs provisoriska ultraljudskluster under
+respektive källrobot efter fixed-start-transformen. Klustren fusioneras aldrig
+till top-level-objekt, får ingen beständig identitet och ger ingen
+navigationsauktoritet. Kör robotarna en i taget under den första
+frame-valideringen.
 
 För att först köra den riktiga 2D-simulatornavigationen och därefter visa dess
 ackumulerade karta i dashboarden:
@@ -371,6 +374,16 @@ inte en animation som browsern själv härleder. Samma
 positiv-vänster/negativ-höger-konvention används av runtime, kontrakt och UI.
 En äldre scan ritas vid sin historiska pose; den flyttas inte till robotens
 nuvarande kropp.
+
+BLAST håller två ultraljudslager strikt åtskilda. Kartan visar dels de råa
+strålarna från stillastående, verifierat `MEASURED`-underlag, dels
+lågkonfidens-hypoteser märkta
+`PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER`. De senare är bara lokala
+ekokluster med stödpunkt, radie och LEFT/FRONT/RIGHT-relation — aldrig en
+klassificering som låda eller person. `NO_VALID_DISTANCE` och instabila svep
+skapar inga hinder. En lokal BLAST-omväg visas samtidigt som hela den namngivna
+waypointsekvensen med `COMPLETED`, `ACTIVE` och `UPCOMING`, inte bara nästa
+punkt.
 
 Det strukturerade action/result-ledger som Gemma använder är däremot ännu
 inte en egen dashboardpanel. Den är episodlokal plannerkontext och

@@ -6,12 +6,24 @@ from copy import deepcopy
 import math
 from typing import Mapping
 
+from .blast_navigation_calibration import (
+    BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
+)
 from .physical_navigation_contract import MOTION_ACTIONS, SCAN_FRONT_ARC
 
 
 SCAN_RESULT_SCHEMA = "blast-scan-front-arc/v3"
-SCAN_RESTORATION_TOLERANCE_DEG = 5.0
+# LEGO-scale completion bands: close enough to the scan start to keep the
+# provisional map useful, without treating normal backlash as a hard fault.
+# Fresh range and motor checks still gate every following physical action.
+SCAN_RESTORATION_TOLERANCE_DEG = 10.0
+SCAN_RESTORATION_COMMON_MODE_TOLERANCE_MM = 25.0
 SCAN_REPEATED_RAY_MAX_DELTA_DEG = 5.0
+SCAN_MAX_ABSOLUTE_BEARING_DEG = 100.0
+SCAN_BEARING_SOURCE = "DRIVE_ENCODER_ODOMETRY"
+SCAN_BEARING_FRAME = "ROBOT_RELATIVE_AT_SCAN_START"
+SCAN_IMU_DIAGNOSTIC_AUTHORITY = "DIAGNOSTIC_ONLY"
+SCAN_DRIVE_ENCODER_ROLES = ("left_drive", "right_drive")
 PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM = 2_000
 RANGE_STATE_MEASURED = "MEASURED"
 RANGE_STATE_NO_VALID_DISTANCE = "NO_VALID_DISTANCE"
@@ -83,8 +95,72 @@ def body_motor_angle(observation):
     return value if type(value) is int else None
 
 
+def drive_encoder_angles(observation):
+    """Return exact drive anchors; scan geometry never guesses them."""
+
+    motor_angles = (
+        observation.get("motor_angles_deg")
+        if isinstance(observation, Mapping)
+        else None
+    )
+    if not isinstance(motor_angles, Mapping) or any(
+        type(motor_angles.get(role)) is not int
+        for role in SCAN_DRIVE_ENCODER_ROLES
+    ):
+        return None
+    return {
+        role: motor_angles[role] for role in SCAN_DRIVE_ENCODER_ROLES
+    }
+
+
+def encoder_relative_bearing_deg(observation, start_drive_angles):
+    """Return left-negative/right-positive yaw from drive encoders."""
+
+    current = drive_encoder_angles(observation)
+    if current is None or not isinstance(start_drive_angles, Mapping) or any(
+        type(start_drive_angles.get(role)) is not int
+        for role in SCAN_DRIVE_ENCODER_ROLES
+    ):
+        return None
+    left_delta = current["left_drive"] - start_drive_angles["left_drive"]
+    right_delta = (
+        current["right_drive"] - start_drive_angles["right_drive"]
+    )
+    opposed_encoder_deg = (right_delta - left_delta) / 2.0
+    return -(
+        opposed_encoder_deg
+        * BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
+        .turn_mdeg_per_opposed_encoder_degree
+        / 1_000.0
+    )
+
+
+def encoder_common_mode_residue_mm(final_drive_angles, start_drive_angles):
+    if not all(isinstance(value, Mapping) for value in (
+        final_drive_angles, start_drive_angles,
+    )) or any(
+        type(angles.get(role)) is not int
+        for angles in (final_drive_angles, start_drive_angles)
+        for role in SCAN_DRIVE_ENCODER_ROLES
+    ):
+        return None
+    left_delta = (
+        final_drive_angles["left_drive"]
+        - start_drive_angles["left_drive"]
+    )
+    right_delta = (
+        final_drive_angles["right_drive"]
+        - start_drive_angles["right_drive"]
+    )
+    return (
+        (left_delta + right_delta) / 2.0
+        * BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
+        .linear_mm_per_encoder_degree
+    )
+
+
 def validate_blast_scan_ray_contract(scan):
-    """Validate ray order, range state, and body-angle telemetry."""
+    """Validate encoder-authoritative bearings and restoration evidence."""
 
     if not isinstance(scan, Mapping) or scan.get("schema") != (
         SCAN_RESULT_SCHEMA
@@ -94,7 +170,48 @@ def validate_blast_scan_ray_contract(scan):
     angular_rays = scan.get("angular_rays")
     evidence_rays = angular_rays if isinstance(angular_rays, list) else rays
 
+    start_encoders = scan.get("encoder_start_angles_deg")
+    final_encoders = scan.get("encoder_final_angles_deg")
+    restoration = scan.get("encoder_restoration")
+    imu_diagnostics = scan.get("imu_heading_diagnostics")
+
+    def exact_drive_angles(value):
+        return (
+            isinstance(value, Mapping)
+            and set(value) == set(SCAN_DRIVE_ENCODER_ROLES)
+            and all(type(value.get(role)) is int for role in (
+                SCAN_DRIVE_ENCODER_ROLES
+            ))
+        )
+
     def ray_invalid(ray):
+        encoder_delta = (
+            ray.get("drive_encoder_delta_deg")
+            if isinstance(ray, Mapping) else None
+        )
+        heading = finite_number(
+            ray.get("heading_deg") if isinstance(ray, Mapping) else None
+        )
+        relative = finite_number(
+            ray.get("relative_heading_deg")
+            if isinstance(ray, Mapping) else None
+        )
+        imu_heading = finite_number(
+            ray.get("imu_heading_deg")
+            if isinstance(ray, Mapping) else None
+        )
+        expected_bearing = None
+        if exact_drive_angles(encoder_delta):
+            expected_bearing = -(
+                (
+                    encoder_delta["right_drive"]
+                    - encoder_delta["left_drive"]
+                )
+                / 2.0
+                * BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
+                .turn_mdeg_per_opposed_encoder_degree
+                / 1_000.0
+            )
         return (
             not isinstance(ray, Mapping)
             or type(ray.get("observation_settled")) is not bool
@@ -116,6 +233,15 @@ def validate_blast_scan_ray_contract(scan):
             or (
                 ray.get("body_motor_angle_deg") is not None
                 and type(ray.get("body_motor_angle_deg")) is not int
+            )
+            or expected_bearing is None
+            or heading is None
+            or relative is None
+            or not math.isclose(
+                heading, expected_bearing, abs_tol=1e-9,
+            )
+            or not math.isclose(
+                relative, expected_bearing, abs_tol=1e-9,
             )
         )
 
@@ -147,9 +273,11 @@ def validate_blast_scan_ray_contract(scan):
             or not (
                 relative[0] == 0.0
                 and 0.0 > relative[1] > relative[2]
-                > relative[3] > relative[4] >= -90.0
+                > relative[3] > relative[4]
+                >= -SCAN_MAX_ABSOLUTE_BEARING_DEG
                 and 0.0 < relative[5] < relative[6]
-                < relative[7] < relative[8] <= 90.0
+                < relative[7] < relative[8]
+                <= SCAN_MAX_ABSOLUTE_BEARING_DEG
             )
             or not isinstance(rays, list)
             or len(rays) != 5
@@ -159,6 +287,77 @@ def validate_blast_scan_ray_contract(scan):
                                          (3, 6), (4, 8))
             )
         )
+    canonical_start = finite_number(scan.get("start_heading_deg"))
+    canonical_final = finite_number(scan.get("final_heading_deg"))
+    canonical_error = finite_number(scan.get("restoration_error_deg"))
+    legacy_heading_fields_valid = all(
+        finite_number(ray.get("heading_deg")) is not None
+        for ray in evidence_rays
+    ) if isinstance(evidence_rays, list) else False
+    final_bearing = (
+        encoder_relative_bearing_deg(
+            {"motor_angles_deg": final_encoders}, start_encoders,
+        )
+        if exact_drive_angles(start_encoders)
+        and exact_drive_angles(final_encoders)
+        else None
+    )
+    common_residue = encoder_common_mode_residue_mm(
+        final_encoders, start_encoders,
+    )
+    restoration_contract = (
+        isinstance(restoration, Mapping)
+        and set(restoration) == {
+            "common_mode_residue_mm",
+            "opposed_residue_deg",
+            "motion_stopped",
+            "observation_settled",
+            "body_pose_verified",
+        }
+        and finite_number(restoration.get("common_mode_residue_mm"))
+        is not None
+        and finite_number(restoration.get("opposed_residue_deg"))
+        is not None
+        and all(type(restoration.get(key)) is bool for key in (
+            "motion_stopped", "observation_settled",
+            "body_pose_verified",
+        ))
+    )
+    expected_restored = (
+        restoration_contract
+        and final_bearing is not None
+        and common_residue is not None
+        and abs(common_residue)
+        <= SCAN_RESTORATION_COMMON_MODE_TOLERANCE_MM
+        and abs(final_bearing) <= SCAN_RESTORATION_TOLERANCE_DEG
+        and restoration["motion_stopped"]
+        and restoration["observation_settled"]
+        and restoration["body_pose_verified"]
+    )
+    imu_contract = (
+        isinstance(imu_diagnostics, Mapping)
+        and set(imu_diagnostics) == {
+            "authority", "start_heading_deg", "final_heading_deg",
+            "restoration_error_deg",
+        }
+        and imu_diagnostics.get("authority")
+        == SCAN_IMU_DIAGNOSTIC_AUTHORITY
+    )
+    raw_imu_start = (
+        imu_diagnostics.get("start_heading_deg")
+        if isinstance(imu_diagnostics, Mapping) else None
+    )
+    raw_imu_final = (
+        imu_diagnostics.get("final_heading_deg")
+        if isinstance(imu_diagnostics, Mapping) else None
+    )
+    raw_imu_error = (
+        imu_diagnostics.get("restoration_error_deg")
+        if isinstance(imu_diagnostics, Mapping) else None
+    )
+    imu_start = finite_number(raw_imu_start)
+    imu_final = finite_number(raw_imu_final)
+    imu_error = finite_number(raw_imu_error)
     if (
         not isinstance(rays, list)
         or tuple(
@@ -174,6 +373,58 @@ def validate_blast_scan_ray_contract(scan):
         )
         or any(ray_invalid(ray) for ray in rays)
         or angular_invalid
+        or scan.get("bearing_source") != SCAN_BEARING_SOURCE
+        or scan.get("bearing_frame") != SCAN_BEARING_FRAME
+        or not exact_drive_angles(start_encoders)
+        or not exact_drive_angles(final_encoders)
+        or not legacy_heading_fields_valid
+        or canonical_start != 0.0
+        or canonical_final is None
+        or canonical_error is None
+        or final_bearing is None
+        or not math.isclose(canonical_final, final_bearing, abs_tol=1e-9)
+        or not math.isclose(canonical_error, final_bearing, abs_tol=1e-9)
+        or not restoration_contract
+        or not math.isclose(
+            float(restoration["common_mode_residue_mm"]),
+            common_residue,
+            abs_tol=1e-9,
+        )
+        or not math.isclose(
+            float(restoration["opposed_residue_deg"]),
+            final_bearing,
+            abs_tol=1e-9,
+        )
+        or type(scan.get("restoration_verified")) is not bool
+        or scan.get("restoration_verified") is not expected_restored
+        or scan.get("result") != (
+            "restored" if expected_restored else "restoration_unverified"
+        )
+        or not imu_contract
+        or any(
+            raw is not None and normalized is None
+            for raw, normalized in (
+                (raw_imu_start, imu_start),
+                (raw_imu_final, imu_final),
+                (raw_imu_error, imu_error),
+            )
+        )
+        or (
+            imu_start is not None
+            and imu_final is not None
+            and (
+                imu_error is None
+                or not math.isclose(
+                    imu_error,
+                    scan_heading_delta(imu_final, imu_start),
+                    abs_tol=1e-9,
+                )
+            )
+        )
+        or (
+            (imu_start is None or imu_final is None)
+            and imu_error is not None
+        )
     ):
         raise ValueError("BLAST scan result is invalid")
     return deepcopy(scan)
@@ -251,11 +502,16 @@ def scan_heading_delta(heading, reference):
 def scan_ray(
     side,
     observation,
-    start_heading,
+    start_drive_angles,
     observation_settled,
     evidence_use=SCAN_RAY_EVIDENCE_SETTLED,
 ):
-    heading = scan_heading(observation)
+    heading = encoder_relative_bearing_deg(
+        observation, start_drive_angles,
+    )
+    current_drive_angles = drive_encoder_angles(observation)
+    if heading is None or current_drive_angles is None:
+        raise ValueError("BLAST scan drive encoder evidence is invalid")
     observed_at_ms = observation.get("observed_at_ms")
     if type(observed_at_ms) is not int:
         observed_at_ms = None
@@ -266,7 +522,12 @@ def scan_ray(
         "range_state": blast_range_state(distance_mm),
         "body_motor_angle_deg": body_motor_angle(observation),
         "heading_deg": heading,
-        "relative_heading_deg": scan_heading_delta(heading, start_heading),
+        "relative_heading_deg": heading,
+        "imu_heading_deg": scan_heading(observation),
+        "drive_encoder_delta_deg": {
+            role: current_drive_angles[role] - start_drive_angles[role]
+            for role in SCAN_DRIVE_ENCODER_ROLES
+        },
         "observation_settled": observation_settled,
         "evidence_use": evidence_use,
         "observed_at_ms": observed_at_ms,
@@ -275,7 +536,7 @@ def scan_ray(
 
 def aggregate_repeated_scan_ray(
     side,
-    start_heading,
+    start_drive_angles,
     primary,
     repeated,
 ):
@@ -285,9 +546,16 @@ def aggregate_repeated_scan_ray(
     repeated_observation, repeated_settled, _repeated_evidence = repeated
     primary_state = blast_range_state(primary_observation.get("distance_mm"))
     repeated_state = blast_range_state(repeated_observation.get("distance_mm"))
-    repeated_delta = scan_heading_delta(
-        scan_heading(repeated_observation),
-        scan_heading(primary_observation),
+    primary_bearing = encoder_relative_bearing_deg(
+        primary_observation, start_drive_angles,
+    )
+    repeated_bearing = encoder_relative_bearing_deg(
+        repeated_observation, start_drive_angles,
+    )
+    repeated_delta = (
+        None
+        if primary_bearing is None or repeated_bearing is None
+        else repeated_bearing - primary_bearing
     )
     primary_is_usable = (
         primary_settled is True
@@ -313,10 +581,116 @@ def aggregate_repeated_scan_ray(
     return scan_ray(
         side,
         observation,
-        start_heading,
+        start_drive_angles,
         observation_settled,
         evidence_use,
     )
+
+
+def build_blast_encoder_scan(
+    *, center, center_settled, start_drive_angles,
+    left_outbound, left_return, right_outbound, right_return,
+    final, final_settled, final_body_verified,
+):
+    """Build and validate one encoder-authoritative nine-ray scan."""
+
+    start_imu_heading = scan_heading(center)
+    final_imu_heading = scan_heading(final)
+    imu_restoration_error = scan_heading_delta(
+        final_imu_heading, start_imu_heading,
+    )
+    final_drive_angles = drive_encoder_angles(final)
+    restoration_error = encoder_relative_bearing_deg(
+        final, start_drive_angles,
+    )
+    common_mode_residue = encoder_common_mode_residue_mm(
+        final_drive_angles, start_drive_angles,
+    )
+    restoration_verified = (
+        restoration_error is not None
+        and common_mode_residue is not None
+        and abs(common_mode_residue)
+        <= SCAN_RESTORATION_COMMON_MODE_TOLERANCE_MM
+        and abs(restoration_error) <= SCAN_RESTORATION_TOLERANCE_DEG
+        and final.get("motion_active") is False
+        and final_settled is True
+        and final_body_verified
+    )
+    left_rays = []
+    right_rays = []
+    for index in range(4):
+        left_primary = left_outbound[index][1:]
+        right_primary = right_outbound[index][1:]
+        left_rays.append(
+            scan_ray(
+                "left_{}".format(index + 1),
+                left_primary[0], start_drive_angles,
+                left_primary[1], left_primary[2],
+            )
+            if index == 3
+            else aggregate_repeated_scan_ray(
+                "left_{}".format(index + 1), start_drive_angles,
+                left_primary, left_return[2 - index][1:],
+            )
+        )
+        right_rays.append(
+            scan_ray(
+                "right_{}".format(index + 1),
+                right_primary[0], start_drive_angles,
+                right_primary[1], right_primary[2],
+            )
+            if index == 3
+            else aggregate_repeated_scan_ray(
+                "right_{}".format(index + 1), start_drive_angles,
+                right_primary, right_return[2 - index][1:],
+            )
+        )
+    center_ray = scan_ray(
+        "center", center, start_drive_angles, center_settled,
+    )
+    angular_rays = [center_ray, *left_rays, *right_rays]
+    rays = [
+        center_ray,
+        {**left_rays[1], "side": "left_near"},
+        {**left_rays[3], "side": "left_far"},
+        {**right_rays[1], "side": "right_near"},
+        {**right_rays[3], "side": "right_far"},
+    ]
+    scan = {
+        "schema": SCAN_RESULT_SCHEMA,
+        "state": "complete",
+        "result": (
+            "restored" if restoration_verified
+            else "restoration_unverified"
+        ),
+        "bearing_source": SCAN_BEARING_SOURCE,
+        "bearing_frame": SCAN_BEARING_FRAME,
+        "start_heading_deg": 0.0,
+        "final_heading_deg": restoration_error,
+        "restoration_error_deg": restoration_error,
+        "restoration_verified": restoration_verified,
+        "encoder_start_angles_deg": start_drive_angles,
+        "encoder_final_angles_deg": final_drive_angles,
+        "encoder_restoration": {
+            "common_mode_residue_mm": common_mode_residue,
+            "opposed_residue_deg": restoration_error,
+            "motion_stopped": final.get("motion_active") is False,
+            "observation_settled": final_settled is True,
+            "body_pose_verified": final_body_verified,
+        },
+        "imu_heading_diagnostics": {
+            "authority": SCAN_IMU_DIAGNOSTIC_AUTHORITY,
+            "start_heading_deg": start_imu_heading,
+            "final_heading_deg": final_imu_heading,
+            "restoration_error_deg": imu_restoration_error,
+        },
+        "all_observations_settled": all(
+            ray["observation_settled"] for ray in angular_rays
+        ),
+        "rays": rays,
+        "angular_rays": angular_rays,
+    }
+    return validate_blast_scan_ray_contract(scan)
 
 
 __all__ = (
@@ -327,16 +701,26 @@ __all__ = (
     "ROBOT_RELATIVE_SIDE_RAYS",
     "ROBOT_RELATIVE_SIDE_SCAN_SCHEMA",
     "SCAN_ANGULAR_RAY_SIDES",
+    "SCAN_BEARING_FRAME",
+    "SCAN_BEARING_SOURCE",
+    "SCAN_DRIVE_ENCODER_ROLES",
+    "SCAN_IMU_DIAGNOSTIC_AUTHORITY",
+    "SCAN_MAX_ABSOLUTE_BEARING_DEG",
     "SCAN_RAY_EVIDENCE_SETTLED",
     "SCAN_RAY_EVIDENCE_SWEEP_ONLY",
     "SCAN_RAY_SIDES",
     "SCAN_REPEATED_RAY_MAX_DELTA_DEG",
+    "SCAN_RESTORATION_COMMON_MODE_TOLERANCE_MM",
     "SCAN_RESTORATION_TOLERANCE_DEG",
     "SCAN_RESULT_SCHEMA",
     "aggregate_repeated_scan_ray",
     "blast_range_state",
     "body_motor_angle",
+    "build_blast_encoder_scan",
     "current_side_scan",
+    "drive_encoder_angles",
+    "encoder_common_mode_residue_mm",
+    "encoder_relative_bearing_deg",
     "finite_number",
     "scan_heading",
     "scan_heading_delta",

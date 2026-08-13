@@ -38,6 +38,7 @@ _PROJECTION_SCHEMA = "blast-planar-scan-projection/v1"
 # the calibrated rotation envelope at the current 450 mm search cap.
 _MAX_TOWARD_FRONT_HEADING_MDEG = 4_100
 TARGET_REACQUISITION_SEARCH_BASIS = "FROZEN_SUPPORT_REACQUISITION"
+RECOVERY_REBASE_SEARCH_BASIS = "FROZEN_SUPPORT_REBASE"
 _TARGET_DEPTH_BAND_MM = 45
 _TARGET_INTERIOR_MM = 45
 _TARGET_MAX_BEARING_DEG = 30.0
@@ -175,14 +176,20 @@ def target_side_has_only_settled_no_return(view, selected_side):
         scan = validate_blast_scan_ray_contract(view.get("scan"))
     except ValueError:
         return False
+    evidence_rays = scan.get("angular_rays", scan["rays"])
     prefix = "right_" if selected_side == "LEFT" else "left_"
-    rays = [ray for ray in scan["rays"] if ray["side"].startswith(prefix)]
-    center = [ray for ray in scan["rays"] if ray["side"] == "center"]
+    rays = [
+        ray for ray in evidence_rays if ray["side"].startswith(prefix)
+    ]
+    center = [
+        ray for ray in evidence_rays if ray["side"] == "center"
+    ]
+    expected_side_count = 4 if "angular_rays" in scan else 2
     return (
         len(center) == 1
         and center[0].get("observation_settled") is True
         and center[0]["range_state"] == RANGE_STATE_MEASURED
-        and len(rays) == 2
+        and len(rays) == expected_side_count
         and all(
             ray["range_state"] == RANGE_STATE_NO_VALID_DISTANCE
             and ray.get("observation_settled") is True
@@ -217,6 +224,67 @@ def side_search_scan_sweep_is_clear(origin_view, pose) -> bool:
         if intersects:
             return False
     return True
+
+
+def side_search_advance_sweep_is_clear(origin_view, pose) -> bool:
+    """Whether one maximum outbound pulse misses the frozen front target."""
+
+    if not isinstance(pose, PhysicalPose):
+        return False
+    try:
+        support = _frozen_target_support(origin_view)
+    except ValueError:
+        return False
+    _nominal, maximum = nominal_effect(
+        pose,
+        ADVANCE,
+        BLAST_NAVIGATION_ACTION_SPECS,
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+    )
+    footprint, _sensor = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    )
+    _start, intersects = footprint_sweep_intersects(
+        obstacle_x_mm=support["center_x_mm"],
+        obstacle_y_mm=support["center_y_mm"],
+        obstacle_radius_mm=support["radius_mm"],
+        start=pose,
+        end=maximum,
+        footprint=footprint,
+    )
+    return not intersects
+
+
+def side_search_turn_sweep_is_clear(origin_view, pose, action) -> bool:
+    """Whether one full navigation turn misses the frozen front target."""
+
+    if (
+        not isinstance(pose, PhysicalPose)
+        or action not in (TURN_LEFT_90, TURN_RIGHT_90)
+    ):
+        return False
+    try:
+        support = _frozen_target_support(origin_view)
+    except ValueError:
+        return False
+    _nominal, maximum = nominal_effect(
+        pose,
+        action,
+        BLAST_NAVIGATION_ACTION_SPECS,
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+    )
+    footprint, _sensor = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    )
+    _start, intersects = footprint_sweep_intersects(
+        obstacle_x_mm=support["center_x_mm"],
+        obstacle_y_mm=support["center_y_mm"],
+        obstacle_radius_mm=support["radius_mm"],
+        start=pose,
+        end=maximum,
+        footprint=footprint,
+    )
+    return not intersects
 
 
 def _reacquisition_action_is_clear(pose, waypoint, action):
@@ -503,6 +571,168 @@ def target_reacquisition_waypoint(
     }
 
 
+def recovery_rebase_waypoint(
+    origin_view, failed_side_view, selected_side, host_actions,
+):
+    """Return a bounded forward-only retrace to the verified scan origin."""
+
+    if selected_side not in ("LEFT", "RIGHT"):
+        raise ValueError("BLAST recovery rebase side is invalid")
+    support = _frozen_target_support(origin_view)
+    current = _pose(
+        failed_side_view.get("scan_pose") if isinstance(
+            failed_side_view, Mapping) else None,
+        "recovery rebase",
+    )
+    origin = support["origin"]
+    if (
+        not isinstance(host_actions, (list, tuple))
+        or not host_actions
+        or host_actions[-1] != SCAN_FRONT_ARC
+        or any(action not in (
+            ADVANCE, TURN_LEFT_90, TURN_RIGHT_90, SCAN_FRONT_ARC,
+        ) for action in host_actions)
+        or current.verified_motion_count - origin.verified_motion_count
+        != 1 + sum(action != SCAN_FRONT_ARC for action in host_actions)
+    ):
+        raise ValueError("BLAST recovery motion history is uncorrelated")
+    longitudinal, lateral = _axes(origin, current.x_mm, current.y_mm)
+    side_sign = 1 if selected_side == "LEFT" else -1
+    footprint, _sensor = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    )
+    longitudinal_limit = (
+        footprint.front_extent_mm
+        if longitudinal >= 0 else footprint.rear_extent_mm
+    ) + footprint.clearance_margin_mm
+    if (
+        abs(normalize_heading_mdeg(
+            current.heading_mdeg - origin.heading_mdeg
+        )) > _TARGET_OBSERVATION_HEADING_TOLERANCE_MDEG
+        or abs(longitudinal) > longitudinal_limit
+        or side_sign * lateral <= POSITION_TOLERANCE_MM
+    ):
+        raise ValueError("BLAST recovery rebase pose is uncorrelated")
+    pulse_count = _advance_slots(abs(lateral))
+    if not 1 <= pulse_count <= 16:
+        raise ValueError("BLAST recovery rebase distance is invalid")
+    outward_turn = (
+        TURN_LEFT_90 if selected_side == "LEFT" else TURN_RIGHT_90
+    )
+    retrace_turn = (
+        TURN_RIGHT_90 if selected_side == "LEFT" else TURN_LEFT_90
+    )
+    return {
+        "kind": "SIDE_SEARCH_REBASE",
+        "selected_side": selected_side,
+        "travel_side": "RIGHT" if selected_side == "LEFT" else "LEFT",
+        "scope": "SEARCH_POSITION_ONLY",
+        "clearance_proven": False,
+        "passage_proven": False,
+        "route_eligible": False,
+        "frame": "EPISODE_LOCAL_ODOMETRY",
+        "origin_pose": current.to_dict(),
+        "target_x_mm": origin.x_mm,
+        "target_y_mm": origin.y_mm,
+        "target_heading_mdeg": _nominal_pose(
+            current, retrace_turn
+        ).heading_mdeg,
+        "position_tolerance_mm": POSITION_TOLERANCE_MM,
+        "target_lateral_offset_mm": 0,
+        "search_basis": RECOVERY_REBASE_SEARCH_BASIS,
+        "search_target_capped": False,
+        "required_action_slots": pulse_count + 7,
+        "rebase_lateral_max_count": pulse_count,
+        "rebase_correction_max_count": 4,
+        "rebase_turn_action": retrace_turn,
+        "restore_turn_action": outward_turn,
+        "restored_heading_mdeg": origin.heading_mdeg,
+        "restored_longitudinal_min_mm": 0,
+        "restored_longitudinal_max_mm": longitudinal_limit,
+        "frozen_target_centroid_x_mm": support["center_x_mm"],
+        "frozen_target_centroid_y_mm": support["center_y_mm"],
+        "frozen_target_radius_mm": support["radius_mm"],
+    }
+
+
+def recovery_rebase_completed(
+    origin_view, rebase_view, waypoint, pose, host_actions, action_start,
+) -> bool:
+    """Whether one fresh restored scan re-established the scan origin."""
+
+    try:
+        origin = _pose(origin_view.get("scan_pose"), "recovery origin")
+        scan = validate_blast_scan_ray_contract(rebase_view.get("scan"))
+    except (AttributeError, ValueError):
+        return False
+    if (
+        waypoint.get("search_basis") != RECOVERY_REBASE_SEARCH_BASIS
+        or rebase_view.get("scan_pose") != pose.to_dict()
+        or type(action_start) is not int
+        or not isinstance(host_actions, (list, tuple))
+        or not 0 <= action_start < len(host_actions)
+        or scan.get("state") != "complete"
+        or scan.get("result") != "restored"
+        or scan.get("restoration_verified") is not True
+        or scan.get("all_observations_settled") is not True
+        or type(waypoint.get("rebase_lateral_max_count")) is not int
+        or type(waypoint.get("rebase_correction_max_count")) is not int
+        or type(waypoint.get("restored_longitudinal_min_mm")) is not int
+        or type(waypoint.get("restored_longitudinal_max_mm")) is not int
+    ):
+        return False
+    longitudinal, lateral = _axes(origin, pose.x_mm, pose.y_mm)
+    try:
+        rebase_start = _pose(waypoint.get("origin_pose"), "recovery start")
+    except ValueError:
+        return False
+    suffix = tuple(host_actions[action_start:])
+    restore = waypoint.get("restore_turn_action")
+    try:
+        restore_index = suffix.index(restore)
+    except ValueError:
+        return False
+    lateral_actions = suffix[1:restore_index]
+    correction_actions = suffix[restore_index + 1:-1]
+    return (
+        suffix[0] == waypoint.get("rebase_turn_action")
+        and suffix[-1] == SCAN_FRONT_ARC
+        and 1 <= len(lateral_actions)
+        <= waypoint["rebase_lateral_max_count"]
+        and all(action == ADVANCE for action in lateral_actions)
+        and len(correction_actions)
+        <= waypoint["rebase_correction_max_count"]
+        and all(action == ADVANCE for action in correction_actions)
+        and pose.verified_motion_count
+        == rebase_start.verified_motion_count + sum(
+            action != SCAN_FRONT_ARC for action in suffix
+        )
+        and waypoint["restored_longitudinal_min_mm"] <= longitudinal
+        <= waypoint["restored_longitudinal_max_mm"]
+        and abs(lateral) <= POSITION_TOLERANCE_MM
+        and abs(normalize_heading_mdeg(
+            pose.heading_mdeg - origin.heading_mdeg
+        )) <= _TARGET_OBSERVATION_HEADING_TOLERANCE_MDEG
+    )
+
+
+def maximum_side_search_required_slots() -> int:
+    """Worst bounded complete side observation from a fresh origin scan."""
+
+    footprint, _sensor = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    )
+    stride = (
+        footprint.left_extent_mm
+        + footprint.right_extent_mm
+        + 2 * footprint.clearance_margin_mm
+    )
+    worst_path = 2 * stride / math.cos(math.radians(
+        HEADING_TOLERANCE_MDEG / 1_000.0
+    ))
+    return 1 + _advance_slots(worst_path) + 2
+
+
 def target_reacquisition_resolved(
     origin_view,
     reacquisition_view,
@@ -536,8 +766,9 @@ def target_reacquisition_resolved(
     ) > _TARGET_MAX_BEARING_DEG:
         return False
     prefix = "right_" if selected_side == "LEFT" else "left_"
+    evidence_rays = scan.get("angular_rays", scan["rays"])
     measured_sides = {
-        ray["side"] for ray in scan["rays"]
+        ray["side"] for ray in evidence_rays
         if ray["side"].startswith(prefix)
         and ray["range_state"] == RANGE_STATE_MEASURED
     }
@@ -560,10 +791,17 @@ def _advance_slots(distance_mm: float) -> int:
 
 
 def side_search_required_slots(waypoint) -> int:
-    if waypoint.get("search_basis") == TARGET_REACQUISITION_SEARCH_BASIS:
+    if waypoint.get("search_basis") in (
+        TARGET_REACQUISITION_SEARCH_BASIS,
+        RECOVERY_REBASE_SEARCH_BASIS,
+    ):
         required = waypoint.get("required_action_slots")
-        if type(required) is not int or not 4 <= required <= 9:
-            raise ValueError("BLAST target reacquisition budget is invalid")
+        maximum = (
+            23 if waypoint.get("search_basis")
+            == RECOVERY_REBASE_SEARCH_BASIS else 9
+        )
+        if type(required) is not int or not 4 <= required <= maximum:
+            raise ValueError("BLAST bounded search budget is invalid")
         return required
     outward_mm = abs(waypoint["target_lateral_offset_mm"])
     worst_path_mm = outward_mm / math.cos(math.radians(
@@ -573,9 +811,97 @@ def side_search_required_slots(waypoint) -> int:
 
 
 def side_search_followup_slots(pose, waypoint) -> int:
-    if waypoint.get("search_basis") == TARGET_REACQUISITION_SEARCH_BASIS:
+    if waypoint.get("search_basis") in (
+        TARGET_REACQUISITION_SEARCH_BASIS,
+        RECOVERY_REBASE_SEARCH_BASIS,
+    ):
         return side_search_required_slots(waypoint)
     return _advance_slots(side_search_distance(pose, waypoint)) + 1 + 1
+
+
+def _recovery_rebase_progress(
+    pose, waypoint, outbound_orientation_attempted,
+):
+    origin = PhysicalPose(
+        x_mm=waypoint["target_x_mm"],
+        y_mm=waypoint["target_y_mm"],
+        heading_mdeg=waypoint["restored_heading_mdeg"],
+    )
+    longitudinal, lateral = _axes(origin, pose.x_mm, pose.y_mm)
+    sign = 1 if waypoint["selected_side"] == "LEFT" else -1
+    lateral_remaining = sign * lateral
+    origin_error = normalize_heading_mdeg(
+        origin.heading_mdeg - pose.heading_mdeg
+    )
+    retrace_error = normalize_heading_mdeg(
+        waypoint["target_heading_mdeg"] - pose.heading_mdeg
+    )
+    phase, action = "BLOCKED", None
+    distance = round(math.hypot(longitudinal, lateral))
+    if lateral_remaining > POSITION_TOLERANCE_MM:
+        if abs(retrace_error) <= HEADING_TOLERANCE_MDEG:
+            candidate = _nominal_pose(pose, ADVANCE)
+            _next_longitudinal, next_lateral = _axes(
+                origin, candidate.x_mm, candidate.y_mm
+            )
+            if (
+                sign * next_lateral < lateral_remaining
+                and _reacquisition_action_is_clear(
+                    pose, waypoint, ADVANCE,
+                )
+            ):
+                phase, action, distance = (
+                    "OUTBOUND", ADVANCE, round(lateral_remaining)
+                )
+        elif not outbound_orientation_attempted and abs(
+            origin_error
+        ) <= HEADING_TOLERANCE_MDEG:
+            candidate = _nominal_pose(
+                pose, waypoint["rebase_turn_action"]
+            )
+            projected = normalize_heading_mdeg(
+                waypoint["target_heading_mdeg"] - candidate.heading_mdeg
+            )
+            if abs(projected) <= HEADING_TOLERANCE_MDEG:
+                phase, action = (
+                    "ORIENT_INWARD", waypoint["rebase_turn_action"]
+                )
+    elif abs(origin_error) > HEADING_TOLERANCE_MDEG:
+        candidate = _nominal_pose(pose, waypoint["restore_turn_action"])
+        projected = normalize_heading_mdeg(
+            origin.heading_mdeg - candidate.heading_mdeg
+        )
+        if abs(projected) < abs(origin_error) and abs(
+            projected
+        ) <= HEADING_TOLERANCE_MDEG:
+            phase, action = "REORIENT", waypoint["restore_turn_action"]
+    elif longitudinal < waypoint["restored_longitudinal_min_mm"]:
+        candidate = _nominal_pose(pose, ADVANCE)
+        next_longitudinal, next_lateral = _axes(
+            origin, candidate.x_mm, candidate.y_mm
+        )
+        if (
+            next_longitudinal > longitudinal
+            and abs(next_lateral) <= POSITION_TOLERANCE_MM
+            and _reacquisition_action_is_clear(pose, waypoint, ADVANCE)
+        ):
+            phase, action, distance = (
+                "OUTBOUND", ADVANCE, round(-longitudinal)
+            )
+    elif (
+        longitudinal <= waypoint["restored_longitudinal_max_mm"]
+        and abs(lateral) <= POSITION_TOLERANCE_MM
+    ):
+        phase, action = "RESCAN", SCAN_FRONT_ARC
+    return {
+        "phase": phase,
+        "distance_remaining_mm": max(0, distance),
+        "heading_error_mdeg": (
+            retrace_error if phase in ("ORIENT_INWARD", "OUTBOUND")
+            else origin_error
+        ),
+        "required_action": action,
+    }
 
 
 def side_search_progress(
@@ -583,8 +909,14 @@ def side_search_progress(
     waypoint: Mapping[str, object],
     *,
     reorientation_attempted: bool = False,
+    outbound_orientation_attempted: bool = False,
 ):
     """Derive one bounded action for the selected side observation pose."""
+
+    if waypoint.get("search_basis") == RECOVERY_REBASE_SEARCH_BASIS:
+        return _recovery_rebase_progress(
+            pose, waypoint, outbound_orientation_attempted,
+        )
 
     distance = side_search_distance(pose, waypoint)
     heading_error = normalize_heading_mdeg(
@@ -598,10 +930,13 @@ def side_search_progress(
         waypoint.get("search_basis")
         == TARGET_REACQUISITION_SEARCH_BASIS
     )
+    rebasing = (
+        waypoint.get("search_basis") == RECOVERY_REBASE_SEARCH_BASIS
+    )
     if reorientation_attempted:
         rescan_tolerance = (
             _TARGET_OBSERVATION_HEADING_TOLERANCE_MDEG
-            if reacquiring else HEADING_TOLERANCE_MDEG
+            if reacquiring or rebasing else HEADING_TOLERANCE_MDEG
         )
         if distance <= POSITION_TOLERANCE_MM and abs(
             origin_error
@@ -621,16 +956,18 @@ def side_search_progress(
                 _nominal_pose(pose, ADVANCE), waypoint
             ) < distance
             and (
-                not reacquiring
+                not (reacquiring or rebasing)
                 or _reacquisition_action_is_clear(pose, waypoint, ADVANCE)
             )
         ):
             required_action = ADVANCE
         elif (
-            reacquiring
+            (reacquiring or rebasing)
             and abs(origin_error) <= HEADING_TOLERANCE_MDEG
         ):
-            action = waypoint.get("inward_turn_action")
+            action = waypoint.get(
+                "rebase_turn_action" if rebasing else "inward_turn_action"
+            )
             if action in (TURN_LEFT_90, TURN_RIGHT_90):
                 projected_error = normalize_heading_mdeg(
                     waypoint["target_heading_mdeg"]
@@ -645,7 +982,9 @@ def side_search_progress(
     else:
         phase = "REORIENT"
         heading_error = origin_error
-        action = waypoint.get("restore_turn_action") if reacquiring else (
+        action = waypoint.get("restore_turn_action") if (
+            reacquiring or rebasing
+        ) else (
             TURN_RIGHT_90
             if waypoint["selected_side"] == "LEFT"
             else TURN_LEFT_90
@@ -657,7 +996,7 @@ def side_search_progress(
             abs(projected_error) < abs(heading_error)
             and abs(projected_error) <= HEADING_TOLERANCE_MDEG
             and (
-                not reacquiring
+                not (reacquiring or rebasing)
                 or _reacquisition_action_is_clear(pose, waypoint, action)
             )
         ):
@@ -673,12 +1012,18 @@ def side_search_progress(
 __all__ = (
     "HEADING_TOLERANCE_MDEG",
     "POSITION_TOLERANCE_MM",
+    "RECOVERY_REBASE_SEARCH_BASIS",
     "TARGET_REACQUISITION_SEARCH_BASIS",
+    "recovery_rebase_waypoint",
+    "recovery_rebase_completed",
+    "maximum_side_search_required_slots",
     "side_search_distance",
+    "side_search_advance_sweep_is_clear",
     "side_search_followup_slots",
     "side_search_progress",
     "side_search_required_slots",
     "side_search_scan_sweep_is_clear",
+    "side_search_turn_sweep_is_clear",
     "side_search_waypoint",
     "target_side_has_only_settled_no_return",
     "target_reacquisition_resolved",

@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Mapping
 
-
 logger = logging.getLogger(__name__)
 
 MAX_SPEECH_ERROR_CODE_CHARACTERS = 128
@@ -115,20 +114,41 @@ class BlastEpisodeSpeech:
             self.close()
             self._publish_failed(error, stage="start")
 
-    def offer(self, text, *, progress_revision: int) -> None:
+    def offer(self, text, *, progress_revision: int):
         if self._runtime is None or text is None:
-            return
+            return None
         try:
-            self._runtime.offer(
+            offer_with_admission = getattr(
+                self._runtime, "offer_with_admission", None,
+            )
+            offer = (
+                offer_with_admission
+                if callable(offer_with_admission)
+                else self._runtime.offer
+            )
+            admission = offer(
                 episode_id=self._context.episode_id,
                 text=text,
                 locale=self._context.request.locale,
                 progress_revision=progress_revision,
                 cancel_requested=self._cancelled,
             )
+            return admission if callable(offer_with_admission) else None
         except Exception as error:
             # A rejected utterance cannot invalidate a verified action.
             self._publish_failed(error, stage="offer")
+            return None
+
+    def await_admission(self, admission, *, cancel_requested=None) -> str:
+        if admission is None:
+            return "skipped"
+        try:
+            return admission.wait(
+                cancel_requested=cancel_requested or self._cancelled,
+            )
+        except Exception as error:
+            self._publish_failed(error, stage="admission")
+            return "failed"
 
     def cancel(self) -> None:
         if self._runtime is None:

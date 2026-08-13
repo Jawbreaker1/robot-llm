@@ -28,6 +28,7 @@ from .robot_control_contract import (
     STOPPING,
     RobotControlSettings,
     RobotControlSnapshot,
+    RobotControlTarget,
     RobotEpisodeStart,
     RobotRuntimeUpdate,
     finite_unix_ms,
@@ -54,6 +55,28 @@ class RobotControlServiceError(RuntimeError):
         self.status = status
         self.code = code
         super().__init__(message)
+
+
+class RobotEpisodeGate:
+    """Allow at most one accepted physical episode across service owners."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owner = None
+
+    def acquire(self, owner: object) -> bool:
+        if owner is None:
+            raise ValueError("Robot episode gate owner is required")
+        with self._lock:
+            if self._owner is not None:
+                return False
+            self._owner = owner
+            return True
+
+    def release(self, owner: object) -> None:
+        with self._lock:
+            if self._owner is owner:
+                self._owner = None
 
 
 @dataclass(frozen=True)
@@ -209,12 +232,14 @@ class RobotControlService:
         runtime_adapter=None,
         *,
         settings: Optional[RobotControlSettings] = None,
+        target: Optional[RobotControlTarget] = None,
         event_capacity: int = MAX_EVENTS,
         snapshot_capacity: int = MAX_SNAPSHOTS,
         event_byte_capacity: int = MAX_EVENT_HISTORY_BYTES,
         snapshot_byte_capacity: int = MAX_SNAPSHOT_HISTORY_BYTES,
         clock_ms: Clock = _default_clock_ms,
         id_factory: IDFactory = _default_id,
+        episode_gate: Optional[RobotEpisodeGate] = None,
     ):
         if (
             isinstance(event_capacity, bool)
@@ -235,6 +260,10 @@ class RobotControlService:
             <= 256 * 1024 * 1024
             or not callable(clock_ms)
             or not callable(id_factory)
+            or (
+                episode_gate is not None
+                and not isinstance(episode_gate, RobotEpisodeGate)
+            )
         ):
             raise ValueError("Robot control service configuration is invalid")
         if runtime_adapter is not None:
@@ -243,12 +272,22 @@ class RobotControlService:
                     raise ValueError(
                         "Robot runtime adapter must implement {}".format(name)
                     )
+        if (
+            target is not None
+            and not isinstance(target, RobotControlTarget)
+        ) or ((target is None) != (runtime_adapter is None)):
+            raise ValueError(
+                "Robot control target must exist exactly when a runtime "
+                "adapter is configured"
+            )
         self._adapter = runtime_adapter
+        self._target = target
         self._settings = settings or RobotControlSettings()
         if not isinstance(self._settings, RobotControlSettings):
             raise ValueError("Robot control settings are invalid")
         self._clock_ms = clock_ms
         self._id_factory = id_factory
+        self._episode_gate = episode_gate
         self._lock = threading.RLock()
         self._state = IDLE if runtime_adapter is not None else DISABLED
         self._accepting = True
@@ -383,6 +422,7 @@ class RobotControlService:
             sequence=sequence,
             state=self._state,
             enabled=self._adapter is not None,
+            target=self._target,
             accepting=self._accepting,
             settings=self._settings,
             episode_id=self._episode_id,
@@ -452,6 +492,13 @@ class RobotControlService:
                 "Robot episode finished",
                 {"terminal_reason": self._terminal_reason},
             )
+        if (
+            self._episode_gate is not None
+            and self._thread is None
+            and self._control_signals_inflight == 0
+            and self._state not in ACTIVE_STATES
+        ):
+            self._episode_gate.release(self)
 
     def _remember_request_locked(
         self,
@@ -593,39 +640,15 @@ class RobotControlService:
                     "Robot settings revision does not match",
                 )
             episode_id = _validated_id("episode", self._id_factory)
-            self._episode_id = episode_id
-            self._request = request
-            self._started_at_unix_ms = self._now()
-            self._terminal_reason = None
-            self._last_error_code = None
-            self._last_primary_error_code = None
-            self._last_primary_error_message = None
-            self._runtime = RobotRuntimeUpdate(
-                speech_status=(
-                    "idle"
-                    if self._settings.speech_enabled
-                    else "disabled"
-                )
-            )
-            self._stop_requested = threading.Event()
-            self._emergency_stop_requested = threading.Event()
-            self._remember_request_locked(request, episode_id)
-            snapshot = self._transition_locked(
-                STARTING,
-                "robot.episode_starting",
-                "Robot episode is starting",
-                {
-                    "client_request_id": client_request_id,
-                    "settings_revision": self._settings.revision,
-                    "locale": locale,
-                },
-            )
+            started_at_unix_ms = self._now()
+            stop_requested = threading.Event()
+            emergency_stop_requested = threading.Event()
             context = RobotEpisodeContext(
                 episode_id=episode_id,
                 request=request,
                 settings=self._settings,
-                stop_requested=self._stop_requested,
-                emergency_stop_requested=self._emergency_stop_requested,
+                stop_requested=stop_requested,
+                emergency_stop_requested=emergency_stop_requested,
                 publish=lambda update: self._publish(
                     episode_id,
                     update,
@@ -637,8 +660,88 @@ class RobotControlService:
                 name="robot-control-{}".format(episode_id),
                 daemon=True,
             )
-            self._thread = thread
-            thread.start()
+            if (
+                self._episode_gate is not None
+                and not self._episode_gate.acquire(self)
+            ):
+                raise RobotControlServiceError(
+                    409,
+                    "robot_episode_gate_busy",
+                    "Another robot episode is already active",
+                )
+            previous = (
+                self._episode_id,
+                self._request,
+                self._started_at_unix_ms,
+                self._terminal_reason,
+                self._last_error_code,
+                self._last_primary_error_code,
+                self._last_primary_error_message,
+                self._runtime,
+                self._stop_requested,
+                self._emergency_stop_requested,
+                self._thread,
+                self._state,
+            )
+            try:
+                self._episode_id = episode_id
+                self._request = request
+                self._started_at_unix_ms = started_at_unix_ms
+                self._terminal_reason = None
+                self._last_error_code = None
+                self._last_primary_error_code = None
+                self._last_primary_error_message = None
+                self._runtime = RobotRuntimeUpdate(
+                    speech_status=(
+                        "idle"
+                        if self._settings.speech_enabled
+                        else "disabled"
+                    )
+                )
+                self._stop_requested = stop_requested
+                self._emergency_stop_requested = emergency_stop_requested
+                self._remember_request_locked(request, episode_id)
+                snapshot = self._transition_locked(
+                    STARTING,
+                    "robot.episode_starting",
+                    "Robot episode is starting",
+                    {
+                        "client_request_id": client_request_id,
+                        "settings_revision": self._settings.revision,
+                        "locale": locale,
+                    },
+                )
+                self._thread = thread
+                thread.start()
+            except BaseException:
+                (
+                    self._episode_id,
+                    self._request,
+                    self._started_at_unix_ms,
+                    self._terminal_reason,
+                    self._last_error_code,
+                    self._last_primary_error_code,
+                    self._last_primary_error_message,
+                    self._runtime,
+                    self._stop_requested,
+                    self._emergency_stop_requested,
+                    self._thread,
+                    self._state,
+                ) = previous
+                remembered = self._request_history.get(client_request_id)
+                if remembered == (request, episode_id):
+                    self._request_history.pop(client_request_id, None)
+                    try:
+                        self._request_order.remove(client_request_id)
+                    except ValueError:
+                        pass
+                if self._episode_gate is not None:
+                    self._episode_gate.release(self)
+                try:
+                    self._record_snapshot_locked()
+                except Exception:
+                    pass
+                raise
             return {
                 "accepted_episode_id": episode_id,
                 "idempotent": False,
@@ -784,7 +887,12 @@ class RobotControlService:
                 # unwinding.  It is not the failure diagnosis and must not
                 # remain presented as the episode's final message.
                 self._runtime = RobotRuntimeUpdate.from_mapping(
-                    {"message": None},
+                    {
+                        "current_action": None,
+                        "active_route": None,
+                        "plan": [],
+                        "message": None,
+                    },
                     self._runtime,
                 )
                 fault_data = {
@@ -922,6 +1030,7 @@ class RobotControlService:
                     level="error",
                 )
                 self._control_signals_inflight -= 1
+                self._finish_stopping_if_quiescent_locked()
             raise RobotControlServiceError(
                 503,
                 "robot_emergency_stop_failed",

@@ -97,6 +97,49 @@ class DashboardServiceError(RuntimeError):
         super().__init__(message)
 
 
+def strict_spatial_map_snapshot(
+    provider,
+    *,
+    expected_schema: str = SPATIAL_MAP_SCHEMA,
+):
+    """Detach and validate one read-only spatial-map provider result."""
+
+    try:
+        operation = getattr(provider, "snapshot", None)
+        if not callable(operation):
+            operation = getattr(provider, "spatial_map", None)
+        if not callable(operation):
+            operation = provider
+        if not callable(operation):
+            raise ValueError("map provider is unavailable")
+        supplied = operation()
+        to_dict = getattr(supplied, "to_dict", None)
+        if callable(to_dict):
+            supplied = to_dict()
+        encoded = json.dumps(
+            supplied,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded) > MAX_SPATIAL_MAP_BYTES:
+            raise ValueError("map snapshot is too large")
+        snapshot = strict_json_object(encoded)
+        if (
+            snapshot.get("schema") != expected_schema
+            or snapshot.get("read_only") is not True
+        ):
+            raise ValueError("map snapshot contract mismatch")
+    except Exception:
+        raise DashboardServiceError(
+            503,
+            "spatial_map_unavailable",
+            "Spatial map snapshot is unavailable",
+        ) from None
+    return snapshot
+
+
 @dataclass(frozen=True)
 class _ChatJob:
     turn: ChatTurn
@@ -803,33 +846,7 @@ class DashboardService:
         JSON so callers cannot mutate provider state through the dashboard.
         """
 
-        try:
-            supplied = self._spatial_map_provider()
-            to_dict = getattr(supplied, "to_dict", None)
-            if callable(to_dict):
-                supplied = to_dict()
-            encoded = json.dumps(
-                supplied,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-            if len(encoded) > MAX_SPATIAL_MAP_BYTES:
-                raise ValueError("map snapshot is too large")
-            snapshot = strict_json_object(encoded)
-            if (
-                snapshot.get("schema") != SPATIAL_MAP_SCHEMA
-                or snapshot.get("read_only") is not True
-            ):
-                raise ValueError("map snapshot contract mismatch")
-        except Exception:
-            raise DashboardServiceError(
-                503,
-                "spatial_map_unavailable",
-                "Spatial map snapshot is unavailable",
-            ) from None
-        return snapshot
+        return strict_spatial_map_snapshot(self._spatial_map_provider)
 
     def shared_spatial_map(self):
         """Return one detached, finite shared-world map snapshot."""
@@ -840,33 +857,10 @@ class DashboardService:
                 "spatial_map_unavailable",
                 "Spatial map snapshot is unavailable",
             )
-        try:
-            supplied = self._shared_spatial_map_provider()
-            to_dict = getattr(supplied, "to_dict", None)
-            if callable(to_dict):
-                supplied = to_dict()
-            encoded = json.dumps(
-                supplied,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-            if len(encoded) > MAX_SPATIAL_MAP_BYTES:
-                raise ValueError("map snapshot is too large")
-            snapshot = strict_json_object(encoded)
-            if (
-                snapshot.get("schema") != SHARED_SPATIAL_MAP_SCHEMA
-                or snapshot.get("read_only") is not True
-            ):
-                raise ValueError("map snapshot contract mismatch")
-        except Exception:
-            raise DashboardServiceError(
-                503,
-                "spatial_map_unavailable",
-                "Spatial map snapshot is unavailable",
-            ) from None
-        return snapshot
+        return strict_spatial_map_snapshot(
+            self._shared_spatial_map_provider,
+            expected_schema=SHARED_SPATIAL_MAP_SCHEMA,
+        )
 
     @staticmethod
     def experiments():

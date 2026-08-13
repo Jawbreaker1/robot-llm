@@ -36,9 +36,21 @@ class SideSearchNavigationState:
     reorientation_attempted: bool = False
     previous_outbound_distance_mm: int | None = None
     host_actions: tuple[str, ...] = ()
+    recovery_rebase: bool = False
+    recovery_action_start: int | None = None
+    outbound_orientation_attempted: bool = False
 
     def mark_reorientation_attempted(self) -> "SideSearchNavigationState":
-        return replace(self, reorientation_attempted=True)
+        return replace(
+            self,
+            reorientation_attempted=True,
+            previous_outbound_distance_mm=None,
+        )
+
+    def mark_outbound_orientation_attempted(
+        self,
+    ) -> "SideSearchNavigationState":
+        return replace(self, outbound_orientation_attempted=True)
 
     def record_host_action(
         self,
@@ -65,6 +77,19 @@ class SideSearchNavigationState:
             waypoint=waypoint,
             reorientation_attempted=False,
             previous_outbound_distance_mm=None,
+        )
+
+    def begin_recovery_rebase(
+        self, waypoint: Mapping,
+    ) -> "SideSearchNavigationState":
+        return replace(
+            self,
+            waypoint=waypoint,
+            reorientation_attempted=False,
+            previous_outbound_distance_mm=None,
+            recovery_rebase=True,
+            recovery_action_start=len(self.host_actions),
+            outbound_orientation_attempted=False,
         )
 
     def bind_local_detour(

@@ -77,7 +77,8 @@ class BlastNavigationStateTests(unittest.TestCase):
         self.assertEqual(initial.host_actions, ())
         self.assertIsNone(initial.previous_outbound_distance_mm)
         self.assertEqual(restored.host_actions, (ADVANCE, TURN_RIGHT_90))
-        self.assertEqual(restored.previous_outbound_distance_mm, 180)
+        self.assertEqual(moved.previous_outbound_distance_mm, 180)
+        self.assertIsNone(restored.previous_outbound_distance_mm)
         self.assertTrue(restored.reorientation_attempted)
 
     def test_reacquisition_resets_only_waypoint_progress(self):

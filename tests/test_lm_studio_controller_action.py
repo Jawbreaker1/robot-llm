@@ -114,6 +114,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         self.assertEqual(supplied["observation"]["distance_mm"], 480)
         self.assertEqual(supplied["goal"], context().goal)
         self.assertTrue(supplied["completion_allowed"])
+        self.assertTrue(supplied["abort_allowed"])
         self.assertNotIn("robot_relative_side_scan", supplied)
         action_schema = request["response_format"]["json_schema"][
             "schema"
@@ -181,6 +182,10 @@ class ControllerActionPlannerTests(unittest.TestCase):
             "schema"
         ]["properties"]["utterance"]["oneOf"][0]
         self.assertEqual(utterance_schema["maxLength"], maximum)
+        self.assertIn(
+            "at or below 120 Unicode characters",
+            request["messages"][0]["content"],
+        )
 
         rejected, _ = self.planner(
             completion({
@@ -194,6 +199,28 @@ class ControllerActionPlannerTests(unittest.TestCase):
         )
         with self.assertRaises(LMStudioProtocolError):
             rejected.decide(context())
+
+    def test_blast_bound_rejects_the_live_eight_second_utterance(self):
+        live_utterance = (
+            "Nu rör vi oss! 46 millimeter är en bra början, men vi har "
+            "inte ens sett hindren än. Dags att skanna av terrängen så jag激"
+        )
+        self.assertEqual(len(live_utterance), 120)
+        planner, _ = self.planner(
+            completion({
+                "action": SCAN_FRONT_ARC,
+                "confidence_milli": 900,
+                "assessment": "Terrängen behöver skannas.",
+                "plan": [SCAN_FRONT_ARC],
+                "utterance": live_utterance,
+            }),
+            max_utterance_chars=72,
+        )
+
+        with self.assertRaises(LMStudioProtocolError):
+            planner.decide(context(
+                available_actions=(SCAN_FRONT_ARC,),
+            ))
 
     def test_rejects_invalid_utterance_limits(self):
         for maximum in (
@@ -322,6 +349,64 @@ class ControllerActionPlannerTests(unittest.TestCase):
         with self.assertRaises(LMStudioProtocolError):
             invalid.decide(context(completion_allowed=False))
 
+    def test_abort_can_be_withheld_while_safe_actions_remain(self):
+        planner, transport = self.planner(completion({
+            "action": "TURN_LEFT",
+            "confidence_milli": 800,
+            "assessment": "Jag provar en annan säker observation.",
+            "plan": ["TURN_LEFT"],
+            "utterance": None,
+        }))
+
+        planner.decide(context(
+            completion_allowed=False,
+            abort_allowed=False,
+        ))
+
+        request = json.loads(transport.calls[0][1])
+        supplied = json.loads(request["messages"][1]["content"])
+        choices = request["response_format"]["json_schema"][
+            "schema"
+        ]["properties"]["action"]["enum"]
+        self.assertFalse(supplied["abort_allowed"])
+        self.assertNotIn("ABORT", choices)
+        self.assertNotIn(COMPLETE, choices)
+
+        invalid, _ = self.planner(completion({
+            "action": "ABORT",
+            "confidence_milli": 900,
+            "assessment": "Avbryt.",
+            "plan": [],
+            "utterance": None,
+        }))
+        with self.assertRaises(LMStudioProtocolError):
+            invalid.decide(context(
+                completion_allowed=False,
+                abort_allowed=False,
+            ))
+
+    def test_empty_motion_actions_expose_only_terminal_choices(self):
+        planner, transport = self.planner(completion({
+            "action": COMPLETE,
+            "confidence_milli": 900,
+            "assessment": "Målet är verifierat trots den blockerade fronten.",
+            "plan": [],
+            "utterance": None,
+        }))
+
+        result = planner.decide(context(available_actions=()))
+
+        self.assertEqual(result.decision.action, COMPLETE)
+        request = json.loads(transport.calls[0][1])
+        supplied = json.loads(request["messages"][1]["content"])
+        action_schema = request["response_format"]["json_schema"][
+            "schema"
+        ]["properties"]["action"]
+        self.assertEqual(supplied["available_actions"], [])
+        self.assertEqual(action_schema["enum"], [COMPLETE, "ABORT"])
+        with self.assertRaises(LMStudioInputError):
+            context(available_actions=(), completion_allowed=False)
+
     def test_scan_action_is_described_as_a_returning_two_sided_sweep(self):
         planner, transport = self.planner(completion({
             "action": SCAN_FRONT_ARC,
@@ -408,6 +493,49 @@ class ControllerActionPlannerTests(unittest.TestCase):
             "host does not rank or choose the turn side",
         ):
             self.assertIn(instruction, system_prompt)
+
+    def test_local_map_evidence_is_optional_echo_only_context(self):
+        local_map = {
+            "schema": "blast-local-map-evidence/v1",
+            "frame": "EPISODE_LOCAL_ODOMETRY",
+            "robot_pose": {"x_mm": 45, "y_mm": 0, "heading_mdeg": 0},
+            "directional_goal": {
+                "target_x_mm": 420,
+                "target_y_mm": 0,
+                "remaining_forward_progress_mm": 375,
+            },
+            "scan_views": [{
+                "scan_id": "episode-a-scan-1",
+                "scan_pose": {"x_mm": 0, "y_mm": 0, "heading_mdeg": 0},
+                "echo_points": [{"x_mm": 250, "y_mm": -180}],
+            }],
+            "unobserved_space": "UNKNOWN_NOT_FREE",
+            "occupancy_model": "NONE",
+        }
+        planner, transport = self.planner(completion({
+            "action": SCAN_FRONT_ARC,
+            "confidence_milli": 800,
+            "assessment": "Jag behöver undersöka den okända korridoren.",
+            "plan": [SCAN_FRONT_ARC],
+            "utterance": None,
+        }))
+
+        planner.decide(context(
+            available_actions=(SCAN_FRONT_ARC,),
+            local_map_evidence=local_map,
+        ))
+
+        request = json.loads(transport.calls[0][1])
+        supplied = json.loads(request["messages"][1]["content"])
+        self.assertEqual(supplied["local_map_evidence"], local_map)
+        system_prompt = request["messages"][0]["content"]
+        self.assertIn("accumulated echo points", system_prompt)
+        self.assertIn("Unobserved space is unknown, never free", system_prompt)
+        self.assertIn("has not selected a corridor", system_prompt)
+        self.assertNotIn("local_map_evidence", context().to_dict())
+
+        with self.assertRaises(LMStudioInputError):
+            context(local_map_evidence=[])
 
     def test_nonterminal_plan_must_start_with_selected_action(self):
         planner, _ = self.planner(completion({

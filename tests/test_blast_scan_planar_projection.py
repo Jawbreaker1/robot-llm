@@ -10,6 +10,7 @@ from robot_agent.blast_observation_monitor import (
     SCAN_RESULT_SCHEMA,
     blast_range_state,
 )
+from robot_agent.blast_scan_observation import SCAN_ANGULAR_RAY_SIDES
 from robot_agent.blast_scan_planar_projection import (
     project_blast_scan_planar_surfaces,
 )
@@ -17,15 +18,46 @@ from robot_agent.physical_odometry import PhysicalPose
 
 
 def scan_result(ranges=(300.0, 2_000.0, 2_000.0, 2_000.0, 2_000.0)):
-    relative = (0.0, -45.0, -90.0, 45.0, 90.0)
+    relative = (0.0, -44.1, -88.2, 44.1, 88.2)
+    turn_scale = 0.490
+
+    def encoder_delta(bearing):
+        opposed = round(abs(bearing) / turn_scale)
+        if bearing < 0:
+            return {"left_drive": -opposed, "right_drive": opposed}
+        if bearing > 0:
+            return {"left_drive": opposed, "right_drive": -opposed}
+        return {"left_drive": 0, "right_drive": 0}
+
     return {
         "schema": SCAN_RESULT_SCHEMA,
         "state": "complete",
         "result": "restored",
+        "bearing_source": "DRIVE_ENCODER_ODOMETRY",
+        "bearing_frame": "ROBOT_RELATIVE_AT_SCAN_START",
         "start_heading_deg": 0.0,
         "final_heading_deg": 0.0,
         "restoration_error_deg": 0.0,
         "restoration_verified": True,
+        "encoder_start_angles_deg": {
+            "left_drive": 100, "right_drive": 200,
+        },
+        "encoder_final_angles_deg": {
+            "left_drive": 100, "right_drive": 200,
+        },
+        "encoder_restoration": {
+            "common_mode_residue_mm": 0.0,
+            "opposed_residue_deg": 0.0,
+            "motion_stopped": True,
+            "observation_settled": True,
+            "body_pose_verified": True,
+        },
+        "imu_heading_diagnostics": {
+            "authority": "DIAGNOSTIC_ONLY",
+            "start_heading_deg": 0.0,
+            "final_heading_deg": 0.0,
+            "restoration_error_deg": 0.0,
+        },
         "all_observations_settled": True,
         "rays": [
             {
@@ -35,6 +67,8 @@ def scan_result(ranges=(300.0, 2_000.0, 2_000.0, 2_000.0, 2_000.0)):
                 "body_motor_angle_deg": 158,
                 "heading_deg": heading,
                 "relative_heading_deg": heading,
+                "imu_heading_deg": heading,
+                "drive_encoder_delta_deg": encoder_delta(heading),
                 "observation_settled": True,
             }
             for side, distance, heading in zip(
@@ -44,6 +78,52 @@ def scan_result(ranges=(300.0, 2_000.0, 2_000.0, 2_000.0, 2_000.0)):
             )
         ],
     }
+
+
+def dense_scan_result(ranges, relative):
+    value = scan_result()
+    turn_scale = 0.490
+
+    def encoder_evidence(bearing):
+        opposed = round(abs(bearing) / turn_scale)
+        if bearing < 0:
+            delta = {"left_drive": -opposed, "right_drive": opposed}
+            return delta, -opposed * turn_scale
+        if bearing > 0:
+            delta = {"left_drive": opposed, "right_drive": -opposed}
+            return delta, opposed * turn_scale
+        return {"left_drive": 0, "right_drive": 0}, 0.0
+
+    value["angular_rays"] = [
+        {
+            "side": side,
+            "distance_mm": distance,
+            "range_state": blast_range_state(distance),
+            "body_motor_angle_deg": 158,
+            "heading_deg": encoder_evidence(heading)[1],
+            "relative_heading_deg": encoder_evidence(heading)[1],
+            "imu_heading_deg": heading,
+            "drive_encoder_delta_deg": encoder_evidence(heading)[0],
+            "observation_settled": True,
+        }
+        for side, distance, heading in zip(
+            SCAN_ANGULAR_RAY_SIDES, ranges, relative,
+        )
+    ]
+    value["rays"] = [
+        {
+            **deepcopy(value["angular_rays"][dense]),
+            "side": side,
+        }
+        for dense, side in (
+            (0, "center"),
+            (2, "left_near"),
+            (4, "left_far"),
+            (6, "right_near"),
+            (8, "right_far"),
+        )
+    ]
+    return value
 
 
 def projected_points(scan=None, pose=None):
@@ -71,6 +151,53 @@ _SIDE_FIELDS = (
 
 
 class BlastScanPlanarProjectionTests(TestCase):
+    def test_calibrated_wide_scan_projects_both_ninety_five_degree_edges(self):
+        scan = dense_scan_result(
+            (300,) * 9,
+            (0.0, -23.52, -47.04, -70.56, -94.57,
+             23.52, 47.04, 70.56, 94.57),
+        )
+
+        points = projected_points(scan)
+
+        self.assertEqual(
+            [points[index]["relative_bearing_mdeg"] for index in (4, 8)],
+            [94_570, -94_570],
+        )
+
+    def test_scan_bearing_over_one_hundred_degrees_is_rejected(self):
+        scan = dense_scan_result(
+            (300,) * 9,
+            (0.0, -25.0, -50.0, -75.0, -100.45,
+             25.0, 50.0, 75.0, 100.45),
+        )
+
+        with self.assertRaises(ValueError):
+            projected_points(scan)
+
+    def test_live_dense_scan_projects_all_nine_settled_measured_rays(self):
+        scan = dense_scan_result(
+            (265, 285, 310, 351, 379, 250, 250, 251, 1_228),
+            (0.0, -9.98, -21.16, -32.58, -43.90,
+             11.48, 22.21, 33.75, 44.56),
+        )
+
+        points = projected_points(scan)
+
+        self.assertEqual(
+            [point["side"] for point in points],
+            list(SCAN_ANGULAR_RAY_SIDES),
+        )
+        right_three = points[7]
+        self.assertEqual(
+            (
+                right_three["relative_bearing_mdeg"],
+                right_three["nominal_echo_x_mm"],
+                right_three["nominal_echo_y_mm"],
+            ),
+            (-33_810, 344, -134),
+        )
+
     def test_center_echo_uses_extrinsics_and_pose_heading(self):
         cases = (
             (PhysicalPose(), (110, 80, 0, 410, 80)),
@@ -91,24 +218,27 @@ class BlastScanPlanarProjectionTests(TestCase):
 
         self.assertEqual(
             tuple(left[field] for field in _SIDE_FIELDS),
-            ("left_far", 90_000, -80, 110, -80, 410),
+            ("left_far", 88_200, -77, 112, -67, 412),
         )
         self.assertEqual(
             tuple(right[field] for field in _SIDE_FIELDS),
-            ("right_far", -90_000, 80, -110, 80, -410),
+            ("right_far", -88_200, 83, -107, 93, -407),
         )
 
     def test_heading_wrap_is_normalized(self):
         scan = scan_result((2_000.0, 100.0, 2_000.0, 2_000.0, 2_000.0))
-        scan["rays"][1]["heading_deg"] = -30.0
-        scan["rays"][1]["relative_heading_deg"] = -30.0
+        scan["rays"][1]["heading_deg"] = -29.89
+        scan["rays"][1]["relative_heading_deg"] = -29.89
+        scan["rays"][1]["drive_encoder_delta_deg"] = {
+            "left_drive": -61, "right_drive": 61,
+        }
         point = projected_points(
             scan,
             PhysicalPose(heading_mdeg=170_000),
         )[0]
 
-        self.assertEqual(point["relative_bearing_mdeg"], 30_000)
-        self.assertEqual(point["beam_heading_mdeg"], -160_000)
+        self.assertEqual(point["relative_bearing_mdeg"], 29_890)
+        self.assertEqual(point["beam_heading_mdeg"], -160_110)
 
     def test_sensor_yaw_rotates_beam_but_not_mounted_origin(self):
         calibration = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION

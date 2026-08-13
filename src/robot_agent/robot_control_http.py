@@ -13,6 +13,7 @@ from typing import Mapping
 from urllib.parse import parse_qs
 
 from .dashboard_contract import DashboardContractError, strict_json_loads
+from .dashboard_service import strict_spatial_map_snapshot
 from .robot_control_service import (
     MAX_ROBOT_PAGE_RESPONSE_BYTES,
     RobotControlServiceError,
@@ -20,6 +21,8 @@ from .robot_control_service import (
 
 
 ROBOT_API_PREFIX = "/api/v1/robot/"
+ROBOTS_DIRECTORY_PATH = "/api/v1/robots"
+ROBOTS_API_PREFIX = ROBOTS_DIRECTORY_PATH + "/"
 CONTROLLER_API_PREFIX = "/api/v1/controllers/"
 BLAST_COMMAND_PATH = "/api/v1/controllers/blast-01.hub/commands"
 BLAST_CONNECTION_PATH = "/api/v1/controllers/blast-01.hub/connection"
@@ -505,6 +508,214 @@ class RobotControlHTTPRouter:
                 )
             return RobotControlHTTPResponse(200, value)
 
+        raise RobotControlHTTPError(
+            404,
+            "robot_route_not_found",
+            "Robot route was not found",
+        )
+
+
+class RobotControlHTTPDirectoryRouter:
+    """Select one existing one-robot router by its immutable robot ID."""
+
+    _OPERATIONS = frozenset((
+        "status",
+        "settings",
+        "episodes",
+        "turns",
+        "stop",
+        "emergency-stop",
+        "events",
+        "snapshots",
+    ))
+    _SPATIAL_MAP_OPERATION = "spatial-map"
+
+    def __init__(
+        self,
+        routers: Mapping[str, RobotControlHTTPRouter],
+        *,
+        default_router: RobotControlHTTPRouter,
+        default_robot_id=None,
+        spatial_map_providers=None,
+    ):
+        map_providers = (
+            {} if spatial_map_providers is None else spatial_map_providers
+        )
+        if (
+            not isinstance(routers, Mapping)
+            or not isinstance(default_router, RobotControlHTTPRouter)
+            or not isinstance(map_providers, Mapping)
+            or any(
+                not isinstance(robot_id, str)
+                or not robot_id
+                or robot_id != robot_id.strip()
+                or "/" in robot_id
+                or not isinstance(router, RobotControlHTTPRouter)
+                for robot_id, router in routers.items()
+            )
+            or (
+                default_robot_id is not None
+                and default_robot_id not in routers
+            )
+            or not set(map_providers) <= set(routers)
+        ):
+            raise ValueError("Robot control HTTP directory is invalid")
+        self._routers = dict(routers)
+        self._default_router = default_router
+        self._default_robot_id = default_robot_id
+        self._spatial_map_providers = dict(map_providers)
+
+    @staticmethod
+    def handles(path: str) -> bool:
+        return isinstance(path, str) and (
+            path == ROBOTS_DIRECTORY_PATH
+            or path.startswith(ROBOTS_API_PREFIX)
+            or RobotControlHTTPRouter.handles(path)
+        )
+
+    def _directory(self, method: str, query: str, body: bytes):
+        if method != "GET":
+            raise RobotControlHTTPError(
+                404,
+                "robot_route_not_found",
+                "Robot route was not found",
+            )
+        RobotControlHTTPRouter._no_query(
+            query,
+            "Robot directory endpoint",
+        )
+        controls = []
+        for robot_id in sorted(self._routers):
+            response = self._routers[robot_id].handle(
+                "GET",
+                "/api/v1/robot/status",
+                "",
+                body,
+            )
+            control = response.body.get("control")
+            target = (
+                control.get("target")
+                if isinstance(control, Mapping)
+                else None
+            )
+            if (
+                not isinstance(target, Mapping)
+                or target.get("robot_id") != robot_id
+            ):
+                raise RobotControlHTTPError(
+                    500,
+                    "robot_directory_target_mismatch",
+                    "Robot directory target does not match its service",
+                )
+            controls.append(control)
+        return RobotControlHTTPResponse(
+            200,
+            {
+                "schema": "robot-control-directory/v1",
+                "controls": controls,
+            },
+        )
+
+    def _scoped_router(self, path: str):
+        remainder = path[len(ROBOTS_API_PREFIX):]
+        robot_id, separator, operation = remainder.partition("/")
+        if (
+            not separator
+            or not robot_id
+            or operation not in self._OPERATIONS
+        ):
+            raise RobotControlHTTPError(
+                404,
+                "robot_route_not_found",
+                "Robot route was not found",
+            )
+        router = self._routers.get(robot_id)
+        if router is None:
+            raise RobotControlHTTPError(
+                404,
+                "robot_target_not_found",
+                "Robot target was not found",
+            )
+        return router, "/api/v1/robot/{}".format(operation)
+
+    def _scoped_spatial_map(
+        self,
+        method: str,
+        path: str,
+        query: str,
+    ):
+        remainder = path[len(ROBOTS_API_PREFIX):]
+        robot_id, separator, operation = remainder.partition("/")
+        if (
+            not separator
+            or operation != self._SPATIAL_MAP_OPERATION
+        ):
+            return None
+        if robot_id not in self._routers:
+            raise RobotControlHTTPError(
+                404,
+                "robot_target_not_found",
+                "Robot target was not found",
+            )
+        if method != "GET":
+            raise RobotControlHTTPError(
+                404,
+                "robot_route_not_found",
+                "Robot route was not found",
+            )
+        RobotControlHTTPRouter._no_query(
+            query,
+            "Robot spatial map endpoint",
+        )
+        provider = self._spatial_map_providers.get(robot_id)
+        if provider is None:
+            raise RobotControlHTTPError(
+                503,
+                "spatial_map_unavailable",
+                "Spatial map snapshot is unavailable",
+            )
+        try:
+            snapshot = strict_spatial_map_snapshot(provider)
+        except Exception as error:
+            status = getattr(error, "status", None)
+            code = getattr(error, "code", None)
+            if isinstance(status, int) and isinstance(code, str) and code:
+                raise RobotControlHTTPError(
+                    status,
+                    code,
+                    str(error),
+                ) from None
+            raise
+        value = {"map": snapshot}
+        if _response_size(value) > MAX_ROBOT_PAGE_RESPONSE_BYTES:
+            raise RobotControlHTTPError(
+                503,
+                "spatial_map_unavailable",
+                "Spatial map response exceeds its byte capacity",
+            )
+        return RobotControlHTTPResponse(200, value)
+
+    def handle(
+        self,
+        method: str,
+        path: str,
+        query: str,
+        body: bytes,
+    ) -> RobotControlHTTPResponse:
+        if path == ROBOTS_DIRECTORY_PATH:
+            return self._directory(method, query, body)
+        if path.startswith(ROBOTS_API_PREFIX):
+            spatial_map = self._scoped_spatial_map(
+                method,
+                path,
+                query,
+            )
+            if spatial_map is not None:
+                return spatial_map
+            router, delegated_path = self._scoped_router(path)
+            return router.handle(method, delegated_path, query, body)
+        if RobotControlHTTPRouter.handles(path):
+            return self._default_router.handle(method, path, query, body)
         raise RobotControlHTTPError(
             404,
             "robot_route_not_found",

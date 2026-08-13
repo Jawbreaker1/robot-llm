@@ -514,7 +514,8 @@
       throw new TypeError("Robot mission panel dependencies are invalid.");
     }
     const byId = (id) => documentApi.getElementById(id);
-    const history = createHistoryStore();
+    let robotId = text(options.robotId, "ev3rstorm-01");
+    let history = createHistoryStore();
     let control = normalizeSnapshot({});
     let connection = "waiting";
     let busy = false;
@@ -522,6 +523,7 @@
     let stopped = false;
     let hasControl = false;
     let pollTimer = null;
+    let targetGeneration = 0;
     let renderedTimelineSignature = "";
     let renderedAnnouncementSignature = "";
 
@@ -977,26 +979,36 @@
         return false;
       }
       busy = true;
+      const requestedRobotId = robotId;
+      const requestedHistory = history;
+      const requestedGeneration = targetGeneration;
       try {
         for (let page = 0; page < MAX_CATCH_UP_PAGES; page += 1) {
-          const cursors = history.cursors();
+          const cursors = requestedHistory.cursors();
+          const endpoint = (
+            `/api/v1/robots/${encodeURIComponent(requestedRobotId)}`
+          );
           const results = await Promise.allSettled([
             request(
-              `/api/v1/robot/events?after_sequence=${cursors.event}&limit=500`,
+              `${endpoint}/events?after_sequence=${cursors.event}&limit=500`,
               { timeout: 5000 },
             ),
             request(
-              `/api/v1/robot/snapshots?after_sequence=${cursors.snapshot}&limit=500`,
+              `${endpoint}/snapshots?after_sequence=${cursors.snapshot}&limit=500`,
               { timeout: 5000 },
             ),
           ]);
-          if (stopped) {
+          if (
+            stopped
+            || robotId !== requestedRobotId
+            || targetGeneration !== requestedGeneration
+          ) {
             return false;
           }
           let accepted = 0;
           if (results[0].status === "fulfilled") {
             try {
-              if (history.ingestEvents(results[0].value)) {
+              if (requestedHistory.ingestEvents(results[0].value)) {
                 accepted += 1;
               }
             } catch (_error) {
@@ -1005,7 +1017,7 @@
           }
           if (results[1].status === "fulfilled") {
             try {
-              if (history.ingestSnapshots(results[1].value)) {
+              if (requestedHistory.ingestSnapshots(results[1].value)) {
                 accepted += 1;
               }
             } catch (_error) {
@@ -1016,11 +1028,11 @@
             connection = accepted === 1 ? "partial" : "offline";
             break;
           }
-          if (history.caughtUp()) {
+          if (requestedHistory.caughtUp()) {
             connection = "live";
             break;
           }
-          const advanced = history.cursors();
+          const advanced = requestedHistory.cursors();
           if (
             advanced.event <= cursors.event
             && advanced.snapshot <= cursors.snapshot
@@ -1033,11 +1045,21 @@
         render();
         return connection === "live";
       } catch (_error) {
-        connection = "offline";
-        renderConnection();
+        if (
+          robotId === requestedRobotId
+          && targetGeneration === requestedGeneration
+        ) {
+          connection = "offline";
+          renderConnection();
+        }
         return false;
       } finally {
-        busy = false;
+        if (
+          robotId === requestedRobotId
+          && targetGeneration === requestedGeneration
+        ) {
+          busy = false;
+        }
       }
     }
 
@@ -1091,6 +1113,31 @@
       return true;
     }
 
+    function setRobotId(nextRobotId) {
+      const next = text(nextRobotId);
+      if (!next) {
+        throw new TypeError("Robot mission panel target is invalid.");
+      }
+      if (next === robotId) {
+        return false;
+      }
+      robotId = next;
+      targetGeneration += 1;
+      history = createHistoryStore();
+      control = normalizeSnapshot({});
+      connection = "waiting";
+      busy = false;
+      hasControl = false;
+      renderedTimelineSignature = "";
+      renderedAnnouncementSignature = "";
+      render();
+      if (initialized && !stopped) {
+        void refreshHistory();
+        schedulePoll();
+      }
+      return true;
+    }
+
     async function initialize() {
       if (stopped) {
         return;
@@ -1109,6 +1156,7 @@
         render();
       },
       setControl,
+      setRobotId,
       stopPolling,
     });
   }

@@ -2,7 +2,10 @@ import json
 import unittest
 
 from robot_agent.dashboard_http import DashboardRouter
-from robot_agent.robot_control_http import RobotControlHTTPRouter
+from robot_agent.robot_control_http import (
+    RobotControlHTTPDirectoryRouter,
+    RobotControlHTTPRouter,
+)
 
 from tests.test_dashboard_http import FakeDashboardService
 from tests.test_robot_control_http import (
@@ -133,6 +136,41 @@ class RobotControlDashboardIntegrationTests(unittest.TestCase):
             input_service.calls,
             [("Vad ser du?", "sv", "robot-turn-1", 3)],
         )
+
+    def test_authenticated_scoped_spatial_map_has_strict_envelope(self):
+        blast = FakeRobotControlService("blast-01", "BLAST")
+        blast_router = RobotControlHTTPRouter(blast)
+        router = DashboardRouter(
+            service=FakeDashboardService(),
+            session_token=TOKEN,
+            expected_host=HOST,
+            robot_control_router=RobotControlHTTPDirectoryRouter(
+                {"blast-01": blast_router},
+                default_router=blast_router,
+                default_robot_id="blast-01",
+                spatial_map_providers={
+                    "blast-01": lambda: {
+                        "schema": "robot-spatial-map/v1",
+                        "read_only": True,
+                        "source_id": "blast-live-map",
+                    },
+                },
+            ),
+        )
+        path = "/api/v1/robots/blast-01/spatial-map"
+
+        response = router.handle("GET", path, self.headers())
+        rejected = router.handle(
+            "GET",
+            path,
+            {"Host": HOST},
+        )
+
+        self.assertEqual(response.status, 200)
+        decoded = json.loads(response.body)
+        self.assertEqual(set(decoded), {"map"})
+        self.assertEqual(decoded["map"]["source_id"], "blast-live-map")
+        self.assertEqual(rejected.status, 403)
 
     def test_emergency_stop_is_an_explicit_json_mutation(self):
         response = self.router.handle(

@@ -24,9 +24,17 @@ from .blast_ble_runtime import (
     BlastBLERuntime,
     _adpcm_sample_count,
 )
-from .blast_pcm_upload import BlastPCMDeadline, BlastPCMUpload
+from .blast_pcm_upload import (
+    BlastPCMDeadline,
+    BlastPCMStartTimeout,
+    BlastPCMUpload,
+)
 from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
+)
+from .blast_navigation_action_profile import (
+    SCAN_TURN_ENCODER_DEGREES_PER_PULSE,
+    TURN_SPEED_DPS,
 )
 from .blast_scan_observation import (
     PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM,
@@ -41,6 +49,9 @@ from .blast_scan_observation import (
     aggregate_repeated_scan_ray,
     blast_range_state,
     body_motor_angle as _body_motor_angle,
+    build_blast_encoder_scan,
+    drive_encoder_angles,
+    encoder_relative_bearing_deg,
     finite_number as _finite_number,
     scan_heading,
     scan_heading_delta,
@@ -70,6 +81,7 @@ MOTION_POLL_INTERVAL_SECONDS = 0.05
 POST_MOTION_SETTLE_TIMEOUT_SECONDS = 1.5
 SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS = 3.0
 SCAN_PULSE_POST_MOTION_SETTLE_TIMEOUT_SECONDS = 1.5
+_SCAN_PERMIT_EXPECTED_ANCHOR_TOLERANCE_DEG = 1
 POST_MOTION_SETTLE_SAMPLE_COUNT = 5
 POST_MOTION_DISTANCE_RANGE_MM = 5.0
 POST_MOTION_TILT_RANGE_DEG = 1.0
@@ -102,12 +114,12 @@ NAVIGATION_MOTION_COMMANDS = {
 
 @dataclass(frozen=True)
 class _BlastNoReturnScanPermit:
-    """One short-lived host permit for a geometry-checked scan."""
+    """One short-lived scan permit bound to an exact encoder anchor."""
 
     runtime_generation: int
     expires_at_monotonic_ns: int
     drive_angles_deg: tuple[float, float]
-    heading_deg: float
+    allow_no_return: bool = True
 
 
 class BlastControllerError(RuntimeError):
@@ -227,10 +239,17 @@ class BlastObservationMonitor:
         with self._lock:
             return deepcopy(self._snapshot)
 
+    def runtime_generation(self) -> int:
+        """Return the current BLE session generation without exposing state."""
+
+        with self._lock:
+            return self._runtime_generation
+
     def issue_no_return_scan_permit(
-        self, *, pose, prior_receipt, geometry_checked,
+        self, *, pose=None, prior_receipt=None, geometry_checked=False,
+        expected_drive_angles=None, allow_no_return=True,
     ):
-        """Issue one short-lived token from exact same-pose host evidence."""
+        """Issue one short-lived token from an exact trusted scan anchor."""
 
         with self._lock:
             snapshot = deepcopy(self._snapshot)
@@ -245,58 +264,75 @@ class BlastObservationMonitor:
         previous_motors = previous.get("motor_angles_deg") if isinstance(
             previous, Mapping
         ) else None
-        imu = observation.get("imu") if isinstance(observation, Mapping) else None
-        heading = imu.get("heading_deg") if isinstance(imu, Mapping) else None
         now_ns = time.monotonic_ns()
         observed_ms = snapshot.get("last_observed_at_monotonic_ms")
         roles = ("left_drive", "right_drive")
+        expected = (
+            expected_drive_angles
+            if isinstance(expected_drive_angles, Mapping) else motors
+        )
+        anchor_matched = (
+            type(allow_no_return) is bool
+            and isinstance(motors, Mapping)
+            and isinstance(expected, Mapping)
+            and all(
+                isinstance(motors.get(role), (int, float))
+                and not isinstance(motors.get(role), bool)
+                and math.isfinite(float(motors[role]))
+                and isinstance(expected.get(role), (int, float))
+                and not isinstance(expected.get(role), bool)
+                and math.isfinite(float(expected[role]))
+                and abs(float(motors[role]) - float(expected[role]))
+                <= _SCAN_PERMIT_EXPECTED_ANCHOR_TOLERANCE_DEG
+                for role in roles
+            )
+        )
         valid_pose = isinstance(pose, Mapping) and all(
             type(pose.get(key)) is int
             for key in ("x_mm", "y_mm", "heading_mdeg")
         )
         if not (
-            geometry_checked is True
-            and snapshot.get("state") == "online"
-            and valid_pose
+            snapshot.get("state") == "online"
+            and anchor_matched
             and isinstance(observed_ms, int)
             and 0 <= now_ns // 1_000_000 - observed_ms <= 3_000
-            and isinstance(prior_receipt, Mapping)
-            and prior_receipt.get("observation_settled") is True
-            and prior_receipt.get("pose") == dict(pose)
-            and (
-                not isinstance(prior_receipt.get("motion"), Mapping)
-                or prior_receipt["motion"].get("command_completed") is True
-            )
-            and isinstance(previous, Mapping)
-            and previous.get("motion_active") is False
-            and blast_range_state(previous.get("distance_mm"))
-            == RANGE_STATE_NO_VALID_DISTANCE
             and isinstance(observation, Mapping)
             and observation.get("motion_active") is False
-            and blast_range_state(observation.get("distance_mm"))
-            == RANGE_STATE_NO_VALID_DISTANCE
-            and isinstance(motors, Mapping)
-            and isinstance(previous_motors, Mapping)
-            and all(
-                isinstance(motors.get(role), (int, float))
-                and not isinstance(motors.get(role), bool)
-                and math.isfinite(float(motors[role]))
-                and isinstance(previous_motors.get(role), (int, float))
-                and not isinstance(previous_motors.get(role), bool)
-                and math.isfinite(float(previous_motors[role]))
-                and float(motors[role]) == float(previous_motors[role])
-                for role in roles
+            and (
+                not allow_no_return
+                or geometry_checked is True
+                and valid_pose
+                and isinstance(prior_receipt, Mapping)
+                and prior_receipt.get("observation_settled") is True
+                and prior_receipt.get("pose") == dict(pose)
+                and (
+                    not isinstance(prior_receipt.get("motion"), Mapping)
+                    or prior_receipt["motion"].get(
+                        "command_completed"
+                    ) is True
+                )
+                and isinstance(previous, Mapping)
+                and previous.get("motion_active") is False
+                and blast_range_state(previous.get("distance_mm"))
+                == RANGE_STATE_NO_VALID_DISTANCE
+                and blast_range_state(observation.get("distance_mm"))
+                == RANGE_STATE_NO_VALID_DISTANCE
+                and isinstance(previous_motors, Mapping)
+                and all(
+                    isinstance(previous_motors.get(role), (int, float))
+                    and not isinstance(previous_motors.get(role), bool)
+                    and math.isfinite(float(previous_motors[role]))
+                    and float(motors[role]) == float(previous_motors[role])
+                    for role in roles
+                )
             )
-            and isinstance(heading, (int, float))
-            and not isinstance(heading, bool)
-            and math.isfinite(float(heading))
         ):
             return None
         permit = _BlastNoReturnScanPermit(
             runtime_generation=runtime_generation,
             expires_at_monotonic_ns=now_ns + 5_000_000_000,
             drive_angles_deg=tuple(float(motors[role]) for role in roles),
-            heading_deg=float(heading),
+            allow_no_return=allow_no_return,
         )
         with self._lock:
             if (
@@ -687,77 +723,62 @@ class BlastObservationMonitor:
                                 speech_request
                             )
                     if speech_upload is not None:
-                        session_usable = True
-                        while speech_upload is not None:
-                            stopped_before_speech = (
-                                await self._service_preempt_stop(
+                        stopped_before_speech = (
+                            await self._service_preempt_stop(
+                                runtime,
+                                generation,
+                            )
+                        )
+                        if stopped_before_speech:
+                            self._interrupt_speech_upload(
+                                speech_upload,
+                                "BLAST speech upload was interrupted by stop",
+                            )
+                            speech_upload = None
+                            continue
+                        if not self._claim_speech_step():
+                            continue
+                        try:
+                            speech_upload, session_usable = (
+                                await self._execute_speech_step(
                                     runtime,
                                     generation,
+                                    speech_upload,
                                 )
                             )
-                            if stopped_before_speech:
-                                self._interrupt_speech_upload(
-                                    speech_upload,
-                                    "BLAST speech upload was interrupted by stop",
-                                )
-                                speech_upload = None
-                                break
-                            if not self._claim_speech_step():
-                                break
-                            try:
-                                speech_upload, session_usable = (
-                                    await self._execute_speech_step(
-                                        runtime,
-                                        generation,
-                                        speech_upload,
-                                    )
-                                )
-                            finally:
-                                self._release_speech_step()
-                            if not session_usable:
-                                break
-                            if speech_upload is not None:
-                                with self._lock:
-                                    stop_pending = (
-                                        self._preempt_stop_request is not None
-                                        or self._pending_command == "stop"
-                                    )
-                                    last_observed_ms = self._snapshot.get(
-                                        "last_observed_at_monotonic_ms"
-                                    )
-                                cancel_pending = (
-                                    speech_upload.cancel_requested is not None
-                                    and speech_upload.cancel_requested()
-                                )
-                                observation_due = (
-                                    not isinstance(last_observed_ms, int)
-                                    or time.monotonic_ns() // 1_000_000
-                                    - last_observed_ms
-                                    >= round(
-                                        self._poll_interval_seconds * 1_000
-                                    )
-                                )
-                                # Telemetry carries no motion authority and
-                                # does not admit queued navigation. Keep its
-                                # safety TTL alive without delaying Stop.
-                                if (
-                                    not stop_pending
-                                    and not cancel_pending
-                                    and observation_due
-                                ):
-                                    self._publish_observation(
-                                        await runtime.observe()
-                                    )
+                        finally:
+                            self._release_speech_step()
                         if not session_usable:
                             break
-                        # Initial arbitration favours one already-queued fixed
-                        # command. A claimed utterance then drains in bounded
-                        # phases so its start receipt precedes later motion;
-                        # stop is still serviced between every phase.
+                        # One bounded audio phase gets a turn after a fixed
+                        # command. The outer loop then admits pending
+                        # navigation before the next upload phase.
                         if speech_upload is not None:
-                            # A stop raced the atomic step claim. Return to the
-                            # outer loop so it wins before any further audio.
-                            continue
+                            fixed_work_pending = self._fixed_work_pending()
+                            with self._lock:
+                                last_observed_ms = self._snapshot.get(
+                                    "last_observed_at_monotonic_ms"
+                                )
+                            cancel_pending = (
+                                speech_upload.cancel_requested is not None
+                                and speech_upload.cancel_requested()
+                            )
+                            observation_due = (
+                                not isinstance(last_observed_ms, int)
+                                or time.monotonic_ns() // 1_000_000
+                                - last_observed_ms
+                                >= round(
+                                    self._poll_interval_seconds * 1_000
+                                )
+                            )
+                            if (
+                                not fixed_work_pending
+                                and not cancel_pending
+                                and observation_due
+                            ):
+                                self._publish_observation(
+                                    await runtime.observe()
+                                )
                         continue
                     if request is None:
                         self._publish_observation(await runtime.observe())
@@ -941,20 +962,40 @@ class BlastObservationMonitor:
             raise
         except Exception as error:
             upload.deadline.finish_start()
+            cancelled = (
+                upload.cancel_requested is not None
+                and upload.cancel_requested()
+            )
+            start_timed_out = isinstance(error, BlastPCMStartTimeout)
             failure = BlastControllerError(
                 (
                     "controller_command_interrupted"
-                    if upload.cancel_requested is not None
-                    and upload.cancel_requested()
-                    else "controller_command_failed"
+                    if cancelled
+                    else (
+                        error.code
+                        if start_timed_out
+                        else "controller_command_failed"
+                    )
                 ),
                 (
                     "BLAST speech was cancelled during playback"
-                    if upload.cancel_requested is not None
-                    and upload.cancel_requested()
-                    else "BLAST sampled-audio transport failed"
+                    if cancelled
+                    else (
+                        "BLAST sampled-audio start receipt timed out"
+                        if start_timed_out
+                        else "BLAST sampled-audio transport failed"
+                    )
                 ),
                 motion_started=False,
+            )
+            logger.warning(
+                "BLAST sampled-audio phase failed phase=%s offset=%d "
+                "byte_count=%d code=%s error_type=%s",
+                upload.current_phase,
+                upload.offset,
+                len(upload.payload),
+                failure.code,
+                type(error).__name__,
             )
             aligned = getattr(runtime, "sampled_audio_aligned", False) is True
             if aligned:
@@ -1084,7 +1125,6 @@ class BlastObservationMonitor:
         if (
             observation.get("motion_active") is not False
             or len(samples) != POST_MOTION_SETTLE_SAMPLE_COUNT
-            or self._scan_heading(observation) is None
             or not (
                 BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
                 .range_sensor_extrinsics
@@ -1118,6 +1158,7 @@ class BlastObservationMonitor:
         generation,
         direction,
         *,
+        start_drive_angles,
         retry_unsettled=False,
     ):
         if await self._service_preempt_stop(runtime, generation):
@@ -1157,15 +1198,58 @@ class BlastObservationMonitor:
             BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
             .range_sensor_extrinsics
         )
+        current_drive_angles = drive_encoder_angles(observation)
+        before_angles = (
+            receipt.get("before_angles_deg")
+            if isinstance(receipt, Mapping) else None
+        )
+        receipt_fields = {
+            "accepted", "direction", "speed_dps", "wheel_angle_deg",
+            "before_angles_deg",
+        }
+        receipt_profile_valid = (
+            isinstance(receipt, Mapping)
+            and set(receipt) == receipt_fields
+            and receipt.get("accepted") is True
+            and receipt.get("direction") == direction
+            and receipt.get("speed_dps") == TURN_SPEED_DPS
+            and receipt.get("wheel_angle_deg")
+            == SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+            and isinstance(before_angles, Mapping)
+            and set(before_angles) == {"left_drive", "right_drive"}
+            and all(type(before_angles.get(role)) is int for role in (
+                "left_drive", "right_drive",
+            ))
+            and current_drive_angles is not None
+        )
+        if receipt_profile_valid:
+            pulse_delta = {
+                role: current_drive_angles[role] - before_angles[role]
+                for role in ("left_drive", "right_drive")
+            }
+            expected_signs = (
+                {"left_drive": -1, "right_drive": 1}
+                if direction == "left"
+                else {"left_drive": 1, "right_drive": -1}
+            )
+            receipt_profile_valid = all(
+                pulse_delta[role] * expected_signs[role] > 0
+                and abs(pulse_delta[role])
+                <= 4 * SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+                for role in ("left_drive", "right_drive")
+            )
         if (
-            self._scan_heading(observation) is None
+            not receipt_profile_valid
+            or encoder_relative_bearing_deg(
+                observation, start_drive_angles,
+            ) is None
             or not sensor.matches_navigation_body_angle(
                 _body_motor_angle(observation)
             )
         ):
             raise BlastControllerError(
                 "scan_sweep_observation_unverified",
-                "BLAST scan lost its calibrated sensor pose evidence",
+                "BLAST scan lost correlated encoder or sensor-pose evidence",
             )
         range_state = blast_range_state(distance)
         if range_state == RANGE_STATE_INVALID:
@@ -1218,8 +1302,10 @@ class BlastObservationMonitor:
             if isinstance(center_motors, Mapping) else None
             for role in ("left_drive", "right_drive")
         )
-        permit_allows_no_return = (
+        start_drive_angles = drive_encoder_angles(center)
+        permit_anchor_matched = (
             isinstance(action_permit, _BlastNoReturnScanPermit)
+            and action_permit.runtime_generation == generation
             and time.monotonic_ns()
             <= action_permit.expires_at_monotonic_ns
             and all(
@@ -1230,15 +1316,14 @@ class BlastObservationMonitor:
                     center_drive, action_permit.drive_angles_deg
                 )
             )
-            and start_heading is not None
-            and abs(
-                (start_heading - action_permit.heading_deg + 180.0)
-                % 360.0 - 180.0
-            ) <= SCAN_RESTORATION_TOLERANCE_DEG
+        )
+        permit_allows_no_return = (
+            permit_anchor_matched and action_permit.allow_no_return
         )
         center_state = blast_range_state(center_distance)
         range_allows_start = (
-            center_state == RANGE_STATE_MEASURED
+            permit_anchor_matched
+            and center_state == RANGE_STATE_MEASURED
             and float(center_distance) > (
                 BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
                 .minimum_rotation_clearance_mm()
@@ -1249,7 +1334,7 @@ class BlastObservationMonitor:
         )
         if not (
             center_settled
-            and start_heading is not None
+            and start_drive_angles is not None
             and sensor.matches_navigation_body_angle(
                 _body_motor_angle(center)
             )
@@ -1268,6 +1353,7 @@ class BlastObservationMonitor:
                 runtime,
                 generation,
                 "left",
+                start_drive_angles=start_drive_angles,
                 retry_unsettled=index == 3,
             ))
 
@@ -1275,8 +1361,12 @@ class BlastObservationMonitor:
         for _index in range(3):
             left_return.append(await self._scan_turn(
                 runtime, generation, "right",
+                start_drive_angles=start_drive_angles,
             ))
-        await self._scan_turn(runtime, generation, "right")
+        await self._scan_turn(
+            runtime, generation, "right",
+            start_drive_angles=start_drive_angles,
+        )
 
         right_outbound = []
         for index in range(4):
@@ -1284,6 +1374,7 @@ class BlastObservationMonitor:
                 runtime,
                 generation,
                 "right",
+                start_drive_angles=start_drive_angles,
                 retry_unsettled=index == 3,
             ))
 
@@ -1291,92 +1382,39 @@ class BlastObservationMonitor:
         for _index in range(3):
             right_return.append(await self._scan_turn(
                 runtime, generation, "left",
+                start_drive_angles=start_drive_angles,
             ))
         (
             _return_receipt,
             final,
             final_settled,
             _final_evidence,
-        ) = await self._scan_turn(runtime, generation, "left")
+        ) = await self._scan_turn(
+            runtime, generation, "left",
+            start_drive_angles=start_drive_angles,
+        )
 
-        final_heading = self._scan_heading(final)
-        restoration_error = self._scan_heading_delta(
-            final_heading,
-            start_heading,
+        final_body_verified = sensor.matches_navigation_body_angle(
+            _body_motor_angle(final)
         )
-        restoration_verified = (
-            restoration_error is not None
-            and abs(restoration_error) <= SCAN_RESTORATION_TOLERANCE_DEG
-        )
-        left_rays = []
-        right_rays = []
-        for index in range(4):
-            left_primary = left_outbound[index][1:]
-            right_primary = right_outbound[index][1:]
-            left_rays.append(
-                self._scan_ray(
-                    "left_{}".format(index + 1),
-                    left_primary[0],
-                    start_heading,
-                    left_primary[1],
-                    left_primary[2],
-                )
-                if index == 3
-                else self._aggregate_repeated_scan_ray(
-                    "left_{}".format(index + 1),
-                    start_heading,
-                    left_primary,
-                    left_return[2 - index][1:],
-                )
+        try:
+            scan = build_blast_encoder_scan(
+                center=center,
+                center_settled=center_settled,
+                start_drive_angles=start_drive_angles,
+                left_outbound=left_outbound,
+                left_return=left_return,
+                right_outbound=right_outbound,
+                right_return=right_return,
+                final=final,
+                final_settled=final_settled,
+                final_body_verified=final_body_verified,
             )
-            right_rays.append(
-                self._scan_ray(
-                    "right_{}".format(index + 1),
-                    right_primary[0],
-                    start_heading,
-                    right_primary[1],
-                    right_primary[2],
-                )
-                if index == 3
-                else self._aggregate_repeated_scan_ray(
-                    "right_{}".format(index + 1),
-                    start_heading,
-                    right_primary,
-                    right_return[2 - index][1:],
-                )
-            )
-        center_ray = self._scan_ray(
-            "center", center, start_heading, center_settled,
-        )
-        angular_rays = [center_ray, *left_rays, *right_rays]
-        left_near_ray = {**left_rays[1], "side": "left_near"}
-        left_far_ray = {**left_rays[3], "side": "left_far"}
-        right_near_ray = {**right_rays[1], "side": "right_near"}
-        right_far_ray = {**right_rays[3], "side": "right_far"}
-        scan = {
-            "schema": SCAN_RESULT_SCHEMA,
-            "state": "complete",
-            "result": (
-                "restored"
-                if restoration_verified
-                else "restoration_unverified"
-            ),
-            "start_heading_deg": start_heading,
-            "final_heading_deg": final_heading,
-            "restoration_error_deg": restoration_error,
-            "restoration_verified": restoration_verified,
-            "all_observations_settled": all((
-                ray["observation_settled"] for ray in angular_rays
-            )),
-            "rays": [
-                center_ray,
-                left_near_ray,
-                left_far_ray,
-                right_near_ray,
-                right_far_ray,
-            ],
-            "angular_rays": angular_rays,
-        }
+        except ValueError as error:
+            raise BlastControllerError(
+                "scan_sweep_observation_unverified",
+                "BLAST scan encoder geometry was invalid",
+            ) from error
         return {
             "schema": COMMAND_RESULT_SCHEMA,
             "robot_id": ROBOT_ID,

@@ -5,18 +5,23 @@ import math
 import time
 from typing import Mapping
 
+from .blast_navigation_calibration import (
+    BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
+)
 from .blast_side_observation import side_search_planned_leg
-from .local_detour_route import ROUTE_COMPLETE
+from .blast_spatial_map import MAX_PLANAR_SCAN_VIEWS
+from .local_detour_route import ROUTE_ACTIVE, ROUTE_COMPLETE, ROUTE_INVALID
 from .physical_navigation_mission import DirectionalMission
 from .physical_navigation_contract import (
     ADVANCE, REVERSE, SCAN_FRONT_ARC, TURN_LEFT_90, TURN_RIGHT_90,
 )
-from .physical_odometry import normalize_heading_mdeg
+from .physical_odometry import PhysicalPose, normalize_heading_mdeg
 
 
 _MOTION_ACTIONS = frozenset((
     ADVANCE, REVERSE, TURN_LEFT_90, TURN_RIGHT_90,
 ))
+_PLANNER_SCAN_VIEW_LIMIT = 4
 
 
 def _map_pose(pose):
@@ -52,6 +57,11 @@ class _BlastEpisodeMapTrace:
         self.navigation_enforced = False
         self.planned_leg = None
         self.planar_scan_views = []
+        self._scan_sequence = 0
+        self.local_detour_route = None
+        self._last_pose = pose
+        self._last_observation = copy.deepcopy(observation)
+        self._last_observed_at_unix_ms = observed_at_unix_ms
         self._offer(
             "begin_episode",
             episode_id=episode_id,
@@ -115,7 +125,10 @@ class _BlastEpisodeMapTrace:
         }
 
     def _offer_trace(self, pose, observation, observed_at_unix_ms):
-        self._offer(
+        self._last_pose = pose
+        self._last_observation = copy.deepcopy(observation)
+        self._last_observed_at_unix_ms = observed_at_unix_ms
+        return self._offer(
             "offer_trace",
             episode_id=self.episode_id,
             final_goal=self._final_goal(pose),
@@ -124,7 +137,160 @@ class _BlastEpisodeMapTrace:
                 observation, observed_at_unix_ms
             ),
             planar_scan_views=tuple(self.planar_scan_views),
+            local_detour_route=self.local_detour_route,
         )
+
+    def planner_local_map_evidence(self, pose):
+        """Return a compact echo-point map with no inferred free space."""
+
+        footprint = (
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.robot_footprint
+        )
+        if not isinstance(pose, PhysicalPose) or footprint is None:
+            return None
+        try:
+            goal = self._final_goal(pose)
+            retained = self.planar_scan_views[-_PLANNER_SCAN_VIEW_LIMIT:]
+            return {
+                "schema": "blast-local-map-evidence/v1",
+                "frame": "EPISODE_LOCAL_ODOMETRY",
+                "quality": "PROVISIONAL_YAW_ONLY",
+                "coordinate_convention": {
+                    "x_positive": "EPISODE_START_FORWARD",
+                    "y_positive": "EPISODE_START_LEFT",
+                    "heading_positive": "LEFT_CCW",
+                },
+                "echo_points_mean": (
+                    "POSSIBLE_OBSTACLE_RETURN_NOT_OBJECT_BOUNDARY"
+                ),
+                "unobserved_space": "UNKNOWN_NOT_FREE",
+                "occupancy_model": "NONE",
+                "robot_pose": _map_pose(pose),
+                "directional_goal": {
+                    key: goal[key]
+                    for key in (
+                        "target_x_mm", "target_y_mm",
+                        "desired_heading_mdeg",
+                        "remaining_forward_progress_mm",
+                    )
+                },
+                "robot_footprint_mm": {
+                    "front": footprint.front_extent_mm,
+                    "rear": footprint.rear_extent_mm,
+                    "left": footprint.left_extent_mm,
+                    "right": footprint.right_extent_mm,
+                    "clearance_margin": footprint.clearance_margin_mm,
+                },
+                "scan_views": [
+                    {
+                        "scan_id": view["scan_id"],
+                        "scan_pose": {
+                            key: view["scan_pose"][key]
+                            for key in ("x_mm", "y_mm", "heading_mdeg")
+                        },
+                        "echo_points": [
+                            {
+                                "x_mm": point["nominal_echo_x_mm"],
+                                "y_mm": point["nominal_echo_y_mm"],
+                            }
+                            for point in view["projection"]["points"]
+                        ],
+                    }
+                    for view in retained
+                ],
+                "truncated": (
+                    len(self.planar_scan_views) > _PLANNER_SCAN_VIEW_LIMIT
+                ),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def clear_planned_leg(
+        self, *, pose, observation, observed_at_unix_ms=None,
+    ):
+        """Publish that no transient leg remains at the supplied pose."""
+
+        if not isinstance(observation, Mapping):
+            return False
+        if observed_at_unix_ms is None:
+            observed_at_unix_ms = self._last_observed_at_unix_ms
+        self.planned_leg = None
+        return self._offer_trace(pose, observation, observed_at_unix_ms)
+
+    def clear_route(
+        self, *, pose, observation, observed_at_unix_ms=None,
+    ):
+        """Publish a causal route reset before recovery replans."""
+
+        if not isinstance(observation, Mapping):
+            return False
+        if observed_at_unix_ms is None:
+            observed_at_unix_ms = self._last_observed_at_unix_ms
+        self.navigation_enforced = False
+        self.planned_leg = None
+        self.local_detour_route = None
+        return self._offer_trace(pose, observation, observed_at_unix_ms)
+
+    def finalize(
+        self, *, pose=None, observation=None, observed_at_unix_ms=None,
+    ):
+        """End transient guidance without erasing diagnostic route history."""
+
+        pose = self._last_pose if pose is None else pose
+        observation = (
+            self._last_observation if observation is None else observation
+        )
+        if not isinstance(observation, Mapping):
+            return False
+        if observed_at_unix_ms is None:
+            observed_at_unix_ms = self._last_observed_at_unix_ms
+        self.planned_leg = None
+        if (
+            self.local_detour_route is not None
+            and self.local_detour_route["status"] == ROUTE_ACTIVE
+        ):
+            route = copy.deepcopy(self.local_detour_route)
+            route["status"] = ROUTE_INVALID
+            for waypoint in route["waypoints"]:
+                if waypoint["status"] == "ACTIVE":
+                    waypoint["status"] = "UPCOMING"
+            self.local_detour_route = route
+            self.navigation_enforced = False
+        elif self.local_detour_route is None:
+            self.navigation_enforced = False
+        return self._offer_trace(pose, observation, observed_at_unix_ms)
+
+    @staticmethod
+    def _route_trace(route):
+        value = route.to_dict()
+        status = value["status"]
+        active_index = value["active_index"]
+        waypoints = []
+        for index, source in enumerate(value["waypoints"]):
+            if status == ROUTE_COMPLETE or index < active_index:
+                waypoint_status = "COMPLETED"
+            elif status == ROUTE_ACTIVE and index == active_index:
+                waypoint_status = "ACTIVE"
+            else:
+                waypoint_status = "UPCOMING"
+            waypoints.append({
+                key: source[key]
+                for key in (
+                    "ordinal", "kind", "x_mm", "y_mm", "heading_mdeg",
+                    "fact_key",
+                )
+            } | {"status": waypoint_status})
+        return {
+            "schema": value["schema"],
+            "read_only": True,
+            "provisional": True,
+            "route_id": value["route_id"],
+            "version": value["version"],
+            "status": status,
+            "detour_side": value["detour_side"],
+            "active_index": active_index,
+            "waypoints": waypoints,
+        }
 
     def record(
         self,
@@ -157,6 +323,8 @@ class _BlastEpisodeMapTrace:
             self.planned_leg = next_leg
         if route is not None:
             self.navigation_enforced = True
+            if route.status in (ROUTE_ACTIVE, ROUTE_COMPLETE, ROUTE_INVALID):
+                self.local_detour_route = self._route_trace(route)
             if route.status == ROUTE_COMPLETE:
                 self.planned_leg = None
             else:
@@ -180,10 +348,11 @@ class _BlastEpisodeMapTrace:
                     },
                 }
         if isinstance(scan_view, Mapping):
+            self._scan_sequence += 1
             self.planar_scan_views.append({
                 "scan_id": "{}-scan-{}".format(
                     self.episode_id,
-                    len(self.planar_scan_views) + 1,
+                    self._scan_sequence,
                 ),
                 "observed_at_unix_ms": observed_at_unix_ms,
                 "scan_pose": {
@@ -194,6 +363,7 @@ class _BlastEpisodeMapTrace:
                     scan_view["planar_projection"]
                 ),
             })
+            del self.planar_scan_views[:-MAX_PLANAR_SCAN_VIEWS]
         self._offer_trace(pose, observation, observed_at_unix_ms)
 
     def record_action(

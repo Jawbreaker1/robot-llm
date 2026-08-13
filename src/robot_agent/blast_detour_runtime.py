@@ -166,7 +166,7 @@ def blast_detour_scan_no_return_allows_progress(
     minimum_forward_clearance_mm,
     route,
     navigation_body_matched,
-    heading_correlated,
+    evidence_correlated,
 ):
     """Whether exact settled no-return evidence admits route progress."""
 
@@ -183,7 +183,7 @@ def blast_detour_scan_no_return_allows_progress(
             route=route,
         )
         and navigation_body_matched
-        and heading_correlated
+        and evidence_correlated
     )
 
 
@@ -196,7 +196,7 @@ def blast_detour_scan_verified(
     minimum_forward_clearance_mm,
     route,
     navigation_body_matched,
-    heading_correlated,
+    evidence_correlated,
 ):
     """Whether measured scan evidence verifies detour progress."""
 
@@ -212,7 +212,7 @@ def blast_detour_scan_verified(
         and blast_range_state(distance) == RANGE_STATE_MEASURED
         and float(distance) > minimum_forward_clearance_mm
         and navigation_body_matched
-        and heading_correlated
+        and evidence_correlated
     )
 
 
@@ -227,30 +227,42 @@ def issue_blast_no_return_scan_permit(
     route,
     pose,
     prior_receipt,
+    expected_drive_angles,
 ):
-    """Issue the existing bounded permit for one host-owned NVD scan."""
+    """Issue one anchor-bound scan permit; NVD keeps its geometry gate."""
 
     action_permit = None
-    if (
-        action == SCAN_FRONT_ARC
-        and (host_side_scan or host_detour_scan)
-        and blast_range_state(distance_mm) == RANGE_STATE_NO_VALID_DISTANCE
-    ):
+    if action == SCAN_FRONT_ARC:
         geometry_checked = (
             side_search_geometry_checked
-            if host_side_scan
-            else blast_detour_scan_sweep_is_clear(route, pose)
+            if not host_detour_scan else (
+                blast_detour_scan_sweep_is_clear(route, pose)
+            )
+        )
+        allow_no_return = (
+            blast_range_state(distance_mm) == RANGE_STATE_NO_VALID_DISTANCE
+            and geometry_checked
         )
         issue = getattr(controller, "issue_no_return_scan_permit", None)
-        if geometry_checked and callable(issue):
+        if (
+            callable(issue)
+            and (
+                not allow_no_return
+                or geometry_checked
+            )
+        ):
             action_permit = issue(
                 pose=pose.to_dict(),
                 prior_receipt=prior_receipt,
-                geometry_checked=True,
+                geometry_checked=geometry_checked,
+                expected_drive_angles=expected_drive_angles,
+                allow_no_return=allow_no_return,
             )
-        if action_permit is None:
+        if action_permit is None and (
+            callable(issue) or allow_no_return
+        ):
             raise BlastNoReturnScanPermitUnavailable(
-                "BLAST no-return action permit was unavailable"
+                "BLAST scan action permit was unavailable"
             )
     return action_permit
 

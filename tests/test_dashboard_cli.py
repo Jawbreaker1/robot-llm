@@ -14,9 +14,11 @@ from robot_agent.dashboard_cli import (
     _parser,
     _raise_termination_interrupt,
     _run,
+    build_server,
     main,
 )
 from robot_agent.dashboard_http import DashboardHTTPResponse
+from robot_agent.robot_control_contract import RobotControlTarget
 from robot_agent.robot_input_service import RobotInputService
 
 
@@ -105,6 +107,56 @@ class DashboardCLITests(unittest.TestCase):
     def test_sigterm_handler_routes_through_keyboard_interrupt_cleanup(self):
         with self.assertRaises(KeyboardInterrupt):
             _raise_termination_interrupt(15, None)
+
+    def test_standalone_server_infers_scoped_robot_map_provider(self):
+        token = "c" * 64
+
+        class MapService:
+            def __init__(self):
+                self.calls = 0
+
+            def spatial_map(self):
+                self.calls += 1
+                return {
+                    "schema": "robot-spatial-map/v1",
+                    "read_only": True,
+                    "source_id": "standalone-map",
+                }
+
+        service = MapService()
+        control = mock.Mock()
+        control.status.return_value = {
+            "target": {
+                "robot_id": "blast-01",
+                "display_name": "BLAST",
+            },
+        }
+        server = mock.Mock()
+        with mock.patch(
+            "robot_agent.dashboard_cli._LoopbackThreadingHTTPServer",
+            return_value=server,
+        ):
+            returned, router = build_server(
+                service,
+                session_token=token,
+                robot_control_service=control,
+            )
+
+        response = router.handle(
+            "GET",
+            "/api/v1/robots/blast-01/spatial-map",
+            {
+                "Host": "127.0.0.1:8765",
+                "X-Robot-Dashboard-Token": token,
+            },
+        )
+
+        self.assertIs(returned, server)
+        self.assertEqual(response.status, 200)
+        decoded = json.loads(response.body)
+        self.assertEqual(set(decoded), {"map"})
+        self.assertEqual(decoded["map"]["source_id"], "standalone-map")
+        self.assertEqual(service.calls, 1)
 
     @staticmethod
     def bare_server(slots=1):
@@ -288,6 +340,10 @@ class DashboardCLITests(unittest.TestCase):
 
     def test_run_injects_robot_adapter_into_separate_control_service(self):
         adapter = mock.Mock()
+        adapter.robot_control_target = RobotControlTarget(
+            robot_id="injected-robot",
+            display_name="Injected Robot",
+        )
         reachability = mock.Mock(spec=("snapshot", "check"))
         adapter.controller_runtime_provider = reachability
         adapter.controller_reachability_service = reachability
@@ -323,6 +379,13 @@ class DashboardCLITests(unittest.TestCase):
             control_factory.call_args.kwargs["settings"].model,
             _parser().parse_args([]).model,
         )
+        self.assertEqual(
+            control_factory.call_args.kwargs["target"].to_dict(),
+            {
+                "robot_id": "injected-robot",
+                "display_name": "Injected Robot",
+            },
+        )
         server_factory.assert_called_once()
         server_args = server_factory.call_args
         self.assertEqual(server_args.args, (dashboard_service, 8765))
@@ -351,6 +414,10 @@ class DashboardCLITests(unittest.TestCase):
 
     def test_run_reuses_configured_live_console_access_key(self):
         adapter = mock.Mock()
+        adapter.robot_control_target = RobotControlTarget(
+            robot_id="injected-robot",
+            display_name="Injected Robot",
+        )
         dashboard_service = mock.Mock()
         control_service = mock.Mock()
         http_server = mock.Mock()

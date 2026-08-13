@@ -13,16 +13,24 @@ from robot_agent.blast_observation_monitor import (
     SCAN_RESULT_SCHEMA,
 )
 from robot_agent.blast_side_search_geometry import (
+    RECOVERY_REBASE_SEARCH_BASIS,
     TARGET_REACQUISITION_SEARCH_BASIS,
+    recovery_rebase_completed,
+    recovery_rebase_waypoint,
+    side_search_advance_sweep_is_clear,
     side_search_progress,
     side_search_required_slots,
-    side_search_scan_sweep_is_clear,
+    side_search_turn_sweep_is_clear,
     target_reacquisition_resolved,
     target_reacquisition_waypoint,
 )
 from robot_agent.blast_scan_planar_projection import (
     project_blast_scan_planar_surfaces,
 )
+from robot_agent.blast_scan_observation import (
+    encoder_relative_bearing_deg,
+)
+from robot_agent.blast_scan_safety import blast_scan_sweep_is_clear
 from robot_agent.physical_navigation_contract import (
     ADVANCE,
     SCAN_FRONT_ARC,
@@ -32,17 +40,66 @@ from robot_agent.physical_navigation_contract import (
 from robot_agent.physical_odometry import PhysicalPose, nominal_effect
 
 
+def encoder_bearing_evidence(requested_bearing_deg):
+    """Build correlated integer-encoder evidence for one synthetic ray."""
+
+    turn_scale = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
+        .turn_mdeg_per_opposed_encoder_degree
+        / 1_000.0
+    )
+    opposed = round(abs(requested_bearing_deg) / turn_scale)
+    if requested_bearing_deg < 0:
+        delta = {"left_drive": -opposed, "right_drive": opposed}
+    elif requested_bearing_deg > 0:
+        delta = {"left_drive": opposed, "right_drive": -opposed}
+    else:
+        delta = {"left_drive": 0, "right_drive": 0}
+    bearing = encoder_relative_bearing_deg(
+        {"motor_angles_deg": delta},
+        {"left_drive": 0, "right_drive": 0},
+    )
+    return delta, bearing
+
+
 def scan_result(distances):
     sides = ("center", "left_near", "left_far", "right_near", "right_far")
-    headings = (0.0, -22.0, -45.0, 24.0, 47.0)
+    requested_headings = (0.0, -22.0, -45.0, 24.0, 47.0)
+    encoder_evidence = tuple(
+        encoder_bearing_evidence(heading)
+        for heading in requested_headings
+    )
     return {
         "schema": SCAN_RESULT_SCHEMA,
         "state": "complete",
         "result": "restored",
+        "bearing_source": "DRIVE_ENCODER_ODOMETRY",
+        "bearing_frame": "ROBOT_RELATIVE_AT_SCAN_START",
         "start_heading_deg": 0.0,
         "final_heading_deg": 0.0,
         "restoration_error_deg": 0.0,
         "restoration_verified": True,
+        "encoder_start_angles_deg": {
+            "left_drive": 0,
+            "right_drive": 0,
+        },
+        "encoder_final_angles_deg": {
+            "left_drive": 0,
+            "right_drive": 0,
+        },
+        "encoder_restoration": {
+            "common_mode_residue_mm": 0.0,
+            "opposed_residue_deg": 0.0,
+            "motion_stopped": True,
+            "observation_settled": True,
+            "body_pose_verified": True,
+        },
+        "imu_heading_diagnostics": {
+            "authority": "DIAGNOSTIC_ONLY",
+            "start_heading_deg": 0.0,
+            "final_heading_deg": 0.0,
+            "restoration_error_deg": 0.0,
+        },
         "all_observations_settled": True,
         "rays": [
             {
@@ -53,11 +110,18 @@ def scan_result(distances):
                     if distance == 2_000 else RANGE_STATE_MEASURED
                 ),
                 "body_motor_angle_deg": 158,
-                "heading_deg": heading,
-                "relative_heading_deg": heading,
+                "heading_deg": evidence[1],
+                "relative_heading_deg": evidence[1],
+                "imu_heading_deg": requested_heading,
+                "drive_encoder_delta_deg": evidence[0],
                 "observation_settled": True,
             }
-            for side, heading, distance in zip(sides, headings, distances)
+            for side, requested_heading, evidence, distance in zip(
+                sides,
+                requested_headings,
+                encoder_evidence,
+                distances,
+            )
         ],
     }
 
@@ -139,15 +203,37 @@ class BlastTargetReacquisitionGeometryTests(unittest.TestCase):
         for fact in ("clearance_proven", "passage_proven", "route_eligible"):
             self.assertFalse(waypoint[fact])
 
-    def test_live_reacquisition_pose_clears_two_pulse_scan_sweep(self):
-        self.assertTrue(side_search_scan_sweep_is_clear(
+    def test_live_reacquisition_pose_clears_bounded_scan_sweep(self):
+        self.assertTrue(blast_scan_sweep_is_clear(
             self.origin, self.current
         ))
 
+    def test_one_outbound_pulse_is_checked_against_frozen_target(self):
+        clear_pose = PhysicalPose(heading_mdeg=-94_570)
+        colliding_pose = PhysicalPose(x_mm=40, y_mm=40)
+
+        self.assertTrue(side_search_advance_sweep_is_clear(
+            self.origin, clear_pose,
+        ))
+        self.assertFalse(side_search_advance_sweep_is_clear(
+            self.origin, colliding_pose,
+        ))
+
     def test_scan_sweep_rejects_remembered_target_intersection(self):
-        self.assertFalse(side_search_scan_sweep_is_clear(
+        self.assertFalse(blast_scan_sweep_is_clear(
             self.origin,
             PhysicalPose(x_mm=40, y_mm=40),
+        ))
+
+    def test_full_width_scan_requires_both_turn_sweeps_clear(self):
+        pose = PhysicalPose(x_mm=574, y_mm=299)
+
+        self.assertFalse(blast_scan_sweep_is_clear(self.origin, pose))
+        self.assertTrue(side_search_turn_sweep_is_clear(
+            self.origin, pose, TURN_LEFT_90,
+        ))
+        self.assertFalse(side_search_turn_sweep_is_clear(
+            self.origin, pose, TURN_RIGHT_90,
         ))
 
     def test_progress_orients_retraces_restores_and_rescans(self):
@@ -175,6 +261,59 @@ class BlastTargetReacquisitionGeometryTests(unittest.TestCase):
         )
         self.assertEqual(progress["phase"], "RESCAN")
         self.assertEqual(progress["required_action"], SCAN_FRONT_ARC)
+
+    def test_recovery_rebase_inverts_verified_side_corridor(self):
+        host_actions = (
+            (ADVANCE,) * 8
+            + (TURN_RIGHT_90, SCAN_FRONT_ARC)
+        )
+        waypoint = recovery_rebase_waypoint(
+            self.origin, self.failed, "LEFT", host_actions,
+        )
+
+        self.assertEqual(
+            waypoint["search_basis"], RECOVERY_REBASE_SEARCH_BASIS,
+        )
+        self.assertEqual(waypoint["rebase_turn_action"], TURN_RIGHT_90)
+        self.assertEqual(waypoint["restore_turn_action"], TURN_LEFT_90)
+        pose = self.current
+        trace = []
+        outbound_oriented = False
+        restored = False
+        for _index in range(20):
+            progress = side_search_progress(
+                pose,
+                waypoint,
+                outbound_orientation_attempted=outbound_oriented,
+            )
+            action = progress["required_action"]
+            self.assertIsNotNone(action)
+            trace.append(action)
+            if action == SCAN_FRONT_ARC:
+                break
+            if progress["phase"] == "ORIENT_INWARD":
+                outbound_oriented = True
+            if progress["phase"] == "REORIENT":
+                restored = True
+            pose = nominal(pose, action)
+
+        self.assertTrue(restored)
+        self.assertEqual(trace[0], TURN_RIGHT_90)
+        self.assertEqual(trace[-1], SCAN_FRONT_ARC)
+        self.assertIn(TURN_LEFT_90, trace)
+        rebase_view = view(
+            pose,
+            (500, 900, 2_000, 1_200, 2_000),
+            (("center", 500, 0),),
+        )
+        self.assertTrue(recovery_rebase_completed(
+            self.origin,
+            rebase_view,
+            waypoint,
+            pose,
+            host_actions + tuple(trace),
+            len(host_actions),
+        ))
 
     def test_requires_exact_no_return_on_both_target_facing_rays(self):
         measured = copy.deepcopy(self.failed)

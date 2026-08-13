@@ -440,6 +440,8 @@ class BlastHubSpeechTests(unittest.TestCase):
             def play_pcm(self, payload, *, cancel_requested):
                 self.calls.append((payload, cancel_requested))
                 return {
+                    "accepted": True,
+                    "started": True,
                     "byte_count": len(payload),
                     "sample_count": _adpcm_sample_count(payload),
                     "duration_ms": 5_136,
@@ -468,6 +470,42 @@ class BlastHubSpeechTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["duration_ms"], 5_136)
 
+    def test_speaker_marks_started_only_after_validated_pcm_receipt(self):
+        audio = wav_bytes((0,) * 256, BLAST_ADPCM_SAMPLE_RATE_HZ)
+
+        class Synthesizer:
+            @staticmethod
+            def synthesize(_text, _locale, _cancel_event):
+                return audio
+
+        class CancelEvent(threading.Event):
+            def __init__(self):
+                super().__init__()
+                self.marked = False
+
+            def mark_playback_started(self):
+                self.marked = True
+
+        cancel = CancelEvent()
+
+        class Controller:
+            @staticmethod
+            def play_pcm(payload, **_kwargs):
+                self.assertFalse(cancel.marked)
+                return {
+                    "accepted": True,
+                    "started": True,
+                    "duration_ms": 16,
+                    "sample_count": _adpcm_sample_count(payload),
+                }
+
+        with mock.patch.object(cancel, "wait", return_value=False):
+            BlastHubSpeaker(Synthesizer(), Controller())(
+                "Hej", "sv", cancel,
+            )
+
+        self.assertTrue(cancel.marked)
+
     def test_cancel_during_started_utterance_finishes_speech_worker(self):
         audio = wav_bytes((0,) * 16_000, BLAST_ADPCM_SAMPLE_RATE_HZ)
 
@@ -482,7 +520,11 @@ class BlastHubSpeechTests(unittest.TestCase):
 
             def play_pcm(self, payload, **_kwargs):
                 self.payloads.append(payload)
-                return {"duration_ms": 1_008}
+                return {
+                    "accepted": True,
+                    "started": True,
+                    "duration_ms": 1_008,
+                }
 
         controller = Controller()
         cancel = threading.Event()

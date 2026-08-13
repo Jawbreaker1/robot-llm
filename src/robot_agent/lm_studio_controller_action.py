@@ -74,6 +74,18 @@ _UTTERANCE_PERSONA_PROMPT = (
     "null."
 )
 
+_UTTERANCE_LENGTH_PROMPT = (
+    " Keep utterance at or below {maximum} Unicode characters."
+)
+
+_LOCAL_MAP_PROMPT = (
+    " When local_map_evidence is present, use its episode-local robot pose, "
+    "directional goal, footprint, and accumulated echo points to decide what "
+    "to inspect or do next. Echo points are possible obstacle returns, not "
+    "object boundaries. Unobserved space is unknown, never free, and the host "
+    "has not selected a corridor, waypoint, or turn side."
+)
+
 
 def _safe_text(name: str, value: str, maximum: int) -> str:
     if (
@@ -151,7 +163,9 @@ def _loads(raw: bytes, maximum: int):
         ) from None
 
 
-def _actions(values: Sequence[str]) -> tuple[str, ...]:
+def _actions(
+    values: Sequence[str], *, allow_empty: bool = False,
+) -> tuple[str, ...]:
     if isinstance(values, (str, bytes)):
         raise _lm.LMStudioInputError("Available controller actions are invalid")
     try:
@@ -160,7 +174,7 @@ def _actions(values: Sequence[str]) -> tuple[str, ...]:
         raise _lm.LMStudioInputError(
             "Available controller actions are invalid"
         ) from None
-    if not actions or len(actions) > 32:
+    if not actions and not allow_empty or len(actions) > 32:
         raise _lm.LMStudioInputError("Available controller actions are invalid")
     for value in actions:
         if _safe_text("Controller action", value, 64) in TERMINAL_ACTIONS:
@@ -182,7 +196,9 @@ class ControllerActionContext:
     observation: Mapping[str, object]
     history: tuple[Mapping[str, object], ...] = ()
     completion_allowed: bool = True
+    abort_allowed: bool = True
     robot_relative_side_scan: Mapping[str, object] | None = None
+    local_map_evidence: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         _safe_text("Controller goal", self.goal, MAX_GOAL_CHARS)
@@ -193,7 +209,10 @@ class ControllerActionContext:
         object.__setattr__(
             self,
             "available_actions",
-            _actions(self.available_actions),
+            _actions(
+                self.available_actions,
+                allow_empty=self.completion_allowed is True,
+            ),
         )
         if not isinstance(self.observation, Mapping):
             raise _lm.LMStudioInputError("Controller observation is invalid")
@@ -202,15 +221,26 @@ class ControllerActionContext:
             or len(self.history) > MAX_HISTORY_ITEMS
             or any(not isinstance(item, Mapping) for item in self.history)
             or type(self.completion_allowed) is not bool
+            or type(self.abort_allowed) is not bool
+            or (
+                not self.abort_allowed
+                and not self.completion_allowed
+                and not self.available_actions
+            )
             or (
                 self.robot_relative_side_scan is not None
                 and not isinstance(self.robot_relative_side_scan, Mapping)
+            )
+            or (
+                self.local_map_evidence is not None
+                and not isinstance(self.local_map_evidence, Mapping)
             )
         ):
             raise _lm.LMStudioInputError("Controller history is invalid")
         _strict_value(self.observation)
         _strict_value(self.history)
         _strict_value(self.robot_relative_side_scan)
+        _strict_value(self.local_map_evidence)
 
     def to_dict(self):
         value = {
@@ -222,10 +252,15 @@ class ControllerActionContext:
             "observation": _strict_value(self.observation),
             "history": _strict_value(self.history),
             "completion_allowed": self.completion_allowed,
+            "abort_allowed": self.abort_allowed,
         }
         if self.robot_relative_side_scan is not None:
             value["robot_relative_side_scan"] = _strict_value(
                 self.robot_relative_side_scan
+            )
+        if self.local_map_evidence is not None:
+            value["local_map_evidence"] = _strict_value(
+                self.local_map_evidence
             )
         return value
 
@@ -295,10 +330,12 @@ class LMStudioControllerActionPlanner:
             raise _lm.LMStudioInputError(
                 "Controller-action request is invalid"
             )
-        terminal_actions = (
-            TERMINAL_ACTIONS
-            if context.completion_allowed
-            else (ABORT,)
+        terminal_actions = tuple(
+            action for action in TERMINAL_ACTIONS
+            if (
+                action == COMPLETE and context.completion_allowed
+                or action == ABORT and context.abort_allowed
+            )
         )
         choices = list(context.available_actions + terminal_actions)
         properties = {
@@ -330,9 +367,15 @@ class LMStudioControllerActionPlanner:
             },
         }
         system_prompt = _SYSTEM_PROMPT
+        if context.local_map_evidence is not None:
+            system_prompt += _LOCAL_MAP_PROMPT
         if self._utterance_persona_by_locale is not None:
             system_prompt += _UTTERANCE_PERSONA_PROMPT.format(
                 persona=self._utterance_persona_by_locale[context.locale]
+            )
+        if self._max_utterance_chars != MAX_UTTERANCE_CHARS:
+            system_prompt += _UTTERANCE_LENGTH_PROMPT.format(
+                maximum=self._max_utterance_chars,
             )
         payload = {
             "model": self._model,
@@ -450,10 +493,12 @@ class LMStudioControllerActionPlanner:
         assessment = value["assessment"]
         plan = value["plan"]
         utterance = value["utterance"]
-        allowed = context.available_actions + (
-            TERMINAL_ACTIONS
-            if context.completion_allowed
-            else (ABORT,)
+        allowed = context.available_actions + tuple(
+            action for action in TERMINAL_ACTIONS
+            if (
+                action == COMPLETE and context.completion_allowed
+                or action == ABORT and context.abort_allowed
+            )
         )
         if (
             action not in allowed

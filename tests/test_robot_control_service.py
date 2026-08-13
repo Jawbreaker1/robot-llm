@@ -1,9 +1,12 @@
-import json
+from dataclasses import FrozenInstanceError
 import itertools
+import json
 import threading
 import time
 import unittest
+from unittest import mock
 
+from robot_agent.dashboard_contract import DashboardContractError
 from robot_agent.lm_studio import DEFAULT_MODEL
 from robot_agent.robot_control_contract import (
     DISABLED,
@@ -14,6 +17,7 @@ from robot_agent.robot_control_contract import (
     STARTING,
     STOPPING,
     RobotControlSettings,
+    RobotControlTarget,
 )
 from robot_agent.robot_control_service import (
     MAX_EVENT_HISTORY_BYTES,
@@ -25,6 +29,7 @@ from robot_agent.robot_control_service import (
     RobotEpisodeOutcome,
     RobotControlService,
     RobotControlServiceError,
+    RobotEpisodeGate,
 )
 
 
@@ -81,6 +86,39 @@ class FakeRuntimeAdapter:
         self.release.set()
 
 
+TEST_TARGET = RobotControlTarget(
+    robot_id="test-robot-01",
+    display_name="Test Robot",
+)
+
+
+class RobotControlTargetContractTests(unittest.TestCase):
+    def test_target_is_exact_serializable_and_immutable(self):
+        target = RobotControlTarget("blast-01", "BLAST")
+
+        self.assertEqual(
+            target.to_dict(),
+            {"robot_id": "blast-01", "display_name": "BLAST"},
+        )
+        with self.assertRaises(FrozenInstanceError):
+            target.display_name = "Another robot"
+
+    def test_target_rejects_ambiguous_or_unstable_identity(self):
+        invalid = (
+            ("", "BLAST"),
+            ("blast 01", "BLAST"),
+            ("blast-01", " BLAST"),
+            ("blast-01", "BLAST\nrobot"),
+        )
+        for robot_id, display_name in invalid:
+            with self.subTest(
+                robot_id=robot_id,
+                display_name=display_name,
+            ):
+                with self.assertRaises(DashboardContractError):
+                    RobotControlTarget(robot_id, display_name)
+
+
 class RobotControlRetentionTests(unittest.TestCase):
     def test_default_observation_histories_are_generous_and_bounded(self):
         self.assertEqual(MAX_EVENTS, 4_096)
@@ -93,6 +131,7 @@ class RobotControlRetentionTests(unittest.TestCase):
         byte_capacity = 128 * 1024
         service = RobotControlService(
             FakeRuntimeAdapter(),
+            target=TEST_TARGET,
             event_byte_capacity=byte_capacity,
             snapshot_byte_capacity=byte_capacity,
         )
@@ -154,6 +193,18 @@ class BlockingEmergencyAdapter(FakeRuntimeAdapter):
         self.emergency_entered.set()
         self.finish_emergency.wait(1.0)
         self.release.set()
+
+
+class BlockingStopAdapter(FakeRuntimeAdapter):
+    def __init__(self):
+        super().__init__()
+        self.stop_entered = threading.Event()
+        self.finish_stop = threading.Event()
+
+    def request_stop(self):
+        self.stop_calls += 1
+        self.stop_entered.set()
+        self.finish_stop.wait(1.0)
 
 
 class FailingEmergencyAdapter(FakeRuntimeAdapter):
@@ -236,10 +287,17 @@ class RobotControlServiceTests(unittest.TestCase):
     def test_control_settings_share_canonical_model_default(self):
         self.assertEqual(RobotControlSettings().model, DEFAULT_MODEL)
 
+    def test_runtime_and_immutable_target_are_configured_together(self):
+        with self.assertRaisesRegex(ValueError, "exactly when"):
+            RobotControlService(FakeRuntimeAdapter())
+        with self.assertRaisesRegex(ValueError, "exactly when"):
+            RobotControlService(target=TEST_TARGET)
+
     def make_service(self, adapter=None, **kwargs):
         values = DeterministicValues()
         service = RobotControlService(
             adapter,
+            target=TEST_TARGET if adapter is not None else None,
             clock_ms=values.clock,
             id_factory=values.identifier,
             **kwargs
@@ -257,8 +315,10 @@ class RobotControlServiceTests(unittest.TestCase):
 
     def test_without_adapter_is_explicitly_disabled(self):
         service = self.make_service()
-        self.assertEqual(service.status()["state"], DISABLED)
-        self.assertFalse(service.status()["enabled"])
+        status = service.status()
+        self.assertEqual(status["state"], DISABLED)
+        self.assertFalse(status["enabled"])
+        self.assertIsNone(status["target"])
         with self.assertRaises(RobotControlServiceError) as raised:
             self.start(service)
         self.assertEqual(raised.exception.status, 503)
@@ -271,6 +331,20 @@ class RobotControlServiceTests(unittest.TestCase):
     def test_start_runs_one_episode_and_publishes_typed_status(self):
         adapter = FakeRuntimeAdapter()
         service = self.make_service(adapter)
+
+        initial = service.status()
+        self.assertEqual(
+            initial["target"],
+            {
+                "robot_id": "test-robot-01",
+                "display_name": "Test Robot",
+            },
+        )
+        initial["target"]["display_name"] = "Tampered"
+        self.assertEqual(
+            service.status()["target"]["display_name"],
+            "Test Robot",
+        )
 
         accepted = self.start(service)
         self.assertEqual(accepted["control"]["state"], STARTING)
@@ -445,6 +519,63 @@ class RobotControlServiceTests(unittest.TestCase):
         )
         adapter.release.set()
 
+    def test_shared_gate_serializes_two_robot_services_until_terminal(self):
+        gate = RobotEpisodeGate()
+        ev3_adapter = FakeRuntimeAdapter()
+        blast_adapter = FakeRuntimeAdapter()
+        ev3 = self.make_service(ev3_adapter, episode_gate=gate)
+        blast = RobotControlService(
+            blast_adapter,
+            target=RobotControlTarget("blast-01", "BLAST"),
+            episode_gate=gate,
+        )
+        self.addCleanup(blast.shutdown, 0.2)
+
+        self.start(ev3, request_id="ev3-request")
+        self.assertTrue(ev3_adapter.entered.wait(1.0))
+        with self.assertRaises(RobotControlServiceError) as busy:
+            self.start(blast, request_id="blast-blocked")
+        self.assertEqual(busy.exception.status, 409)
+        self.assertEqual(busy.exception.code, "robot_episode_gate_busy")
+        self.assertEqual(blast.status()["state"], IDLE)
+
+        ev3_adapter.release.set()
+        wait_for_state(ev3, IDLE)
+        accepted = self.start(blast, request_id="blast-accepted")
+        self.assertFalse(accepted["idempotent"])
+        self.assertTrue(blast_adapter.entered.wait(1.0))
+        blast_adapter.release.set()
+
+    def test_start_setup_failure_releases_shared_gate(self):
+        gate = RobotEpisodeGate()
+        failed = self.make_service(
+            FakeRuntimeAdapter(),
+            episode_gate=gate,
+        )
+        second_adapter = FakeRuntimeAdapter()
+        second = RobotControlService(
+            second_adapter,
+            target=RobotControlTarget("blast-01", "BLAST"),
+            episode_gate=gate,
+        )
+        self.addCleanup(second.shutdown, 0.2)
+        broken_thread = mock.Mock()
+        broken_thread.start.side_effect = RuntimeError("thread failed")
+
+        with (
+            mock.patch(
+                "robot_agent.robot_control_service.threading.Thread",
+                return_value=broken_thread,
+            ),
+            self.assertRaisesRegex(RuntimeError, "thread failed"),
+        ):
+            self.start(failed, request_id="failed-start")
+
+        self.assertEqual(failed.status()["state"], IDLE)
+        self.start(second, request_id="second-start")
+        self.assertTrue(second_adapter.entered.wait(1.0))
+        second_adapter.release.set()
+
     def test_settings_are_revisioned_and_idle_only(self):
         adapter = FakeRuntimeAdapter()
         service = self.make_service(adapter)
@@ -497,6 +628,41 @@ class RobotControlServiceTests(unittest.TestCase):
             "stopped",
         )
         self.assertEqual(service.stop()["state"], IDLE)
+
+    def test_shared_gate_waits_for_blocked_stop_signal_to_quiesce(self):
+        gate = RobotEpisodeGate()
+        first_adapter = BlockingStopAdapter()
+        second_adapter = FakeRuntimeAdapter()
+        first = self.make_service(first_adapter, episode_gate=gate)
+        second = RobotControlService(
+            second_adapter,
+            target=RobotControlTarget("blast-01", "BLAST"),
+            episode_gate=gate,
+        )
+        self.addCleanup(second.shutdown, 0.2)
+        self.start(first, request_id="first-start")
+        self.assertTrue(first_adapter.entered.wait(1.0))
+
+        stop_result = []
+        stop_thread = threading.Thread(
+            target=lambda: stop_result.append(first.stop()),
+        )
+        stop_thread.start()
+        self.assertTrue(first_adapter.stop_entered.wait(1.0))
+        self.assertTrue(first_adapter.exited.wait(1.0))
+        self.assertEqual(first.status()["state"], STOPPING)
+        with self.assertRaises(RobotControlServiceError) as busy:
+            self.start(second, request_id="blocked-during-stop")
+        self.assertEqual(busy.exception.status, 409)
+        self.assertEqual(busy.exception.code, "robot_episode_gate_busy")
+
+        first_adapter.finish_stop.set()
+        stop_thread.join(1.0)
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(wait_for_state(first, IDLE)["state"], IDLE)
+        self.start(second, request_id="accepted-after-stop")
+        self.assertTrue(second_adapter.entered.wait(1.0))
+        second_adapter.release.set()
 
     def test_emergency_stop_calls_adapter_outside_runner(self):
         adapter = FakeRuntimeAdapter()
@@ -560,7 +726,15 @@ class RobotControlServiceTests(unittest.TestCase):
             code = "ev3_transport_failed"
 
         adapter = FakeRuntimeAdapter()
-        adapter.invalid_update = {"message": "navigation_fault"}
+        adapter.invalid_update = {
+            "current_action": "ADVANCE",
+            "active_route": {
+                "route_id": "route-before-fault",
+                "waypoints": [],
+            },
+            "plan": ["ADVANCE"],
+            "message": "navigation_fault",
+        }
         adapter.raise_error = CodedRuntimeError(
             "EV3 link failed\nwhile reading motor\x00" + ("x" * 500)
         )
@@ -573,6 +747,9 @@ class RobotControlServiceTests(unittest.TestCase):
             "ev3_transport_failed",
         )
         self.assertIsNone(faulted["runtime"]["message"])
+        self.assertIsNone(faulted["runtime"]["current_action"])
+        self.assertIsNone(faulted["runtime"]["active_route"])
+        self.assertEqual(faulted["runtime"]["plan"], [])
 
         events = service.events(0, 100)["events"]
         event = next(

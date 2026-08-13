@@ -826,17 +826,73 @@ class SharedSpatialMapCompositorTests(TestCase):
         self.assertIsNone(shared["navigation_authority"])
         robot = shared["robots"][0]
         self.assertEqual(robot["collision_geometry"], geometry)
+        self.assertEqual(robot["object_hypotheses"], [])
         for forbidden in (
             "bounds",
             "cells",
             "sensor_rays",
             "qualitative_observations",
             "scan_evidence_history",
-            "object_hypotheses",
             "navigation_authority",
         ):
             self.assertNotIn(forbidden, robot)
         self.assertIsNone(robot["navigation_trace"])
+
+    def test_provisional_ultrasonic_cluster_is_transformed_per_robot_only(self):
+        calibration = frame_transform(
+            "blast-01", "blast-hub", "blast-local", "episode-a",
+            tx_mm=100, ty_mm=200,
+        )
+        value = local_map(
+            "blast-01", "blast-hub", "blast-local", "episode-a",
+        )
+        value["status"] = "qualitative_only"
+        value["object_hypotheses"] = [{
+            "hypothesis_id": "blast-ultrasonic-a",
+            "classification": "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+            "label": "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
+            "x_mm": 100,
+            "y_mm": 0,
+            "geometry_kind": "PROVISIONAL_ULTRASONIC_ECHO_CLUSTER",
+            "support_radius_mm": 35,
+            "support_points": [{
+                "side": "center", "x_mm": 100, "y_mm": 0,
+                "measured_range_mm": 100,
+                "relative_bearing_mdeg": 0,
+            }],
+            "source_scan_ids": ["dense-scan"],
+            "bearing": "FRONT",
+            "relation": "FRONT_OF_SCAN",
+            "evidence_count": 1,
+            "confidence_milli": 200,
+            "source_id": "blast-settled-measured-planar-projection",
+            "provenance": (
+                "SETTLED_MEASURED_ULTRASONIC + PROVISIONAL_YAW_ONLY"
+            ),
+            "quality": "PROVISIONAL_YAW_ONLY",
+            "settled_measured_only": True,
+            "provisional": True,
+            "read_only": True,
+            "observed_at_unix_ms": 1_000,
+            "age_ms": 0,
+        }]
+
+        shared = compositor((Provider(value), calibration)).snapshot()
+
+        self.assertEqual(shared["object_hypotheses"], [])
+        hypotheses = shared["robots"][0]["object_hypotheses"]
+        self.assertEqual(len(hypotheses), 1)
+        self.assertEqual(
+            (hypotheses[0]["x_mm"], hypotheses[0]["y_mm"]),
+            (200, 200),
+        )
+        self.assertEqual(
+            (
+                hypotheses[0]["support_points"][0]["x_mm"],
+                hypotheses[0]["support_points"][0]["y_mm"],
+            ),
+            (200, 200),
+        )
 
 
 if __name__ == "__main__":

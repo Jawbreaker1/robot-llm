@@ -90,9 +90,10 @@ class SpatialMappingDemoTests(unittest.TestCase):
         script = r"""
 const fs = require("fs");
 const vm = require("vm");
-const source = fs.readFileSync(process.argv[1], "utf8");
 const context = {};
-vm.runInNewContext(source, context, { filename: process.argv[1] });
+for (const filename of process.argv.slice(1)) {
+  vm.runInNewContext(fs.readFileSync(filename, "utf8"), context, { filename });
+}
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
 const map = context.RobotDashboardLogic.normalizeSpatialMap(
   input,
@@ -113,6 +114,7 @@ process.stdout.write(JSON.stringify({
                 "--input-type=commonjs",
                 "-e",
                 script,
+                str(logic_path.with_name("blast_map_semantics.js")),
                 str(logic_path),
             ],
             input=json.dumps(view),

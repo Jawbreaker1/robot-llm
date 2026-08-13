@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
@@ -10,7 +11,17 @@ from robot_agent.blast_detour_route import (
     blast_detour_required_slots,
     blast_detour_scan_allows_progress,
     blast_detour_scan_sweep_is_clear,
+    blast_side_view_associates_frozen_target,
 )
+from robot_agent.blast_observation_monitor import blast_range_state
+from robot_agent.blast_scan_observation import (
+    SCAN_ANGULAR_RAY_SIDES,
+    encoder_relative_bearing_deg,
+)
+from robot_agent.blast_scan_planar_projection import (
+    project_blast_scan_planar_surfaces,
+)
+from robot_agent.blast_side_search_geometry import side_search_waypoint
 from robot_agent.local_detour_route import (
     LATERAL_CLEARANCE,
     MERGE_GOAL_AXIS,
@@ -61,6 +72,114 @@ def waypoint(side, origin_pose=PhysicalPose()):
     }
 
 
+def encoder_scan_bearing_evidence(requested_bearing_deg):
+    """Build one exact integer-encoder bearing for a synthetic scan ray."""
+
+    opposed = round(abs(requested_bearing_deg) / 0.490)
+    if requested_bearing_deg < 0:
+        delta = {"left_drive": -opposed, "right_drive": opposed}
+    elif requested_bearing_deg > 0:
+        delta = {"left_drive": opposed, "right_drive": -opposed}
+    else:
+        delta = {"left_drive": 0, "right_drive": 0}
+    bearing = encoder_relative_bearing_deg(
+        {"motor_angles_deg": delta},
+        {"left_drive": 0, "right_drive": 0},
+    )
+    return delta, bearing
+
+
+def dense_scan_view(pose, ranges, relative, restoration_error=0.0):
+    start = pose.heading_mdeg / 1_000.0
+    encoder_evidence = tuple(
+        encoder_scan_bearing_evidence(heading) for heading in relative
+    )
+    angular = [
+        {
+            "side": side,
+            "distance_mm": distance,
+            "range_state": blast_range_state(distance),
+            "body_motor_angle_deg": 158,
+            "heading_deg": evidence[1],
+            "relative_heading_deg": evidence[1],
+            "imu_heading_deg": start + heading,
+            "drive_encoder_delta_deg": evidence[0],
+            "observation_settled": True,
+        }
+        for side, distance, heading, evidence in zip(
+            SCAN_ANGULAR_RAY_SIDES, ranges, relative, encoder_evidence,
+        )
+    ]
+    scan = {
+        "schema": "blast-scan-front-arc/v3",
+        "state": "complete",
+        "result": "restored",
+        "bearing_source": "DRIVE_ENCODER_ODOMETRY",
+        "bearing_frame": "ROBOT_RELATIVE_AT_SCAN_START",
+        "start_heading_deg": 0.0,
+        "final_heading_deg": 0.0,
+        "restoration_error_deg": 0.0,
+        "restoration_verified": True,
+        "encoder_start_angles_deg": {
+            "left_drive": 0, "right_drive": 0,
+        },
+        "encoder_final_angles_deg": {
+            "left_drive": 0, "right_drive": 0,
+        },
+        "encoder_restoration": {
+            "common_mode_residue_mm": 0.0,
+            "opposed_residue_deg": 0.0,
+            "motion_stopped": True,
+            "observation_settled": True,
+            "body_pose_verified": True,
+        },
+        "imu_heading_diagnostics": {
+            "authority": "DIAGNOSTIC_ONLY",
+            "start_heading_deg": start,
+            "final_heading_deg": start + restoration_error,
+            "restoration_error_deg": restoration_error,
+        },
+        "all_observations_settled": True,
+        "rays": [
+            {**deepcopy(angular[index]), "side": side}
+            for index, side in (
+                (0, "center"),
+                (2, "left_near"),
+                (4, "left_far"),
+                (6, "right_near"),
+                (8, "right_far"),
+            )
+        ],
+        "angular_rays": angular,
+    }
+    return {
+        "scan_pose": pose.to_dict(),
+        "scan": scan,
+        "planar_projection": project_blast_scan_planar_surfaces(
+            scan=scan, scan_pose=pose,
+        ),
+    }
+
+
+def live_dense_right_views(side_pose):
+    origin = dense_scan_view(
+        PhysicalPose(),
+        (265, 285, 310, 351, 379, 250, 250, 251, 1_228),
+        (0.0, -9.98, -21.16, -32.58, -43.90,
+         11.48, 22.21, 33.75, 44.56),
+        0.434,
+    )
+    side = dense_scan_view(
+        side_pose,
+        (2_000, 487, 496, 485, 504,
+         2_000, 2_000, 2_000, 2_000),
+        (0.0, -12.24, -21.56, -33.28, -43.91,
+         9.25, 20.36, 31.31, 41.82),
+        -2.158,
+    )
+    return origin, side
+
+
 def with_settled_scan(value, distances):
     headings = {
         "center": 0.0,
@@ -74,14 +193,39 @@ def with_settled_scan(value, distances):
     }
     for point in value["planar_projection"]["points"]:
         point["measured_range_mm"] = measured[point["side"]]
+    encoder_evidence = {
+        side: encoder_scan_bearing_evidence(heading)
+        for side, heading in headings.items()
+    }
     value["scan"] = {
         "schema": "blast-scan-front-arc/v3",
         "state": "complete",
         "result": "restored",
+        "bearing_source": "DRIVE_ENCODER_ODOMETRY",
+        "bearing_frame": "ROBOT_RELATIVE_AT_SCAN_START",
         "start_heading_deg": 0.0,
         "final_heading_deg": 0.0,
         "restoration_error_deg": 0.0,
         "restoration_verified": True,
+        "encoder_start_angles_deg": {
+            "left_drive": 0, "right_drive": 0,
+        },
+        "encoder_final_angles_deg": {
+            "left_drive": 0, "right_drive": 0,
+        },
+        "encoder_restoration": {
+            "common_mode_residue_mm": 0.0,
+            "opposed_residue_deg": 0.0,
+            "motion_stopped": True,
+            "observation_settled": True,
+            "body_pose_verified": True,
+        },
+        "imu_heading_diagnostics": {
+            "authority": "DIAGNOSTIC_ONLY",
+            "start_heading_deg": 0.0,
+            "final_heading_deg": 0.0,
+            "restoration_error_deg": 0.0,
+        },
         "all_observations_settled": True,
         "rays": [
             {
@@ -92,8 +236,10 @@ def with_settled_scan(value, distances):
                     else "MEASURED"
                 ),
                 "body_motor_angle_deg": 158,
-                "heading_deg": headings[side],
-                "relative_heading_deg": headings[side],
+                "heading_deg": encoder_evidence[side][1],
+                "relative_heading_deg": encoder_evidence[side][1],
+                "imu_heading_deg": headings[side],
+                "drive_encoder_delta_deg": encoder_evidence[side][0],
                 "observation_settled": True,
             }
             for side, distance in distances
@@ -190,6 +336,96 @@ def no_return_waypoint(detour_origin):
 
 
 class BlastDetourRouteTests(unittest.TestCase):
+    def test_live_dense_right_scan_derives_284_mm_route_and_binds_at_it(self):
+        side_pose = PhysicalPose(y_mm=-284, heading_mdeg=-735)
+        origin, side = live_dense_right_views(side_pose)
+        search = side_search_waypoint(
+            PhysicalPose(), "RIGHT", scan_view=origin,
+        )
+
+        route = bind_blast_detour_route(
+            origin_view=origin,
+            side_view=side,
+            selected_side="RIGHT",
+            side_waypoint=search,
+            mission=mission(),
+            current_pose=side_pose,
+        )
+
+        self.assertEqual(search["target_lateral_offset_mm"], -284)
+        self.assertEqual(
+            search["search_basis"],
+            "PROVISIONAL_SAME_DEPTH_ECHO_REACH",
+        )
+        self.assertEqual(route.target_radius_mm, 214)
+        self.assertEqual(route.route_lateral_offset_mm, -284)
+        self.assertTrue(blast_side_view_associates_frozen_target(
+            side, route, "RIGHT",
+        ))
+
+    def test_live_dense_right_scan_rejects_caught_minus_228_pose(self):
+        caught = PhysicalPose(x_mm=-18, y_mm=-228, heading_mdeg=-735)
+        origin, side = live_dense_right_views(caught)
+        search = side_search_waypoint(
+            PhysicalPose(), "RIGHT", scan_view=origin,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "side pose does not match",
+        ):
+            bind_blast_detour_route(
+                origin_view=origin,
+                side_view=side,
+                selected_side="RIGHT",
+                side_waypoint=search,
+                mission=mission(),
+                current_pose=caught,
+            )
+
+    def test_dense_final_view_does_not_generalize_no_return_to_free(self):
+        side_pose = PhysicalPose(y_mm=-284, heading_mdeg=-735)
+        origin, side = live_dense_right_views(side_pose)
+        search = side_search_waypoint(
+            PhysicalPose(), "RIGHT", scan_view=origin,
+        )
+        close_outward = deepcopy(side)
+        close_outward["scan"]["angular_rays"][5].update({
+            "distance_mm": 50,
+            "range_state": "MEASURED",
+        })
+        close_outward["planar_projection"] = (
+            project_blast_scan_planar_surfaces(
+                scan=close_outward["scan"], scan_pose=side_pose,
+            )
+        )
+        unassociated = deepcopy(side)
+        for point in unassociated["planar_projection"]["points"][:3]:
+            point["nominal_echo_x_mm"] += 1_000
+            point["nominal_echo_y_mm"] += 1_000
+
+        for failed in (close_outward, unassociated):
+            with self.subTest(failed=failed):
+                provisional_route = bind_blast_detour_route(
+                    origin_view=origin,
+                    side_view=side,
+                    selected_side="RIGHT",
+                    side_waypoint=search,
+                    mission=mission(),
+                    current_pose=side_pose,
+                )
+                self.assertFalse(blast_side_view_associates_frozen_target(
+                    failed, provisional_route, "RIGHT",
+                ))
+                with self.assertRaises(ValueError):
+                    bind_blast_detour_route(
+                        origin_view=origin,
+                        side_view=failed,
+                        selected_side="RIGHT",
+                        side_waypoint=search,
+                        mission=mission(),
+                        current_pose=side_pose,
+                    )
+
     def test_live_settled_no_return_side_view_binds_frozen_route(self):
         detour_origin, current, origin, side = live_no_return_views()
 
@@ -302,6 +538,36 @@ class BlastDetourRouteTests(unittest.TestCase):
                         mission=mission(),
                         current_pose=current,
                     )
+
+    def test_dense_mixed_far_view_rejects_close_intermediate_ray(self):
+        side_pose = PhysicalPose(y_mm=-284, heading_mdeg=-735)
+        origin, side = live_dense_right_views(side_pose)
+        search = side_search_waypoint(
+            PhysicalPose(), "RIGHT", scan_view=origin,
+        )
+        route = bind_blast_detour_route(
+            origin_view=origin,
+            side_view=side,
+            selected_side="RIGHT",
+            side_waypoint=search,
+            mission=mission(),
+            current_pose=side_pose,
+        )
+        pass_view = dense_scan_view(
+            PhysicalPose(x_mm=877, y_mm=-284),
+            (1_000, 50, 1_000, 1_000, 2_000,
+             1_000, 1_000, 1_000, 1_000),
+            (0.0, -10.0, -21.0, -33.0, -44.0,
+             10.0, 21.0, 33.0, 44.0),
+        )
+
+        self.assertFalse(blast_detour_scan_allows_progress(
+            pass_view,
+            role="PASS",
+            selected_side="RIGHT",
+            minimum_clearance_mm=120,
+            route=route,
+        ))
 
     def test_scan_sweep_uses_live_two_pulse_excursion_geometry(self):
         route = SimpleNamespace(

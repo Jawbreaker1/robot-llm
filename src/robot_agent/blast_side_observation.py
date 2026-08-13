@@ -8,6 +8,7 @@ from typing import Mapping
 
 from .blast_side_search_geometry import POSITION_TOLERANCE_MM
 from .blast_side_search_geometry import (
+    RECOVERY_REBASE_SEARCH_BASIS,
     TARGET_REACQUISITION_SEARCH_BASIS,
     target_reacquisition_resolved,
     target_reacquisition_waypoint,
@@ -24,40 +25,62 @@ def side_search_action_admission(
     progress, waypoint, sensors, available_actions, evidence_correlated,
     rotation_allowed, *, current_pose=None, prior_receipt=None,
     no_return_scan_geometry_checked=False,
+    no_return_advance_geometry_checked=False,
+    no_return_turn_geometry_checked=False,
 ):
     """Return one admitted host action and an optional typed block reason."""
 
     action = progress.get("required_action")
+    no_return_at_pose = settled_no_return_at_pose(
+        sensors.get("distance_mm"), current_pose, prior_receipt,
+    )
     no_return_scan = (
         progress.get("phase") == "RESCAN"
         and action == SCAN_FRONT_ARC
         and no_return_scan_geometry_checked is True
-        and settled_no_return_at_pose(
-            sensors.get("distance_mm"), current_pose, prior_receipt,
-        )
+        and no_return_at_pose
+    )
+    no_return_advance = (
+        progress.get("phase") == "OUTBOUND"
+        and action == ADVANCE
+        and no_return_advance_geometry_checked is True
+        and no_return_at_pose
+    )
+    no_return_turn = (
+        progress.get("phase") in ("ORIENT_INWARD", "REORIENT")
+        and action in (TURN_LEFT_90, TURN_RIGHT_90)
+        and no_return_turn_geometry_checked is True
+        and no_return_at_pose
     )
     if not evidence_correlated:
         action = None
         no_return_scan = False
+        no_return_advance = False
+        no_return_turn = False
     if action == ADVANCE and (
-        blast_range_state(sensors.get("distance_mm"))
-        != RANGE_STATE_MEASURED or ADVANCE not in available_actions
+        (
+            blast_range_state(sensors.get("distance_mm"))
+            != RANGE_STATE_MEASURED or ADVANCE not in available_actions
+        )
+        and not no_return_advance
     ):
         action = None
     if action in (TURN_LEFT_90, TURN_RIGHT_90, SCAN_FRONT_ARC) and not (
-        rotation_allowed or no_return_scan
+        rotation_allowed or no_return_scan or no_return_turn
     ):
         action = None
     if action is not None and (
-        action in available_actions or no_return_scan
+        action in available_actions
+        or no_return_scan
+        or no_return_advance
+        or no_return_turn
     ):
         return (action,), None
-    reason = (
-        "target_reacquisition_blocked"
-        if waypoint.get("search_basis")
-        == TARGET_REACQUISITION_SEARCH_BASIS
-        else "blast_side_search_blocked"
-    )
+    basis = waypoint.get("search_basis")
+    reason = {
+        TARGET_REACQUISITION_SEARCH_BASIS: "target_reacquisition_blocked",
+        RECOVERY_REBASE_SEARCH_BASIS: "recovery_rebase_blocked",
+    }.get(basis, "blast_side_search_blocked")
     return (), reason
 
 

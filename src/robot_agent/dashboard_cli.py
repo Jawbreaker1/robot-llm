@@ -11,7 +11,7 @@ import signal
 import socket
 import sys
 import threading
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from .dashboard_access_key import load_or_create_dashboard_access_key
 from .dashboard_http import (
@@ -49,9 +49,16 @@ from .host_piper_speech import (
     MacOSSayWAVSynthesizer,
     PiperLoopbackSynthesizer,
 )
-from .robot_control_contract import RobotControlSettings
-from .robot_control_http import EV3_CONTROLLER_ID, RobotControlHTTPRouter
-from .robot_control_service import RobotControlService
+from .robot_control_contract import (
+    RobotControlSettings,
+    RobotControlTarget,
+)
+from .robot_control_http import (
+    EV3_CONTROLLER_ID,
+    RobotControlHTTPDirectoryRouter,
+    RobotControlHTTPRouter,
+)
+from .robot_control_service import RobotControlService, RobotEpisodeGate
 from .robot_input_service import RobotInputService
 from .robot_speech_runtime import RobotSpeechRuntime
 from .robot_turn_speech import RobotTurnSpeechSink
@@ -70,7 +77,29 @@ ROBOT_PROFILE_CHOICES = (
     EV3RSTORM_PROFILE_ID,
     BLAST_PROFILE_ID,
 )
-BLAST_MAX_NAVIGATION_UTTERANCE_CHARS = 120
+# BLAST can upload at most eight seconds of ADPCM.  Keep navigation remarks
+# short enough to leave synthesis headroom for natural Swedish pauses.
+BLAST_MAX_NAVIGATION_UTTERANCE_CHARS = 72
+
+
+def _configured_robot_control_target(
+    profile_id: str,
+) -> Optional[RobotControlTarget]:
+    """Return the one physical addressee selected for this server."""
+
+    if profile_id == ROBOT_PROFILE_DISABLED:
+        return None
+    if profile_id == BLAST_PROFILE_ID:
+        return RobotControlTarget(
+            robot_id=BLAST_ROBOT_ID,
+            display_name="BLAST",
+        )
+    if profile_id == EV3RSTORM_PROFILE_ID:
+        return RobotControlTarget(
+            robot_id=EV3RSTORM_PROFILE_ID,
+            display_name="EV3RSTORM",
+        )
+    raise ValueError("physical robot profile is unsupported")
 
 
 class _LoopbackThreadingHTTPServer(ThreadingHTTPServer):
@@ -293,6 +322,10 @@ def build_server(
     robot_control_service=None,
     robot_input_service=None,
     controller_control_services=None,
+    robot_control_services=None,
+    robot_input_services=None,
+    default_robot_id=None,
+    robot_spatial_map_providers=None,
 ):
     if (
         isinstance(port, bool)
@@ -307,14 +340,79 @@ def build_server(
         if robot_control_service is not None
         else RobotControlService()
     )
+    default_control_router = RobotControlHTTPRouter(
+        control_service,
+        robot_input_service,
+        controller_control_services,
+    )
+    if robot_control_services is None:
+        snapshot = control_service.status()
+        target = (
+            snapshot.get("target")
+            if isinstance(snapshot, Mapping)
+            else None
+        )
+        inferred_robot_id = (
+            target.get("robot_id")
+            if isinstance(target, Mapping)
+            else None
+        )
+        scoped_control_services = (
+            {inferred_robot_id: control_service}
+            if isinstance(inferred_robot_id, str)
+            else {}
+        )
+        scoped_input_services = (
+            {inferred_robot_id: robot_input_service}
+            if (
+                isinstance(inferred_robot_id, str)
+                and robot_input_service is not None
+            )
+            else {}
+        )
+        if default_robot_id is None:
+            default_robot_id = inferred_robot_id
+        scoped_map_providers = (
+            {inferred_robot_id: service}
+            if (
+                robot_spatial_map_providers is None
+                and isinstance(inferred_robot_id, str)
+            )
+            else robot_spatial_map_providers
+        )
+    else:
+        scoped_control_services = robot_control_services
+        scoped_input_services = (
+            {} if robot_input_services is None else robot_input_services
+        )
+        scoped_map_providers = robot_spatial_map_providers
+    if scoped_map_providers is None:
+        scoped_map_providers = {}
+    if (
+        not isinstance(scoped_control_services, Mapping)
+        or not isinstance(scoped_input_services, Mapping)
+        or not isinstance(scoped_map_providers, Mapping)
+        or not set(scoped_input_services) <= set(scoped_control_services)
+        or not set(scoped_map_providers) <= set(scoped_control_services)
+    ):
+        raise ValueError("Robot control service directory is invalid")
+    scoped_routers = {
+        robot_id: RobotControlHTTPRouter(
+            scoped_control_service,
+            scoped_input_services.get(robot_id),
+        )
+        for robot_id, scoped_control_service
+        in scoped_control_services.items()
+    }
     router = DashboardRouter(
         service=service,
         session_token=token,
         expected_host=expected_host,
-        robot_control_router=RobotControlHTTPRouter(
-            control_service,
-            robot_input_service,
-            controller_control_services,
+        robot_control_router=RobotControlHTTPDirectoryRouter(
+            scoped_routers,
+            default_router=default_control_router,
+            default_robot_id=default_robot_id,
+            spatial_map_providers=scoped_map_providers,
         ),
     )
     server = _LoopbackThreadingHTTPServer(
@@ -515,53 +613,7 @@ def _configured_robot_runtime_adapter(args, *, blast_monitor=None):
                 "EV3 target/reset options cannot be used with "
                 "--robot-profile blast-01"
             )
-        if blast_monitor is None:
-            raise ValueError(
-                "--blast-hub-name is required with --robot-profile blast-01"
-            )
-        if (
-            not math.isfinite(args.robot_planner_timeout_seconds)
-            or not 0.5 <= args.robot_planner_timeout_seconds <= 60.0
-        ):
-            raise ValueError("physical planner timeout is invalid")
-
-        def planner_factory(model):
-            return LMStudioControllerActionPlanner(
-                base_url=args.lm_studio_url,
-                model=model,
-                timeout_seconds=args.robot_planner_timeout_seconds,
-                utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
-                max_utterance_chars=(
-                    BLAST_MAX_NAVIGATION_UTTERANCE_CHARS
-                ),
-            )
-
-        def speech_runtime_factory(*, event_sink):
-            synthesizer = LocaleSpeechSynthesizer(
-                {
-                    "sv": PiperLoopbackSynthesizer(
-                        profile=BLAST_PIPER_PROFILE,
-                    ),
-                    "en": MacOSSayWAVSynthesizer(),
-                }
-            )
-            return RobotSpeechRuntime(
-                speaker=BlastHubSpeaker(
-                    synthesizer,
-                    blast_monitor,
-                ),
-                event_sink=event_sink,
-                thread_name="blast-01-speech",
-            )
-
-        return BlastEpisodeRuntimeAdapter(
-            controller=blast_monitor,
-            planner_factory=planner_factory,
-            max_decisions=64,
-            execute_provisional_detour=True,
-            speech_runtime_factory=speech_runtime_factory,
-            speech_locales=("sv", "en"),
-        )
+        return _configured_blast_runtime_adapter(args, blast_monitor)
     if args.robot_profile != EV3RSTORM_PROFILE_ID:
         raise ValueError("physical robot profile is unsupported")
     if args.robot_target is None:
@@ -592,6 +644,57 @@ def _configured_robot_runtime_adapter(args, *, blast_monitor=None):
     return profile.build_adapter(
         binding,
         planner_factory=planner_factory,
+    )
+
+
+def _configured_blast_runtime_adapter(args, blast_monitor):
+    """Build BLAST's existing adapter for standalone or combined use."""
+
+    if blast_monitor is None:
+        raise ValueError(
+            "--blast-hub-name is required with --robot-profile blast-01"
+        )
+    if (
+        not math.isfinite(args.robot_planner_timeout_seconds)
+        or not 0.5 <= args.robot_planner_timeout_seconds <= 60.0
+    ):
+        raise ValueError("physical planner timeout is invalid")
+
+    def planner_factory(model):
+        return LMStudioControllerActionPlanner(
+            base_url=args.lm_studio_url,
+            model=model,
+            timeout_seconds=args.robot_planner_timeout_seconds,
+            utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
+            max_utterance_chars=(
+                BLAST_MAX_NAVIGATION_UTTERANCE_CHARS
+            ),
+        )
+
+    def speech_runtime_factory(*, event_sink):
+        synthesizer = LocaleSpeechSynthesizer(
+            {
+                "sv": PiperLoopbackSynthesizer(
+                    profile=BLAST_PIPER_PROFILE,
+                ),
+                "en": MacOSSayWAVSynthesizer(),
+            }
+        )
+        return RobotSpeechRuntime(
+            speaker=BlastHubSpeaker(
+                synthesizer,
+                blast_monitor,
+            ),
+            event_sink=event_sink,
+            thread_name="blast-01-speech",
+        )
+
+    return BlastEpisodeRuntimeAdapter(
+        controller=blast_monitor,
+        planner_factory=planner_factory,
+        max_decisions=64,
+        speech_runtime_factory=speech_runtime_factory,
+        speech_locales=("sv", "en"),
     )
 
 
@@ -671,25 +774,55 @@ def _close_resources(
 ) -> None:
     """Attempt every owned cleanup even if an earlier one is interrupted."""
 
+    def close_all(resources, operation) -> None:
+        if resources is None:
+            return
+        values = (
+            resources
+            if isinstance(resources, (tuple, list))
+            else (resources,)
+        )
+        unique = []
+        for value in values:
+            if value is not None and all(
+                value is not existing for existing in unique
+            ):
+                unique.append(value)
+        first_error = None
+        for value in unique:
+            try:
+                operation(value)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
     try:
         if server is not None:
             server.server_close()
     finally:
         try:
-            if robot_control_service is not None:
-                robot_control_service.shutdown()
+            close_all(
+                robot_control_service,
+                lambda value: value.shutdown(),
+            )
         finally:
             try:
-                if robot_turn_speech is not None:
-                    robot_turn_speech.close(drain=False)
+                close_all(
+                    robot_turn_speech,
+                    lambda value: value.close(drain=False),
+                )
             finally:
                 try:
                     if service is not None:
                         service.shutdown()
                 finally:
                     try:
-                        if map_runtime is not None:
-                            map_runtime.close(drain=drain_map)
+                        close_all(
+                            map_runtime,
+                            lambda value: value.close(drain=drain_map),
+                        )
                     finally:
                         try:
                             if blast_monitor is not None:
@@ -715,6 +848,10 @@ def _run(
     robot_input_service = None
     robot_turn_speech = None
     server = None
+    runtime_entries = []
+    robot_control_resources = []
+    robot_turn_speech_resources = []
+    map_runtime_resources = []
     try:
         if (
             not math.isfinite(args.robot_input_timeout_seconds)
@@ -732,12 +869,14 @@ def _run(
                     "physical profile options"
                 )
         else:
-            if args.robot_profile == BLAST_PROFILE_ID:
-                if not args.blast_hub_name:
-                    raise ValueError(
-                        "--blast-hub-name is required with "
-                        "--robot-profile blast-01"
-                    )
+            if args.robot_profile == BLAST_PROFILE_ID and not (
+                args.blast_hub_name
+            ):
+                raise ValueError(
+                    "--blast-hub-name is required with "
+                    "--robot-profile blast-01"
+                )
+            if args.blast_hub_name:
                 blast_monitor = BlastObservationMonitor(
                     hub_name=args.blast_hub_name,
                 )
@@ -745,6 +884,22 @@ def _run(
                 args,
                 blast_monitor=blast_monitor,
             )
+        if robot_runtime_adapter is not None:
+            primary_profile_id = (
+                None if injected_robot_runtime else args.robot_profile
+            )
+            runtime_entries.append(
+                (primary_profile_id, robot_runtime_adapter)
+            )
+        if (
+            not injected_robot_runtime
+            and args.robot_profile == EV3RSTORM_PROFILE_ID
+            and blast_monitor is not None
+        ):
+            runtime_entries.append((
+                BLAST_PROFILE_ID,
+                _configured_blast_runtime_adapter(args, blast_monitor),
+            ))
         if args.simulation_map_demo and robot_runtime_adapter is not None:
             raise ValueError(
                 "--simulation-map-demo cannot be combined with a physical "
@@ -783,6 +938,19 @@ def _run(
                 and callable(getattr(candidate, "close", None))
             ):
                 map_runtime = candidate
+                map_runtime_resources.append(candidate)
+        for _profile_id, additional_adapter in runtime_entries[1:]:
+            try:
+                additional_state = vars(additional_adapter)
+            except TypeError:
+                additional_state = {}
+            candidate = additional_state.get("spatial_map_provider")
+            if (
+                candidate is not None
+                and callable(getattr(candidate, "snapshot", None))
+                and callable(getattr(candidate, "close", None))
+            ):
+                map_runtime_resources.append(candidate)
         shared_map_runtime = _configured_shared_spatial_map(
             args,
             local_map_provider=map_runtime,
@@ -819,76 +987,137 @@ def _run(
             blast_monitor = BlastObservationMonitor(
                 hub_name=args.blast_hub_name,
             )
-        try:
-            adapter_state = vars(robot_runtime_adapter)
-        except TypeError:
-            adapter_state = {}
-        ev3_runtime_provider = adapter_state.get(
-            "controller_runtime_provider"
-        )
-        ev3_reachability_service = adapter_state.get(
-            "controller_reachability_service"
-        )
-        controller_runtime_providers = tuple(
-            provider
-            for provider in (blast_monitor, ev3_runtime_provider)
-            if provider is not None
-        )
+        entry_states = []
+        for profile_id, adapter in runtime_entries:
+            try:
+                state = vars(adapter)
+            except TypeError:
+                state = {}
+            target = (
+                state.get("robot_control_target")
+                if profile_id is None
+                else _configured_robot_control_target(profile_id)
+            )
+            local_map = state.get("spatial_map_provider")
+            if not callable(getattr(local_map, "snapshot", None)):
+                local_map = None
+            entry_states.append((profile_id, adapter, state, target, local_map))
+
+        controller_runtime_providers = []
+        if blast_monitor is not None:
+            controller_runtime_providers.append(blast_monitor)
+        for _profile_id, _adapter, state, _target, _local_map in entry_states:
+            provider = state.get("controller_runtime_provider")
+            if (
+                provider is not None
+                and all(
+                    provider is not existing
+                    for existing in controller_runtime_providers
+                )
+            ):
+                controller_runtime_providers.append(provider)
         service = DashboardService(
             base_url=args.lm_studio_url,
             model=args.model,
             spatial_map_provider=map_runtime,
             shared_spatial_map_provider=shared_map_runtime,
             speech_transcriber=speech_transcriber,
-            controller_runtime_providers=controller_runtime_providers,
-        )
-        robot_control_service = RobotControlService(
-            robot_runtime_adapter,
-            settings=RobotControlSettings(model=args.model),
-        )
-        speech_factory = adapter_state.get("speech_runtime_factory")
-        speech_locales = adapter_state.get("speech_locales", ())
-        if callable(speech_factory) and speech_locales:
-            robot_turn_speech = RobotTurnSpeechSink(
-                speech_factory,
-                supported_locales=speech_locales,
-            )
-
-        def robot_input_model_factory(model):
-            options = {
-                "base_url": args.lm_studio_url,
-                "model": model,
-                "timeout_seconds": args.robot_input_timeout_seconds,
-            }
-            if args.robot_profile == BLAST_PROFILE_ID:
-                options["reply_persona_by_locale"] = (
-                    BLAST_PERSONA_BY_LOCALE
-                )
-            return LMStudioRobotInputModel(
-                **options,
-            )
-
-        robot_input_service = RobotInputService(
-            control_service=robot_control_service,
-            model_factory=robot_input_model_factory,
-            spatial_map_provider=map_runtime,
-            speech_sink=(
-                robot_turn_speech.submit
-                if robot_turn_speech is not None
-                else None
+            controller_runtime_providers=tuple(
+                controller_runtime_providers
             ),
         )
+
+        def input_model_factory(profile_id):
+            def build_input_model(model):
+                options = {
+                    "base_url": args.lm_studio_url,
+                    "model": model,
+                    "timeout_seconds": args.robot_input_timeout_seconds,
+                }
+                if profile_id == BLAST_PROFILE_ID:
+                    options["reply_persona_by_locale"] = (
+                        BLAST_PERSONA_BY_LOCALE
+                    )
+                return LMStudioRobotInputModel(**options)
+
+            return build_input_model
+
+        robot_control_services = {}
+        robot_input_services = {}
+        robot_spatial_map_providers = {}
+        default_robot_id = None
+        shared_episode_gate = (
+            RobotEpisodeGate() if len(entry_states) > 1 else None
+        )
+        for profile_id, adapter, state, target, local_map in entry_states:
+            control_options = {
+                "settings": RobotControlSettings(model=args.model),
+                "target": target,
+            }
+            if shared_episode_gate is not None:
+                control_options["episode_gate"] = shared_episode_gate
+            control = RobotControlService(
+                adapter,
+                **control_options,
+            )
+            robot_control_resources.append(control)
+            speech = None
+            speech_factory = state.get("speech_runtime_factory")
+            speech_locales = state.get("speech_locales", ())
+            if callable(speech_factory) and speech_locales:
+                speech = RobotTurnSpeechSink(
+                    speech_factory,
+                    supported_locales=speech_locales,
+                )
+                robot_turn_speech_resources.append(speech)
+            input_service = RobotInputService(
+                control_service=control,
+                model_factory=input_model_factory(profile_id),
+                spatial_map_provider=local_map,
+                speech_sink=(
+                    speech.submit if speech is not None else None
+                ),
+            )
+            robot_id = target.robot_id
+            robot_control_services[robot_id] = control
+            robot_input_services[robot_id] = input_service
+            if local_map is not None:
+                robot_spatial_map_providers[robot_id] = local_map
+            if robot_control_service is None:
+                robot_control_service = control
+                robot_input_service = input_service
+                robot_turn_speech = speech
+                default_robot_id = robot_id
+
+        if robot_control_service is None:
+            robot_control_service = RobotControlService(
+                settings=RobotControlSettings(model=args.model),
+            )
+            robot_control_resources.append(robot_control_service)
+            robot_input_service = RobotInputService(
+                control_service=robot_control_service,
+                model_factory=input_model_factory(None),
+                spatial_map_provider=map_runtime,
+            )
         controller_control_services = {}
         if blast_monitor is not None:
             controller_control_services["blast-01.hub"] = blast_monitor
-        if ev3_reachability_service is not None:
-            controller_control_services[
-                "ev3rstorm-01.ev3-main"
-            ] = ev3_reachability_service
+        for _profile_id, _adapter, state, _target, _local_map in entry_states:
+            reachability = state.get("controller_reachability_service")
+            if reachability is not None:
+                controller_control_services[
+                    "ev3rstorm-01.ev3-main"
+                ] = reachability
         server_options = {
             "robot_control_service": robot_control_service,
             "robot_input_service": robot_input_service,
             "controller_control_services": controller_control_services,
+            "robot_control_services": robot_control_services,
+            "robot_input_services": robot_input_services,
+            "robot_spatial_map_providers": (
+                robot_spatial_map_providers
+            ),
+            "default_robot_id": default_robot_id,
         }
         if args.console_access_key_file:
             server_options["session_token"] = (
@@ -964,9 +1193,13 @@ def _run(
         _close_resources(
             server,
             service,
-            robot_control_service,
-            robot_turn_speech,
-            map_runtime,
+            tuple(robot_control_resources),
+            tuple(robot_turn_speech_resources),
+            (
+                tuple(map_runtime_resources)
+                if map_runtime_resources
+                else map_runtime
+            ),
             blast_monitor,
             whisper_runtime,
             drain_map=server is not None,

@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="assets/styles.css">
   <link rel="icon" type="image/png" href="assets/robot-llm-head.png">
   <script src="assets/i18n.js" defer></script>
+  <script src="assets/blast_map_semantics.js" defer></script>
   <script src="assets/dashboard_logic.js" defer></script>
   <script src="assets/controller_panel.js" defer></script>
   <script src="assets/speech_input_logic.js" defer></script>
@@ -220,7 +221,8 @@
             <div class="composer-meta">
               <label for="composer-target" data-i18n="workbench.target.label">Vem pratar du med?</label>
               <select id="composer-target" name="target" aria-describedby="composer-target-help">
-                <option value="robot" data-i18n="workbench.target.robot">Roboten</option>
+                <option value="ev3rstorm-01">EV3RSTORM · robot</option>
+                <option value="blast-01">BLAST · robot</option>
                 <option value="workbench" data-i18n="workbench.target.workbench" selected>Arbetsbänken / applikationen</option>
               </select>
               <span class="target-help sr-only" id="composer-target-help" data-i18n="workbench.target.help">Gäller både skrivna meddelanden och taltranskript.</span>

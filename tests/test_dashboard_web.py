@@ -64,6 +64,9 @@ class DashboardWebContractTests(unittest.TestCase):
         cls.dashboard_logic = (
             WEB_ROOT / "dashboard_logic.js"
         ).read_text(encoding="utf-8")
+        cls.blast_map_semantics = (
+            WEB_ROOT / "blast_map_semantics.js"
+        ).read_text(encoding="utf-8")
         cls.speech_input_logic = (
             WEB_ROOT / "speech_input_logic.js"
         ).read_text(encoding="utf-8")
@@ -89,6 +92,7 @@ class DashboardWebContractTests(unittest.TestCase):
         cls.javascript_assets = "\n".join(
             (
                 cls.i18n,
+                cls.blast_map_semantics,
                 cls.dashboard_logic,
                 cls.controller_panel,
                 cls.speech_input_logic,
@@ -156,6 +160,7 @@ for (const locale of Object.keys(api.CATALOGS)) {
   });
   copySamples[locale] = {
     droppedEvents: instance.t("events.gap", { count: "7" }),
+    namedRobot: instance.t("workbench.target.named_robot", { name: "BLAST" }),
     unknownKey: instance.t("future.unknown.key"),
   };
 }
@@ -496,6 +501,7 @@ process.stdout.write(JSON.stringify({
             self.parser.scripts,
             [
                 "assets/i18n.js",
+                "assets/blast_map_semantics.js",
                 "assets/dashboard_logic.js",
                 "assets/controller_panel.js",
                 "assets/speech_input_logic.js",
@@ -1335,14 +1341,18 @@ function ev3Button(status) {
             if tag == "option"
             and attrs.get("data-i18n") == "workbench.target.workbench"
         )
-        robot_option = next(
+        robot_options = [
             attrs
             for tag, attrs in self.parser.elements
             if tag == "option"
-            and attrs.get("data-i18n") == "workbench.target.robot"
+            and attrs.get("value") in {"ev3rstorm-01", "blast-01"}
+        ]
+        self.assertEqual(
+            [attrs.get("value") for attrs in robot_options],
+            ["ev3rstorm-01", "blast-01"],
         )
         self.assertIn("selected", workbench_option)
-        self.assertNotIn("selected", robot_option)
+        self.assertTrue(all("selected" not in attrs for attrs in robot_options))
         values = self.i18n_contract["catalogs"]
         self.assertEqual(
             values["sv"]["values"]["workbench.target.label"],
@@ -1373,10 +1383,14 @@ function ev3Button(status) {
             )
         ]
         self.assertIn(
-            "const target = selectedConversationTarget()",
+            "const target = microphoneTarget || selectedConversationTarget()",
             transcript_handler,
         )
         self.assertIn("void submitCurrentContent(target)", transcript_handler)
+        self.assertIn(
+            'byId("microphone-button").addEventListener("click"',
+            self.javascript,
+        )
         target_listener = self.javascript[
             self.javascript.index(
                 'byId("composer-target").addEventListener("change"'
@@ -2268,6 +2282,7 @@ function ev3Button(status) {
         )
         for filename, source in (
             ("i18n.js", self.i18n),
+            ("blast_map_semantics.js", self.blast_map_semantics),
             ("dashboard_logic.js", self.dashboard_logic),
             ("controller_panel.js", self.controller_panel),
             ("speech_input_logic.js", self.speech_input_logic),
@@ -2336,7 +2351,7 @@ const targetState = api.createConversationTargetState("workbench");
 const targetTransitions = {
   workbenchDefault: targetState.selected(),
 };
-targetTransitions.workbenchOverride = targetState.override("robot");
+targetTransitions.workbenchOverride = targetState.override("blast-01");
 targetTransitions.robotDefault = targetState.selectView("robot");
 targetTransitions.robotOverride = targetState.override("workbench");
 targetTransitions.workbenchRestored = targetState.selectView("workbench");
@@ -2353,6 +2368,10 @@ const idle = api.normalizeControl({
   state: "IDLE",
   enabled: true,
   accepting: true,
+  target: {
+    robot_id: "blast-01",
+    display_name: "BLAST",
+  },
   settings: {
     revision: 4,
     model: "gemma-4bit",
@@ -2369,20 +2388,46 @@ const idle = api.normalizeControl({
   },
 });
 const disabled = api.normalizeControl({ state: "unexpected" });
+const disabledWithTarget = api.normalizeControl({
+  state: "DISABLED",
+  enabled: false,
+  accepting: true,
+  target: {
+    robot_id: "blast-01",
+    display_name: "BLAST",
+  },
+});
+const idleWithoutTarget = api.normalizeControl({
+  state: "IDLE",
+  enabled: true,
+  accepting: true,
+});
 const faulted = api.normalizeControl({
   state: "FAULTED",
   enabled: true,
   accepting: true,
+  target: {
+    robot_id: "blast-01",
+    display_name: "BLAST",
+  },
 });
 const running = api.normalizeControl({
   state: "RUNNING",
   enabled: true,
   accepting: true,
+  target: {
+    robot_id: "blast-01",
+    display_name: "BLAST",
+  },
 });
 const speechFailed = api.normalizeControl({
   state: "RUNNING",
   enabled: true,
   accepting: true,
+  target: {
+    robot_id: "blast-01",
+    display_name: "BLAST",
+  },
   runtime: {
     speech_status: "failed",
     speech_error_code: "tts_audio_too_long",
@@ -2392,23 +2437,35 @@ const stopping = api.normalizeControl({
   state: "STOPPING",
   enabled: true,
   accepting: true,
+  target: {
+    robot_id: "blast-01",
+    display_name: "BLAST",
+  },
 });
 process.stdout.write(JSON.stringify({
   exports: Object.keys(api).sort(),
   frozen: Object.isFrozen(api),
   states: Array.from(api.CONTROL_STATES),
+  targets: Array.from(api.CONVERSATION_TARGETS),
+  blastEndpoint: api.robotEndpoint("blast-01", "turns"),
+  directory: api.normalizeRobotDirectory({ controls: [idle] }),
   idle,
   disabled,
   preferredLiveTarget: api.preferredInitialTarget(idle, false),
   preferredDisabledTarget: api.preferredInitialTarget(disabled, false),
+  preferredDisabledNamedTarget: api.preferredInitialTarget(
+    disabledWithTarget,
+    false,
+  ),
+  preferredMissingTarget: api.preferredInitialTarget(idleWithoutTarget, false),
   preferredFaultedTarget: api.preferredInitialTarget(faulted, false),
   preferredAfterUserChoice: api.preferredInitialTarget(idle, true),
-  robotPolicy: api.composerPolicy(idle, "robot", true, false),
-  runningRobotPolicy: api.composerPolicy(running, "robot", true, false),
+  robotPolicy: api.composerPolicy(idle, "blast-01", true, false),
+  runningRobotPolicy: api.composerPolicy(running, "blast-01", true, false),
   speechFailed,
-  stoppingRobotPolicy: api.composerPolicy(stopping, "robot", true, false),
-  faultedRobotPolicy: api.composerPolicy(faulted, "robot", true, false),
-  busyRobotPolicy: api.composerPolicy(running, "robot", true, true),
+  stoppingRobotPolicy: api.composerPolicy(stopping, "blast-01", true, false),
+  faultedRobotPolicy: api.composerPolicy(faulted, "blast-01", true, false),
+  busyRobotPolicy: api.composerPolicy(running, "blast-01", true, true),
   physicalTurnControl: api.physicalTurnControl({
     intent: "PHYSICAL_TASK",
     episode: { control: { sequence: 9, state: "STARTING" } },
@@ -2429,6 +2486,12 @@ process.stdout.write(JSON.stringify({
   workbenchWithoutRobot: api.composerPolicy(
     disabled,
     "workbench",
+    true,
+    false,
+  ),
+  unavailableRobotPolicy: api.composerPolicy(
+    idleWithoutTarget,
+    "blast-01",
     true,
     false,
   ),
@@ -2473,13 +2536,18 @@ process.stdout.write(JSON.stringify({
                 "CONTROL_STATES",
                 "CONVERSATION_TARGETS",
                 "CONVERSATION_VIEWS",
+                "DEFAULT_ROBOT_TARGET_ID",
+                "ROBOT_TARGETS",
                 "composerPolicy",
                 "create",
                 "createConversationTargetState",
                 "defaultConversationTarget",
+                "isRobotTarget",
                 "normalizeControl",
+                "normalizeRobotDirectory",
                 "physicalTurnControl",
                 "preferredInitialTarget",
+                "robotEndpoint",
                 "shouldApplySnapshot",
             ],
         )
@@ -2487,18 +2555,23 @@ process.stdout.write(JSON.stringify({
             contract["targetTransitions"],
             {
                 "workbenchDefault": "workbench",
-                "workbenchOverride": "robot",
-                "robotDefault": "robot",
+                "workbenchOverride": "blast-01",
+                "robotDefault": "ev3rstorm-01",
                 "robotOverride": "workbench",
-                "workbenchRestored": "robot",
+                "workbenchRestored": "blast-01",
                 "workbenchCleared": "workbench",
                 "robotRestored": "workbench",
-                "robotCleared": "robot",
+                "robotCleared": "ev3rstorm-01",
             },
         )
         self.assertTrue(contract["invalidTargetRejected"])
-        self.assertEqual(contract["preferredLiveTarget"], "robot")
+        self.assertEqual(contract["preferredLiveTarget"], "blast-01")
         self.assertEqual(contract["preferredDisabledTarget"], "workbench")
+        self.assertEqual(
+            contract["preferredDisabledNamedTarget"],
+            "workbench",
+        )
+        self.assertEqual(contract["preferredMissingTarget"], "workbench")
         self.assertEqual(contract["preferredFaultedTarget"], "workbench")
         self.assertEqual(contract["preferredAfterUserChoice"], "workbench")
         self.assertEqual(
@@ -2511,6 +2584,19 @@ process.stdout.write(JSON.stringify({
                 "STOPPING",
                 "FAULTED",
             ],
+        )
+        self.assertEqual(
+            contract["targets"],
+            ["ev3rstorm-01", "blast-01", "workbench"],
+        )
+        self.assertEqual(
+            contract["blastEndpoint"],
+            "/api/v1/robots/blast-01/turns",
+        )
+        self.assertEqual(contract["directory"]["blast-01"]["state"], "IDLE")
+        self.assertEqual(
+            contract["directory"]["ev3rstorm-01"]["target"],
+            {"robot_id": "ev3rstorm-01", "display_name": "EV3RSTORM"},
         )
         self.assertTrue(
             contract["robotPolicy"]["composerEnabled"]
@@ -2539,6 +2625,14 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(
             contract["workbenchWithoutRobot"]["composerEnabled"]
         )
+        self.assertFalse(
+            contract["unavailableRobotPolicy"]["composerEnabled"]
+        )
+        self.assertEqual(
+            contract["idle"]["target"],
+            {"robot_id": "blast-01", "display_name": "BLAST"},
+        )
+        self.assertIsNone(contract["disabled"]["target"])
         self.assertFalse(contract["lowerSequenceAccepted"])
         self.assertTrue(contract["equalSequenceAccepted"])
         self.assertTrue(contract["higherSequenceAccepted"])
@@ -2567,7 +2661,7 @@ process.stdout.write(JSON.stringify({
             self.robot_control,
         )
         self.assertIn(
-            "if (!shouldApplySnapshot(control, next))",
+            "if (!shouldApplySnapshot(previous, next))",
             self.robot_control,
         )
         self.assertNotIn(
@@ -2583,10 +2677,31 @@ process.stdout.write(JSON.stringify({
             "DISABLED",
         )
         self.assertIn(
-            "/api/v1/robot/emergency-stop",
+            'robotEndpoint(target, operation)',
             self.robot_control,
         )
         self.assertNotIn("/api/v1/robot/motor", self.robot_control)
+        self.assertIn(
+            'translate("workbench.target.named_robot"',
+            self.robot_control,
+        )
+        self.assertIn("option.disabled = false", self.robot_control)
+        for operation in (
+            'robotEndpoint(target, "status")',
+            'robotEndpoint(target, "turns")',
+            'robotEndpoint(target, "settings")',
+            'command(\n          "stop"',
+            'command(\n          "emergency-stop"',
+        ):
+            self.assertIn(operation, self.robot_control)
+        self.assertEqual(
+            self.i18n_contract["copySamples"]["sv"]["namedRobot"],
+            "BLAST · robot",
+        )
+        self.assertEqual(
+            self.i18n_contract["copySamples"]["en"]["namedRobot"],
+            "BLAST · robot",
+        )
 
     def test_robot_composer_uses_composite_turns_and_keeps_dialogue_separate(self):
         submit_input = self.robot_control[
@@ -2596,35 +2711,38 @@ process.stdout.write(JSON.stringify({
                 self.robot_control.index("    async function submitInput("),
             )
         ]
-        self.assertIn('request("/api/v1/robot/turns"', submit_input)
+        self.assertIn('request(robotEndpoint(target, "turns")', submit_input)
         self.assertIn("text: cleanText", submit_input)
         self.assertIn("locale,", submit_input)
         self.assertIn('client_request_id: randomId("robot-ui")', submit_input)
         self.assertIn(
-            "expected_revision: control.settings.revision",
+            "expected_revision: targetControl.settings.revision",
             submit_input,
         )
         self.assertIn("timeout: 65000", submit_input)
         self.assertNotIn("goal:", submit_input)
         self.assertNotIn("/api/v1/robot/episodes", self.robot_control)
         self.assertIn("physicalTurnControl(turn)", submit_input)
-        self.assertIn("setControl(nextControl)", submit_input)
-        self.assertIn("onInputAccepted(cleanText, turn)", submit_input)
+        self.assertIn("setControlFor(target, nextControl)", submit_input)
+        self.assertIn("onInputAccepted(cleanText, turn, target)", submit_input)
 
-        self.assertIn("const MAX_ROBOT_DIALOGUE_MESSAGES = 40;", self.javascript)
-        self.assertIn("robotDialogue: []", self.javascript)
-        self.assertIn("robotOptimisticContent: null", self.javascript)
+        self.assertIn("MAX_ROBOT_DIALOGUE_MESSAGES = 40", self.javascript)
+        self.assertIn("robotDialogueByTarget: {}", self.javascript)
+        self.assertIn("robotOptimisticByTarget: {}", self.javascript)
         self.assertIn("robotControl.submitInput(", self.javascript)
         self.assertIn('author_key: "robot"', self.javascript)
         self.assertIn(
             't(`chat.author.${safeText(message.author_key, role)}`)',
             self.javascript,
         )
-        self.assertIn("onInputAccepted: (originalText, turn) =>", self.javascript)
-        self.assertIn("onTargetChanged: renderConversation", self.javascript)
+        self.assertIn(
+            "onInputAccepted: (originalText, turn, target) =>",
+            self.javascript,
+        )
+        self.assertIn("onTargetChanged: (target) =>", self.javascript)
         self.assertIn(".slice(-MAX_ROBOT_DIALOGUE_MESSAGES)", self.javascript)
         self.assertIn(
-            'const robotTarget = selectedConversationTarget() === "robot";',
+            "const robotTarget = robotControl?.isRobotTarget(target);",
             self.javascript,
         )
 
@@ -2653,6 +2771,244 @@ process.stdout.write(JSON.stringify({
             "while moving",
             catalogs["en"]["values"]["robot.composer.robot_note"],
         )
+
+    def test_spatial_map_follows_selected_robot_without_cross_target_stale_data(self):
+        refresh = self.javascript[
+            self.javascript.index("  async function refreshSpatialMap("):
+            self.javascript.index(
+                "\n  function renderLocalizedState()",
+                self.javascript.index("  async function refreshSpatialMap("),
+            )
+        ]
+        self.assertIn(
+            "`/api/v1/robots/${encodeURIComponent(target)}/spatial-map`",
+            refresh,
+        )
+        self.assertIn("const generation = ++state.mapRequestGeneration", refresh)
+        self.assertIn("target !== selectedConversationTarget()", refresh)
+        self.assertIn(
+            'renderSpatialMap(payload.map, "connected", target)',
+            refresh,
+        )
+        self.assertIn(
+            'renderSpatialMap(state.spatialMapByTarget[target], "offline", target)',
+            refresh,
+        )
+        target_change = self.javascript[
+            self.javascript.index("      onTargetChanged: (target) => {"):
+            self.javascript.index(
+                "\n      },",
+                self.javascript.index("      onTargetChanged: (target) => {")
+            )
+        ]
+        self.assertLess(
+            target_change.index('byId("message-input").value = ""'),
+            target_change.index("refreshSpatialMap(true, target)"),
+        )
+        self.assertIn(
+            'renderSpatialMap(state.spatialMapByTarget[target], "waiting", target)',
+            target_change,
+        )
+
+    def test_robot_selector_keeps_both_named_targets_visible_when_offline(self):
+        script = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+
+class Element {
+  constructor(id) {
+    this.id = id;
+    this.value = "";
+    this.textContent = "";
+    this.disabled = false;
+    this.hidden = false;
+    this.checked = false;
+    this.dataset = {};
+    this.listeners = {};
+    this.className = "";
+    this.classList = { add() {} };
+  }
+  addEventListener(name, listener) {
+    this.listeners[name] = listener;
+  }
+  querySelector() {
+    return null;
+  }
+}
+
+const ids = [
+  "composer-target", "message-input", "send-button",
+  "new-conversation-button", "turn-mode", "turn-mode-control",
+  "mode-capability-note", "composer-status", "robot-control-state",
+  "robot-control-summary", "robot-stop-button",
+  "robot-emergency-stop-button", "robot-current-action",
+  "robot-obstacle", "robot-plan", "robot-scan", "robot-model-latency",
+  "robot-speech-status", "robot-setting-model",
+  "robot-setting-max-episode-ms", "robot-setting-speech-enabled",
+  "robot-save-settings-button", "robot-settings-status",
+  "robot-settings-form", "status-motion",
+];
+const nodes = Object.fromEntries(ids.map((id) => [id, new Element(id)]));
+const robotOptions = {
+  "ev3rstorm-01": new Element("ev3-option"),
+  "blast-01": new Element("blast-option"),
+};
+const sendLabel = new Element("send-label");
+const motionValue = new Element("motion-value");
+nodes["composer-target"].querySelector = (selector) => (
+  robotOptions[selector.match(/option\[value="([^"]+)"\]/)?.[1]] || null
+);
+nodes["send-button"].querySelector = () => sendLabel;
+nodes["status-motion"].querySelector = () => motionValue;
+
+const named = {
+  schema: "robot-control/v1",
+  sequence: 2,
+  state: "IDLE",
+  enabled: true,
+  accepting: true,
+  target: { robot_id: "blast-01", display_name: "BLAST" },
+  settings: {
+    revision: 1,
+    model: "gemma",
+    max_episode_ms: 900000,
+    speech_enabled: true,
+  },
+  runtime: { speech_status: "idle", plan: [] },
+};
+const unavailable = {
+  ...named,
+  sequence: 3,
+  state: "DISABLED",
+  enabled: false,
+  target: { robot_id: "blast-01", display_name: "BLAST" },
+};
+const ev3Unavailable = {
+  ...unavailable,
+  sequence: 1,
+  target: { robot_id: "ev3rstorm-01", display_name: "EV3RSTORM" },
+};
+const requests = [];
+let locale = "sv";
+const targetChanges = [];
+const window = {
+  RobotMissionPanelUI: {
+    create: () => ({
+      initialize: async () => {},
+      renderLocale() {},
+      setControl() {},
+      setRobotId() {},
+      stopPolling() {},
+    }),
+  },
+  setTimeout: () => 1,
+  clearTimeout() {},
+};
+vm.runInNewContext(source, { window }, { filename: process.argv[1] });
+const ui = window.RobotControlUI.create({
+  document: { getElementById: (id) => nodes[id] },
+  request: async (path, options = {}) => {
+    requests.push({ path, method: options.method || "GET" });
+    if (path === "/api/v1/robots") {
+      return { schema: "robot-control-directory/v1", controls: [
+        ev3Unavailable, named,
+      ] };
+    }
+    if (path === "/api/v1/robots/blast-01/status") {
+      return { control: unavailable };
+    }
+    throw new Error("unexpected request");
+  },
+  translate: (key, args = {}) => {
+    if (key === "workbench.target.named_robot") {
+      return `${args.name} · robot-${locale}`;
+    }
+    return key;
+  },
+  randomId: () => "request-1",
+  showToast() {},
+  getLocale: () => locale,
+  sessionGuard: {
+    subscribe() {},
+    isExpired: () => false,
+  },
+  onTargetChanged: (target) => targetChanges.push(target),
+});
+
+(async () => {
+  await ui.initialize();
+  const ready = {
+    selected: ui.selectedTarget(),
+    value: nodes["composer-target"].value,
+    ev3Disabled: robotOptions["ev3rstorm-01"].disabled,
+    blastDisabled: robotOptions["blast-01"].disabled,
+    blastLabel: robotOptions["blast-01"].textContent,
+  };
+  locale = "en";
+  ui.renderLocale();
+  const localizedLabel = robotOptions["blast-01"].textContent;
+  await ui.refresh(false);
+  const unavailableView = {
+    selected: ui.selectedTarget(),
+    value: nodes["composer-target"].value,
+    ev3Disabled: robotOptions["ev3rstorm-01"].disabled,
+    blastDisabled: robotOptions["blast-01"].disabled,
+    blastLabel: robotOptions["blast-01"].textContent,
+  };
+  nodes["message-input"].value = "Move";
+  const accepted = await ui.submitInput("Move", "en");
+  process.stdout.write(JSON.stringify({
+    ready,
+    localizedLabel,
+    unavailableView,
+    accepted,
+    postRequests: requests.filter((request) => request.method === "POST"),
+    targetChanges,
+  }));
+})();
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "-e",
+                script,
+                str(WEB_ROOT / "robot_control.js"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(
+            result["ready"],
+            {
+                "selected": "blast-01",
+                "value": "blast-01",
+                "ev3Disabled": False,
+                "blastDisabled": False,
+                "blastLabel": "BLAST · robot-sv",
+            },
+        )
+        self.assertEqual(result["localizedLabel"], "BLAST · robot-en")
+        self.assertEqual(
+            result["unavailableView"],
+            {
+                "selected": "blast-01",
+                "value": "blast-01",
+                "ev3Disabled": False,
+                "blastDisabled": False,
+                "blastLabel": "BLAST · robot-en",
+            },
+        )
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["postRequests"], [])
+        self.assertEqual(result["targetChanges"][-1], "blast-01")
 
     def test_robot_mission_history_is_cursor_safe_and_semantically_deduplicated(self):
         script = r"""
@@ -3017,11 +3373,11 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(result["catchUpPollMs"], 0)
         self.assertIn('connection = "catching_up";', self.robot_mission_panel)
         self.assertIn(
-            "/api/v1/robot/events?after_sequence=",
+            "${endpoint}/events?after_sequence=",
             self.robot_mission_panel,
         )
         self.assertIn(
-            "/api/v1/robot/snapshots?after_sequence=",
+            "${endpoint}/snapshots?after_sequence=",
             self.robot_mission_panel,
         )
         self.assertNotIn("innerHTML", self.robot_mission_panel)
@@ -3389,14 +3745,14 @@ process.stdout.write(JSON.stringify({
         self.assertGreater(result["timelineTotal"], 500)
         self.assertTrue(result["timelineTruncated"])
         self.assertIn(
-            "/api/v1/robot/events?after_sequence=${cursors.event}&limit=500",
+            "${endpoint}/events?after_sequence=${cursors.event}&limit=500",
             self.robot_mission_panel,
         )
         self.assertIn(
-            "/api/v1/robot/snapshots?after_sequence=${cursors.snapshot}&limit=500",
+            "${endpoint}/snapshots?after_sequence=${cursors.snapshot}&limit=500",
             self.robot_mission_panel,
         )
-        self.assertIn("const MAX_LOCAL_EVENTS = 2000;", self.javascript)
+        self.assertIn("MAX_LOCAL_EVENTS = 2000", self.javascript)
 
     def test_workbench_safety_contract_is_scoped_from_robot_control(self):
         self.assertIn(
@@ -3421,7 +3777,7 @@ process.stdout.write(JSON.stringify({
             )
         ]
         self.assertLess(
-            submit_content.index('target === "robot"'),
+            submit_content.index("robotControl.isRobotTarget(target)"),
             submit_content.index("!state.workbenchReadOnlyInvariant"),
         )
 

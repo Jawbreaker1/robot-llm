@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from robot_agent.blast_episode_speech import BlastEpisodeSpeech
 from robot_agent.dashboard_contract import DashboardContractError
 from robot_agent.robot_control_contract import RobotRuntimeUpdate
+from robot_agent.robot_speech_runtime import RobotSpeechRuntime
 
 
 class _SpeechRuntime:
@@ -38,6 +39,48 @@ def _context(updates):
 
 
 class BlastEpisodeSpeechObservabilityTests(unittest.TestCase):
+    def test_start_timeout_publishes_only_bounded_code(self):
+        updates = []
+
+        class StartTimeout(RuntimeError):
+            code = "sampled_audio_start_timeout"
+
+        def factory(*, event_sink):
+            def speaker(_text, _locale, _cancel_event):
+                raise StartTimeout("private BLE transport detail")
+
+            return RobotSpeechRuntime(
+                speaker=speaker,
+                event_sink=event_sink,
+                thread_name="test-blast-start-timeout",
+            )
+
+        speech = BlastEpisodeSpeech(
+            factory=factory,
+            supported_locales=("sv",),
+            context=_context(updates),
+        )
+        speech.start()
+
+        with self.assertLogs(
+            "robot_agent.blast_episode_speech",
+            level="WARNING",
+        ) as logged:
+            admission = speech.offer("Hej", progress_revision=1)
+            self.assertEqual(speech.await_admission(admission), "failed")
+
+        self.assertEqual(
+            updates[-1],
+            {
+                "speech_status": "failed",
+                "speech_error_code": "sampled_audio_start_timeout",
+            },
+        )
+        diagnostic = "\n".join(logged.output)
+        self.assertIn("code=sampled_audio_start_timeout", diagnostic)
+        self.assertNotIn("private BLE transport detail", diagnostic)
+        self.assertTrue(speech.close())
+
     def test_worker_failure_publishes_bounded_code_and_later_status_clears_it(self):
         updates = []
         captured = {}

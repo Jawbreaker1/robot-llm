@@ -149,6 +149,10 @@ class DashboardRouter:
             "i18n.js",
             "text/javascript; charset=utf-8",
         ),
+        "assets/blast_map_semantics.js": (
+            "blast_map_semantics.js",
+            "text/javascript; charset=utf-8",
+        ),
         "assets/dashboard_logic.js": (
             "dashboard_logic.js",
             "text/javascript; charset=utf-8",

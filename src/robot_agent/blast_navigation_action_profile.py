@@ -27,10 +27,9 @@ TURN_DURATION_MS_PER_PULSE = 250
 # Four bounded pulses are the closest existing semantic quarter turn. The
 # encoder-derived 93.96-degree result remains authoritative over the label.
 TURN_PULSES_PER_QUARTER_TURN = 4
-# SCAN_FRONT_ARC uses its own smaller fixed hub pulse. Four scan pulses stay
-# inside the previous two navigation-pulse excursion (84 < 90 wheel
-# encoder degrees) while providing four distinct bearings on each side.
-SCAN_TURN_ENCODER_DEGREES_PER_PULSE = 21
+# Four fixed scan pulses per side use the calibrated turn pulse and expose an
+# approximately 190-degree encoder-measured front arc (about +/-95 degrees).
+SCAN_TURN_ENCODER_DEGREES_PER_PULSE = 45
 SCAN_TURN_PULSES_PER_SIDE = 4
 TURN_ENCODER_DEGREES_PER_QUARTER_TURN = (
     TURN_ENCODER_DEGREES_PER_PULSE * TURN_PULSES_PER_QUARTER_TURN

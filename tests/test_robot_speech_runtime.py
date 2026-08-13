@@ -5,11 +5,48 @@ import unittest
 from robot_agent.robot_speech_runtime import (
     RobotSpeechRuntime,
     RobotSpeechRuntimeError,
+    SpeechAdmission,
     ev3_ssh_speaker,
 )
 
 
 class RobotSpeechRuntimeTests(unittest.TestCase):
+    def test_admission_waits_for_authoritative_playback_marker(self):
+        speaker_entered = threading.Event()
+        release = threading.Event()
+
+        def speaker(_text, _locale, cancel_event):
+            speaker_entered.set()
+            self.assertEqual(admission.state, "pending")
+            release.wait(1)
+            cancel_event.mark_playback_started()
+
+        runtime = RobotSpeechRuntime(speaker=speaker)
+        self.addCleanup(runtime.close, timeout_seconds=0.2)
+        runtime.start()
+        admission = runtime.offer_with_admission(
+            episode_id="episode-a", text="Hej", locale="sv",
+        )
+
+        self.assertIsInstance(admission, SpeechAdmission)
+        self.assertTrue(speaker_entered.wait(1))
+        self.assertEqual(admission.state, "pending")
+        release.set()
+        self.assertEqual(admission.wait(), "started")
+
+    def test_failed_admission_is_terminal_and_fail_open(self):
+        runtime = RobotSpeechRuntime(
+            speaker=lambda *_args: (_ for _ in ()).throw(RuntimeError()),
+        )
+        self.addCleanup(runtime.close, timeout_seconds=0.2)
+        runtime.start()
+
+        admission = runtime.offer_with_admission(
+            episode_id="episode-a", text="Hej", locale="sv",
+        )
+
+        self.assertEqual(admission.wait(), "failed")
+
     def test_normalized_duplicates_wait_for_real_progress(self):
         first_started = threading.Event()
         release_first = threading.Event()

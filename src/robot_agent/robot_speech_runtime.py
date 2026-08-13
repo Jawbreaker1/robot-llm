@@ -41,6 +41,51 @@ class SpeechItem:
     sequence: int
     text: str
     locale: str
+    admission: Optional["SpeechAdmission"] = None
+
+
+class SpeechAdmission:
+    """One utterance's first-writer-wins playback admission."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._resolved = threading.Event()
+        self._state = "pending"
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    def resolve(self, state: str) -> bool:
+        if state not in {
+            "started", "completed", "failed", "dropped", "cancelled",
+        }:
+            raise ValueError("speech admission state is invalid")
+        with self._lock:
+            if self._state != "pending":
+                return False
+            self._state = state
+            self._resolved.set()
+            return True
+
+    def wait(self, *, cancel_requested=None) -> str:
+        if cancel_requested is not None and not callable(cancel_requested):
+            raise ValueError("speech admission cancellation probe is invalid")
+        while not self._resolved.wait(0.05):
+            if cancel_requested is not None and cancel_requested() is True:
+                return "cancelled"
+        return self.state
+
+
+class _SpeechCancellationEvent(threading.Event):
+    def __init__(self, admission: Optional[SpeechAdmission]) -> None:
+        super().__init__()
+        self._admission = admission
+
+    def mark_playback_started(self) -> None:
+        if self._admission is not None:
+            self._admission.resolve("started")
 
 
 def _bounded_text(value: object) -> str:
@@ -181,6 +226,7 @@ class RobotSpeechRuntime:
         locale: str,
         progress_revision: int = 0,
         cancel_requested: Optional[Callable[[], bool]] = None,
+        admission: Optional[SpeechAdmission] = None,
     ) -> int:
         checked_episode = _identifier(episode_id)
         checked_text = _bounded_text(text)
@@ -193,6 +239,11 @@ class RobotSpeechRuntime:
             raise RobotSpeechRuntimeError(
                 "invalid_speech_cancellation_probe",
                 "Speech cancellation probe is invalid",
+            )
+        if admission is not None and not isinstance(admission, SpeechAdmission):
+            raise RobotSpeechRuntimeError(
+                "invalid_speech_admission",
+                "Speech admission is invalid",
             )
         if (
             isinstance(progress_revision, bool)
@@ -247,6 +298,7 @@ class RobotSpeechRuntime:
                 sequence=self._sequence,
                 text=checked_text,
                 locale=locale,
+                admission=admission,
             )
             if fingerprint in fingerprints:
                 duplicate = item
@@ -258,6 +310,8 @@ class RobotSpeechRuntime:
                 self._pending = item
                 self._condition.notify_all()
         if duplicate is not None:
+            if duplicate.admission is not None:
+                duplicate.admission.resolve("dropped")
             self._emit(
                 "dropped",
                 duplicate,
@@ -265,9 +319,16 @@ class RobotSpeechRuntime:
             )
             return duplicate.sequence
         if dropped is not None:
+            if dropped.admission is not None:
+                dropped.admission.resolve("dropped")
             self._emit("dropped", dropped, reason="replaced_by_newer")
         self._emit("queued", item)
         return item.sequence
+
+    def offer_with_admission(self, **offer) -> SpeechAdmission:
+        admission = SpeechAdmission()
+        self.offer(admission=admission, **offer)
+        return admission
 
     def cancel_episode(self, episode_id: str) -> None:
         checked = _identifier(episode_id)
@@ -284,9 +345,13 @@ class RobotSpeechRuntime:
                 self._active is not None
                 and self._active.episode_id == checked
             ):
+                if self._active.admission is not None:
+                    self._active.admission.resolve("cancelled")
                 self._active_cancel.set()
             self._condition.notify_all()
         if dropped is not None:
+            if dropped.admission is not None:
+                dropped.admission.resolve("cancelled")
             self._emit("cancelled", dropped, reason="episode_cancelled")
 
     def close(
@@ -311,11 +376,18 @@ class RobotSpeechRuntime:
                     dropped = self._pending
                     self._pending = None
                     if self._active_cancel is not None:
+                        if (
+                            self._active is not None
+                            and self._active.admission is not None
+                        ):
+                            self._active.admission.resolve("cancelled")
                         self._active_cancel.set()
                 self._closed = True
                 self._condition.notify_all()
                 thread = self._thread
         if dropped is not None:
+            if dropped.admission is not None:
+                dropped.admission.resolve("cancelled")
             self._emit("cancelled", dropped, reason="runtime_closed")
         if (
             self._started
@@ -343,10 +415,11 @@ class RobotSpeechRuntime:
                     return
                 item = self._pending
                 self._pending = None
-                cancel_event = threading.Event()
+                cancel_event = _SpeechCancellationEvent(item.admission)
                 self._active = item
                 self._active_cancel = cancel_event
             self._emit("playing", item)
+            terminal_state = "failed"
             try:
                 self._speaker(
                     item.text,
@@ -355,12 +428,14 @@ class RobotSpeechRuntime:
                 )
             except Exception as error:
                 if cancel_event.is_set():
+                    terminal_state = "cancelled"
                     self._emit(
                         "cancelled",
                         item,
                         reason="playback_cancelled",
                     )
                 else:
+                    terminal_state = "failed"
                     self._emit(
                         "failed",
                         item,
@@ -372,14 +447,18 @@ class RobotSpeechRuntime:
                     )
             else:
                 if cancel_event.is_set():
+                    terminal_state = "cancelled"
                     self._emit(
                         "cancelled",
                         item,
                         reason="playback_cancelled",
                     )
                 else:
+                    terminal_state = "completed"
                     self._emit("completed", item)
             finally:
+                if item.admission is not None:
+                    item.admission.resolve(terminal_state)
                 with self._condition:
                     if self._active is item:
                         self._active = None
