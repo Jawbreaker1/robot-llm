@@ -14,6 +14,7 @@ from robot_agent.blast_observation_monitor import (
     RANGE_STATE_INVALID,
     RANGE_STATE_MEASURED,
     RANGE_STATE_NO_VALID_DISTANCE,
+    POST_MOTION_SETTLE_SAMPLE_COUNT,
     SCAN_COMMAND,
     SCAN_COMMAND_TIMEOUT_SECONDS,
     SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
@@ -2930,6 +2931,56 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         self.assertIn(("stop",), runtime.calls)
         self.assertEqual(monitor.settle_calls, 3)
+        monitor.close()
+
+    def test_scan_continues_after_same_pose_settle_recovery(self):
+        class RecoveredTurnMonitor(BlastObservationMonitor):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.settle_calls = 0
+
+            async def _observe_until_settled(
+                self,
+                runtime,
+                *,
+                generation,
+                initial_observation,
+                timeout_seconds=None,
+            ):
+                self.settle_calls += 1
+                if self.settle_calls == 2:
+                    return initial_observation, False
+                if self.settle_calls == 3:
+                    self._settling_samples = (
+                        (2_000.0, 0.0, 0.0),
+                    ) * POST_MOTION_SETTLE_SAMPLE_COUNT
+                    initial_observation = {
+                        **initial_observation,
+                        "distance_mm": 2_000,
+                    }
+                return initial_observation, True
+
+        monitor = RecoveredTurnMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        result = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )
+
+        runtime = FakeRuntime.instances[0]
+        self.assertEqual(result["scan"]["state"], "complete")
+        self.assertEqual(result["receipt"], {"turn_count": 16})
+        self.assertEqual(
+            [call for call in runtime.calls if call[0] == "turn_pulse"],
+            [("turn_pulse", "left")] * 16,
+        )
+        self.assertIn(("stop",), runtime.calls)
+        self.assertEqual(monitor.settle_calls, 18)
         monitor.close()
 
     def test_soft_scan_uncertainty_stops_with_partial_evidence(self):

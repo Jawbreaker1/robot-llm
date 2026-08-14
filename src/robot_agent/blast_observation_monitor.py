@@ -1374,8 +1374,10 @@ class BlastObservationMonitor:
                     {"stopped_after_uncertain_evidence": True},
                     final, final_settled, evidence,
                 ))
-                partial_reason = error.code
-                break
+                if not (final_settled is True and
+                        self._scan_sweep_window_allows_continuation(final)):
+                    partial_reason = error.code
+                    break
             if abs(encoder_sweep_bearing_deg(
                 sweep_samples[-1][1], start_drive_angles,
             ) or 0.0) >= 350.0:

@@ -636,6 +636,16 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             controller, planner, max_decisions=1,
             startup_perception=True,
         )
+        map_pose_at_decision = []
+        decide = planner.decide
+
+        def inspect_map(context):
+            map_pose_at_decision.append(
+                adapter.spatial_map_provider.snapshot()["robot_pose"]
+            )
+            return decide(context)
+
+        planner.decide = inspect_map
 
         result = adapter.run(episode_context()[0])
 
@@ -647,6 +657,9 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(
             context.local_map_evidence["robot_pose"]["heading_mdeg"],
             22_050,
+        )
+        self.assertEqual(
+            map_pose_at_decision[0]["heading_mdeg"], 22_050,
         )
         self.assertEqual(
             adapter.spatial_map_provider.snapshot()["robot_pose"][
