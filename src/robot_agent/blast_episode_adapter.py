@@ -772,6 +772,7 @@ class BlastEpisodeRuntimeAdapter:
         deadline_ms,
         abort_allowed,
         local_map_evidence,
+        active_waypoint,
     ):
         outcome = self._control_outcome(context, deadline_ms)
         if outcome is not None: return None, outcome
@@ -788,6 +789,7 @@ class BlastEpisodeRuntimeAdapter:
                 abort_allowed=abort_allowed,
                 robot_relative_side_scan=current_side_scan(history, latest_scan_view),
                 local_map_evidence=local_map_evidence,
+                active_waypoint=active_waypoint,
             ))
         except Exception:
             outcome = self._control_outcome(context, deadline_ms)
@@ -866,6 +868,7 @@ class BlastEpisodeRuntimeAdapter:
             "action_source": _PLANNER_ACTION_SOURCE,
             "observation": observation,
             "bounded_no_valid_eligible": bounded_no_valid,
+            "active_waypoint": decision.waypoint,
         }, None
     def _scan_action_permit(
         self, *, action, observation, geometry_checked, pose, prior_receipt,
@@ -1213,6 +1216,7 @@ class BlastEpisodeRuntimeAdapter:
             speech_factory = (
                 self.speech_runtime_factory if self._speech_available else None)
         history, episode_start_heading, motion_executor = [], None, None
+        active_waypoint = None
         navigation_state, recovery, latest_scan_view = PlannerNavigationState(), BlastAgenticRecovery(), None
         map_trace = None
         speech = BlastEpisodeSpeech(
@@ -1325,6 +1329,7 @@ class BlastEpisodeRuntimeAdapter:
                             motion_executor.pose
                         )
                     ),
+                    active_waypoint=active_waypoint,
                 )
                 if outcome is not None:
                     return outcome
@@ -1333,6 +1338,7 @@ class BlastEpisodeRuntimeAdapter:
                 plan = step["plan"]
                 action_source = step["action_source"]
                 observation = step["observation"]
+                active_waypoint = step["active_waypoint"]
                 scan_pose = motion_executor.pose if action == SCAN_FRONT_ARC else None
                 observation, outcome = admit_blast_spoken_action(
                     self, speech, step, observation, motion_executor,

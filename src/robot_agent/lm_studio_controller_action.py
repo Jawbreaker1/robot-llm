@@ -22,6 +22,8 @@ MAX_ASSESSMENT_CHARS = 240
 MAX_UTTERANCE_CHARS = 160
 MAX_PLAN_STEPS = 8
 MAX_HISTORY_ITEMS = 12
+MAX_WAYPOINT_COORDINATE_MM = 5_000
+MAX_WAYPOINT_PURPOSE_CHARS = 120
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024
 MAX_OUTPUT_BYTES = 8 * 1024
@@ -55,6 +57,11 @@ _SYSTEM_PROMPT = (
     "The host does not rank or choose the turn side. "
     "After scan-guided motion, use a fresh scan from the resulting pose before "
     "claiming passage complete. "
+    "For a multi-step detour, maintain one advisory waypoint in episode-local "
+    "x_mm/y_mm coordinates. Keep it while making useful progress; replace it "
+    "only when reached, blocked, or when the next waypoint better serves the "
+    "final goal. A waypoint is memory for your decisions and never authorizes "
+    "motion by itself. Use null when no intermediate waypoint is needed. "
     "Pick "
     "COMPLETE only when the observation and history support that the goal is "
     "satisfied. Pick ABORT only when progress is no longer reasonable. Otherwise "
@@ -186,6 +193,36 @@ def _actions(
     return actions
 
 
+def _waypoint(value):
+    if value is None:
+        return None
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"x_mm", "y_mm", "purpose"}
+        or any(
+            isinstance(value.get(axis), bool)
+            or not isinstance(value.get(axis), int)
+            or not -MAX_WAYPOINT_COORDINATE_MM
+            <= value[axis] <= MAX_WAYPOINT_COORDINATE_MM
+            for axis in ("x_mm", "y_mm")
+        )
+    ):
+        raise ValueError("invalid waypoint")
+    try:
+        purpose = _safe_text(
+            "Controller waypoint purpose",
+            value["purpose"],
+            MAX_WAYPOINT_PURPOSE_CHARS,
+        )
+    except _lm.LMStudioInputError:
+        raise ValueError("invalid waypoint") from None
+    return {
+        "x_mm": value["x_mm"],
+        "y_mm": value["y_mm"],
+        "purpose": purpose,
+    }
+
+
 @dataclass(frozen=True)
 class ControllerActionContext:
     goal: str
@@ -199,6 +236,7 @@ class ControllerActionContext:
     abort_allowed: bool = True
     robot_relative_side_scan: Mapping[str, object] | None = None
     local_map_evidence: Mapping[str, object] | None = None
+    active_waypoint: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         _safe_text("Controller goal", self.goal, MAX_GOAL_CHARS)
@@ -241,6 +279,14 @@ class ControllerActionContext:
         _strict_value(self.history)
         _strict_value(self.robot_relative_side_scan)
         _strict_value(self.local_map_evidence)
+        try:
+            object.__setattr__(
+                self, "active_waypoint", _waypoint(self.active_waypoint),
+            )
+        except ValueError:
+            raise _lm.LMStudioInputError(
+                "Controller waypoint is invalid"
+            ) from None
 
     def to_dict(self):
         value = {
@@ -262,6 +308,8 @@ class ControllerActionContext:
             value["local_map_evidence"] = _strict_value(
                 self.local_map_evidence
             )
+        if self.active_waypoint is not None:
+            value["active_waypoint"] = dict(self.active_waypoint)
         return value
 
 
@@ -272,6 +320,7 @@ class ControllerActionDecision:
     assessment: str
     plan: tuple[str, ...]
     utterance: str | None
+    waypoint: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -361,6 +410,33 @@ class LMStudioControllerActionPlanner:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": self._max_utterance_chars,
+                    },
+                    {"type": "null"},
+                ]
+            },
+            "waypoint": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "x_mm": {
+                                "type": "integer",
+                                "minimum": -MAX_WAYPOINT_COORDINATE_MM,
+                                "maximum": MAX_WAYPOINT_COORDINATE_MM,
+                            },
+                            "y_mm": {
+                                "type": "integer",
+                                "minimum": -MAX_WAYPOINT_COORDINATE_MM,
+                                "maximum": MAX_WAYPOINT_COORDINATE_MM,
+                            },
+                            "purpose": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_WAYPOINT_PURPOSE_CHARS,
+                            },
+                        },
+                        "required": ["x_mm", "y_mm", "purpose"],
+                        "additionalProperties": False,
                     },
                     {"type": "null"},
                 ]
@@ -483,6 +559,7 @@ class LMStudioControllerActionPlanner:
             "assessment",
             "plan",
             "utterance",
+            "waypoint",
         }
         if not isinstance(value, dict) or set(value) != expected:
             raise _lm.LMStudioProtocolError(
@@ -493,6 +570,12 @@ class LMStudioControllerActionPlanner:
         assessment = value["assessment"]
         plan = value["plan"]
         utterance = value["utterance"]
+        try:
+            waypoint = _waypoint(value["waypoint"])
+        except ValueError:
+            raise _lm.LMStudioProtocolError(
+                "LM Studio controller-action waypoint is invalid"
+            ) from None
         allowed = context.available_actions + tuple(
             action for action in TERMINAL_ACTIONS
             if (
@@ -533,6 +616,7 @@ class LMStudioControllerActionPlanner:
             assessment=assessment,
             plan=() if action in TERMINAL_ACTIONS else tuple(plan),
             utterance=utterance,
+            waypoint=waypoint,
         )
 
 

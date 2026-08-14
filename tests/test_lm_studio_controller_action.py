@@ -50,6 +50,7 @@ def context(**changes):
 
 
 def completion(output, **changes):
+    output = {"waypoint": None, **output}
     value = {
         "object": "chat.completion",
         "model": MODEL,
@@ -536,6 +537,51 @@ class ControllerActionPlannerTests(unittest.TestCase):
 
         with self.assertRaises(LMStudioInputError):
             context(local_map_evidence=[])
+
+    def test_waypoint_round_trips_as_model_owned_advisory_memory(self):
+        waypoint = {
+            "x_mm": 120,
+            "y_mm": -280,
+            "purpose": "Pass the obstacle on its open right side",
+        }
+        planner, transport = self.planner(completion({
+            "action": "DRIVE_FORWARD",
+            "confidence_milli": 850,
+            "assessment": "I am still approaching my chosen detour point.",
+            "plan": ["DRIVE_FORWARD"],
+            "utterance": None,
+            "waypoint": waypoint,
+        }))
+
+        result = planner.decide(context(active_waypoint=waypoint))
+
+        self.assertEqual(result.decision.waypoint, waypoint)
+        request = json.loads(transport.calls[0][1])
+        supplied = json.loads(request["messages"][1]["content"])
+        self.assertEqual(supplied["active_waypoint"], waypoint)
+        self.assertIn(
+            "waypoint is memory for your decisions",
+            request["messages"][0]["content"],
+        )
+        self.assertIn(
+            "waypoint",
+            request["response_format"]["json_schema"]["schema"][
+                "required"
+            ],
+        )
+        with self.assertRaises(LMStudioInputError):
+            context(active_waypoint={**waypoint, "host_executes": True})
+
+        invalid, _ = self.planner(completion({
+            "action": "DRIVE_FORWARD",
+            "confidence_milli": 850,
+            "assessment": "The proposed waypoint is outside the episode.",
+            "plan": ["DRIVE_FORWARD"],
+            "utterance": None,
+            "waypoint": {**waypoint, "x_mm": 5_001},
+        }))
+        with self.assertRaises(LMStudioProtocolError):
+            invalid.decide(context())
 
     def test_nonterminal_plan_must_start_with_selected_action(self):
         planner, _ = self.planner(completion({

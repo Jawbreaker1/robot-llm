@@ -51,7 +51,9 @@ from robot_agent.robot_control_contract import RobotRuntimeUpdate
 from robot_agent.robot_speech_runtime import SpeechAdmission
 
 
-def decision(action, *, plan=(), assessment="ok", utterance=None):
+def decision(
+    action, *, plan=(), assessment="ok", utterance=None, waypoint=None,
+):
     return ControllerActionPlannerResult(
         decision=ControllerActionDecision(
             action=action,
@@ -59,6 +61,7 @@ def decision(action, *, plan=(), assessment="ok", utterance=None):
             assessment=assessment,
             plan=tuple(plan),
             utterance=utterance,
+            waypoint=waypoint,
         ),
         latency_ms=12,
     )
@@ -1346,6 +1349,30 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             planner.contexts[1].observation["odometry"]["x_mm"],
             45,
         )
+
+    def test_gemma_waypoint_persists_without_creating_a_host_route(self):
+        waypoint = {
+            "x_mm": 120,
+            "y_mm": -280,
+            "purpose": "Pass the obstacle on its open right side",
+        }
+        controller = FakeController(500)
+        planner = Planner([
+            decision(ADVANCE, waypoint=waypoint),
+            decision(ADVANCE, waypoint=waypoint),
+        ])
+        adapter = self.adapter(controller, planner, max_decisions=2)
+
+        result = adapter.run(episode_context()[0])
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertIsNone(planner.contexts[0].active_waypoint)
+        self.assertEqual(planner.contexts[1].active_waypoint, waypoint)
+        self.assertIsNot(planner.contexts[1].active_waypoint, waypoint)
+        trace = adapter.spatial_map_provider.snapshot()["navigation_trace"]
+        self.assertIsNone(trace["planned_leg"])
+        self.assertIsNone(trace["local_detour_route"])
+        self.assertFalse(trace["final_goal"]["navigation_enforced"])
 
     def test_live_dense_scan_cannot_complete_with_328_mm_remaining(self):
         class LiveContradictionController(FakeScanController):
