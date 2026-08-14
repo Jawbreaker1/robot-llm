@@ -2604,6 +2604,30 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     allow_no_valid_distance_with_bounded_evidence=True,
                 ))
 
+    def test_full_surroundings_scan_offers_turns_at_no_return(self):
+        controller = FakeController(2_000)
+        adapter = self.adapter(controller, Planner([]))
+        observation = adapter._observation()
+        scan = scan_result(center_distance_mm=2_000)
+        scan["sweep_coverage_deg"] = 356.0
+
+        self.assertEqual(
+            adapter._available_actions(observation, ({
+                "action": SCAN_FRONT_ARC,
+                "scan": scan,
+            },)),
+            (TURN_LEFT_90, TURN_RIGHT_90),
+        )
+
+        scan.pop("sweep_coverage_deg")
+        self.assertEqual(
+            adapter._available_actions(observation, ({
+                "action": SCAN_FRONT_ARC,
+                "scan": scan,
+            },)),
+            (),
+        )
+
     def test_arbitrary_planner_turn_still_stops_on_no_valid_range(self):
         class NoReturnDuringPlannerTurn(FakeController):
             def command(self, command, *, cancel_requested=None):

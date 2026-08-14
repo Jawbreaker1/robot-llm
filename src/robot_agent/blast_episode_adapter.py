@@ -308,6 +308,16 @@ class BlastEpisodeRuntimeAdapter:
         if not history or history[-1].get("action") != SCAN_FRONT_ARC:
             return False
         scan = history[-1].get("scan")
+        if (
+            isinstance(scan, Mapping)
+            and scan.get("sweep_coverage_deg") is not None
+        ):
+            return (
+                scan.get("state") == "complete"
+                and scan.get("result") == "restored"
+                and scan.get("restoration_verified") is True
+                and scan.get("all_observations_settled") is True
+            )
         rays = scan.get("rays") if isinstance(scan, Mapping) else None
         if not (
             isinstance(rays, list)
@@ -373,6 +383,13 @@ class BlastEpisodeRuntimeAdapter:
             for action in (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90)
             if self._current_observation_allows_action(action, observation)
         ]
+        if (
+            blast_range_state(
+                observation["sensors"].get("distance_mm")
+            ) == RANGE_STATE_NO_VALID_DISTANCE
+            and self._current_scan_allows_quarter_turn(history)
+        ):
+            available.extend((TURN_LEFT_90, TURN_RIGHT_90))
         if (
             self._current_observation_allows_action(
                 SCAN_FRONT_ARC, observation
