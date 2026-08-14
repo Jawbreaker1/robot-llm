@@ -349,6 +349,7 @@ class FakeController:
             observation["imu"]["heading_deg"] = heading + (
                 -23.765 if left else 23.765
             )
+            observation["rotation_sweep_window_verified"] = True
         else:
             deltas = (0, 0)
             if command == "scan_front_arc":
@@ -2643,7 +2644,9 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                         "body"
                     ] = 156
                 else:
-                    candidate["observation_settled"] = False
+                    candidate["observation"][
+                        "rotation_sweep_window_verified"
+                    ] = False
                 self.assertFalse(blast_turn_slice_allows_continuation(
                     candidate,
                     allow_no_valid_distance_with_bounded_evidence=True,

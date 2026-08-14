@@ -17,7 +17,7 @@ def blast_turn_slice_allows_continuation(
     *,
     allow_no_valid_distance_with_bounded_evidence=False,
 ) -> bool:
-    """Admit another pulse only from settled, calibrated telemetry.
+    """Admit another pulse only from monitor-verified rotation telemetry.
 
     The opt-in is bounded scan/route turn eligibility for a no-return echo,
     never a claim that geometric clearance has been proved.
@@ -30,8 +30,7 @@ def blast_turn_slice_allows_continuation(
         return False
     sensors = command_result.get("observation")
     if not (
-        command_result.get("observation_settled") is True
-        or isinstance(sensors, Mapping)
+        isinstance(sensors, Mapping)
         and sensors.get("rotation_sweep_window_verified") is True
     ):
         return False

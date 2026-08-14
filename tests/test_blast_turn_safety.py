@@ -15,6 +15,7 @@ def turn_result(distance_mm=500):
             "distance_mm": distance_mm,
             "motor_angles_deg": {"body": 158},
             "imu": {"ready": False, "stationary": False},
+            "rotation_sweep_window_verified": True,
         },
     }
 
@@ -34,7 +35,9 @@ class BlastTurnSafetyTests(unittest.TestCase):
         safe = turn_result()
         mutations = (
             lambda value: value.update(completed=False),
-            lambda value: value.update(observation_settled=False),
+            lambda value: value["observation"].update(
+                rotation_sweep_window_verified=False,
+            ),
             lambda value: value["observation"].update(motion_active=True),
             lambda value: value["observation"]["motor_angles_deg"].update(
                 body=120,
@@ -59,7 +62,6 @@ class BlastTurnSafetyTests(unittest.TestCase):
     def test_clear_unsettled_window_preserves_hard_range_gate(self):
         result = turn_result()
         result["observation_settled"] = False
-        result["observation"]["rotation_sweep_window_verified"] = True
         self.assertTrue(blast_turn_slice_allows_continuation(result))
 
         result["observation"]["distance_mm"] = 40
