@@ -4166,7 +4166,9 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 self.assertEqual(monitor.settle_attempts, 1)
                 self.assertFalse(result["observation_settled"])
                 self.assertIs(
-                    result["rotation_sweep_window_verified"],
+                    result["observation"][
+                        "rotation_sweep_window_verified"
+                    ],
                     clearance_verified,
                 )
                 monitor.close()

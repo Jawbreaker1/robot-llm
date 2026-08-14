@@ -11,6 +11,9 @@ from robot_agent.blast_observation_monitor import (
     CONTROLLER_ID,
     ROBOT_ID,
 )
+from robot_agent.blast_turn_safety import (
+    blast_turn_slice_allows_continuation,
+)
 from robot_agent.physical_navigation_contract import (
     ADVANCE,
     TURN_LEFT_90,
@@ -419,6 +422,32 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertFalse(result.motion.complete)
         self.assertEqual(result.motion.verified_slice_count, 1)
         self.assertEqual(result.pose.heading_mdeg, 23_520)
+
+    def test_turn_window_evidence_preserves_exact_motion_contract(self):
+        controller, executor = self.executor()
+        original_command = controller.command
+
+        def command(name, *, cancel_requested=None):
+            result = original_command(
+                name, cancel_requested=cancel_requested,
+            )
+            result["observation_settled"] = False
+            result["observation"]["distance_mm"] = 500
+            result["observation"]["motor_angles_deg"]["body"] = 158
+            result["observation"][
+                "rotation_sweep_window_verified"
+            ] = True
+            return result
+
+        controller.command = command
+
+        result = executor.execute(
+            TURN_LEFT_90,
+            continue_requested=blast_turn_slice_allows_continuation,
+        )
+
+        self.assertTrue(result.motion.complete)
+        self.assertEqual(controller.commands, ["turn_left"] * 4)
 
     def test_invalid_first_turn_receipt_stops_before_second_pulse(self):
         for corruption in ("command", "encoder_direction"):

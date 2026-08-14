@@ -1467,9 +1467,7 @@ class BlastObservationMonitor:
         )
         observation_settled = None
         turn_command = command in ("turn_left", "turn_right")
-        if command in NAVIGATION_MOTION_COMMANDS or (
-            command == SETTLED_OBSERVATION_COMMAND
-        ):
+        if command in NAVIGATION_MOTION_COMMANDS or command == SETTLED_OBSERVATION_COMMAND:
             observation, observation_settled = await self._observe_until_settled(
                 runtime, generation=generation,
                 initial_observation=observation,
@@ -1477,6 +1475,12 @@ class BlastObservationMonitor:
                     SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS
                     if turn_command else None
                 ),
+            )
+        if turn_command:
+            observation = dict(observation)
+            observation["rotation_sweep_window_verified"] = (
+                observation_settled is True
+                or self._scan_sweep_window_allows_continuation(observation)
             )
         result = {
             "schema": COMMAND_RESULT_SCHEMA,
@@ -1490,11 +1494,6 @@ class BlastObservationMonitor:
         }
         if observation_settled is not None:
             result["observation_settled"] = observation_settled
-        if turn_command:
-            result["rotation_sweep_window_verified"] = (
-                observation_settled is True
-                or self._scan_sweep_window_allows_continuation(observation)
-            )
         return result
 
     async def _observe_until_idle(

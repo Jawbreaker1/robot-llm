@@ -59,7 +59,7 @@ class BlastTurnSafetyTests(unittest.TestCase):
     def test_clear_unsettled_window_preserves_hard_range_gate(self):
         result = turn_result()
         result["observation_settled"] = False
-        result["rotation_sweep_window_verified"] = True
+        result["observation"]["rotation_sweep_window_verified"] = True
         self.assertTrue(blast_turn_slice_allows_continuation(result))
 
         result["observation"]["distance_mm"] = 40
