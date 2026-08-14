@@ -1180,12 +1180,6 @@ class BlastObservationMonitor:
         except BlastControllerError as error:
             error.motion_started = True
             raise
-        if observation_settled is not True:
-            raise BlastControllerError(
-                "scan_sweep_observation_unverified",
-                "BLAST scan could not settle between turn pulses",
-                motion_started=True, evidence_uncertain=True,
-            )
         distance = observation.get("distance_mm")
         sweep_only = observation_settled is not True
         sensor = (
@@ -1253,6 +1247,13 @@ class BlastObservationMonitor:
                 "BLAST scan received invalid settled range evidence",
                 motion_started=True,
                 evidence_uncertain=True,
+            )
+        if sweep_only and not self._scan_sweep_window_allows_continuation(
+                observation):
+            raise BlastControllerError(
+                "scan_sweep_observation_unverified",
+                "BLAST scan could not verify a safe sweep window",
+                motion_started=True, evidence_uncertain=True,
             )
         if range_state == RANGE_STATE_MEASURED and float(distance) <= (
             BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
@@ -1374,8 +1375,7 @@ class BlastObservationMonitor:
                     {"stopped_after_uncertain_evidence": True},
                     final, final_settled, evidence,
                 ))
-                if not (final_settled is True and
-                        self._scan_sweep_window_allows_continuation(final)):
+                if not self._scan_sweep_window_allows_continuation(final):
                     partial_reason = error.code
                     break
             if abs(encoder_sweep_bearing_deg(

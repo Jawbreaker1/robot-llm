@@ -2983,6 +2983,64 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(monitor.settle_calls, 18)
         monitor.close()
 
+    def test_scan_continues_past_one_safe_unsettled_echo(self):
+        class SafeUnsettledTurnMonitor(BlastObservationMonitor):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.settle_calls = 0
+
+            async def _observe_until_settled(
+                self,
+                runtime,
+                *,
+                generation,
+                initial_observation,
+                timeout_seconds=None,
+            ):
+                self.settle_calls += 1
+                if self.settle_calls == 5:
+                    observation = {
+                        **initial_observation,
+                        "distance_mm": 840,
+                        "motion_active": False,
+                    }
+                    self._settling_samples = (
+                        (840.0, 0.0, 0.0),
+                    ) * POST_MOTION_SETTLE_SAMPLE_COUNT
+                    return observation, False
+                return initial_observation, True
+
+        monitor = SafeUnsettledTurnMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        result = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )
+
+        self.assertEqual(result["scan"]["state"], "complete")
+        self.assertEqual(result["receipt"], {"turn_count": 16})
+        self.assertFalse(result["scan"]["all_observations_settled"])
+        unsettled = [
+            ray for ray in result["scan"]["angular_rays"]
+            if ray["observation_settled"] is False
+        ]
+        self.assertEqual(len(unsettled), 1)
+        self.assertEqual(
+            unsettled[0]["evidence_use"],
+            "SWEEP_CONTINUATION_ONLY",
+        )
+        runtime = FakeRuntime.instances[0]
+        self.assertEqual(
+            [call for call in runtime.calls if call[0] == "turn_pulse"],
+            [("turn_pulse", "left")] * 16,
+        )
+        monitor.close()
+
     def test_soft_scan_uncertainty_stops_with_partial_evidence(self):
         for distance, settled in ((40, False), (-1, True), (2_001, True)):
             with self.subTest(distance=distance, settled=settled):
