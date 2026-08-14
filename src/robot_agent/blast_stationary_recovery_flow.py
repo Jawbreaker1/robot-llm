@@ -278,7 +278,9 @@ def prepare_blast_iteration_actions(
 ):
     """Apply scan-side and agentic-recovery filters in one reusable step."""
 
-    available_actions = adapter._available_actions(observation, history)
+    available_actions = adapter._available_actions(
+        observation, history, latest_scan_view,
+    )
     scan_is_current = adapter._scan_is_current(history)
     scan_allows_turn = (
         adapter._current_scan_allows_quarter_turn(history)

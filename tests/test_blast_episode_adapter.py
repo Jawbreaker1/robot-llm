@@ -22,6 +22,7 @@ from robot_agent.blast_navigation_motion_execution import (
     BlastNavigationMotionExecutor,
 )
 from robot_agent.blast_scan_observation import (
+    build_blast_encoder_scan,
     build_blast_partial_scan,
     encoder_common_mode_residue_mm,
     encoder_relative_bearing_deg,
@@ -249,6 +250,41 @@ def dense_scan_result(
         ],
         "angular_rays": angular,
     }
+
+
+def surroundings_scan_result(
+    center, *, left_forward_mm=500, right_forward_mm=500,
+):
+    """Build one valid full-turn scan with a settled NVD center ray."""
+
+    start = {
+        role: center["motor_angles_deg"][role]
+        for role in ("left_drive", "right_drive")
+    }
+    sweep_samples = []
+    for index in range(1, 17):
+        observation = copy.deepcopy(center)
+        observation["motor_angles_deg"].update({
+            "left_drive": start["left_drive"] - 45 * index,
+            "right_drive": start["right_drive"] + 45 * index,
+        })
+        observation["distance_mm"] = (
+            left_forward_mm if index == 2
+            else right_forward_mm if index == 14
+            else 2_000 if index == 16
+            else 500
+        )
+        sweep_samples.append(({}, observation, True, "SETTLED_RANGE"))
+    final = sweep_samples[-1][1]
+    return build_blast_encoder_scan(
+        center=center,
+        center_settled=True,
+        start_drive_angles=start,
+        sweep_samples=sweep_samples,
+        final=final,
+        final_settled=True,
+        final_body_verified=True,
+    ), final
 
 
 def anchor_scan_result(scan, observation):
@@ -2522,6 +2558,107 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             },)),
             (),
         )
+
+    def test_full_scan_brackets_one_bounded_advance_at_no_return(self):
+        controller = FakeController(2_000)
+        adapter = self.adapter(controller, Planner([]))
+        observation = adapter._observation()
+        scan, _final = surroundings_scan_result(
+            copy.deepcopy(observation["sensors"]),
+        )
+        history = ({"action": SCAN_FRONT_ARC, "scan": scan},)
+        latest_scan_view = {"scan": scan}
+
+        self.assertIn(ADVANCE, adapter._available_actions(
+            observation, history, latest_scan_view,
+        ))
+        unknown_flank = copy.deepcopy(scan)
+        unknown_flank["angular_rays"][1].update({
+            "distance_mm": 2_000,
+            "range_state": RANGE_STATE_NO_VALID_DISTANCE,
+        })
+        self.assertIn(ADVANCE, adapter._available_actions(
+            observation,
+            ({"action": SCAN_FRONT_ARC, "scan": unknown_flank},),
+            {"scan": unknown_flank},
+        ))
+        self.assertNotIn(ADVANCE, adapter._available_actions(
+            observation,
+            (*history, {"action": ADVANCE}),
+            latest_scan_view,
+        ))
+
+        for side, change in (
+            ("left_1", {"observation_settled": False}),
+            ("right_1", {
+                "distance_mm": 100,
+                "range_state": RANGE_STATE_MEASURED,
+            }),
+        ):
+            with self.subTest(side=side):
+                blocked = copy.deepcopy(scan)
+                ray = next(
+                    item for item in blocked["angular_rays"]
+                    if item["side"] == side
+                )
+                ray.update(change)
+                self.assertNotIn(ADVANCE, adapter._available_actions(
+                    observation,
+                    ({"action": SCAN_FRONT_ARC, "scan": blocked},),
+                    {"scan": blocked},
+                ))
+
+    def test_agentic_full_scan_can_advance_once_at_no_return(self):
+        class FullNoReturnScanController(FakeController):
+            def issue_no_return_scan_permit(self, **_values):
+                return object()
+
+            def command(
+                self, command, *, cancel_requested=None,
+                action_permit=None,
+            ):
+                if command != "scan_front_arc":
+                    result = super().command(
+                        command, cancel_requested=cancel_requested,
+                    )
+                    if command == "drive_forward":
+                        result["observation"]["distance_mm"] = 2_000
+                        self.snapshot_value["observation"] = result[
+                            "observation"
+                        ]
+                    return result
+                self.commands.append(command)
+                center = copy.deepcopy(self.snapshot_value["observation"])
+                scan, final = surroundings_scan_result(center)
+                self.snapshot_value["observation"] = final
+                return {
+                    "schema": COMMAND_RESULT_SCHEMA,
+                    "robot_id": ROBOT_ID,
+                    "controller_id": CONTROLLER_ID,
+                    "command": command,
+                    "accepted": True,
+                    "completed": True,
+                    "receipt": {"turn_count": 16},
+                    "observation": final,
+                    "observation_settled": True,
+                    "scan": scan,
+                }
+
+        controller = FullNoReturnScanController(2_000)
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(ADVANCE),
+        ])
+
+        result = self.adapter(
+            controller, planner, max_decisions=2,
+        ).run(episode_context()[0])
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(
+            controller.commands, ["scan_front_arc", "drive_forward"],
+        )
+        self.assertIn(ADVANCE, planner.contexts[1].available_actions)
 
     def test_full_scan_turns_use_settled_rays_around_unknown_echoes(self):
         adapter = self.adapter(FakeController(), Planner([]))

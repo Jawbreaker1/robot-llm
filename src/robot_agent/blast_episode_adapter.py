@@ -356,6 +356,64 @@ class BlastEpisodeRuntimeAdapter:
             > _minimum_rotation_clearance_mm()
         )
 
+    def _current_scan_allows_bounded_advance(
+        self, history, latest_scan_view,
+    ) -> bool:
+        """Whether a current full scan has no block in its forward fan."""
+
+        if (
+            not self._scan_evidence_is_fresh(history)
+            or not isinstance(latest_scan_view, Mapping)
+        ):
+            return False
+        scan = latest_scan_view.get("scan")
+        rays = scan.get("angular_rays") if isinstance(scan, Mapping) else None
+        coverage = (
+            scan.get("sweep_coverage_deg")
+            if isinstance(scan, Mapping) else None
+        )
+        if not (
+            isinstance(scan, Mapping)
+            and scan.get("state") == "complete"
+            and scan.get("result") == "restored"
+            and scan.get("restoration_verified") is True
+            and isinstance(coverage, (int, float))
+            and not isinstance(coverage, bool)
+            and math.isfinite(float(coverage))
+            and 350.0 <= float(coverage) <= 390.0
+            and isinstance(rays, list)
+        ):
+            return False
+        by_side = {
+            ray.get("side"): ray for ray in rays
+            if isinstance(ray, Mapping)
+        }
+        def settled_not_blocked(side):
+            ray = by_side.get(side)
+            distance = ray.get("distance_mm") if isinstance(
+                ray, Mapping
+            ) else None
+            return (
+                isinstance(ray, Mapping)
+                and ray.get("observation_settled") is True
+                and (
+                    ray.get("range_state")
+                    == RANGE_STATE_NO_VALID_DISTANCE
+                    or (
+                        ray.get("range_state") == RANGE_STATE_MEASURED
+                        and isinstance(distance, (int, float))
+                        and not isinstance(distance, bool)
+                        and math.isfinite(float(distance))
+                        and float(distance)
+                        > self.minimum_forward_clearance_mm
+                    )
+                )
+            )
+
+        return all(settled_not_blocked(side) for side in (
+            "center", "left_1", "right_1",
+        ))
+
     @staticmethod
     def _current_range_allows_rotation(observation) -> bool:
         distance = observation["sensors"].get("distance_mm")
@@ -398,7 +456,9 @@ class BlastEpisodeRuntimeAdapter:
             )
         return False
 
-    def _available_actions(self, observation, history=()) -> tuple[str, ...]:
+    def _available_actions(
+        self, observation, history=(), latest_scan_view=None,
+    ) -> tuple[str, ...]:
         # BLAST has no rear-facing clearance source yet. Keep reverse in the
         # executor contract, but never offer it as a planner action.
         available = [
@@ -410,9 +470,13 @@ class BlastEpisodeRuntimeAdapter:
             blast_range_state(
                 observation["sensors"].get("distance_mm")
             ) == RANGE_STATE_NO_VALID_DISTANCE
-            and self._current_scan_allows_quarter_turn(history)
         ):
-            available.extend((TURN_LEFT_90, TURN_RIGHT_90))
+            if self._current_scan_allows_bounded_advance(
+                history, latest_scan_view,
+            ):
+                available.append(ADVANCE)
+            if self._current_scan_allows_quarter_turn(history):
+                available.extend((TURN_LEFT_90, TURN_RIGHT_90))
         if (
             self._current_observation_allows_action(
                 SCAN_FRONT_ARC, observation
@@ -646,7 +710,7 @@ class BlastEpisodeRuntimeAdapter:
         episode_start_heading,
         motion_executor,
         cancel_requested,
-        allow_turn_no_valid_with_bounded_evidence=False,
+        allow_no_valid_with_bounded_evidence=False,
     ):
         return fresh_blast_action_observation(
             self, action=action,
@@ -656,15 +720,15 @@ class BlastEpisodeRuntimeAdapter:
             episode_error_type=BlastEpisodeError,
             encoder_anchor_correlated=_side_search_encoder_correlated,
             navigation_body_matched=_navigation_body_matched,
-            allow_turn_no_valid_with_bounded_evidence=(
-                allow_turn_no_valid_with_bounded_evidence
+            allow_no_valid_with_bounded_evidence=(
+                allow_no_valid_with_bounded_evidence
             ),
         )
 
     def _fresh_planner_observation_or_stop(
         self, action, episode_start_heading,
         motion_executor, context, deadline_ms,
-        allow_turn_no_valid_with_bounded_evidence=False,
+        allow_no_valid_with_bounded_evidence=False,
     ):
         control_requested = lambda: (
             self._control_outcome(
@@ -677,8 +741,8 @@ class BlastEpisodeRuntimeAdapter:
                 episode_start_heading=episode_start_heading,
                 motion_executor=motion_executor,
                 cancel_requested=control_requested,
-                allow_turn_no_valid_with_bounded_evidence=(
-                    allow_turn_no_valid_with_bounded_evidence
+                allow_no_valid_with_bounded_evidence=(
+                    allow_no_valid_with_bounded_evidence
                 ),
             )
         except BlastControllerError as error:
@@ -745,6 +809,13 @@ class BlastEpisodeRuntimeAdapter:
             and scan_allows_turn
             and action in (TURN_LEFT_90, TURN_RIGHT_90)
         )
+        scan_guided_advance = (
+            action == ADVANCE
+            and self._current_scan_allows_bounded_advance(
+                history, latest_scan_view,
+            )
+        )
+        bounded_no_valid = scan_guided_turn or scan_guided_advance
         terminal_actions = tuple(
             action for action in (COMPLETE, ABORT)
             if (
@@ -761,7 +832,7 @@ class BlastEpisodeRuntimeAdapter:
             observation, stopped = self._fresh_planner_observation_or_stop(
                 action, episode_start_heading,
                 motion_executor, context, deadline_ms,
-                allow_turn_no_valid_with_bounded_evidence=scan_guided_turn,
+                allow_no_valid_with_bounded_evidence=bounded_no_valid,
             )
             if stopped is not None:
                 return None, stopped
@@ -794,7 +865,7 @@ class BlastEpisodeRuntimeAdapter:
             "plan": list(decision.plan),
             "action_source": _PLANNER_ACTION_SOURCE,
             "observation": observation,
-            "bounded_turn_no_valid_eligible": scan_guided_turn,
+            "bounded_no_valid_eligible": bounded_no_valid,
         }, None
     def _scan_action_permit(
         self, *, action, observation, geometry_checked, pose, prior_receipt,
@@ -1289,7 +1360,8 @@ class BlastEpisodeRuntimeAdapter:
                     motion_executor=motion_executor,
                     prior_receipt=(history[-1] if history else None),
                     allow_turn_no_valid_with_bounded_evidence=(
-                        step["bounded_turn_no_valid_eligible"]
+                        step["bounded_no_valid_eligible"]
+                        and action in (TURN_LEFT_90, TURN_RIGHT_90)
                     ),
                     context=context,
                     deadline_ms=deadline_ms,
