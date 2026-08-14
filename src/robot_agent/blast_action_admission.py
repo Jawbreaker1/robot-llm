@@ -15,7 +15,6 @@ from .blast_stationary_recovery_flow import (
     collect_episode_stationary_evidence,
 )
 from .physical_navigation_contract import (
-    ADVANCE,
     SCAN_FRONT_ARC,
     TURN_LEFT_90,
     TURN_RIGHT_90,
@@ -40,40 +39,6 @@ def _read_observation(
     )
     observation["odometry"] = motion_executor.pose.to_dict()
     return observation
-
-
-def _post_speech_observation(
-    adapter, *, action, selects_detour_side, episode_start_heading,
-    motion_executor, context, deadline_ms, episode_error_type,
-):
-    minimum = (
-        adapter.minimum_forward_clearance_mm
-        if action == ADVANCE
-        else BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-        .minimum_rotation_clearance_mm()
-    )
-    recovered = collect_episode_stationary_evidence(
-        adapter, context=context, deadline_ms=deadline_ms,
-        motion_executor=motion_executor,
-        episode_start_heading=episode_start_heading,
-        minimum_safe_distance_mm=minimum,
-    )
-    if recovered.control is not None:
-        raise _interrupted()
-    admitted_status = (
-        recovered.status == BlastStationaryEvidenceStatus.MEASURED_SAFE
-        or action == SCAN_FRONT_ARC
-        and recovered.status == BlastStationaryEvidenceStatus.EXACT_NVD
-    )
-    if not admitted_status or recovered.observation is None:
-        raise episode_error_type(
-            (
-                "blast_side_search_blocked" if selects_detour_side
-                else "blast_action_start_unverified"
-            ),
-            "BLAST action has no fresh settled range",
-        )
-    return recovered.observation
 
 
 def _side_selection_observation(
@@ -109,24 +74,14 @@ def fresh_blast_action_observation(
     adapter, *, action, selects_detour_side, episode_start_heading,
     motion_executor, cancel_requested, episode_error_type,
     encoder_anchor_correlated, navigation_body_matched,
-    force_remeasure=False,
     allow_turn_no_valid_with_bounded_evidence=False,
     context=None, deadline_ms=None,
 ):
-    observation = (
-        _post_speech_observation(
-            adapter, action=action,
-            selects_detour_side=selects_detour_side,
-            episode_start_heading=episode_start_heading,
-            motion_executor=motion_executor, context=context,
-            deadline_ms=deadline_ms, episode_error_type=episode_error_type,
-        )
-        if force_remeasure else _read_observation(
-            adapter, episode_start_heading, motion_executor,
-            cancel_requested,
-        )
+    observation = _read_observation(
+        adapter, episode_start_heading, motion_executor,
+        cancel_requested,
     )
-    should_remeasure = not force_remeasure and (
+    should_remeasure = (
         selects_detour_side
         and action in (TURN_LEFT_90, TURN_RIGHT_90)
         and blast_range_state(observation["sensors"].get("distance_mm"))
@@ -144,11 +99,7 @@ def fresh_blast_action_observation(
     if not encoder_anchor_correlated(observation, motion_executor):
         raise episode_error_type(
             "blast_action_start_unverified",
-            (
-                "BLAST moved while speech was prepared"
-                if force_remeasure
-                else "BLAST drive encoders lost their trusted pose anchor"
-            ),
+            "BLAST drive encoders lost their trusted pose anchor",
         )
     exact_nvd_scan = (
         action == SCAN_FRONT_ARC
@@ -164,7 +115,7 @@ def fresh_blast_action_observation(
         and navigation_body_matched(observation["sensors"])
     )
     if (
-        (force_remeasure or action != SCAN_FRONT_ARC)
+        action != SCAN_FRONT_ARC
         and not exact_nvd_scan
         and not exact_nvd_bounded_turn
         and not adapter._current_observation_allows_action(action, observation)
@@ -209,7 +160,6 @@ def admit_blast_spoken_action(
     return adapter._fresh_planner_observation_or_stop(
         step["action"], step["selects_detour_side"],
         episode_start_heading, motion_executor, context, deadline_ms,
-        force_remeasure=step["action"] != SCAN_FRONT_ARC,
     )
 
 

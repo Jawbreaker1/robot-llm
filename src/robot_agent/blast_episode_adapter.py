@@ -624,7 +624,6 @@ class BlastEpisodeRuntimeAdapter:
         episode_start_heading,
         motion_executor,
         cancel_requested,
-        force_remeasure=False,
         allow_turn_no_valid_with_bounded_evidence=False,
         context=None, deadline_ms=None,
     ):
@@ -636,7 +635,6 @@ class BlastEpisodeRuntimeAdapter:
             episode_error_type=BlastEpisodeError,
             encoder_anchor_correlated=_side_search_encoder_correlated,
             navigation_body_matched=_navigation_body_matched,
-            force_remeasure=force_remeasure,
             allow_turn_no_valid_with_bounded_evidence=(
                 allow_turn_no_valid_with_bounded_evidence
             ),
@@ -645,7 +643,7 @@ class BlastEpisodeRuntimeAdapter:
 
     def _fresh_planner_observation_or_stop(
         self, action, selects_detour_side, episode_start_heading,
-        motion_executor, context, deadline_ms, force_remeasure=False,
+        motion_executor, context, deadline_ms,
         allow_turn_no_valid_with_bounded_evidence=False,
     ):
         control_requested = lambda: (
@@ -660,7 +658,6 @@ class BlastEpisodeRuntimeAdapter:
                 episode_start_heading=episode_start_heading,
                 motion_executor=motion_executor,
                 cancel_requested=control_requested,
-                force_remeasure=force_remeasure,
                 allow_turn_no_valid_with_bounded_evidence=(
                     allow_turn_no_valid_with_bounded_evidence
                 ),

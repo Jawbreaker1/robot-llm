@@ -934,21 +934,10 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             [update.get("speech_status") for update in updates],
         )
 
-    def test_long_speech_admission_precedes_fresh_observe_and_motion(self):
+    def test_long_speech_admission_precedes_fresh_snapshot_and_motion(self):
         for terminal_state in ("started", "failed"):
             with self.subTest(terminal_state=terminal_state):
                 clock = {"now": 1_000}
-
-                class FreshController(FakeController):
-                    def command(self, command, *, cancel_requested=None):
-                        result = super().command(
-                            command, cancel_requested=cancel_requested,
-                        )
-                        if command == SETTLED_OBSERVATION_COMMAND:
-                            self.snapshot_value[
-                                "last_observed_at_monotonic_ms"
-                            ] = clock["now"]
-                        return result
 
                 class GatedSpeech:
                     def __init__(self):
@@ -963,7 +952,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     def cancel_episode(self, _episode_id): return None
                     def close(self, **_options): return True
 
-                controller = FreshController(500)
+                controller = FakeController(500)
                 speech = GatedSpeech()
                 context, _updates = episode_context()
                 context.settings.speech_enabled = True
@@ -1002,10 +991,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     result[0].terminal_reason,
                     "decision_budget_exhausted",
                 )
-                self.assertEqual(
-                    controller.commands,
-                    [SETTLED_OBSERVATION_COMMAND, "drive_forward"],
-                )
+                self.assertEqual(controller.commands, ["drive_forward"])
 
     def test_spoken_scan_settles_only_inside_the_scan_command(self):
         class NoDuplicateSettleController(FakeScanController):
@@ -1098,97 +1084,11 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(errors[0].code, "blast_action_start_unverified")
         self.assertEqual(controller.commands, [])
 
-    def test_post_speech_timeout_reconnects_once_then_moves(self):
-        clock = [1_000]
-
-        class TimeoutReconnectController(FakeController):
-            def __init__(self):
-                super().__init__(500)
-                self.timed_out = False
-                self.reconnect_pending = False
-
-            def snapshot(self):
-                if self.reconnect_pending:
-                    self.reconnect_pending = False
-                    self.generation += 1
-                    self.snapshot_value["state"] = "online"
-                return super().snapshot()
-
-            def command(self, command, *, cancel_requested=None):
-                if (
-                    command == SETTLED_OBSERVATION_COMMAND
-                    and not self.timed_out
-                ):
-                    self.commands.append(command)
-                    self.timed_out = True
-                    self.reconnect_pending = True
-                    self.snapshot_value["state"] = "offline"
-                    raise BlastControllerError(
-                        "controller_command_timeout",
-                        "injected post-speech timeout",
-                        motion_started=False,
-                    )
-                result = super().command(
-                    command, cancel_requested=cancel_requested,
-                )
-                if command == SETTLED_OBSERVATION_COMMAND:
-                    clock[0] += 1
-                    self.snapshot_value[
-                        "last_observed_at_monotonic_ms"
-                    ] = clock[0]
-                return result
-
-        class StartedSpeech:
-            def start(self): return None
-            def offer(self, **_offer): return None
-            def offer_with_admission(self, **_offer):
-                admission = SpeechAdmission()
-                admission.resolve("started")
-                return admission
-            def cancel_episode(self, _episode_id): return None
-            def close(self, **_options): return True
-
-        controller = TimeoutReconnectController()
-        context, _updates = episode_context()
-        context.settings.speech_enabled = True
-
-        result = self.adapter(
-            controller,
-            Planner([
-                decision("ADVANCE", utterance="Nu kör jag."),
-                decision(COMPLETE),
-            ]),
-            max_decisions=1,
-            monotonic_ms=lambda: clock[0],
-            speech_runtime_factory=lambda **_kwargs: StartedSpeech(),
-            speech_locales=("en",),
-        ).run(context)
-
-        self.assertFalse(result.completed)
-        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
-        self.assertEqual(
-            controller.commands,
-            [
-                SETTLED_OBSERVATION_COMMAND,
-                SETTLED_OBSERVATION_COMMAND,
-                "drive_forward",
-            ],
-        )
-        self.assertEqual(controller.generation, 2)
-
-    def test_post_speech_second_generation_exhausts_without_motion(self):
-        clock = [1_000]
-
-        class TwiceTimeoutController(FakeController):
+    def test_post_speech_uses_fresh_monitor_observation(self):
+        class NoDuplicateSettleController(FakeController):
             def command(self, command, *, cancel_requested=None):
                 if command == SETTLED_OBSERVATION_COMMAND:
-                    self.commands.append(command)
-                    self.generation += 1
-                    raise BlastControllerError(
-                        "controller_command_timeout",
-                        "injected repeated post-speech timeout",
-                        motion_started=False,
-                    )
+                    raise AssertionError("duplicate post-speech settle")
                 return super().command(
                     command, cancel_requested=cancel_requested,
                 )
@@ -1203,29 +1103,24 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             def cancel_episode(self, _episode_id): return None
             def close(self, **_options): return True
 
-        controller = TwiceTimeoutController(500)
+        controller = NoDuplicateSettleController(500)
         context, _updates = episode_context()
         context.settings.speech_enabled = True
 
-        with self.assertRaises(BlastEpisodeError) as raised:
-            self.adapter(
-                controller,
-                Planner([
-                    decision("ADVANCE", utterance="Nu kör jag."),
-                ]),
-                monotonic_ms=lambda: clock[0],
-                speech_runtime_factory=lambda **_kwargs: StartedSpeech(),
-                speech_locales=("en",),
-            ).run(context)
+        result = self.adapter(
+            controller,
+            Planner([
+                decision("ADVANCE", utterance="Nu kör jag."),
+                decision(COMPLETE),
+            ]),
+            max_decisions=1,
+            speech_runtime_factory=lambda **_kwargs: StartedSpeech(),
+            speech_locales=("en",),
+        ).run(context)
 
-        self.assertEqual(
-            raised.exception.code, "blast_action_start_unverified",
-        )
-        self.assertEqual(
-            controller.commands,
-            [SETTLED_OBSERVATION_COMMAND] * 2,
-        )
-        self.assertNotIn("drive_forward", controller.commands)
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(controller.commands, ["drive_forward"])
 
     def test_stop_or_deadline_during_speech_admission_never_moves(self):
         for interruption in ("stop", "deadline"):
