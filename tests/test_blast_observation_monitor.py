@@ -3978,6 +3978,41 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         monitor.close()
 
+    def test_perception_only_permit_starts_measured_scan(self):
+        class MeasuredRuntime(FakeRuntime):
+            async def observe(self):
+                observation = await super().observe()
+                observation["distance_mm"] = 285
+                return observation
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=MeasuredRuntime,
+        )
+        monitor.start()
+        snapshot = self.wait_for(monitor, "online")
+        while snapshot["observation"] is None:
+            time.sleep(0.005)
+            snapshot = monitor.snapshot()
+
+        permit = issue_blast_scan_permit(
+            controller=monitor,
+            action=SCAN_FRONT_ARC,
+            distance_mm=285,
+            geometry_checked=False,
+            pose=PhysicalPose(),
+            prior_receipt=None,
+            expected_drive_angles=snapshot["observation"][
+                "motor_angles_deg"
+            ],
+            perception_only=True,
+        )
+        self.assertIsNotNone(permit)
+        result = monitor.command(SCAN_COMMAND, action_permit=permit)
+
+        self.assertTrue(result["completed"])
+        monitor.close()
+
     def test_scan_settling_recovers_after_one_no_valid_center_sample(self):
         class TransientCenterRuntime(FakeRuntime):
             center_samples = None

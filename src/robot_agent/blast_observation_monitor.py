@@ -294,7 +294,6 @@ class BlastObservationMonitor:
         if not (
             snapshot.get("state") == "online"
             and type(perception_only) is bool
-            and (not perception_only or allow_no_return)
             and anchor_matched
             and isinstance(observed_ms, int)
             and 0 <= now_ns // 1_000_000 - observed_ms <= 3_000
