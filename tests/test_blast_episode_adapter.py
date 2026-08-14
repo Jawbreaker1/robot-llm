@@ -1007,6 +1007,42 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     [SETTLED_OBSERVATION_COMMAND, "drive_forward"],
                 )
 
+    def test_spoken_scan_settles_only_inside_the_scan_command(self):
+        class NoDuplicateSettleController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                if command == SETTLED_OBSERVATION_COMMAND:
+                    raise AssertionError("duplicate pre-scan settle")
+                return super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+
+        class StartedSpeech:
+            def start(self): return None
+            def offer(self, **_offer): return None
+            def offer_with_admission(self, **_offer):
+                admission = SpeechAdmission()
+                admission.resolve("started")
+                return admission
+            def cancel_episode(self, _episode_id): return None
+            def close(self, **_options): return True
+
+        controller = NoDuplicateSettleController(500)
+        context, _updates = episode_context()
+        context.settings.speech_enabled = True
+
+        result = self.adapter(
+            controller,
+            Planner([decision(
+                SCAN_FRONT_ARC, utterance="Jag ser mig omkring.",
+            )]),
+            max_decisions=1,
+            speech_runtime_factory=lambda **_kwargs: StartedSpeech(),
+            speech_locales=("en",),
+        ).run(context)
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(controller.commands, ["scan_front_arc"])
+
     def test_obstacle_during_speech_preload_blocks_motor(self):
         clock = {"now": 1_000}
 
@@ -2313,7 +2349,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             + ["turn_right"] * 4,
         )
 
-    def test_planner_scan_executes_after_turn_settles_at_no_valid_distance(self):
+    def test_planner_scan_executes_after_turn_at_no_valid_distance(self):
         class NvdAfterTurnController(FakeScanController):
             def __init__(self):
                 super().__init__(248)
@@ -2396,12 +2432,8 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             controller.commands,
-            ["scan_front_arc"]
-            + ["turn_left"] * 4
-            + [
-                SETTLED_OBSERVATION_COMMAND,
-                "scan_front_arc",
-            ],
+            ["scan_front_arc"] + ["turn_left"] * 4
+            + ["scan_front_arc"],
         )
         self.assertIsNotNone(controller.scan_permits[-1])
         self.assertTrue(controller.permit_requests[-1]["allow_no_return"])

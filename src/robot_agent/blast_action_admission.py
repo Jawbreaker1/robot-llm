@@ -209,7 +209,7 @@ def admit_blast_spoken_action(
     return adapter._fresh_planner_observation_or_stop(
         step["action"], step["selects_detour_side"],
         episode_start_heading, motion_executor, context, deadline_ms,
-        force_remeasure=True,
+        force_remeasure=step["action"] != SCAN_FRONT_ARC,
     )
 
 
