@@ -109,7 +109,9 @@ def fresh_blast_action_observation(
     adapter, *, action, selects_detour_side, episode_start_heading,
     motion_executor, cancel_requested, episode_error_type,
     encoder_anchor_correlated, navigation_body_matched,
-    force_remeasure=False, context=None, deadline_ms=None,
+    force_remeasure=False,
+    allow_turn_no_valid_with_bounded_evidence=False,
+    context=None, deadline_ms=None,
 ):
     observation = (
         _post_speech_observation(
@@ -154,9 +156,17 @@ def fresh_blast_action_observation(
         == RANGE_STATE_NO_VALID_DISTANCE
         and navigation_body_matched(observation["sensors"])
     )
+    exact_nvd_bounded_turn = (
+        allow_turn_no_valid_with_bounded_evidence is True
+        and action in (TURN_LEFT_90, TURN_RIGHT_90)
+        and blast_range_state(observation["sensors"].get("distance_mm"))
+        == RANGE_STATE_NO_VALID_DISTANCE
+        and navigation_body_matched(observation["sensors"])
+    )
     if (
         (force_remeasure or action != SCAN_FRONT_ARC)
         and not exact_nvd_scan
+        and not exact_nvd_bounded_turn
         and not adapter._current_observation_allows_action(action, observation)
     ):
         code = (

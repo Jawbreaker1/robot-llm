@@ -86,14 +86,69 @@ _STARTUP_SURROUNDINGS_ACTION = "SCAN_SURROUNDINGS"
 _SCAN_REFUSAL_CODES = frozenset(("scan_start_clearance_unverified",
                                  "scan_sweep_clearance_lost",
                                  "scan_sweep_observation_unverified"))
-_STARTUP_PERCEPTION_ACTIONS = (
-    SCAN_FRONT_ARC,
-    TURN_LEFT_90,
-    TURN_LEFT_90,
-    SCAN_FRONT_ARC,
-    TURN_RIGHT_90,
-    TURN_RIGHT_90,
-)
+
+
+def _startup_side_clearance_score(scan, side):
+    """Rank one verified scan side for the rear-view transit only."""
+
+    rays = scan.get("angular_rays", scan.get("rays")) if isinstance(
+        scan, Mapping
+    ) else None
+    if not isinstance(rays, list):
+        return None
+    measured = []
+    no_return_count = 0
+    for ray in rays:
+        label = ray.get("side") if isinstance(ray, Mapping) else None
+        if not isinstance(label, str) or not label.startswith(side + "_"):
+            continue
+        if ray.get("observation_settled") is not True:
+            continue
+        state = ray.get("range_state")
+        if state == RANGE_STATE_NO_VALID_DISTANCE:
+            no_return_count += 1
+            continue
+        if state != RANGE_STATE_MEASURED:
+            continue
+        distance = ray.get("distance_mm")
+        if (
+            isinstance(distance, bool)
+            or not isinstance(distance, (int, float))
+            or not math.isfinite(float(distance))
+            or float(distance) <= _minimum_rotation_clearance_mm()
+        ):
+            return None
+        measured.append(float(distance))
+    if not measured:
+        return None
+    return (min(measured), sum(measured) / len(measured), no_return_count)
+
+
+def _startup_transit_turn(scan, episode_id):
+    """Choose scan transit direction from evidence, never a default side."""
+
+    scores = {
+        TURN_LEFT_90: _startup_side_clearance_score(scan, "left"),
+        TURN_RIGHT_90: _startup_side_clearance_score(scan, "right"),
+    }
+    candidates = [action for action, score in scores.items() if score]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    left_score = scores[TURN_LEFT_90]
+    right_score = scores[TURN_RIGHT_90]
+    if left_score != right_score:
+        return (
+            TURN_LEFT_90 if left_score > right_score else TURN_RIGHT_90
+        )
+    # Equal safe evidence alternates by episode instead of introducing a
+    # persistent left/right bias or process-global randomness.
+    return (
+        TURN_LEFT_90
+        if sum(episode_id.encode("utf-8")) % 2 == 0
+        else TURN_RIGHT_90
+    )
 
 
 def _side_search_encoder_correlated(observation, motion_executor) -> bool:
@@ -604,7 +659,9 @@ class BlastEpisodeRuntimeAdapter:
         episode_start_heading,
         motion_executor,
         cancel_requested,
-        force_remeasure=False, context=None, deadline_ms=None,
+        force_remeasure=False,
+        allow_turn_no_valid_with_bounded_evidence=False,
+        context=None, deadline_ms=None,
     ):
         return fresh_blast_action_observation(
             self, action=action, selects_detour_side=selects_detour_side,
@@ -615,12 +672,16 @@ class BlastEpisodeRuntimeAdapter:
             encoder_anchor_correlated=_side_search_encoder_correlated,
             navigation_body_matched=_navigation_body_matched,
             force_remeasure=force_remeasure,
+            allow_turn_no_valid_with_bounded_evidence=(
+                allow_turn_no_valid_with_bounded_evidence
+            ),
             context=context, deadline_ms=deadline_ms,
         )
 
     def _fresh_planner_observation_or_stop(
         self, action, selects_detour_side, episode_start_heading,
         motion_executor, context, deadline_ms, force_remeasure=False,
+        allow_turn_no_valid_with_bounded_evidence=False,
     ):
         control_requested = lambda: (
             self._control_outcome(
@@ -635,6 +696,9 @@ class BlastEpisodeRuntimeAdapter:
                 motion_executor=motion_executor,
                 cancel_requested=control_requested,
                 force_remeasure=force_remeasure,
+                allow_turn_no_valid_with_bounded_evidence=(
+                    allow_turn_no_valid_with_bounded_evidence
+                ),
                 context=context, deadline_ms=deadline_ms,
             )
         except BlastControllerError as error:
@@ -958,12 +1022,21 @@ class BlastEpisodeRuntimeAdapter:
 
         initial_scan_view_count = len(map_trace.planar_scan_views)
         startup_history = []
-        for action in _STARTUP_PERCEPTION_ACTIONS:
+        startup_actions = [SCAN_FRONT_ARC]
+        transit_turn = None
+        for action in startup_actions:
+            bounded_transit = (
+                transit_turn is not None
+                and action in (TURN_LEFT_90, TURN_RIGHT_90)
+            )
             try:
                 observation, outcome = (
                     self._fresh_planner_observation_or_stop(
                         action, False, episode_start_heading,
                         motion_executor, context, deadline_ms,
+                        allow_turn_no_valid_with_bounded_evidence=(
+                            bounded_transit
+                        ),
                     )
                 )
             except BlastEpisodeError:
@@ -1014,7 +1087,9 @@ class BlastEpisodeRuntimeAdapter:
                         if startup_history
                         else (history[-1] if history else None)
                     ),
-                    allow_turn_no_valid_with_bounded_evidence=False,
+                    allow_turn_no_valid_with_bounded_evidence=(
+                        bounded_transit
+                    ),
                     context=context,
                     deadline_ms=deadline_ms,
                     map_trace=map_trace,
@@ -1078,6 +1153,28 @@ class BlastEpisodeRuntimeAdapter:
                         "BLAST startup rotation did not complete safely",
                     ),
                 )
+            if len(startup_history) == 1:
+                transit_turn = _startup_transit_turn(
+                    latest_scan_view.get("scan"), context.episode_id,
+                )
+                if transit_turn is None:
+                    return (
+                        observation, available_actions, scan_allows_turn,
+                        latest_scan_view,
+                        self._outcome(
+                            "blast_startup_perception_incomplete", False,
+                            "BLAST startup scan found no verified transit "
+                            "direction",
+                        ),
+                    )
+                return_turn = (
+                    TURN_RIGHT_90
+                    if transit_turn == TURN_LEFT_90 else TURN_LEFT_90
+                )
+                startup_actions.extend((
+                    transit_turn, transit_turn, SCAN_FRONT_ARC,
+                    return_turn, return_turn,
+                ))
         if (
             not motion_executor.localization_valid
             or len(map_trace.planar_scan_views)

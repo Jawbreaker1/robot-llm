@@ -547,9 +547,9 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(len(planner.contexts), 1)
         expected_bootstrap_commands = [
             "scan_front_arc",
-            *(["turn_left"] * 8),
-            "scan_front_arc",
             *(["turn_right"] * 8),
+            "scan_front_arc",
+            *(["turn_left"] * 8),
         ]
         self.assertEqual(
             controller.commands,
@@ -598,6 +598,66 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             first.local_map_evidence["robot_pose"]["heading_mdeg"], 0,
+        )
+
+    def test_startup_transit_direction_follows_scan_evidence(self):
+        class LeftIsClearer(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    for ray in result["scan"]["rays"]:
+                        if ray["side"] == "left_near":
+                            ray["distance_mm"] = 1_500.0
+                        elif ray["side"] == "right_near":
+                            ray["distance_mm"] = 200.0
+                return result
+
+        controller = LeftIsClearer(500)
+        planner = Planner([decision(ADVANCE)])
+        result = self.adapter(
+            controller, planner, max_decisions=1,
+            startup_perception=True,
+        ).run(episode_context()[0])
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(
+            controller.commands[:9],
+            ["scan_front_arc", *(["turn_left"] * 8)],
+        )
+
+    def test_startup_transit_accepts_bounded_no_return_between_turns(self):
+        class NoReturnDuringRightTransit(FakeScanController):
+            def __init__(self):
+                super().__init__(500)
+                self.right_turn_count = 0
+
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "turn_right":
+                    self.right_turn_count += 1
+                    distance = (
+                        2_000 if self.right_turn_count < 8 else 500
+                    )
+                    result["observation"]["distance_mm"] = distance
+                    self.snapshot_value["observation"] = result[
+                        "observation"
+                    ]
+                return result
+
+        controller = NoReturnDuringRightTransit()
+        planner = Planner([decision(ADVANCE)])
+        result = self.adapter(
+            controller, planner, max_decisions=1,
+            startup_perception=True,
+        ).run(episode_context()[0])
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(controller.right_turn_count, 8)
+        self.assertEqual(len(planner.contexts), 1)
+        self.assertEqual(
+            len(planner.contexts[0].local_map_evidence["scan_views"]), 2,
         )
 
     def test_unsafe_startup_perception_stops_before_planner(self):
@@ -714,7 +774,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 result = super().command(
                     command, cancel_requested=cancel_requested,
                 )
-                if command == "turn_left":
+                if command == "turn_right":
                     result["observation"]["distance_mm"] = 40
                     self.snapshot_value["observation"] = result[
                         "observation"
@@ -744,12 +804,12 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             controller.commands,
-            ["scan_front_arc", "turn_left"],
+            ["scan_front_arc", "turn_right"],
         )
         self.assertEqual(planner.contexts, [])
         self.assertEqual(
             [item["action"] for item in recorded],
-            [SCAN_FRONT_ARC, TURN_LEFT_90],
+            [SCAN_FRONT_ARC, TURN_RIGHT_90],
         )
         self.assertFalse(recorded[-1]["motion"]["command_completed"])
         self.assertNotEqual(recorded[-1]["pose"]["heading_mdeg"], 0)
