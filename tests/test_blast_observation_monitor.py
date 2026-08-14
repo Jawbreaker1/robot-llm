@@ -19,8 +19,6 @@ from robot_agent.blast_observation_monitor import (
     SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
     SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
     SCAN_PULSE_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
-    SCAN_RAY_EVIDENCE_SETTLED,
-    SCAN_RAY_EVIDENCE_SWEEP_ONLY,
     SCAN_RESULT_SCHEMA,
     SETTLED_OBSERVATION_COMMAND,
     BlastControllerError,
@@ -2606,28 +2604,16 @@ class BlastObservationMonitorTests(unittest.TestCase):
             async def turn_pulse(self, direction):
                 receipt = await super().turn_pulse(direction)
                 expected = (
-                    "left",
-                    "left",
-                    "left",
-                    "left",
-                    "right",
-                    "right",
-                    "right",
-                    "right",
-                    "right",
-                    "right",
-                    "right",
-                    "right",
-                    "left",
-                    "left",
-                    "left",
-                    "left",
+                    "left", "left", "left", "left",
+                    "left", "left", "left", "left",
+                    "left", "left", "left", "left",
+                    "left", "left", "left", "left",
                 )
                 self.assert_direction(direction, expected[self.turn_index])
                 delta = (
                     -11.0, -11.0, -11.0, -11.0,
-                    11.0, 11.0, 11.0, 11.0,
-                    11.0, 11.0, 11.0, 11.0,
+                    -11.0, -11.0, -11.0, -11.0,
+                    -11.0, -11.0, -11.0, -11.0,
                     -11.0, -11.0, -11.0, -11.0,
                 )[self.turn_index]
                 self.heading = (
@@ -2664,28 +2650,11 @@ class BlastObservationMonitorTests(unittest.TestCase):
         runtime = FakeRuntime.instances[0]
         self.assertEqual(
             [call for call in runtime.calls if call[0] == "turn_pulse"],
-            [
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-            ],
+            [("turn_pulse", "left")] * 16,
         )
         self.assertEqual(result["command"], SCAN_COMMAND)
         self.assertEqual(result["receipt"], {"turn_count": 16})
-        self.assertEqual(result["observation"]["imu"]["heading_deg"], 179.0)
+        self.assertEqual(result["observation"]["imu"]["heading_deg"], 3.0)
         scan = result["scan"]
         self.assertEqual(scan["schema"], SCAN_RESULT_SCHEMA)
         self.assertEqual(
@@ -2700,16 +2669,16 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         self.assertEqual(
             [ray["distance_mm"] for ray in scan["rays"]],
-            [300.0, 720.0, 2_000.0, 1_100.0, 2_000.0],
+            [300.0, 2_000.0, 300.0, 2_000.0, 600.0],
         )
         self.assertEqual(
             [ray["range_state"] for ray in scan["rays"]],
             [
                 RANGE_STATE_MEASURED,
-                RANGE_STATE_MEASURED,
                 RANGE_STATE_NO_VALID_DISTANCE,
                 RANGE_STATE_MEASURED,
                 RANGE_STATE_NO_VALID_DISTANCE,
+                RANGE_STATE_MEASURED,
             ],
         )
         self.assertEqual(
@@ -2718,15 +2687,16 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         self.assertEqual(
             [ray["relative_heading_deg"] for ray in scan["rays"]],
-            [0.0, -44.1, -88.2, 44.1, 88.2],
+            [0.0, -88.2, -176.4, 95.4, 161.55],
         )
-        self.assertEqual(scan["restoration_error_deg"], 0.0)
+        self.assertEqual(scan["restoration_error_deg"], 7.2)
+        self.assertEqual(scan["sweep_coverage_deg"], 352.8)
         self.assertTrue(scan["restoration_verified"])
         self.assertTrue(scan["all_observations_settled"])
         self.assertEqual(
             [ray["relative_heading_deg"] for ray in scan["angular_rays"]],
-            [0.0, -22.05, -44.1, -66.15, -88.2,
-             22.05, 44.1, 66.15, 88.2],
+            [0.0, -44.1, -88.2, -132.3, -176.4,
+             51.3, 95.4, 139.5, 161.55],
         )
         validate_blast_scan_ray_contract(scan)
         monitor.close()
@@ -2762,7 +2732,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )["scan"]
 
         self.assertTrue(scan["restoration_verified"])
-        self.assertEqual(scan["restoration_error_deg"], 0.0)
+        self.assertEqual(scan["restoration_error_deg"], 7.2)
         self.assertEqual(
             scan["imu_heading_diagnostics"],
             {
@@ -2774,12 +2744,12 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         self.assertEqual(
             [ray["relative_heading_deg"] for ray in scan["angular_rays"]],
-            [0.0, -22.05, -44.1, -66.15, -88.2,
-             22.05, 44.1, 66.15, 88.2],
+            [0.0, -44.1, -88.2, -132.3, -176.4,
+             51.3, 95.4, 139.5, 161.55],
         )
         monitor.close()
 
-    def test_scan_records_calibrated_ninety_five_degree_edges_bilaterally(self):
+    def test_scan_records_one_calibrated_full_encoder_turn(self):
         class CalibratedSweepRuntime(FakeRuntime):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -2821,292 +2791,13 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
         self.assertEqual(
             [ray["relative_heading_deg"] for ray in scan["angular_rays"]],
-            [0.0, -23.52, -47.04, -70.56, -94.57,
-             23.52, 47.04, 70.56, 94.57],
+            [0.0, -47.04, -94.57, -141.61, -165.13,
+             52.77, 100.3, 123.82, 170.86],
         )
         self.assertTrue(scan["restoration_verified"])
-        self.assertEqual(scan["restoration_error_deg"], 0.0)
+        self.assertEqual(scan["restoration_error_deg"], 5.73)
+        self.assertEqual(scan["sweep_coverage_deg"], 354.27)
         monitor.close()
-
-    def test_encoder_opposed_residue_over_ten_degrees_is_unrestored(self):
-        class OpposedResidueRuntime(FakeRuntime):
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-                self.left_scan_pulses = 0
-                self.right_scan_pulses = 0
-
-            async def scan_turn_pulse(self, direction):
-                before = {
-                    "left_drive": self.left_drive_angle,
-                    "right_drive": self.right_drive_angle,
-                }
-                await self.turn_pulse(direction)
-                if direction == "left":
-                    quotient, remainder = divmod(
-                        8 * SCAN_TURN_ENCODER_DEGREES_PER_PULSE - 22,
-                        8,
-                    )
-                    right_delta = quotient + (
-                        self.left_scan_pulses < remainder
-                    )
-                    self.left_scan_pulses += 1
-                    self.left_drive_angle -= (
-                        SCAN_TURN_ENCODER_DEGREES_PER_PULSE
-                    )
-                    self.right_drive_angle += right_delta
-                else:
-                    quotient, remainder = divmod(
-                        8 * SCAN_TURN_ENCODER_DEGREES_PER_PULSE + 22,
-                        8,
-                    )
-                    left_delta = quotient + (
-                        self.right_scan_pulses < remainder
-                    )
-                    self.right_scan_pulses += 1
-                    self.left_drive_angle += left_delta
-                    self.right_drive_angle -= (
-                        SCAN_TURN_ENCODER_DEGREES_PER_PULSE
-                    )
-                return {
-                    "accepted": True,
-                    "direction": direction,
-                    "speed_dps": TURN_SPEED_DPS,
-                    "wheel_angle_deg": (
-                        SCAN_TURN_ENCODER_DEGREES_PER_PULSE
-                    ),
-                    "before_angles_deg": before,
-                }
-
-        monitor = BlastObservationMonitor(
-            poll_interval_seconds=0.05,
-            runtime_factory=OpposedResidueRuntime,
-        )
-        monitor.start()
-        self.wait_for(monitor, "online")
-
-        scan = monitor.command(
-            SCAN_COMMAND,
-            action_permit=self.measured_scan_permit(monitor),
-        )["scan"]
-
-        self.assertFalse(scan["restoration_verified"])
-        self.assertEqual(scan["result"], "restoration_unverified")
-        self.assertGreater(abs(scan["restoration_error_deg"]), 10.0)
-        monitor.close()
-
-    def test_scan_restoration_uses_lego_scale_translation_band(self):
-        for delta, expected_restored, expected_common_mm in (
-            ((24, 20), True, 11.0),
-            ((74, 66), False, 35.0),
-        ):
-            with self.subTest(delta=delta):
-                class CommonResidueRuntime(FakeRuntime):
-                    def __init__(self, **kwargs):
-                        super().__init__(**kwargs)
-                        self.left_scan_pulses = 0
-                        self.right_scan_pulses = 0
-
-                    async def scan_turn_pulse(self, direction):
-                        before = {
-                            "left_drive": self.left_drive_angle,
-                            "right_drive": self.right_drive_angle,
-                        }
-                        await self.turn_pulse(direction)
-                        if direction == "left":
-                            quotient, remainder = divmod(
-                                8 * SCAN_TURN_ENCODER_DEGREES_PER_PULSE
-                                + delta[1],
-                                8,
-                            )
-                            right_delta = quotient + (
-                                self.left_scan_pulses < remainder
-                            )
-                            self.left_scan_pulses += 1
-                            self.left_drive_angle -= (
-                                SCAN_TURN_ENCODER_DEGREES_PER_PULSE
-                            )
-                            self.right_drive_angle += right_delta
-                        else:
-                            quotient, remainder = divmod(
-                                8 * SCAN_TURN_ENCODER_DEGREES_PER_PULSE
-                                + delta[0],
-                                8,
-                            )
-                            left_delta = quotient + (
-                                self.right_scan_pulses < remainder
-                            )
-                            self.right_scan_pulses += 1
-                            self.left_drive_angle += left_delta
-                            self.right_drive_angle -= (
-                                SCAN_TURN_ENCODER_DEGREES_PER_PULSE
-                            )
-                        return {
-                            "accepted": True,
-                            "direction": direction,
-                            "speed_dps": TURN_SPEED_DPS,
-                            "wheel_angle_deg": (
-                                SCAN_TURN_ENCODER_DEGREES_PER_PULSE
-                            ),
-                            "before_angles_deg": before,
-                        }
-
-                monitor = BlastObservationMonitor(
-                    poll_interval_seconds=0.05,
-                    runtime_factory=CommonResidueRuntime,
-                )
-                monitor.start()
-                self.wait_for(monitor, "online")
-
-                scan = monitor.command(
-                    SCAN_COMMAND,
-                    action_permit=self.measured_scan_permit(monitor),
-                )["scan"]
-
-                self.assertIs(
-                    scan["restoration_verified"], expected_restored,
-                )
-                self.assertEqual(
-                    scan["encoder_restoration"][
-                        "common_mode_residue_mm"
-                    ],
-                    expected_common_mm,
-                )
-                monitor.close()
-
-    def test_repeated_near_ray_only_replaces_weak_equivalent_evidence(self):
-        monitor = BlastObservationMonitor(runtime_factory=FakeRuntime)
-
-        def observation(distance, heading, observed_at, body=158):
-            opposed = round(abs(heading) / 0.490)
-            drive = (
-                {"left_drive": -opposed, "right_drive": opposed}
-                if heading < 0
-                else {"left_drive": opposed, "right_drive": -opposed}
-            )
-            return {
-                "distance_mm": distance,
-                "imu": {"heading_deg": heading},
-                "motor_angles_deg": {"body": body, **drive},
-                "observed_at_ms": observed_at,
-            }
-
-        cases = (
-            (
-                "settled echo replaces no-return",
-                (observation(2_000, -22.0, 1), True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-                (observation(180, -21.0, 2, 159), True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-                (180.0, -21.07, 159, 2, True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-            ),
-            (
-                "settled primary echo is not cherry-picked",
-                (observation(400, -22.0, 1), True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-                (observation(180, -21.0, 2), True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-                (400.0, -22.05, 158, 1, True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-            ),
-            (
-                "unsettled return echo is ignored",
-                (observation(2_000, -22.0, 1), True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-                (observation(180, -21.0, 2), False,
-                 SCAN_RAY_EVIDENCE_SWEEP_ONLY),
-                (2_000.0, -22.05, 158, 1, True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-            ),
-            (
-                "different return heading is ignored",
-                (observation(2_000, -22.0, 1), True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-                (observation(180, -16.0, 2), True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-                (2_000.0, -22.05, 158, 1, True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-            ),
-            (
-                "settled no-return replaces unresolved primary",
-                (observation(700, -22.0, 1), False,
-                 SCAN_RAY_EVIDENCE_SWEEP_ONLY),
-                (observation(2_000, -21.0, 2), True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-                (2_000.0, -21.07, 158, 2, True,
-                 SCAN_RAY_EVIDENCE_SETTLED),
-            ),
-        )
-        for name, primary, repeated, expected in cases:
-            with self.subTest(name=name):
-                ray = monitor._aggregate_repeated_scan_ray(
-                    "left_near",
-                    {"left_drive": 0, "right_drive": 0},
-                    primary,
-                    repeated,
-                )
-                self.assertEqual(
-                    (
-                        ray["distance_mm"],
-                        ray["heading_deg"],
-                        ray["body_motor_angle_deg"],
-                        ray["observed_at_ms"],
-                        ray["observation_settled"],
-                        ray["evidence_use"],
-                    ),
-                    expected,
-                )
-
-    def test_close_or_invalid_return_ray_cannot_be_masked(self):
-        for distance, error_code in (
-            (40, "scan_sweep_clearance_lost"),
-            (-1, "scan_sweep_observation_unverified"),
-        ):
-            with self.subTest(distance=distance):
-                FakeRuntime.instances = []
-
-                class UnsafeReturnRuntime(FakeRuntime):
-                    def __init__(self, **kwargs):
-                        super().__init__(**kwargs)
-                        self.turn_count = 0
-
-                    async def turn_pulse(self, direction):
-                        receipt = await super().turn_pulse(direction)
-                        self.turn_count += 1
-                        return receipt
-
-                    async def observe(self):
-                        result = await super().observe()
-                        if self.turn_count == 1:
-                            result["distance_mm"] = 2_000
-                        elif self.turn_count == 3:
-                            result["distance_mm"] = distance
-                        return result
-
-                monitor = BlastObservationMonitor(
-                    poll_interval_seconds=0.05,
-                    runtime_factory=UnsafeReturnRuntime,
-                )
-                monitor.start()
-                self.wait_for(monitor, "online")
-
-                with self.assertRaises(BlastControllerError) as raised:
-                    monitor.command(
-                        SCAN_COMMAND,
-                        action_permit=self.measured_scan_permit(monitor),
-                    )
-
-                self.assertEqual(raised.exception.code, error_code)
-                self.assertIs(raised.exception.motion_started, True)
-                runtime = FakeRuntime.instances[0]
-                self.assertEqual(
-                    len([
-                        call for call in runtime.calls
-                        if call[0] == "turn_pulse"
-                    ]),
-                    3,
-                )
-                monitor.close()
 
     def test_scan_and_turns_use_a_longer_settle_window_than_driving(self):
         class RecordingMonitor(BlastObservationMonitor):
@@ -3152,8 +2843,8 @@ class BlastObservationMonitorTests(unittest.TestCase):
             monitor.settle_timeouts[-2:],
             [SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS, None],
         )
-        # Hardware needs transport and scheduling headroom beyond the centre,
-        # sixteen pulse windows and two possible outer-ray retries.
+        # Hardware needs transport and scheduling headroom beyond the centre
+        # and sixteen pulse windows.
         self.assertGreaterEqual(
             SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
             SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS
@@ -3163,263 +2854,6 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertGreaterEqual(
             SCAN_COMMAND_TIMEOUT_SECONDS,
             SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS + 3,
-        )
-        monitor.close()
-
-    def test_scan_recovers_unresolved_near_ray_on_return_pass(self):
-        class RetryMonitor(BlastObservationMonitor):
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-                self.turn_counts_at_settle = []
-
-            async def _observe_until_settled(
-                self,
-                runtime,
-                *,
-                generation,
-                initial_observation,
-                timeout_seconds=None,
-            ):
-                self.turn_counts_at_settle.append(len([
-                    call for call in runtime.calls
-                    if call[0] == "turn_pulse"
-                ]))
-                if len(self.turn_counts_at_settle) == 3:
-                    self._settling_samples = (
-                        (1_391.0, 0.0, 0.0),
-                        (1_503.0, 0.1, -0.1),
-                        (1_420.0, 0.0, 0.0),
-                        (2_000.0, -0.1, 0.1),
-                        (1_489.0, 0.0, 0.0),
-                    )
-                    return {
-                        **initial_observation,
-                        "distance_mm": 1_489,
-                    }, False
-                return (
-                    initial_observation,
-                    True,
-                )
-
-        monitor = RetryMonitor(
-            poll_interval_seconds=0.05,
-            runtime_factory=FakeRuntime,
-        )
-        monitor.start()
-        self.wait_for(monitor, "online")
-
-        result = monitor.command(
-            SCAN_COMMAND,
-            action_permit=self.measured_scan_permit(monitor),
-        )
-
-        runtime = FakeRuntime.instances[0]
-        self.assertTrue(result["completed"])
-        self.assertEqual(
-            len([call for call in runtime.calls if call[0] == "turn_pulse"]),
-            16,
-        )
-        self.assertEqual(
-            monitor.turn_counts_at_settle,
-            list(range(17)),
-        )
-        self.assertTrue(result["scan"]["all_observations_settled"])
-        left_near = result["scan"]["rays"][1]
-        self.assertEqual(left_near["distance_mm"], 321.0)
-        self.assertTrue(left_near["observation_settled"])
-        self.assertEqual(
-            left_near["evidence_use"], "SETTLED_RANGE",
-        )
-        monitor.close()
-
-    def test_scan_reobserves_unsettled_far_ray_without_another_turn(self):
-        class FarRetryMonitor(BlastObservationMonitor):
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-                self.turn_counts_at_settle = []
-
-            async def _observe_until_settled(
-                self,
-                runtime,
-                *,
-                generation,
-                initial_observation,
-                timeout_seconds=None,
-            ):
-                turn_count = len([
-                    call for call in runtime.calls
-                    if call[0] == "turn_pulse"
-                ])
-                self.turn_counts_at_settle.append(turn_count)
-                if len(self.turn_counts_at_settle) == 5:
-                    self._settling_samples = (
-                        (156.0, 0.0, 0.0),
-                        (170.0, 0.1, -0.1),
-                        (160.0, 0.0, 0.0),
-                        (180.0, -0.1, 0.1),
-                        (156.0, 0.0, 0.0),
-                    )
-                    return {
-                        **initial_observation,
-                        "distance_mm": 156,
-                    }, False
-                if len(self.turn_counts_at_settle) == 6:
-                    return {
-                        **initial_observation,
-                        "distance_mm": 156,
-                    }, True
-                return initial_observation, True
-
-        monitor = FarRetryMonitor(
-            poll_interval_seconds=0.05,
-            runtime_factory=FakeRuntime,
-        )
-        monitor.start()
-        self.wait_for(monitor, "online")
-
-        result = monitor.command(
-            SCAN_COMMAND,
-            action_permit=self.measured_scan_permit(monitor),
-        )
-
-        runtime = FakeRuntime.instances[0]
-        self.assertEqual(
-            [call for call in runtime.calls if call[0] == "turn_pulse"],
-            [
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "right"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-                ("turn_pulse", "left"),
-            ],
-        )
-        self.assertEqual(
-            monitor.turn_counts_at_settle,
-            [0, 1, 2, 3, 4, 4, 5, 6, 7, 8,
-             9, 10, 11, 12, 13, 14, 15, 16],
-        )
-        left_far = result["scan"]["rays"][2]
-        self.assertEqual(left_far["distance_mm"], 156.0)
-        self.assertTrue(left_far["observation_settled"])
-        self.assertEqual(
-            left_far["evidence_use"], SCAN_RAY_EVIDENCE_SETTLED,
-        )
-        self.assertTrue(result["scan"]["all_observations_settled"])
-        monitor.close()
-
-    def test_unstored_sweep_only_pulses_do_not_change_ray_aggregate(self):
-        for unsettled_call in (9, 17):
-            with self.subTest(unsettled_call=unsettled_call):
-                FakeRuntime.instances = []
-
-                class UnstoredSweepOnlyMonitor(BlastObservationMonitor):
-                    def __init__(self, **kwargs):
-                        super().__init__(**kwargs)
-                        self.settle_calls = 0
-
-                    async def _observe_until_settled(
-                        self,
-                        runtime,
-                        *,
-                        generation,
-                        initial_observation,
-                        timeout_seconds=None,
-                    ):
-                        self.settle_calls += 1
-                        if self.settle_calls == unsettled_call:
-                            self._settling_samples = (
-                                (1_400.0, 0.0, 0.0),
-                            ) * 5
-                            return initial_observation, False
-                        return initial_observation, True
-
-                monitor = UnstoredSweepOnlyMonitor(
-                    poll_interval_seconds=0.05,
-                    runtime_factory=FakeRuntime,
-                )
-                monitor.start()
-                self.wait_for(monitor, "online")
-
-                result = monitor.command(
-                    SCAN_COMMAND,
-                    action_permit=self.measured_scan_permit(monitor),
-                )
-
-                self.assertTrue(
-                    result["scan"]["all_observations_settled"]
-                )
-                self.assertEqual(
-                    result["observation_settled"],
-                    unsettled_call != 17,
-                )
-                monitor.close()
-
-    def test_safe_unsettled_left_ray_keeps_right_half_visible(self):
-        class SoftLeftEvidenceMonitor(BlastObservationMonitor):
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-                self.settle_calls = 0
-
-            async def _observe_until_settled(
-                self,
-                runtime,
-                *,
-                generation,
-                initial_observation,
-                timeout_seconds=None,
-            ):
-                self.settle_calls += 1
-                # The first left ray and its matching return sample are
-                # evidence-poor, but the stopped sweep window is still safe.
-                if self.settle_calls in (2, 8):
-                    self._settling_samples = (
-                        (1_400.0, 0.0, 0.0),
-                    ) * 5
-                    return initial_observation, False
-                return initial_observation, True
-
-        monitor = SoftLeftEvidenceMonitor(
-            poll_interval_seconds=0.05,
-            runtime_factory=FakeRuntime,
-        )
-        monitor.start()
-        self.wait_for(monitor, "online")
-
-        result = monitor.command(
-            SCAN_COMMAND,
-            action_permit=self.measured_scan_permit(monitor),
-        )
-
-        rays = {
-            ray["side"]: ray for ray in result["scan"]["angular_rays"]
-        }
-        self.assertFalse(rays["left_1"]["observation_settled"])
-        self.assertEqual(
-            rays["left_1"]["evidence_use"],
-            SCAN_RAY_EVIDENCE_SWEEP_ONLY,
-        )
-        self.assertTrue(all(
-            rays["right_{}".format(index)]["observation_settled"]
-            for index in range(1, 5)
-        ))
-        runtime = FakeRuntime.instances[0]
-        self.assertEqual(
-            len([
-                call for call in runtime.calls
-                if call[0] == "turn_pulse"
-            ]),
-            16,
         )
         monitor.close()
 
@@ -3458,7 +2892,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
             **observation, "imu": {},
         }))
 
-    def test_scan_stops_when_unsettled_turn_has_no_safe_window(self):
+    def test_uncertain_scan_stops_and_returns_partial_encoder_map(self):
         class NeverSettledTurnMonitor(BlastObservationMonitor):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -3482,27 +2916,25 @@ class BlastObservationMonitorTests(unittest.TestCase):
         monitor.start()
         self.wait_for(monitor, "online")
 
-        with self.assertRaises(BlastControllerError) as raised:
-            monitor.command(
-                SCAN_COMMAND,
-                action_permit=self.measured_scan_permit(monitor),
-            )
-
-        self.assertEqual(
-            raised.exception.code,
-            "scan_sweep_observation_unverified",
+        result = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
         )
+        self.assertEqual(result["scan"]["state"], "partial")
+        self.assertEqual(result["scan"]["sweep_coverage_deg"], 22.05)
+        self.assertFalse(result["receipt"]["coverage_complete"])
         runtime = FakeRuntime.instances[0]
         self.assertEqual(
             [call for call in runtime.calls if call[0] == "turn_pulse"],
             [("turn_pulse", "left")],
         )
-        self.assertEqual(monitor.settle_calls, 2)
+        self.assertIn(("stop",), runtime.calls)
+        self.assertEqual(monitor.settle_calls, 3)
         monitor.close()
 
-    def test_scan_does_not_continue_unsettled_close_or_invalid_evidence(self):
-        for distance in (40, -1):
-            with self.subTest(distance=distance):
+    def test_soft_scan_uncertainty_stops_with_partial_evidence(self):
+        for distance, settled in ((40, False), (-1, True), (2_001, True)):
+            with self.subTest(distance=distance, settled=settled):
                 FakeRuntime.instances = []
 
                 class UnsafeTurnMonitor(BlastObservationMonitor):
@@ -3525,7 +2957,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
                             **initial_observation,
                             "distance_mm": distance,
                         }
-                        return observation, False
+                        return observation, settled
 
                 monitor = UnsafeTurnMonitor(
                     poll_interval_seconds=0.05,
@@ -3534,11 +2966,11 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 monitor.start()
                 self.wait_for(monitor, "online")
 
-                with self.assertRaises(BlastControllerError):
-                    monitor.command(
-                        SCAN_COMMAND,
-                        action_permit=self.measured_scan_permit(monitor),
-                    )
+                result = monitor.command(
+                    SCAN_COMMAND,
+                    action_permit=self.measured_scan_permit(monitor),
+                )
+                self.assertEqual(result["scan"]["state"], "partial")
 
                 runtime = FakeRuntime.instances[0]
                 self.assertEqual(
@@ -3548,7 +2980,8 @@ class BlastObservationMonitorTests(unittest.TestCase):
                     ],
                     [("turn_pulse", "left")],
                 )
-                self.assertEqual(monitor.settle_calls, 2)
+                self.assertIn(("stop",), runtime.calls)
+                self.assertEqual(monitor.settle_calls, 3)
                 monitor.close()
 
     def test_stop_cancellation_wins_during_scan_settle_window(self):
@@ -3626,8 +3059,6 @@ class BlastObservationMonitorTests(unittest.TestCase):
     def test_scan_stops_after_first_close_settled_turn_pulse(self):
         for distance, body, heading, error_code in (
             (40, 158, 12, "scan_sweep_clearance_lost"),
-            (-1, 158, 12, "scan_sweep_observation_unverified"),
-            (2_001, 158, 12, "scan_sweep_observation_unverified"),
             (321, 156, 12, "scan_sweep_observation_unverified"),
         ):
             with self.subTest(distance=distance, body=body, heading=heading):

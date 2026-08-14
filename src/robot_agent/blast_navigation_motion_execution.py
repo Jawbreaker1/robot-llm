@@ -19,8 +19,11 @@ from .blast_scan_observation import (
     SCAN_RESTORATION_COMMON_MODE_TOLERANCE_MM,
     encoder_common_mode_residue_mm,
     encoder_relative_bearing_deg,
+    validate_blast_scan_ray_contract,
 )
-from .physical_navigation_contract import PhysicalNavigationContractError
+from .physical_navigation_contract import (
+    TURN_LEFT_90, TURN_RIGHT_90, PhysicalNavigationContractError,
+)
 from .physical_odometry import (
     PhysicalPose, VerifiedMotion, apply_verified_motion,
     verified_motion_from_result,
@@ -152,7 +155,7 @@ class BlastNavigationMotionExecutor:
         return final_angles, motion, pose
 
     def reanchor_after_restored_scan(self, command_result) -> bool:
-        """Pose-preserving approximation for one verified restored scan."""
+        """Apply the verified encoder endpoint of one scan."""
         if not self._localization_valid:
             _fail("blast_navigation_localization_invalid",
                   "BLAST encoder localization must be restarted")
@@ -169,9 +172,28 @@ class BlastNavigationMotionExecutor:
                              "BLAST returned an invalid scan result")
         scan = command_result.get("scan")
         observation = command_result.get("observation")
+        sweep_direction = (
+            scan.get("sweep_direction")
+            if isinstance(scan, Mapping) else None
+        )
+        if sweep_direction is not None:
+            try:
+                scan = validate_blast_scan_ray_contract(scan)
+            except ValueError:
+                self._invalidate("blast_scan_result_invalid",
+                                 "BLAST returned an invalid scan result")
+        verified_sweep = sweep_direction in ("left", "right")
+        partial_scan = (
+            verified_sweep
+            and scan.get("state") == "partial"
+            and scan.get("result") == "coverage_incomplete"
+        )
         if (
             not isinstance(scan, Mapping)
-            or scan.get("restoration_verified") is not True
+            or (
+                scan.get("restoration_verified") is not True
+                and not partial_scan
+            )
             or not isinstance(observation, Mapping)
             or observation.get("motion_active") is not False
         ):
@@ -214,16 +236,21 @@ class BlastNavigationMotionExecutor:
             and recomputed_common_mm is not None
             and recomputed_opposed_deg is not None
             and encoder_restoration.get("motion_stopped") is True
-            and encoder_restoration.get("observation_settled") is True
             and encoder_restoration.get("body_pose_verified") is True
-            and command_result.get("observation_settled") is True
+            and (
+                verified_sweep
+                or (
+                    encoder_restoration.get("observation_settled") is True
+                    and command_result.get("observation_settled") is True
+                )
+            )
         )
         if not encoder_scan_contract_valid:
             self._invalidate(
                 "blast_scan_restoration_unverified",
                 "BLAST scan did not verify its encoder restoration",
             )
-        if (
+        if not verified_sweep and (
             abs(sum(residue))
             > 2 * MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES
             or abs(residue[1] - residue[0])
@@ -231,6 +258,16 @@ class BlastNavigationMotionExecutor:
         ):
             self._invalidate("blast_scan_encoder_residue_excessive",
                              "BLAST scan left excessive encoder residue")
+        if verified_sweep:
+            self._pose = apply_verified_motion(
+                self._pose,
+                VerifiedMotion(
+                    TURN_LEFT_90 if sweep_direction == "left"
+                    else TURN_RIGHT_90,
+                    residue[0], residue[1], 1, 1, "completed",
+                ),
+                BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+            )
         self._expected_start_angles = angles
         return True
 

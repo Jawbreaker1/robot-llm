@@ -16,7 +16,7 @@
   ]);
   const ROUTE_STATUSES = new Set(["ACTIVE", "COMPLETE", "INVALID"]);
   const WAYPOINT_STATUSES = new Set(["COMPLETED", "ACTIVE", "UPCOMING"]);
-  const SCAN_MAX_ABSOLUTE_BEARING_MDEG = 100000;
+  const SCAN_MAX_ABSOLUTE_BEARING_MDEG = 180000;
   const ROUTE_FIELDS = Object.freeze([
     "schema", "read_only", "provisional", "route_id", "version",
     "status", "detour_side", "active_index", "waypoints",

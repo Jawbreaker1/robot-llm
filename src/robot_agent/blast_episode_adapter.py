@@ -88,69 +88,6 @@ _SCAN_REFUSAL_CODES = frozenset(("scan_start_clearance_unverified",
                                  "scan_sweep_observation_unverified"))
 
 
-def _startup_side_clearance_score(scan, side):
-    """Rank one verified scan side for the rear-view transit only."""
-
-    rays = scan.get("angular_rays", scan.get("rays")) if isinstance(
-        scan, Mapping
-    ) else None
-    if not isinstance(rays, list):
-        return None
-    measured = []
-    no_return_count = 0
-    for ray in rays:
-        label = ray.get("side") if isinstance(ray, Mapping) else None
-        if not isinstance(label, str) or not label.startswith(side + "_"):
-            continue
-        if ray.get("observation_settled") is not True:
-            continue
-        state = ray.get("range_state")
-        if state == RANGE_STATE_NO_VALID_DISTANCE:
-            no_return_count += 1
-            continue
-        if state != RANGE_STATE_MEASURED:
-            continue
-        distance = ray.get("distance_mm")
-        if (
-            isinstance(distance, bool)
-            or not isinstance(distance, (int, float))
-            or not math.isfinite(float(distance))
-            or float(distance) <= _minimum_rotation_clearance_mm()
-        ):
-            return None
-        measured.append(float(distance))
-    if not measured:
-        return None
-    return (min(measured), sum(measured) / len(measured), no_return_count)
-
-
-def _startup_transit_turn(scan, episode_id):
-    """Choose scan transit direction from evidence, never a default side."""
-
-    scores = {
-        TURN_LEFT_90: _startup_side_clearance_score(scan, "left"),
-        TURN_RIGHT_90: _startup_side_clearance_score(scan, "right"),
-    }
-    candidates = [action for action, score in scores.items() if score]
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0]
-    left_score = scores[TURN_LEFT_90]
-    right_score = scores[TURN_RIGHT_90]
-    if left_score != right_score:
-        return (
-            TURN_LEFT_90 if left_score > right_score else TURN_RIGHT_90
-        )
-    # Equal safe evidence alternates by episode instead of introducing a
-    # persistent left/right bias or process-global randomness.
-    return (
-        TURN_LEFT_90
-        if sum(episode_id.encode("utf-8")) % 2 == 0
-        else TURN_RIGHT_90
-    )
-
-
 def _side_search_encoder_correlated(observation, motion_executor) -> bool:
     sensors = (
         observation.get("sensors")
@@ -1020,160 +957,86 @@ class BlastEpisodeRuntimeAdapter:
         latest_scan_view, history, motion_executor, episode_start_heading,
         map_trace, navigation_state, recovery, context, deadline_ms,
     ):
-        """Acquire front and rear surroundings before Gemma first decides."""
+        """Acquire one complete encoder-measured view before Gemma decides."""
 
         initial_scan_view_count = len(map_trace.planar_scan_views)
         startup_history = []
-        startup_actions = [SCAN_FRONT_ARC]
-        transit_turn = None
-        for action in startup_actions:
-            bounded_transit = (
-                transit_turn is not None
-                and action in (TURN_LEFT_90, TURN_RIGHT_90)
+        action = SCAN_FRONT_ARC
+        try:
+            observation, outcome = self._fresh_planner_observation_or_stop(
+                action, False, episode_start_heading, motion_executor,
+                context, deadline_ms,
             )
-            try:
-                observation, outcome = (
-                    self._fresh_planner_observation_or_stop(
-                        action, False, episode_start_heading,
-                        motion_executor, context, deadline_ms,
-                        allow_turn_no_valid_with_bounded_evidence=(
-                            bounded_transit
-                        ),
-                    )
-                )
-            except BlastEpisodeError:
-                return (
-                    observation, available_actions, scan_allows_turn,
-                    latest_scan_view,
-                    self._outcome(
-                        "blast_startup_perception_incomplete", False,
-                        "BLAST could not safely complete its startup scan",
-                    ),
-                )
-            if outcome is not None:
-                return (
-                    observation, available_actions, scan_allows_turn,
-                    latest_scan_view, outcome,
-                )
-            scan_pose = (
-                motion_executor.pose if action == SCAN_FRONT_ARC else None
+        except BlastEpisodeError:
+            outcome = self._outcome(
+                "blast_startup_perception_incomplete", False,
+                "BLAST could not safely begin its surroundings scan",
             )
-            geometry_checked = _planner_scan_geometry_checked(
-                action, observation, latest_scan_view,
-                motion_executor.pose,
+        if outcome is not None:
+            return (
+                observation, available_actions, scan_allows_turn,
+                latest_scan_view, outcome,
             )
-            command_result, execution, observation, outcome = (
-                self._dispatch_episode_action(
-                    action=action,
-                    observation=observation,
-                    geometry_checked=geometry_checked,
-                    motion_executor=motion_executor,
-                    prior_receipt=(
-                        startup_history[-1]
-                        if startup_history
-                        else (history[-1] if history else None)
-                    ),
-                    allow_turn_no_valid_with_bounded_evidence=(
-                        bounded_transit
-                    ),
-                    context=context,
-                    deadline_ms=deadline_ms,
-                    map_trace=map_trace,
-                    perception_only_scan=(action == SCAN_FRONT_ARC),
-                )
+        command_result, execution, observation, outcome = (
+            self._dispatch_episode_action(
+                action=action,
+                observation=observation,
+                geometry_checked=False,
+                motion_executor=motion_executor,
+                prior_receipt=history[-1] if history else None,
+                allow_turn_no_valid_with_bounded_evidence=False,
+                context=context,
+                deadline_ms=deadline_ms,
+                map_trace=map_trace,
+                perception_only_scan=True,
             )
-            if outcome is not None:
-                if outcome.terminal_reason in (
+        )
+        if outcome is not None:
+            startup_outcome = (
+                outcome if outcome.terminal_reason in (
                     "stopped", "episode_deadline_elapsed",
                     "episode_deadline_headroom_insufficient",
-                ):
-                    startup_outcome = outcome
-                else:
-                    startup_outcome = self._outcome(
-                        "blast_startup_perception_incomplete", False,
-                        "BLAST could not safely complete its startup scan",
-                    )
-                return (
-                    observation, available_actions, scan_allows_turn,
-                    latest_scan_view, startup_outcome,
+                ) else self._outcome(
+                    "blast_startup_perception_incomplete", False,
+                    "BLAST could not safely complete its surroundings scan",
                 )
-            new_scan_view = self._record_episode_action_result(
-                action=action,
-                action_source=_STARTUP_PERCEPTION_ACTION_SOURCE,
-                assessment="Mandatory startup surroundings acquisition",
-                plan=(action,),
-                command_result=command_result,
-                execution=execution,
-                scan_pose=scan_pose,
-                motion_executor=motion_executor,
-                history=startup_history,
-                map_trace=map_trace,
-                context=context,
-                published_action=_STARTUP_SURROUNDINGS_ACTION,
             )
-            if action == SCAN_FRONT_ARC and new_scan_view is None:
-                return (
-                    observation, available_actions, scan_allows_turn,
-                    latest_scan_view,
-                    self._outcome(
-                        "blast_startup_perception_incomplete", False,
-                        "BLAST startup scan produced no usable map view",
-                    ),
-                )
-            if new_scan_view is not None:
-                latest_scan_view = new_scan_view
-            outcome = self._control_outcome(context, deadline_ms)
-            if outcome is not None:
-                return (
-                    observation, available_actions, scan_allows_turn,
-                    latest_scan_view, outcome,
-                )
-            if (
-                action in ACTION_COMMANDS
-                and (execution is None or not execution.motion.complete)
-            ):
-                return (
-                    observation, available_actions, scan_allows_turn,
-                    latest_scan_view,
-                    self._outcome(
-                        "blast_startup_perception_incomplete", False,
-                        "BLAST startup rotation did not complete safely",
-                    ),
-                )
-            if len(startup_history) == 1:
-                transit_turn = _startup_transit_turn(
-                    latest_scan_view.get("scan"), context.episode_id,
-                )
-                if transit_turn is None:
-                    return (
-                        observation, available_actions, scan_allows_turn,
-                        latest_scan_view,
-                        self._outcome(
-                            "blast_startup_perception_incomplete", False,
-                            "BLAST startup scan found no verified transit "
-                            "direction",
-                        ),
-                    )
-                return_turn = (
-                    TURN_RIGHT_90
-                    if transit_turn == TURN_LEFT_90 else TURN_LEFT_90
-                )
-                startup_actions.extend((
-                    transit_turn, transit_turn, SCAN_FRONT_ARC,
-                    return_turn, return_turn,
-                ))
+            return (
+                observation, available_actions, scan_allows_turn,
+                latest_scan_view, startup_outcome,
+            )
+        latest_scan_view = self._record_episode_action_result(
+            action=action,
+            action_source=_STARTUP_PERCEPTION_ACTION_SOURCE,
+            assessment="Mandatory startup surroundings acquisition",
+            plan=(action,),
+            command_result=command_result,
+            execution=execution,
+            scan_pose=motion_executor.pose,
+            motion_executor=motion_executor,
+            history=startup_history,
+            map_trace=map_trace,
+            context=context,
+            published_action=_STARTUP_SURROUNDINGS_ACTION,
+        )
+        outcome = self._control_outcome(context, deadline_ms)
+        if outcome is not None:
+            return (
+                observation, available_actions, scan_allows_turn,
+                latest_scan_view, outcome,
+            )
         if (
-            not motion_executor.localization_valid
+            latest_scan_view is None
+            or not motion_executor.localization_valid
             or len(map_trace.planar_scan_views)
-            != initial_scan_view_count + 2
+            != initial_scan_view_count + 1
         ):
             return (
                 observation, available_actions, scan_allows_turn,
                 latest_scan_view,
                 self._outcome(
                     "blast_startup_perception_incomplete", False,
-                    "BLAST startup scan did not produce complete localized "
-                    "surroundings coverage",
+                    "BLAST startup scan produced no localized surroundings",
                 ),
             )
         history.append({
@@ -1188,7 +1051,11 @@ class BlastEpisodeRuntimeAdapter:
                 "observation_settled"
             ],
             "pose": motion_executor.pose.to_dict(),
-            "scan_view_count": 2,
+            "scan_view_count": 1,
+            "scan_state": startup_history[-1]["scan"]["state"],
+            "sweep_coverage_deg": startup_history[-1]["scan"].get(
+                "sweep_coverage_deg"
+            ),
         })
         final_observation = startup_history[-1]["result_observation"]
         context.publish({

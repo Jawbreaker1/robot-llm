@@ -34,11 +34,16 @@ def _headings(scan):
         relative = _finite(ray.get("relative_heading_deg"))
         values.append(relative)
     center = values[0]
-    side_count = (len(values) - 1) // 2
-    left = values[1:1 + side_count]
-    right = values[1 + side_count:]
+    left = [
+        value for ray, value in zip(rays[1:], values[1:])
+        if ray.get("side", "").startswith("left_")
+    ]
+    right = [
+        value for ray, value in zip(rays[1:], values[1:])
+        if ray.get("side", "").startswith("right_")
+    ]
     if (
-        len(values) not in (5, 9)
+        not 1 <= len(values) <= 9
         or center != 0.0
         or not all(
             -SCAN_MAX_ABSOLUTE_BEARING_DEG <= value < 0.0
@@ -57,7 +62,11 @@ def _headings(scan):
         encoder_restoration.get("opposed_residue_deg")
         if isinstance(encoder_restoration, Mapping) else None
     )
-    if abs(error) > scan_contract.SCAN_RESTORATION_TOLERANCE_DEG:
+    if (
+        scan.get("state") != "partial"
+        and scan.get("sweep_direction") is None
+        and abs(error) > scan_contract.SCAN_RESTORATION_TOLERANCE_DEG
+    ):
         raise ValueError("BLAST scan restoration evidence is inconsistent")
     return rays, tuple(values)
 
@@ -70,12 +79,18 @@ def project_blast_scan_planar_surfaces(
     if not isinstance(scan_pose, PhysicalPose):
         raise ValueError("BLAST scan pose is invalid")
     checked = scan_contract.validate_blast_scan_ray_contract(scan)
-    if not (
+    complete = (
         checked.get("state") == "complete"
         and checked.get("result") == "restored"
         and checked.get("restoration_verified") is True
+    )
+    partial = (
+        checked.get("state") == "partial"
+        and checked.get("result") == "coverage_incomplete"
+    )
+    if not (
+        (complete or partial)
         and checked["rays"][0].get("side") == "center"
-        and checked["rays"][0].get("observation_settled") is True
     ):
         raise ValueError("BLAST scan is not projection-ready")
     projection_rays, raw_headings = _headings(checked)

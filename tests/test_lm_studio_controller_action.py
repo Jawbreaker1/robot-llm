@@ -407,7 +407,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         with self.assertRaises(LMStudioInputError):
             context(available_actions=(), completion_allowed=False)
 
-    def test_scan_action_is_described_as_a_returning_two_sided_sweep(self):
+    def test_scan_action_is_described_as_a_full_surroundings_sweep(self):
         planner, transport = self.planner(completion({
             "action": SCAN_FRONT_ARC,
             "confidence_milli": 900,
@@ -426,8 +426,8 @@ class ControllerActionPlannerTests(unittest.TestCase):
         request = json.loads(transport.calls[0][1])
         system_prompt = request["messages"][0]["content"]
         self.assertIn(SCAN_FRONT_ARC, system_prompt)
-        self.assertIn("both sides", system_prompt)
-        self.assertIn("returns near its starting heading", system_prompt)
+        self.assertIn("full surroundings sweep", system_prompt)
+        self.assertIn("encoder-measured final pose", system_prompt)
 
     def test_side_scan_context_and_prompt_preserve_gemmas_side_choice(self):
         side_scan = {

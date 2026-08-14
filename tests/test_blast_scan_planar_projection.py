@@ -165,11 +165,11 @@ class BlastScanPlanarProjectionTests(TestCase):
             [94_570, -94_570],
         )
 
-    def test_scan_bearing_over_one_hundred_degrees_is_rejected(self):
+    def test_scan_bearing_beyond_full_circle_half_plane_is_rejected(self):
         scan = dense_scan_result(
             (300,) * 9,
-            (0.0, -25.0, -50.0, -75.0, -100.45,
-             25.0, 50.0, 75.0, 100.45),
+            (0.0, -45.0, -90.0, -135.0, -180.45,
+             45.0, 90.0, 135.0, 180.45),
         )
 
         with self.assertRaises(ValueError):

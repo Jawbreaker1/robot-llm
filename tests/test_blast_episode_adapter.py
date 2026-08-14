@@ -22,6 +22,7 @@ from robot_agent.blast_navigation_motion_execution import (
     BlastNavigationMotionExecutor,
 )
 from robot_agent.blast_scan_observation import (
+    build_blast_partial_scan,
     encoder_common_mode_residue_mm,
     encoder_relative_bearing_deg,
 )
@@ -546,12 +547,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertEqual(len(planner.contexts), 1)
-        expected_bootstrap_commands = [
-            "scan_front_arc",
-            *(["turn_right"] * 8),
-            "scan_front_arc",
-            *(["turn_left"] * 8),
-        ]
+        expected_bootstrap_commands = ["scan_front_arc"]
         self.assertEqual(
             controller.commands,
             [*expected_bootstrap_commands, "drive_forward"],
@@ -564,7 +560,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(
             first.history[0]["action_source"], "STARTUP_PERCEPTION",
         )
-        self.assertEqual(first.history[0]["scan_view_count"], 2)
+        self.assertEqual(first.history[0]["scan_view_count"], 1)
         published_actions = [
             update.get("current_action") for update in updates
             if "current_action" in update
@@ -590,7 +586,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 {"action": ADVANCE},
             ))
         )
-        self.assertEqual(len(first.local_map_evidence["scan_views"]), 2)
+        self.assertEqual(len(first.local_map_evidence["scan_views"]), 1)
         self.assertEqual(
             first.local_map_evidence["robot_pose"]["x_mm"], 0,
         )
@@ -601,64 +597,62 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             first.local_map_evidence["robot_pose"]["heading_mdeg"], 0,
         )
 
-    def test_startup_transit_direction_follows_scan_evidence(self):
-        class LeftIsClearer(FakeScanController):
+    def test_partial_startup_scan_reaches_gemma_with_true_pose_and_map(self):
+        class PartialStartupController(FakeScanController):
             def command(self, command, *, cancel_requested=None):
-                result = super().command(
-                    command, cancel_requested=cancel_requested,
+                center = copy.deepcopy(self.snapshot_value["observation"])
+                result = FakeController.command(
+                    self, command, cancel_requested=cancel_requested,
                 )
-                if command == "scan_front_arc":
-                    for ray in result["scan"]["rays"]:
-                        if ray["side"] == "left_near":
-                            ray["distance_mm"] = 1_500.0
-                        elif ray["side"] == "right_near":
-                            ray["distance_mm"] = 200.0
+                if command != "scan_front_arc":
+                    return result
+                final = copy.deepcopy(result["observation"])
+                final["motor_angles_deg"].update({
+                    "left_drive": -45, "right_drive": 45,
+                })
+                self.snapshot_value["observation"] = final
+                result.update({
+                    "observation": final,
+                    "observation_settled": True,
+                    "receipt": {"turn_count": 1,
+                                "coverage_complete": False},
+                    "scan": build_blast_partial_scan(
+                        center=center,
+                        center_settled=True,
+                        start_drive_angles={
+                            "left_drive": 0, "right_drive": 0,
+                        },
+                        sweep_samples=(({}, final, True, "SETTLED_RANGE"),),
+                        final=final,
+                        final_settled=True,
+                        final_body_verified=True,
+                    ),
+                })
                 return result
 
-        controller = LeftIsClearer(500)
+        controller = PartialStartupController(500)
         planner = Planner([decision(ADVANCE)])
-        result = self.adapter(
+        adapter = self.adapter(
             controller, planner, max_decisions=1,
             startup_perception=True,
-        ).run(episode_context()[0])
-        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
-        self.assertEqual(
-            controller.commands[:9],
-            ["scan_front_arc", *(["turn_left"] * 8)],
         )
 
-    def test_startup_transit_accepts_bounded_no_return_between_turns(self):
-        class NoReturnDuringRightTransit(FakeScanController):
-            def __init__(self):
-                super().__init__(500)
-                self.right_turn_count = 0
+        result = adapter.run(episode_context()[0])
 
-            def command(self, command, *, cancel_requested=None):
-                result = super().command(
-                    command, cancel_requested=cancel_requested,
-                )
-                if command == "turn_right":
-                    self.right_turn_count += 1
-                    distance = (
-                        2_000 if self.right_turn_count < 8 else 500
-                    )
-                    result["observation"]["distance_mm"] = distance
-                    self.snapshot_value["observation"] = result[
-                        "observation"
-                    ]
-                return result
-
-        controller = NoReturnDuringRightTransit()
-        planner = Planner([decision(ADVANCE)])
-        result = self.adapter(
-            controller, planner, max_decisions=1,
-            startup_perception=True,
-        ).run(episode_context()[0])
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
-        self.assertEqual(controller.right_turn_count, 8)
         self.assertEqual(len(planner.contexts), 1)
+        context = planner.contexts[0]
+        self.assertEqual(context.history[0]["scan_state"], "partial")
+        self.assertEqual(len(context.local_map_evidence["scan_views"]), 1)
         self.assertEqual(
-            len(planner.contexts[0].local_map_evidence["scan_views"]), 2,
+            context.local_map_evidence["robot_pose"]["heading_mdeg"],
+            22_050,
+        )
+        self.assertEqual(
+            adapter.spatial_map_provider.snapshot()["robot_pose"][
+                "heading_mdeg"
+            ],
+            22_050,
         )
 
     def test_unsafe_startup_perception_stops_before_planner(self):
@@ -683,7 +677,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertEqual(
             result.terminal_reason,
-            "blast_startup_perception_incomplete",
+            "no_safe_blast_action",
         )
         self.assertEqual(controller.commands, ["scan_front_arc"])
         self.assertEqual(planner.contexts, [])
@@ -693,7 +687,6 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             def __init__(self):
                 super().__init__(2_000)
                 self.permits = []
-                self.turn_count = 0
 
             def issue_no_return_scan_permit(self, **values):
                 self.permits.append(values)
@@ -706,13 +699,11 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 result = super().command(
                     command, cancel_requested=cancel_requested,
                 )
-                if command in ("turn_left", "turn_right"):
-                    self.turn_count += 1
-                    if self.turn_count == 16:
-                        result["observation"]["distance_mm"] = 500
-                        self.snapshot_value["observation"] = result[
-                            "observation"
-                        ]
+                if command == "scan_front_arc":
+                    result["observation"]["distance_mm"] = 500
+                    self.snapshot_value["observation"] = result[
+                        "observation"
+                    ]
                 return result
 
         controller = NoReturnStartupController()
@@ -724,17 +715,16 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         ).run(episode_context()[0])
 
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
-        self.assertEqual(len(controller.permits), 2)
+        self.assertEqual(len(controller.permits), 1)
         self.assertTrue(all(
             permit["perception_only"] is True
             and permit["geometry_checked"] is False
             for permit in controller.permits
         ))
-        self.assertEqual(controller.commands.count("scan_front_arc"), 2)
-        self.assertEqual(controller.turn_count, 16)
+        self.assertEqual(controller.commands.count("scan_front_arc"), 1)
         self.assertEqual(len(planner.contexts), 1)
         self.assertEqual(
-            len(planner.contexts[0].local_map_evidence["scan_views"]), 2,
+            len(planner.contexts[0].local_map_evidence["scan_views"]), 1,
         )
 
     def test_stop_or_deadline_after_bootstrap_result_prevents_next_action(self):
@@ -771,89 +761,6 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 self.assertEqual(result.terminal_reason, expected)
                 self.assertEqual(controller.commands, ["scan_front_arc"])
                 self.assertEqual(planner.contexts, [])
-
-    def test_startup_perception_keeps_truthful_turn_residual(self):
-        class AsymmetricTurns(FakeScanController):
-            def command(self, command, *, cancel_requested=None):
-                result = super().command(
-                    command, cancel_requested=cancel_requested,
-                )
-                if command == "turn_right":
-                    motors = result["observation"]["motor_angles_deg"]
-                    motors["left_drive"] += 1
-                    self.snapshot_value["observation"] = result[
-                        "observation"
-                    ]
-                return result
-
-        controller = AsymmetricTurns(500)
-        planner = Planner([decision(ADVANCE)])
-
-        result = self.adapter(
-            controller, planner,
-            max_decisions=1,
-            startup_perception=True,
-        ).run(episode_context()[0])
-
-        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
-        self.assertEqual(len(planner.contexts), 1)
-        local_map = planner.contexts[0].local_map_evidence
-        self.assertEqual(len(local_map["scan_views"]), 2)
-        self.assertNotEqual(
-            local_map["robot_pose"]["heading_mdeg"], 0,
-        )
-
-    def test_partial_startup_turn_is_recorded_before_terminal_outcome(self):
-        class PartialTurn(FakeScanController):
-            def command(self, command, *, cancel_requested=None):
-                result = super().command(
-                    command, cancel_requested=cancel_requested,
-                )
-                if command == "turn_right":
-                    result["observation"]["distance_mm"] = 40
-                    self.snapshot_value["observation"] = result[
-                        "observation"
-                    ]
-                return result
-
-        controller = PartialTurn(500)
-        planner = Planner([decision(ADVANCE)])
-        adapter = self.adapter(
-            controller, planner, startup_perception=True,
-        )
-        recorded = []
-        original_record = adapter._record_episode_action_result
-
-        def capture(**values):
-            result = original_record(**values)
-            recorded.append(copy.deepcopy(values["history"][-1]))
-            return result
-
-        adapter._record_episode_action_result = capture
-
-        result = adapter.run(episode_context()[0])
-
-        self.assertEqual(
-            result.terminal_reason,
-            "blast_startup_perception_incomplete",
-        )
-        self.assertEqual(
-            controller.commands,
-            ["scan_front_arc", "turn_right"],
-        )
-        self.assertEqual(planner.contexts, [])
-        self.assertEqual(
-            [item["action"] for item in recorded],
-            [SCAN_FRONT_ARC, TURN_RIGHT_90],
-        )
-        self.assertFalse(recorded[-1]["motion"]["command_completed"])
-        self.assertNotEqual(recorded[-1]["pose"]["heading_mdeg"], 0)
-        self.assertEqual(
-            adapter.spatial_map_provider.snapshot()["robot_pose"][
-                "heading_mdeg"
-            ],
-            recorded[-1]["pose"]["heading_mdeg"],
-        )
 
     def test_failed_startup_scan_marks_map_localization_lost(self):
         class FailedScan(FakeScanController):
