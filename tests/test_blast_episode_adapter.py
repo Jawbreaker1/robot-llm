@@ -2523,6 +2523,20 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             (),
         )
 
+    def test_full_scan_turns_use_settled_rays_around_unknown_echoes(self):
+        adapter = self.adapter(FakeController(), Planner([]))
+        scan = scan_result(center_distance_mm=81)
+        scan["sweep_coverage_deg"] = 353.29
+        scan["all_observations_settled"] = False
+        for index in (1, 3):
+            scan["rays"][index]["observation_settled"] = False
+
+        history = ({"action": SCAN_FRONT_ARC, "scan": scan},)
+        self.assertTrue(adapter._current_scan_allows_quarter_turn(history))
+
+        scan["rays"][4]["observation_settled"] = False
+        self.assertFalse(adapter._current_scan_allows_quarter_turn(history))
+
     def test_arbitrary_planner_turn_still_stops_on_no_valid_range(self):
         class NoReturnDuringPlannerTurn(FakeController):
             def command(self, command, *, cancel_requested=None):

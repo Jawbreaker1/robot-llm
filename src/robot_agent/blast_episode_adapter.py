@@ -312,11 +312,34 @@ class BlastEpisodeRuntimeAdapter:
             isinstance(scan, Mapping)
             and scan.get("sweep_coverage_deg") is not None
         ):
+            rays = scan.get("rays")
+            if not isinstance(rays, list) or len(rays) != 5:
+                return False
+
+            def settled_clear(ray):
+                if not (
+                    isinstance(ray, Mapping)
+                    and ray.get("observation_settled") is True
+                ):
+                    return False
+                if ray.get("range_state") == RANGE_STATE_NO_VALID_DISTANCE:
+                    return True
+                distance = ray.get("distance_mm")
+                return (
+                    ray.get("range_state") == RANGE_STATE_MEASURED
+                    and isinstance(distance, (int, float))
+                    and not isinstance(distance, bool)
+                    and math.isfinite(float(distance))
+                    and float(distance) > _minimum_rotation_clearance_mm()
+                )
+
             return (
                 scan.get("state") == "complete"
                 and scan.get("result") == "restored"
                 and scan.get("restoration_verified") is True
-                and scan.get("all_observations_settled") is True
+                and settled_clear(rays[0])
+                and any(settled_clear(ray) for ray in rays[1:3])
+                and any(settled_clear(ray) for ray in rays[3:5])
             )
         rays = scan.get("rays") if isinstance(scan, Mapping) else None
         if not (
