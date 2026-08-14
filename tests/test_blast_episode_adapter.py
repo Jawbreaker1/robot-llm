@@ -2537,6 +2537,33 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         scan["rays"][4]["observation_settled"] = False
         self.assertFalse(adapter._current_scan_allows_quarter_turn(history))
 
+    def test_agentic_scan_guided_turn_continues_at_no_return(self):
+        class NoReturnAfterScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    result["observation"]["distance_mm"] = 2_000
+                    self.snapshot_value["observation"] = result["observation"]
+                return result
+
+        controller = NoReturnAfterScanController()
+        result = self.adapter(
+            controller,
+            Planner([
+                decision(SCAN_FRONT_ARC),
+                decision(TURN_RIGHT_90),
+            ]),
+            max_decisions=2,
+        ).run(episode_context()[0])
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(
+            controller.commands,
+            ["scan_front_arc"] + ["turn_right"] * 4,
+        )
+
     def test_arbitrary_planner_turn_still_stops_on_no_valid_range(self):
         class NoReturnDuringPlannerTurn(FakeController):
             def command(self, command, *, cancel_requested=None):

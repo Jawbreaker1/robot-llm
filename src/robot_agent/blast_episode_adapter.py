@@ -643,15 +643,13 @@ class BlastEpisodeRuntimeAdapter:
         self,
         *,
         action,
-        selects_detour_side,
         episode_start_heading,
         motion_executor,
         cancel_requested,
         allow_turn_no_valid_with_bounded_evidence=False,
-        context=None, deadline_ms=None,
     ):
         return fresh_blast_action_observation(
-            self, action=action, selects_detour_side=selects_detour_side,
+            self, action=action,
             episode_start_heading=episode_start_heading,
             motion_executor=motion_executor,
             cancel_requested=cancel_requested,
@@ -661,11 +659,10 @@ class BlastEpisodeRuntimeAdapter:
             allow_turn_no_valid_with_bounded_evidence=(
                 allow_turn_no_valid_with_bounded_evidence
             ),
-            context=context, deadline_ms=deadline_ms,
         )
 
     def _fresh_planner_observation_or_stop(
-        self, action, selects_detour_side, episode_start_heading,
+        self, action, episode_start_heading,
         motion_executor, context, deadline_ms,
         allow_turn_no_valid_with_bounded_evidence=False,
     ):
@@ -677,14 +674,12 @@ class BlastEpisodeRuntimeAdapter:
         try:
             observation = self._fresh_planner_action_observation(
                 action=action,
-                selects_detour_side=selects_detour_side,
                 episode_start_heading=episode_start_heading,
                 motion_executor=motion_executor,
                 cancel_requested=control_requested,
                 allow_turn_no_valid_with_bounded_evidence=(
                     allow_turn_no_valid_with_bounded_evidence
                 ),
-                context=context, deadline_ms=deadline_ms,
             )
         except BlastControllerError as error:
             outcome = self._control_outcome(
@@ -764,8 +759,9 @@ class BlastEpisodeRuntimeAdapter:
             )
         if action in ACTION_COMMANDS or action == SCAN_FRONT_ARC:
             observation, stopped = self._fresh_planner_observation_or_stop(
-                action, scan_guided_turn, episode_start_heading,
+                action, episode_start_heading,
                 motion_executor, context, deadline_ms,
+                allow_turn_no_valid_with_bounded_evidence=scan_guided_turn,
             )
             if stopped is not None:
                 return None, stopped
@@ -798,7 +794,6 @@ class BlastEpisodeRuntimeAdapter:
             "plan": list(decision.plan),
             "action_source": _PLANNER_ACTION_SOURCE,
             "observation": observation,
-            "selects_detour_side": False,
             "bounded_turn_no_valid_eligible": scan_guided_turn,
         }, None
     def _scan_action_permit(
@@ -1013,7 +1008,7 @@ class BlastEpisodeRuntimeAdapter:
         action = SCAN_FRONT_ARC
         try:
             observation, outcome = self._fresh_planner_observation_or_stop(
-                action, False, episode_start_heading, motion_executor,
+                action, episode_start_heading, motion_executor,
                 context, deadline_ms,
             )
         except BlastEpisodeError:

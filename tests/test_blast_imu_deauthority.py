@@ -74,7 +74,7 @@ class BlastIMUDeauthorityTests(unittest.TestCase):
                     SCAN_FRONT_ARC, observation,
                 ))
 
-    def test_side_and_pre_action_authority_is_the_encoder_anchor(self):
+    def test_pre_action_authority_is_the_encoder_anchor(self):
         controller, adapter, executor = self.runtime({
             "ready": True,
             "stationary": False,
@@ -86,7 +86,6 @@ class BlastIMUDeauthorityTests(unittest.TestCase):
         ))
         admitted = adapter._fresh_planner_action_observation(
             action=TURN_LEFT_90,
-            selects_detour_side=True,
             episode_start_heading=0.0,
             motion_executor=executor,
             cancel_requested=lambda: False,
@@ -99,7 +98,6 @@ class BlastIMUDeauthorityTests(unittest.TestCase):
         with self.assertRaises(BlastEpisodeError) as raised:
             adapter._fresh_planner_action_observation(
                 action=TURN_LEFT_90,
-                selects_detour_side=True,
                 episode_start_heading=0.0,
                 motion_executor=executor,
                 cancel_requested=lambda: False,
