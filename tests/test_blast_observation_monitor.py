@@ -4132,10 +4132,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertFalse(result["observation"]["motion_active"])
         monitor.close()
 
-    def test_turn_remeasures_only_one_safe_unsettled_window(self):
-        for distance, attempts, settled in (
-            (500, 2, True),
-            (40, 1, False),
+    def test_turn_marks_only_safe_unsettled_clearance(self):
+        for distance, clearance_verified in (
+            (500, True),
+            (40, False),
         ):
             with self.subTest(distance=distance):
                 class RemeasureMonitor(BlastObservationMonitor):
@@ -4152,7 +4152,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
                         self._settling_samples = (
                             (float(distance), 0.0, 0.0),
                         ) * 5
-                        return observation, self.settle_attempts > 1
+                        return observation, False
 
                 monitor = RemeasureMonitor(
                     poll_interval_seconds=0.05,
@@ -4163,8 +4163,12 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
                 result = monitor.command("turn_right")
 
-                self.assertEqual(monitor.settle_attempts, attempts)
-                self.assertIs(result["observation_settled"], settled)
+                self.assertEqual(monitor.settle_attempts, 1)
+                self.assertFalse(result["observation_settled"])
+                self.assertIs(
+                    result["rotation_sweep_window_verified"],
+                    clearance_verified,
+                )
                 monitor.close()
 
     def test_stop_wins_at_the_final_settled_sample(self):

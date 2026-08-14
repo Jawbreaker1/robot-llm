@@ -26,7 +26,10 @@ def blast_turn_slice_allows_continuation(
     if not (
         isinstance(command_result, Mapping)
         and command_result.get("completed") is True
-        and command_result.get("observation_settled") is True
+        and (
+            command_result.get("observation_settled") is True
+            or command_result.get("rotation_sweep_window_verified") is True
+        )
     ):
         return False
     sensors = command_result.get("observation")
