@@ -349,7 +349,16 @@ class BlastEpisodeRuntimeAdapter:
                 blast_range_state(distance) == RANGE_STATE_MEASURED
                 and float(distance) > self.minimum_forward_clearance_mm
             )
-        if action in (TURN_LEFT_90, TURN_RIGHT_90, SCAN_FRONT_ARC):
+        if action == SCAN_FRONT_ARC:
+            return (
+                _navigation_drive_encoders_available(sensors)
+                and (
+                    self._current_range_allows_rotation(observation)
+                    or blast_range_state(distance)
+                    == RANGE_STATE_NO_VALID_DISTANCE
+                )
+            )
+        if action in (TURN_LEFT_90, TURN_RIGHT_90):
             return (
                 _navigation_drive_encoders_available(sensors)
                 and self._current_range_allows_rotation(observation)
@@ -554,7 +563,8 @@ class BlastEpisodeRuntimeAdapter:
                                     ).get("episode_start_heading_deg")
                                 ),
                                 allow_no_return=(
-                                    action_permit is not None
+                                    perception_only_scan
+                                    or action_permit is not None
                                     and blast_range_state(
                                         observation["sensors"].get(
                                             "distance_mm"
@@ -1252,6 +1262,7 @@ class BlastEpisodeRuntimeAdapter:
                     context=context,
                     deadline_ms=deadline_ms,
                     map_trace=map_trace,
+                    perception_only_scan=(action == SCAN_FRONT_ARC),
                 )
                 if outcome is not None:
                     return outcome

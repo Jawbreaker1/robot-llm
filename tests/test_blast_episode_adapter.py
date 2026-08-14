@@ -2620,10 +2620,13 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         controller = NoReturnDuringPlannerTurn(500)
         result = self.adapter(
             controller, Planner([decision(TURN_LEFT_90)]),
+            max_decisions=1,
         ).run(episode_context()[0])
 
         self.assertFalse(result.completed)
-        self.assertEqual(result.terminal_reason, "no_safe_blast_action")
+        self.assertEqual(
+            result.terminal_reason, "decision_budget_exhausted",
+        )
         self.assertEqual(controller.commands, ["turn_left"])
 
     def test_unprojectable_current_scan_cannot_authorize_a_side_turn(self):
@@ -2932,7 +2935,6 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
     def test_unobserved_or_too_close_state_authorizes_no_action(self):
         for distance, body, observes in (
-            (2_000, 158, 2),
             (53, 158, 0),
             (500, 156, 0),
         ):
@@ -2958,25 +2960,94 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 )
                 self.assertEqual(planner.contexts, [])
 
-    def test_planner_soft_no_action_remeasures_before_giving_up(self):
-        controller = FreshStationaryController(
-            2_000, recovered_distance_mm=500,
-        )
-        planner = Planner([decision(ADVANCE, assessment="recovered")])
+    def test_no_return_offers_perception_scan_without_remeasure(self):
+        class NoReturnController(FakeScanController):
+            def __init__(self):
+                super().__init__(2_000)
+                self.permit_requests = []
+                self.scan_permits = []
+
+            def issue_no_return_scan_permit(self, **values):
+                self.permit_requests.append(values)
+                return object()
+
+            def command(
+                self, command, *, cancel_requested=None,
+                action_permit=None,
+            ):
+                if command == "scan_front_arc":
+                    self.scan_permits.append(action_permit)
+                return super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+
+        controller = NoReturnController()
+        planner = Planner([decision(SCAN_FRONT_ARC)])
 
         result = self.adapter(
             controller, planner,
             max_decisions=1,
-            monotonic_ms=lambda: controller.clock[0],
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(controller.commands, ["scan_front_arc"])
+        self.assertEqual(
+            planner.contexts[0].available_actions, (SCAN_FRONT_ARC,),
+        )
+        self.assertTrue(
+            controller.permit_requests[0]["perception_only"],
+        )
+        self.assertIsNotNone(controller.scan_permits[0])
+
+    def test_advance_to_no_return_offers_only_perception_scan(self):
+        class NoReturnAfterAdvanceController(FakeScanController):
+            def __init__(self):
+                super().__init__(500)
+                self.permit_requests = []
+                self.scan_permits = []
+
+            def issue_no_return_scan_permit(self, **values):
+                self.permit_requests.append(values)
+                return object()
+
+            def command(
+                self, command, *, cancel_requested=None,
+                action_permit=None,
+            ):
+                if command == "scan_front_arc":
+                    self.scan_permits.append(action_permit)
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "drive_forward":
+                    result["observation"]["distance_mm"] = 2_000
+                    self.snapshot_value["observation"] = result[
+                        "observation"
+                    ]
+                return result
+
+        controller = NoReturnAfterAdvanceController()
+        planner = Planner([
+            decision(ADVANCE),
+            decision(SCAN_FRONT_ARC),
+        ])
+
+        result = self.adapter(
+            controller, planner, max_decisions=2,
         ).run(episode_context()[0])
 
         self.assertFalse(result.completed)
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertEqual(
-            controller.commands,
-            [SETTLED_OBSERVATION_COMMAND, "drive_forward"],
+            controller.commands, ["drive_forward", "scan_front_arc"],
         )
-        self.assertIn("ADVANCE", planner.contexts[0].available_actions)
+        self.assertEqual(
+            planner.contexts[1].available_actions, (SCAN_FRONT_ARC,),
+        )
+        self.assertTrue(controller.permit_requests[-1]["allow_no_return"])
+        self.assertTrue(controller.permit_requests[-1]["perception_only"])
+        self.assertIsNotNone(controller.scan_permits[-1])
 
     def test_initial_stale_or_offline_observation_recovers_motorlessly(self):
         for fault in ("stale", "offline"):
@@ -3067,7 +3138,18 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 return result
 
         class SettlingScanController(FakeScanController):
-            def command(self, command, *, cancel_requested=None):
+            def __init__(self, distance_mm):
+                super().__init__(distance_mm)
+                self.permit_requests = []
+
+            def issue_no_return_scan_permit(self, **values):
+                self.permit_requests.append(values)
+                return object()
+
+            def command(
+                self, command, *, cancel_requested=None,
+                action_permit=None,
+            ):
                 result = super().command(
                     command,
                     cancel_requested=cancel_requested,
@@ -3090,6 +3172,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertEqual(controller.commands, ["scan_front_arc"])
         self.assertEqual(len(planner.contexts), 1)
+        self.assertTrue(controller.permit_requests[0]["perception_only"])
 
     def test_scan_start_quality_failure_gets_exactly_one_retry(self):
         controller = ScanStartRetryController()
@@ -3373,30 +3456,50 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 self.assertEqual(controller.commands, expected_commands)
                 self.assertEqual(controller.scan_attempts, 1)
 
-    def test_planner_no_return_scan_cannot_gain_retry_permit(self):
+    def test_planner_scan_retry_can_continue_from_exact_no_return(self):
         def lose_echo(controller):
             controller.snapshot_value["observation"][
                 "distance_mm"
             ] = 2_000
 
-        controller = ScanStartRetryController(
-            after_failure=lose_echo,
-            settled_observation={"distance_mm": 2_000},
-        )
+        class NoReturnRetryController(ScanStartRetryController):
+            def __init__(self):
+                super().__init__(
+                    after_failure=lose_echo,
+                    settled_observation={"distance_mm": 2_000},
+                )
+                self.permit_requests = []
+
+            def issue_no_return_scan_permit(self, **values):
+                self.permit_requests.append(values)
+                return object()
+
+        controller = NoReturnRetryController()
         planner = Planner([decision(SCAN_FRONT_ARC)])
 
-        result = self.adapter(controller, planner).run(
+        result = self.adapter(
+            controller, planner, max_decisions=1,
+        ).run(
             episode_context()[0]
         )
 
         self.assertFalse(result.completed)
-        self.assertEqual(result.terminal_reason, "no_safe_blast_action")
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertEqual(
             controller.commands,
-            ["scan_front_arc", SETTLED_OBSERVATION_COMMAND],
+            [
+                "scan_front_arc",
+                SETTLED_OBSERVATION_COMMAND,
+                "scan_front_arc",
+            ],
         )
-        self.assertEqual(controller.scan_attempts, 1)
-        self.assertEqual(controller.scan_permits, [None])
+        self.assertEqual(controller.scan_attempts, 2)
+        self.assertEqual(len(controller.scan_permits), 2)
+        self.assertTrue(all(
+            permit is not None for permit in controller.scan_permits
+        ))
+        self.assertTrue(controller.permit_requests[-1]["allow_no_return"])
+        self.assertTrue(controller.permit_requests[-1]["perception_only"])
 
     def test_settled_scan_refusal_is_safe_noncomplete(self):
         for error_code in (

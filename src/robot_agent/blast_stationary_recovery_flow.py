@@ -18,7 +18,6 @@ from .blast_scan_observation import (
     RANGE_STATE_MEASURED,
     RANGE_STATE_NO_VALID_DISTANCE,
 )
-from .blast_scan_safety import blast_scan_sweep_is_clear
 from .blast_stationary_evidence import (
     BlastStationaryEvidenceOutcome,
     BlastStationaryEvidenceStatus,
@@ -281,17 +280,6 @@ def prepare_blast_iteration_actions(
 
     available_actions = adapter._available_actions(observation, history)
     scan_is_current = adapter._scan_is_current(history)
-    if (
-        not scan_is_current
-        and blast_range_state(
-            observation["sensors"].get("distance_mm")
-        ) == RANGE_STATE_NO_VALID_DISTANCE
-        and latest_scan_view is not None
-        and blast_scan_sweep_is_clear(
-            latest_scan_view, motion_executor.pose,
-        )
-    ):
-        available_actions += (SCAN_FRONT_ARC,)
     scan_allows_turn = (
         adapter._current_scan_allows_quarter_turn(history)
         and latest_scan_view is not None
