@@ -831,6 +831,45 @@ class BlastSpatialMapBridge:
             self._refresh_snapshot(item)
             return True
 
+    def invalidate_localization(self, *, episode_id: str) -> bool:
+        """Stop presenting a stale pose after unverified physical motion."""
+
+        now_monotonic = _clock_value(
+            "BLAST spatial monotonic clock", self._monotonic_clock_ms
+        )
+        now_unix = _clock_value(
+            "BLAST spatial Unix clock", self._unix_clock_ms
+        )
+        with self._lock:
+            if not self._accepting or episode_id != self._episode_id:
+                return False
+            if (
+                self._last_monotonic_ms is not None
+                and now_monotonic < self._last_monotonic_ms
+            ):
+                return False
+            self._state_version += 1
+            self._map_version += 1
+            self._last_monotonic_ms = now_monotonic
+            self._last_unix_ms = now_unix
+            snapshot = deepcopy(self._snapshot)
+            snapshot.update({
+                "status": "unavailable",
+                "reason_code": "localization_lost",
+                "map_version": self._map_version,
+                "based_on_state_version": self._state_version,
+                "robot_pose": None,
+                "captured_at_unix_ms": now_unix,
+                "observed_at_unix_ms": now_unix,
+                "observed_age_ms": 0,
+                "age_ms": 0,
+            })
+            localization = dict(snapshot.get("localization") or {})
+            localization["valid"] = False
+            snapshot["localization"] = localization
+            self._snapshot = snapshot
+            return True
+
     def offer_trace(
         self, *, episode_id: str, final_goal: Mapping[str, object],
         planned_leg: Optional[Mapping[str, object]] = None,

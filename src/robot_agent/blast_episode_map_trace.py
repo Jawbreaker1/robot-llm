@@ -231,6 +231,13 @@ class _BlastEpisodeMapTrace:
         self.local_detour_route = None
         return self._offer_trace(pose, observation, observed_at_unix_ms)
 
+    def invalidate_localization(self):
+        """Make an ambiguous post-motion pose explicitly unavailable."""
+
+        return self._offer(
+            "invalidate_localization", episode_id=self.episode_id,
+        )
+
     def finalize(
         self, *, pose=None, observation=None, observed_at_unix_ms=None,
     ):

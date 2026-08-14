@@ -82,6 +82,7 @@ DEFAULT_MIN_FORWARD_CLEARANCE_MM = 120
 DEFAULT_MINIMUM_FORWARD_PROGRESS_MM = 420
 _PLANNER_ACTION_SOURCE = "PLANNER_ACTION"
 _STARTUP_PERCEPTION_ACTION_SOURCE = "STARTUP_PERCEPTION"
+_STARTUP_SURROUNDINGS_ACTION = "SCAN_SURROUNDINGS"
 _SCAN_REFUSAL_CODES = frozenset(("scan_start_clearance_unverified",
                                  "scan_sweep_clearance_lost",
                                  "scan_sweep_observation_unverified"))
@@ -290,6 +291,27 @@ class BlastEpisodeRuntimeAdapter:
         return False
 
     @staticmethod
+    def _scan_evidence_is_fresh(history) -> bool:
+        """Whether the latest scan evidence still matches the current pose."""
+
+        for item in reversed(history):
+            action = item.get("action")
+            if action in (SCAN_FRONT_ARC, _STARTUP_SURROUNDINGS_ACTION):
+                return True
+            if action in ACTION_COMMANDS:
+                return False
+        return False
+
+    @staticmethod
+    def _has_scan_evidence(history) -> bool:
+        return any(
+            item.get("action") in (
+                SCAN_FRONT_ARC, _STARTUP_SURROUNDINGS_ACTION,
+            )
+            for item in history
+        )
+
+    @staticmethod
     def _current_scan_allows_quarter_turn(history) -> bool:
         if not history or history[-1].get("action") != SCAN_FRONT_ARC:
             return False
@@ -354,7 +376,7 @@ class BlastEpisodeRuntimeAdapter:
             self._current_observation_allows_action(
                 SCAN_FRONT_ARC, observation
             )
-            and not self._scan_is_current(history)
+            and not self._scan_evidence_is_fresh(history)
         ):
             available.append(SCAN_FRONT_ARC)
         return tuple(available)
@@ -458,6 +480,7 @@ class BlastEpisodeRuntimeAdapter:
         self, *, action, observation, geometry_checked, motion_executor,
         prior_receipt,
         allow_turn_no_valid_with_bounded_evidence, context, deadline_ms,
+        map_trace=None,
     ):
         outcome = self._control_outcome(
             context, deadline_ms, blast_action_deadline_headroom_ms(action),
@@ -496,6 +519,13 @@ class BlastEpisodeRuntimeAdapter:
                 )
                 return command_result, execution, observation, None
             except BlastControllerError as error:
+                if (
+                    action == SCAN_FRONT_ARC
+                    and error.motion_started is not False
+                ):
+                    motion_executor.invalidate_after_failed_scan()
+                    if map_trace is not None:
+                        map_trace.invalidate_localization()
                 outcome = self._control_outcome(context, deadline_ms)
                 if (
                     error.code in (
@@ -778,6 +808,35 @@ class BlastEpisodeRuntimeAdapter:
     def _record_episode_action_result(
         self, *, action, action_source, assessment, plan, command_result,
         execution, scan_pose, motion_executor, history, map_trace, context,
+        published_action=None,
+    ):
+        """Record one result, invalidating any rejected completed scan."""
+
+        try:
+            return self._retain_episode_action_result(
+                action=action,
+                action_source=action_source,
+                assessment=assessment,
+                plan=plan,
+                command_result=command_result,
+                execution=execution,
+                scan_pose=scan_pose,
+                motion_executor=motion_executor,
+                history=history,
+                map_trace=map_trace,
+                context=context,
+                published_action=published_action,
+            )
+        except Exception:
+            if action == SCAN_FRONT_ARC:
+                motion_executor.invalidate_after_failed_scan()
+                map_trace.invalidate_localization()
+            raise
+
+    def _retain_episode_action_result(
+        self, *, action, action_source, assessment, plan, command_result,
+        execution, scan_pose, motion_executor, history, map_trace, context,
+        published_action=None,
     ):
         """Validate and retain one result through the shared scan/map path."""
 
@@ -882,7 +941,11 @@ class BlastEpisodeRuntimeAdapter:
         )
         history.append(history_item)
         self._publish_action_result(
-            context, action, result_observation, scan, planar_projection,
+            context,
+            action if published_action is None else published_action,
+            result_observation,
+            scan,
+            planar_projection,
         )
         return latest_scan_view
 
@@ -894,6 +957,7 @@ class BlastEpisodeRuntimeAdapter:
         """Acquire front and rear surroundings before Gemma first decides."""
 
         initial_scan_view_count = len(map_trace.planar_scan_views)
+        startup_history = []
         for action in _STARTUP_PERCEPTION_ACTIONS:
             try:
                 observation, outcome = (
@@ -945,10 +1009,15 @@ class BlastEpisodeRuntimeAdapter:
                     observation=observation,
                     geometry_checked=geometry_checked,
                     motion_executor=motion_executor,
-                    prior_receipt=(history[-1] if history else None),
+                    prior_receipt=(
+                        startup_history[-1]
+                        if startup_history
+                        else (history[-1] if history else None)
+                    ),
                     allow_turn_no_valid_with_bounded_evidence=False,
                     context=context,
                     deadline_ms=deadline_ms,
+                    map_trace=map_trace,
                 )
             )
             if outcome is not None:
@@ -975,9 +1044,10 @@ class BlastEpisodeRuntimeAdapter:
                 execution=execution,
                 scan_pose=scan_pose,
                 motion_executor=motion_executor,
-                history=history,
+                history=startup_history,
                 map_trace=map_trace,
                 context=context,
+                published_action=_STARTUP_SURROUNDINGS_ACTION,
             )
             if action == SCAN_FRONT_ARC and new_scan_view is None:
                 return (
@@ -1022,6 +1092,32 @@ class BlastEpisodeRuntimeAdapter:
                     "surroundings coverage",
                 ),
             )
+        history.append({
+            "action": _STARTUP_SURROUNDINGS_ACTION,
+            "action_source": _STARTUP_PERCEPTION_ACTION_SOURCE,
+            "assessment": "Mandatory startup surroundings acquisition",
+            "plan": [_STARTUP_SURROUNDINGS_ACTION],
+            "result_observation": startup_history[-1][
+                "result_observation"
+            ],
+            "observation_settled": startup_history[-1][
+                "observation_settled"
+            ],
+            "pose": motion_executor.pose.to_dict(),
+            "scan_view_count": 2,
+        })
+        final_observation = startup_history[-1]["result_observation"]
+        context.publish({
+            "current_action": None,
+            "scan": None,
+            "obstacle": {
+                "distance_mm": (
+                    final_observation.get("distance_mm")
+                    if isinstance(final_observation, Mapping)
+                    else None
+                )
+            },
+        })
         (
             observation, available_actions, scan_allows_turn,
             _runtime, outcome,
@@ -1118,11 +1214,8 @@ class BlastEpisodeRuntimeAdapter:
                     mission=map_trace.mission, pose=motion_executor.pose,
                     localization_valid=motion_executor.localization_valid,
                     scan_fresh=(
-                        not any(
-                            item.get("action") == SCAN_FRONT_ARC
-                            for item in history
-                        )
-                        or self._scan_is_current(history)
+                        not self._has_scan_evidence(history)
+                        or self._scan_evidence_is_fresh(history)
                     ),
                 )
                 if not available_actions and not completion_allowed:
@@ -1205,6 +1298,7 @@ class BlastEpisodeRuntimeAdapter:
                     ),
                     context=context,
                     deadline_ms=deadline_ms,
+                    map_trace=map_trace,
                 )
                 if outcome is not None:
                     return outcome

@@ -3097,6 +3097,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
                     )
 
                 self.assertEqual(raised.exception.code, error_code)
+                self.assertIs(raised.exception.motion_started, True)
                 runtime = FakeRuntime.instances[0]
                 self.assertEqual(
                     len([
@@ -3363,6 +3364,64 @@ class BlastObservationMonitorTests(unittest.TestCase):
                     unsettled_call != 17,
                 )
                 monitor.close()
+
+    def test_safe_unsettled_left_ray_keeps_right_half_visible(self):
+        class SoftLeftEvidenceMonitor(BlastObservationMonitor):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.settle_calls = 0
+
+            async def _observe_until_settled(
+                self,
+                runtime,
+                *,
+                generation,
+                initial_observation,
+                timeout_seconds=None,
+            ):
+                self.settle_calls += 1
+                # The first left ray and its matching return sample are
+                # evidence-poor, but the stopped sweep window is still safe.
+                if self.settle_calls in (2, 8):
+                    self._settling_samples = (
+                        (1_400.0, 0.0, 0.0),
+                    ) * 5
+                    return initial_observation, False
+                return initial_observation, True
+
+        monitor = SoftLeftEvidenceMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=FakeRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+
+        result = monitor.command(
+            SCAN_COMMAND,
+            action_permit=self.measured_scan_permit(monitor),
+        )
+
+        rays = {
+            ray["side"]: ray for ray in result["scan"]["angular_rays"]
+        }
+        self.assertFalse(rays["left_1"]["observation_settled"])
+        self.assertEqual(
+            rays["left_1"]["evidence_use"],
+            SCAN_RAY_EVIDENCE_SWEEP_ONLY,
+        )
+        self.assertTrue(all(
+            rays["right_{}".format(index)]["observation_settled"]
+            for index in range(1, 5)
+        ))
+        runtime = FakeRuntime.instances[0]
+        self.assertEqual(
+            len([
+                call for call in runtime.calls
+                if call[0] == "turn_pulse"
+            ]),
+            16,
+        )
+        monitor.close()
 
     def test_sweep_only_window_rejects_each_pose_and_range_fault(self):
         monitor = BlastObservationMonitor(runtime_factory=FakeRuntime)

@@ -1168,29 +1168,38 @@ class BlastObservationMonitor:
                 motion_started=False,
             )
         receipt = await runtime.scan_turn_pulse(direction)
-        observation = await self._observe_until_idle(
-            runtime,
-            generation=generation,
-            stop_only=False,
-        )
+        try:
+            observation = await self._observe_until_idle(
+                runtime,
+                generation=generation,
+                stop_only=False,
+            )
+        except BlastControllerError as error:
+            error.motion_started = True
+            raise
         settle_attempts = 2 if retry_unsettled else 1
         for _attempt in range(settle_attempts):
-            observation, observation_settled = (
-                await self._observe_until_settled(
-                    runtime,
-                    generation=generation,
-                    initial_observation=observation,
-                    timeout_seconds=(
-                        SCAN_PULSE_POST_MOTION_SETTLE_TIMEOUT_SECONDS
-                    ),
+            try:
+                observation, observation_settled = (
+                    await self._observe_until_settled(
+                        runtime,
+                        generation=generation,
+                        initial_observation=observation,
+                        timeout_seconds=(
+                            SCAN_PULSE_POST_MOTION_SETTLE_TIMEOUT_SECONDS
+                        ),
+                    )
                 )
-            )
+            except BlastControllerError as error:
+                error.motion_started = True
+                raise
             if observation_settled is True:
                 break
             if not self._scan_sweep_window_allows_continuation(observation):
                 raise BlastControllerError(
                     "scan_sweep_observation_unverified",
                     "BLAST scan could not settle safely between turn pulses",
+                    motion_started=True,
                 )
         distance = observation.get("distance_mm")
         sweep_only = observation_settled is not True
@@ -1250,12 +1259,14 @@ class BlastObservationMonitor:
             raise BlastControllerError(
                 "scan_sweep_observation_unverified",
                 "BLAST scan lost correlated encoder or sensor-pose evidence",
+                motion_started=True,
             )
         range_state = blast_range_state(distance)
         if range_state == RANGE_STATE_INVALID:
             raise BlastControllerError(
                 "scan_sweep_observation_unverified",
                 "BLAST scan received invalid settled range evidence",
+                motion_started=True,
             )
         if range_state == RANGE_STATE_MEASURED and float(distance) <= (
             BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
@@ -1264,6 +1275,7 @@ class BlastObservationMonitor:
             raise BlastControllerError(
                 "scan_sweep_clearance_lost",
                 "BLAST scan stopped after a close settled observation",
+                motion_started=True,
             )
         return (
             receipt,
@@ -1414,6 +1426,7 @@ class BlastObservationMonitor:
             raise BlastControllerError(
                 "scan_sweep_observation_unverified",
                 "BLAST scan encoder geometry was invalid",
+                motion_started=True,
             ) from error
         return {
             "schema": COMMAND_RESULT_SCHEMA,

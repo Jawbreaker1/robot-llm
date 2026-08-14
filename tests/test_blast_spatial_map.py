@@ -108,6 +108,27 @@ class BlastSpatialMapBridgeTests(TestCase):
             "ASYMMETRIC_RECTANGLE",
         )
 
+    def test_failed_scan_marks_stale_pose_as_localization_lost(self):
+        bridge = self.bridge()
+        bridge.begin_episode(
+            episode_id="episode-a",
+            pose=PhysicalPose(),
+            observation=observation(),
+        )
+
+        self.assertTrue(bridge.invalidate_localization(
+            episode_id="episode-a",
+        ))
+
+        value = bridge.snapshot()
+        self.assertEqual(value["status"], "unavailable")
+        self.assertEqual(value["reason_code"], "localization_lost")
+        self.assertIsNone(value["robot_pose"])
+        self.assertFalse(value["localization"]["valid"])
+        self.assertFalse(bridge.invalidate_localization(
+            episode_id="wrong-episode",
+        ))
+
     def test_pose_history_is_detached_bounded_and_resets_per_episode(self):
         bridge = self.bridge()
         bridge.begin_episode(

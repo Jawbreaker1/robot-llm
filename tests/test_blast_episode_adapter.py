@@ -535,12 +535,13 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
     def test_startup_perception_precedes_first_planner_decision(self):
         controller = FakeScanController(500)
         planner = Planner([decision(ADVANCE)])
+        context, updates = episode_context()
 
         result = self.adapter(
             controller, planner,
             max_decisions=1,
             startup_perception=True,
-        ).run(episode_context()[0])
+        ).run(context)
 
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertEqual(len(planner.contexts), 1)
@@ -556,20 +557,38 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         first = planner.contexts[0]
         self.assertEqual(
-            [item["action"] for item in first.history[:6]],
-            [
-                SCAN_FRONT_ARC,
-                TURN_LEFT_90,
-                TURN_LEFT_90,
-                SCAN_FRONT_ARC,
-                TURN_RIGHT_90,
-                TURN_RIGHT_90,
-            ],
+            [item["action"] for item in first.history],
+            ["SCAN_SURROUNDINGS"],
         )
-        self.assertTrue(all(
-            item["action_source"] == "STARTUP_PERCEPTION"
-            for item in first.history[:6]
-        ))
+        self.assertEqual(
+            first.history[0]["action_source"], "STARTUP_PERCEPTION",
+        )
+        self.assertEqual(first.history[0]["scan_view_count"], 2)
+        published_actions = [
+            update.get("current_action") for update in updates
+            if "current_action" in update
+        ]
+        self.assertNotIn(TURN_LEFT_90, published_actions)
+        self.assertNotIn(TURN_RIGHT_90, published_actions)
+        self.assertIn("SCAN_SURROUNDINGS", published_actions)
+        self.assertIsNone([
+            update["scan"] for update in updates if "scan" in update
+        ][-1])
+        self.assertNotIn(SCAN_FRONT_ARC, first.available_actions)
+        self.assertIn(ADVANCE, first.available_actions)
+        self.assertIn(TURN_LEFT_90, first.available_actions)
+        self.assertIn(TURN_RIGHT_90, first.available_actions)
+        self.assertTrue(
+            BlastEpisodeRuntimeAdapter._scan_evidence_is_fresh(
+                first.history,
+            )
+        )
+        self.assertFalse(
+            BlastEpisodeRuntimeAdapter._scan_evidence_is_fresh((
+                *first.history,
+                {"action": ADVANCE},
+            ))
+        )
         self.assertEqual(len(first.local_map_evidence["scan_views"]), 2)
         self.assertEqual(
             first.local_map_evidence["robot_pose"]["x_mm"], 0,
@@ -740,6 +759,46 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             ],
             recorded[-1]["pose"]["heading_mdeg"],
         )
+
+    def test_failed_startup_scan_marks_map_localization_lost(self):
+        class FailedScan(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                if command != "scan_front_arc":
+                    return super().command(
+                        command, cancel_requested=cancel_requested,
+                    )
+                self.commands.append(command)
+                motors = self.snapshot_value["observation"][
+                    "motor_angles_deg"
+                ]
+                motors["left_drive"] -= 45
+                motors["right_drive"] += 45
+                raise BlastControllerError(
+                    "scan_sweep_clearance_lost",
+                    "injected post-pulse scan failure",
+                    motion_started=True,
+                )
+
+        controller = FailedScan(500)
+        planner = Planner([decision(ADVANCE)])
+        adapter = self.adapter(
+            controller, planner, startup_perception=True,
+        )
+
+        result = adapter.run(episode_context()[0])
+
+        self.assertEqual(
+            result.terminal_reason,
+            "blast_startup_perception_incomplete",
+        )
+        self.assertEqual(planner.contexts, [])
+        spatial_map = adapter.spatial_map_provider.snapshot()
+        self.assertEqual(spatial_map["status"], "unavailable")
+        self.assertEqual(
+            spatial_map["reason_code"], "localization_lost",
+        )
+        self.assertIsNone(spatial_map["robot_pose"])
+        self.assertFalse(spatial_map["localization"]["valid"])
 
     def test_speech_configuration_is_explicit_composition_metadata(self):
         factory = lambda **_kwargs: object()
@@ -1963,14 +2022,16 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 return result
 
         planner = Planner([decision(SCAN_FRONT_ARC)])
+        adapter = self.adapter(LegacyScanController(), planner)
 
         with self.assertRaises(BlastEpisodeError) as rejected:
-            self.adapter(LegacyScanController(), planner).run(
-                episode_context()[0]
-            )
+            adapter.run(episode_context()[0])
 
         self.assertEqual(rejected.exception.code, "blast_scan_result_invalid")
         self.assertEqual(len(planner.contexts), 1)
+        spatial_map = adapter.spatial_map_provider.snapshot()
+        self.assertEqual(spatial_map["reason_code"], "localization_lost")
+        self.assertIsNone(spatial_map["robot_pose"])
 
     def test_malformed_canonical_ray_with_dense_scan_fails_closed(self):
         class MalformedDenseScanController(FakeScanController):

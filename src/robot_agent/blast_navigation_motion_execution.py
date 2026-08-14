@@ -127,6 +127,11 @@ class BlastNavigationMotionExecutor:
         self._localization_valid = False
         _fail(code, message)
 
+    def invalidate_after_failed_scan(self) -> None:
+        """Refuse further odometry claims after ambiguous scan motion."""
+
+        self._localization_valid = False
+
     def _validated_result(self, action, results):
         final_observation = results[-1].get("observation")
         final_angles = _encoder_angles(final_observation)
