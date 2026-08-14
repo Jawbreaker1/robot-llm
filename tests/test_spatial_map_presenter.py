@@ -119,6 +119,8 @@ const map = {
       origin_x_mm: 0, origin_y_mm: 0, target_x_mm: 420, target_y_mm: 0,
       desired_heading_mdeg: 0, minimum_forward_progress_mm: 420,
       heading_tolerance_mdeg: 5000, current_forward_progress_mm: 45,
+      current_lateral_offset_mm: -225,
+      goal_radius_mm: 120, distance_to_goal_mm: 437,
       remaining_forward_progress_mm: 375 },
     planned_leg: { kind: "REACQUIRE_GOAL_HEADING",
       scope: "LOCAL_DETOUR_ROUTE", clearance_proven: false,
@@ -1127,11 +1129,18 @@ for (const filename of process.argv.slice(1)) {
 const translations = {
   "common.missing": "—",
   "map.navigation_trace.final_goal_title": "FINAL GOAL",
+  "map.navigation_trace.goal_distance": ({ distance, radius }) => (
+    `DISTANCE ${distance} RADIUS ${radius}`
+  ),
   "map.navigation_trace.goal_progress": ({ current, target, remaining }) => (
     `${current}/${target}/${remaining}`
   ),
   "map.navigation_trace.goal_heading": ({ heading }) => `GOAL ${heading}`,
-  "map.navigation_trace.final_goal_label": ({ heading }) => `FINAL ${heading}`,
+  "map.navigation_trace.final_goal_label": ({ distance }) => `GOAL ${distance}`,
+  "map.navigation_trace.advisory_waypoint_label": "GEMMA WAYPOINT",
+  "map.navigation_trace.advisory_waypoint_pose": ({ x, y }) => `${x}/${y}`,
+  "map.navigation_trace.advisory_waypoint_read_only": "READ ONLY",
+  "map.navigation_trace.advisory_waypoint_title": "ADVISORY WAYPOINT",
   "map.navigation_trace.planned_leg_title": ({ side }) => `PLAN ${side}`,
   "map.navigation_trace.search_position_only": "SEARCH POSITION ONLY",
   "map.navigation_trace.planned_waypoint_label": "WAYPOINT",
@@ -1196,7 +1205,10 @@ const trace = {
     minimum_forward_progress_mm: 600,
     heading_tolerance_mdeg: 5000,
     current_forward_progress_mm: 20,
+    current_lateral_offset_mm: 210,
     remaining_forward_progress_mm: 580,
+    goal_radius_mm: 120,
+    distance_to_goal_mm: 617,
   },
   imu_heading: {
     heading_mdeg: 95000,
@@ -1212,6 +1224,13 @@ const trace = {
     selected_side: "LEFT",
     bind_pose: { x_mm: 0, y_mm: 0, heading_mdeg: 90000 },
     waypoint: { x_mm: 0, y_mm: 225, heading_mdeg: 90000 },
+  },
+  advisory_waypoint: {
+    x_mm: 120,
+    y_mm: -280,
+    purpose: "Pass the obstacle on its open right side",
+    source: "GEMMA_MODEL",
+    read_only: true,
   },
   planar_scan_views: [scan],
 };
@@ -1275,6 +1294,9 @@ process.stdout.write(JSON.stringify({
     && Object.isFrozen(renderedMap.navigationTrace.planarScanViews),
   layerAttributes: nodes["map-local-odometry-layer"].attributes,
   goalAttributes: byClass("map-final-goal").attributes,
+  goalZoneAttributes: byClass("map-final-goal-zone").attributes,
+  advisoryAttributes: byClass("map-advisory-waypoint").attributes,
+  hasAdvisoryMarker: Boolean(byClass("map-advisory-waypoint-marker")),
   legAttributes: byClass("map-planned-leg").attributes,
   imuAttributes: byClass("map-local-imu-heading").attributes,
   rayAttributes: byClass("map-blast-scan-ray").attributes,
@@ -1318,6 +1340,15 @@ process.stdout.write(JSON.stringify({
             "580",
         )
         self.assertEqual(
+            result["goalAttributes"]["data-distance-to-goal-mm"],
+            "617",
+        )
+        self.assertEqual(
+            result["goalAttributes"]["data-goal-radius-mm"],
+            "120",
+        )
+        self.assertGreater(float(result["goalZoneAttributes"]["r"]), 11)
+        self.assertEqual(
             result["goalAttributes"]["data-navigation-enforced"],
             "false",
         )
@@ -1331,6 +1362,12 @@ process.stdout.write(JSON.stringify({
         )
         self.assertEqual(result["imuAttributes"]["data-heading-mdeg"], "95000")
         self.assertEqual(
+            result["advisoryAttributes"]["data-source"],
+            "GEMMA_MODEL",
+        )
+        self.assertEqual(result["advisoryAttributes"]["data-read-only"], "true")
+        self.assertTrue(result["hasAdvisoryMarker"])
+        self.assertEqual(
             result["rayAttributes"]["data-quality"],
             "PROVISIONAL_YAW_ONLY",
         )
@@ -1342,6 +1379,7 @@ process.stdout.write(JSON.stringify({
         self.assertAlmostEqual(result["distanceRatio"], 2 / 3)
         self.assertIn("PROVISIONAL_ENCODER_ODOMETRY", result["localText"])
         self.assertIn("SEARCH POSITION ONLY", result["localText"])
+        self.assertIn("GEMMA WAYPOINT", result["localText"])
         self.assertIsNone(result["invalidFrame"])
         self.assertIsNone(result["invalidEcho"])
         self.assertIsNone(result["overCapacity"])
@@ -1493,7 +1531,10 @@ blast.navigation_trace = {
     minimum_forward_progress_mm: 600,
     heading_tolerance_mdeg: 5000,
     current_forward_progress_mm: 200,
+    current_lateral_offset_mm: 0,
     remaining_forward_progress_mm: 400,
+    goal_radius_mm: 120,
+    distance_to_goal_mm: 400,
   },
   imu_heading: null,
   planned_leg: {

@@ -42,6 +42,7 @@ _NAVIGATION_TRACE_FIELDS = (
     "final_goal",
     "imu_heading",
     "planned_leg",
+    "advisory_waypoint",
     "planar_scan_views",
 )
 _NAVIGATION_TRACE_ROUTE_FIELD = "local_detour_route"
@@ -299,6 +300,7 @@ def _transform_navigation_trace(
         value.get("planar_scan_views"),
         captured_at_unix_ms,
         value.get(_NAVIGATION_TRACE_ROUTE_FIELD),
+        value.get("advisory_waypoint"),
     ):
         raise _SourceUnavailable("source_navigation_trace_invalid")
 
@@ -339,6 +341,16 @@ def _transform_navigation_trace(
         planned_leg["waypoint"] = _transform_trace_pose(
             planned_leg["waypoint"], transform
         )
+
+    advisory_waypoint = value["advisory_waypoint"]
+    if advisory_waypoint is not None:
+        advisory_waypoint = dict(advisory_waypoint)
+        x_mm, y_mm = _transform_trace_point(
+            advisory_waypoint["x_mm"],
+            advisory_waypoint["y_mm"],
+            transform,
+        )
+        advisory_waypoint.update({"x_mm": x_mm, "y_mm": y_mm})
 
     local_detour_route = value.get(_NAVIGATION_TRACE_ROUTE_FIELD)
     if local_detour_route is not None:
@@ -406,6 +418,7 @@ def _transform_navigation_trace(
         "final_goal": final_goal,
         "imu_heading": imu_heading,
         "planned_leg": planned_leg,
+        "advisory_waypoint": advisory_waypoint,
         "planar_scan_views": planar_scan_views,
     }
     if _NAVIGATION_TRACE_ROUTE_FIELD in value:

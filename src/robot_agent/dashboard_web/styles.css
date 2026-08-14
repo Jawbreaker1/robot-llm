@@ -2230,6 +2230,13 @@ textarea:focus-visible,
   stroke-width: 3;
 }
 
+.map-final-goal-zone {
+  fill: rgb(242 184 75 / 10%);
+  stroke: var(--warning);
+  stroke-dasharray: 8 6;
+  stroke-width: 3;
+}
+
 .map-final-goal-target {
   fill: rgb(242 184 75 / 20%);
   stroke: var(--warning);
@@ -2282,6 +2289,19 @@ textarea:focus-visible,
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 3;
+}
+
+.map-advisory-waypoint-line {
+  stroke: var(--model);
+  stroke-dasharray: 7 6;
+  stroke-linecap: round;
+  stroke-width: 3;
+}
+
+.map-advisory-waypoint-marker {
+  fill: rgb(122 162 247 / 22%);
+  stroke: var(--model);
+  stroke-width: 4;
 }
 
 .map-planned-leg[data-route-eligible="true"] .map-planned-leg-line {
@@ -2413,6 +2433,11 @@ textarea:focus-visible,
 
 .map-planned-waypoint-label {
   fill: var(--model);
+}
+
+.map-advisory-waypoint-label {
+  fill: var(--model);
+  font-size: 11px;
 }
 
 .map-blast-scan-label {
@@ -2649,8 +2674,11 @@ textarea:focus-visible,
 .map-shared-navigation-trace[data-provisional="true"]
   :is(
     .map-final-goal-line,
+    .map-final-goal-zone,
     .map-final-goal-heading,
     .map-final-goal-target,
+    .map-advisory-waypoint-line,
+    .map-advisory-waypoint-marker,
     .map-planned-leg-line,
     .map-planned-leg-bind,
     .map-planned-waypoint,
@@ -2667,6 +2695,8 @@ textarea:focus-visible,
 .map-shared-navigation-trace[data-provisional="true"]
   :is(
     .map-final-goal-target,
+    .map-final-goal-zone,
+    .map-advisory-waypoint-marker,
     .map-planned-leg-bind,
     .map-planned-waypoint,
     .map-local-detour-waypoint-marker,
@@ -2804,7 +2834,11 @@ textarea:focus-visible,
 }
 
 .legend-planned-leg {
-  border-top: 3px dashed var(--model);
+  width: 10px;
+  height: 10px;
+  background: rgb(122 162 247 / 22%);
+  border: 2px solid var(--model);
+  transform: rotate(45deg);
 }
 
 .legend-imu-heading {

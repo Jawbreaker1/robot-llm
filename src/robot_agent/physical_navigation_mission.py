@@ -75,6 +75,26 @@ class DirectionalMission:
             )
         )
 
+    def target_point(self) -> tuple[int, int]:
+        heading = math.radians(self.reference_heading_mdeg / 1000.0)
+        return (
+            int(round(
+                self.origin_x_mm
+                + self.minimum_forward_progress_mm * math.cos(heading)
+            )),
+            int(round(
+                self.origin_y_mm
+                + self.minimum_forward_progress_mm * math.sin(heading)
+            )),
+        )
+
+    def distance_to_target_mm(self, pose: PhysicalPose) -> int:
+        target_x, target_y = self.target_point()
+        return int(round(math.hypot(
+            target_x - pose.x_mm,
+            target_y - pose.y_mm,
+        )))
+
     def heading_aligned(self, pose: PhysicalPose) -> bool:
         return (
             abs(

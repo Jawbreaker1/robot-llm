@@ -1370,6 +1370,11 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(planner.contexts[1].active_waypoint, waypoint)
         self.assertIsNot(planner.contexts[1].active_waypoint, waypoint)
         trace = adapter.spatial_map_provider.snapshot()["navigation_trace"]
+        self.assertEqual(trace["advisory_waypoint"], {
+            **waypoint,
+            "source": "GEMMA_MODEL",
+            "read_only": True,
+        })
         self.assertIsNone(trace["planned_leg"])
         self.assertIsNone(trace["local_detour_route"])
         self.assertFalse(trace["final_goal"]["navigation_enforced"])
@@ -1491,7 +1496,13 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertFalse(blast_directional_completion_allowed(
             mission=mission,
-            pose=PhysicalPose(x_mm=419),
+            pose=PhysicalPose(x_mm=299),
+            localization_valid=True,
+            scan_fresh=True,
+        ))
+        self.assertFalse(blast_directional_completion_allowed(
+            mission=mission,
+            pose=PhysicalPose(x_mm=420, y_mm=121),
             localization_valid=True,
             scan_fresh=True,
         ))
@@ -1515,7 +1526,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         ))
         self.assertTrue(blast_directional_completion_allowed(
             mission=mission,
-            pose=PhysicalPose(x_mm=420),
+            pose=PhysicalPose(x_mm=420, y_mm=120),
             localization_valid=True,
             scan_fresh=True,
         ))
@@ -1537,7 +1548,8 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(result.completed)
         self.assertEqual(result.terminal_reason, "completed")
         self.assertEqual(controller.commands, ["drive_forward"] * 10)
-        self.assertFalse(planner.contexts[-2].completion_allowed)
+        self.assertFalse(planner.contexts[6].completion_allowed)
+        self.assertTrue(planner.contexts[7].completion_allowed)
         self.assertTrue(planner.contexts[-1].completion_allowed)
         self.assertEqual(
             planner.contexts[-1].observation["odometry"]["x_mm"],

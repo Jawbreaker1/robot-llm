@@ -8,6 +8,10 @@ from typing import Mapping
 from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
 )
+from .blast_mission_completion import (
+    BLAST_GOAL_HEADING_TOLERANCE_MDEG,
+    BLAST_GOAL_RADIUS_MM,
+)
 from .blast_side_observation import side_search_planned_leg
 from .blast_spatial_map import MAX_PLANAR_SCAN_VIEWS
 from .local_detour_route import ROUTE_ACTIVE, ROUTE_COMPLETE, ROUTE_INVALID
@@ -53,8 +57,10 @@ class _BlastEpisodeMapTrace:
             episode_id=episode_id,
             minimum_forward_progress_mm=minimum_forward_progress_mm,
             pose=pose,
+            heading_tolerance_mdeg=BLAST_GOAL_HEADING_TOLERANCE_MDEG,
         )
         self.navigation_enforced = False
+        self.advisory_waypoint = None
         self.planned_leg = None
         self.planar_scan_views = []
         self._scan_sequence = 0
@@ -77,26 +83,23 @@ class _BlastEpisodeMapTrace:
             return False
 
     def _final_goal(self, pose):
-        heading = math.radians(
-            self.mission.reference_heading_mdeg / 1_000.0
-        )
         distance = self.mission.minimum_forward_progress_mm
         current = self.mission.longitudinal_progress_mm(pose)
+        target_x, target_y = self.mission.target_point()
         return {
             "kind": "DIRECTIONAL_HEADING",
             "navigation_enforced": self.navigation_enforced,
             "origin_x_mm": self.mission.origin_x_mm,
             "origin_y_mm": self.mission.origin_y_mm,
-            "target_x_mm": int(round(
-                self.mission.origin_x_mm + distance * math.cos(heading)
-            )),
-            "target_y_mm": int(round(
-                self.mission.origin_y_mm + distance * math.sin(heading)
-            )),
+            "target_x_mm": target_x,
+            "target_y_mm": target_y,
+            "goal_radius_mm": BLAST_GOAL_RADIUS_MM,
+            "distance_to_goal_mm": self.mission.distance_to_target_mm(pose),
             "desired_heading_mdeg": self.mission.reference_heading_mdeg,
             "minimum_forward_progress_mm": distance,
             "heading_tolerance_mdeg": self.mission.heading_tolerance_mdeg,
             "current_forward_progress_mm": current,
+            "current_lateral_offset_mm": self.mission.lateral_offset_mm(pose),
             "remaining_forward_progress_mm": max(0, distance - current),
         }
 
@@ -133,6 +136,7 @@ class _BlastEpisodeMapTrace:
             episode_id=self.episode_id,
             final_goal=self._final_goal(pose),
             planned_leg=self.planned_leg,
+            advisory_waypoint=self.advisory_waypoint,
             imu_heading=self._imu_heading(
                 observation, observed_at_unix_ms
             ),
@@ -171,6 +175,8 @@ class _BlastEpisodeMapTrace:
                     for key in (
                         "target_x_mm", "target_y_mm",
                         "desired_heading_mdeg",
+                        "goal_radius_mm", "distance_to_goal_mm",
+                        "current_lateral_offset_mm",
                         "remaining_forward_progress_mm",
                     )
                 },
@@ -204,6 +210,24 @@ class _BlastEpisodeMapTrace:
             }
         except (KeyError, TypeError, ValueError):
             return None
+
+    def set_advisory_waypoint(
+        self, waypoint, *, pose, observation, observed_at_unix_ms,
+    ):
+        """Publish Gemma's memory without granting it motion authority."""
+
+        try:
+            candidate = None if waypoint is None else {
+                "x_mm": waypoint["x_mm"],
+                "y_mm": waypoint["y_mm"],
+                "purpose": waypoint["purpose"],
+                "source": "GEMMA_MODEL",
+                "read_only": True,
+            }
+        except (KeyError, TypeError):
+            return False
+        self.advisory_waypoint = candidate
+        return self._offer_trace(pose, observation, observed_at_unix_ms)
 
     def clear_planned_leg(
         self, *, pose, observation, observed_at_unix_ms=None,

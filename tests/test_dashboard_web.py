@@ -1066,33 +1066,29 @@ function ev3Button(status) {
         self.assertNotIn("map-waypoint", self.html)
         self.assertNotIn("map-stop", self.html)
 
-    def test_enforced_blast_detour_is_visibly_distinct_from_reference(self):
+    def test_blast_goal_zone_and_gemma_waypoint_are_visibly_distinct(self):
         self.assertIn(
-            '"data-navigation-enforced": String(goalEnforced)',
-            self.spatial_map_presenter,
+            '"data-distance-to-goal-mm": goal.distanceToGoalMm',
+            self.blast_map_semantics,
         )
         self.assertIn(
-            '"map.navigation_trace.final_goal_enforced_label"',
-            self.spatial_map_presenter,
+            'class: "map-final-goal-zone"',
+            self.blast_map_semantics,
         )
         self.assertIn(
-            '"map.navigation_trace.local_detour_waypoint_label"',
-            self.spatial_map_presenter,
+            'class: "map-advisory-waypoint-marker"',
+            self.blast_map_semantics,
+        )
+        self.assertIn(".map-final-goal-zone", self.css)
+        self.assertIn(".map-advisory-waypoint-marker", self.css)
+        self.assertIn(
+            "Slutmålspunkt med LEGO-anpassad målzon",
+            self.i18n,
         )
         self.assertIn(
-            '.map-final-goal[data-navigation-enforced="true"] '
-            ".map-final-goal-line",
-            self.css,
+            "Rådgivande minne; hosten väljer ingen rutt",
+            self.i18n,
         )
-        self.assertIn(
-            '.map-planned-leg[data-route-eligible="true"] '
-            ".map-planned-leg-line",
-            self.css,
-        )
-        self.assertIn("FINAL GOAL · ENFORCED", self.i18n)
-        self.assertIn("FINAL-GOAL REFERENCE · NOT ENFORCED", self.i18n)
-        self.assertIn("SLUTMÅL · STYRANDE", self.i18n)
-        self.assertIn("SLUTMÅLSREFERENS · EJ STYRANDE", self.i18n)
 
     def test_shared_navigation_traces_keep_robot_color_and_caveats(self):
         self.assertIn(

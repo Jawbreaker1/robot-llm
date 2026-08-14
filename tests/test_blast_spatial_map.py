@@ -29,7 +29,7 @@ def observation(left=0, right=0):
     }
 
 
-def final_goal(current=0, navigation_enforced=False):
+def final_goal(current=0, navigation_enforced=False, lateral=0):
     return {
         "kind": "DIRECTIONAL_HEADING",
         "navigation_enforced": navigation_enforced,
@@ -37,10 +37,13 @@ def final_goal(current=0, navigation_enforced=False):
         "origin_y_mm": 0,
         "target_x_mm": 420,
         "target_y_mm": 0,
+        "goal_radius_mm": 120,
+        "distance_to_goal_mm": round(math.hypot(420 - current, lateral)),
         "desired_heading_mdeg": 0,
         "minimum_forward_progress_mm": 420,
         "heading_tolerance_mdeg": 5_000,
         "current_forward_progress_mm": current,
+        "current_lateral_offset_mm": lateral,
         "remaining_forward_progress_mm": max(0, 420 - current),
     }
 
@@ -512,6 +515,9 @@ class BlastSpatialMapBridgeTests(TestCase):
             "target_x_mm": 420,
             "target_y_mm": 0,
             "desired_heading_mdeg": 0,
+            "goal_radius_mm": 120,
+            "distance_to_goal_mm": 375,
+            "current_lateral_offset_mm": -10,
             "remaining_forward_progress_mm": 375,
         })
         self.assertEqual(

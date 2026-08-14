@@ -854,7 +854,10 @@ const goal = {
   minimum_forward_progress_mm: 420,
   heading_tolerance_mdeg: 5000,
   current_forward_progress_mm: 45,
+  current_lateral_offset_mm: 0,
   remaining_forward_progress_mm: 375,
+  goal_radius_mm: 120,
+  distance_to_goal_mm: 375,
 };
 const sideSearch = {
   kind: "SIDE_SEARCH",
@@ -872,7 +875,12 @@ const localDetour = {
   scope: "LOCAL_DETOUR_ROUTE",
   route_eligible: true,
 };
-function mapFor(finalGoal, plannedLeg) {
+const advisory = {
+  x_mm: 120, y_mm: -280,
+  purpose: "Pass the obstacle on its open right side",
+  source: "GEMMA_MODEL", read_only: true,
+};
+function mapFor(finalGoal, plannedLeg, advisoryWaypoint = advisory) {
   return {
     schema: "robot-spatial-map/v1",
     read_only: true,
@@ -892,6 +900,7 @@ function mapFor(finalGoal, plannedLeg) {
       provenance: "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY",
       final_goal: finalGoal,
       planned_leg: plannedLeg,
+      advisory_waypoint: advisoryWaypoint,
       imu_heading: null,
       planar_scan_views: [],
     },
@@ -923,11 +932,15 @@ const mismatchedEnforced = logic.normalizeSpatialMap(mapFor(
   { ...goal, navigation_enforced: true },
   sideSearch,
 ), 2000).navigationTrace;
+const invalidAdvisory = logic.normalizeSpatialMap(mapFor(
+  goal, sideSearch, { ...advisory, read_only: false },
+), 2000).navigationTrace;
 
 process.stdout.write(JSON.stringify({
   reference: {
     navigationEnforced: reference.finalGoal.navigationEnforced,
     plannedLeg: reference.plannedLeg,
+    advisoryWaypoint: reference.advisoryWaypoint,
   },
   enforced: {
     navigationEnforced: enforced.finalGoal.navigationEnforced,
@@ -939,6 +952,7 @@ process.stdout.write(JSON.stringify({
   invalidEnforcement,
   mismatchedReference,
   mismatchedEnforced,
+  invalidAdvisory,
 }));
 """
         completed = subprocess.run(
@@ -966,6 +980,10 @@ process.stdout.write(JSON.stringify({
         self.assertFalse(
             result["reference"]["plannedLeg"]["routeEligible"]
         )
+        self.assertEqual(
+            result["reference"]["advisoryWaypoint"]["source"],
+            "GEMMA_MODEL",
+        )
         self.assertTrue(result["enforced"]["navigationEnforced"])
         self.assertEqual(
             result["enforced"]["plannedLeg"]["kind"],
@@ -990,6 +1008,7 @@ process.stdout.write(JSON.stringify({
         self.assertIsNone(result["invalidEnforcement"])
         self.assertIsNone(result["mismatchedReference"])
         self.assertIsNone(result["mismatchedEnforced"])
+        self.assertIsNone(result["invalidAdvisory"])
 
     def test_shared_map_normalization_fences_frames_and_is_bounded(self):
         script = r"""
@@ -1288,7 +1307,10 @@ const trace = {
     minimum_forward_progress_mm: 400,
     heading_tolerance_mdeg: 5000,
     current_forward_progress_mm: 50,
+    current_lateral_offset_mm: 0,
     remaining_forward_progress_mm: 350,
+    goal_radius_mm: 120,
+    distance_to_goal_mm: 350,
   },
   imu_heading: {
     reference: "EPISODE_START",
@@ -1627,7 +1649,9 @@ const trace = {
     origin_x_mm: 0, origin_y_mm: 0, target_x_mm: 420, target_y_mm: 0,
     desired_heading_mdeg: 0, minimum_forward_progress_mm: 420,
     heading_tolerance_mdeg: 5000, current_forward_progress_mm: 45,
+    current_lateral_offset_mm: 0,
     remaining_forward_progress_mm: 375,
+    goal_radius_mm: 120, distance_to_goal_mm: 375,
   },
   planned_leg: {
     kind: "REACQUIRE_GOAL_HEADING", scope: "LOCAL_DETOUR_ROUTE",

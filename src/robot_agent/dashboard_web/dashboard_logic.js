@@ -149,75 +149,14 @@
   }
 
   function normalizeFinalGoal(value, geometryToleranceMm = 1.5) {
-    const goal = record(value);
-    const originX = localCoordinate(goal.origin_x_mm);
-    const originY = localCoordinate(goal.origin_y_mm);
-    const targetX = localCoordinate(goal.target_x_mm);
-    const targetY = localCoordinate(goal.target_y_mm);
-    const desiredHeadingMdeg = localHeading(
-      goal.desired_heading_mdeg,
+    return blastMapSemantics.normalizeFinalGoal(
+      value, geometryToleranceMm,
+      {
+        record, coordinate: localCoordinate, heading: localHeading,
+        positive, nonnegativeInteger,
+        maxCoordinateMm: MAX_LOCAL_COORDINATE_MM,
+      },
     );
-    const minimumForwardProgressMm = positive(
-      goal.minimum_forward_progress_mm,
-    );
-    const headingToleranceMdeg = positive(
-      goal.heading_tolerance_mdeg,
-    );
-    const currentForwardProgressMm = finite(
-      goal.current_forward_progress_mm,
-    );
-    const remainingForwardProgressMm = finite(
-      goal.remaining_forward_progress_mm,
-    );
-    if (
-      goal.kind !== "DIRECTIONAL_HEADING"
-      || typeof goal.navigation_enforced !== "boolean"
-      || originX === null
-      || originY === null
-      || targetX === null
-      || targetY === null
-      || desiredHeadingMdeg === null
-      || minimumForwardProgressMm === null
-      || minimumForwardProgressMm > MAX_LOCAL_COORDINATE_MM
-      || headingToleranceMdeg === null
-      || headingToleranceMdeg > 180000
-      || currentForwardProgressMm === null
-      || Math.abs(currentForwardProgressMm) > MAX_LOCAL_COORDINATE_MM
-      || remainingForwardProgressMm === null
-      || remainingForwardProgressMm < 0
-      || remainingForwardProgressMm > MAX_LOCAL_COORDINATE_MM
-    ) {
-      return null;
-    }
-    const headingRadians = desiredHeadingMdeg / 1000 * Math.PI / 180;
-    const expectedTargetX = originX
-      + minimumForwardProgressMm * Math.cos(headingRadians);
-    const expectedTargetY = originY
-      + minimumForwardProgressMm * Math.sin(headingRadians);
-    const expectedRemaining = Math.max(
-      0,
-      minimumForwardProgressMm - currentForwardProgressMm,
-    );
-    if (
-      Math.abs(targetX - expectedTargetX) > geometryToleranceMm
-      || Math.abs(targetY - expectedTargetY) > geometryToleranceMm
-      || Math.abs(remainingForwardProgressMm - expectedRemaining) > 1
-    ) {
-      return null;
-    }
-    return Object.freeze({
-      kind: "DIRECTIONAL_HEADING",
-      navigationEnforced: goal.navigation_enforced,
-      originX,
-      originY,
-      targetX,
-      targetY,
-      desiredHeadingMdeg,
-      minimumForwardProgressMm,
-      headingToleranceMdeg,
-      currentForwardProgressMm,
-      remainingForwardProgressMm,
-    });
   }
 
   function normalizeImuHeading(value, nowUnixMs) {
@@ -417,6 +356,10 @@
       trace.local_detour_route,
       { record, identifier, nonnegativeInteger, normalizeTracePose },
     );
+    const advisoryWaypoint = blastMapSemantics.normalizeAdvisoryWaypoint(
+      trace.advisory_waypoint,
+      { record, coordinate: localCoordinate, strictText },
+    );
     const transformProvenance = shared
       ? trace.transform_provenance
       : null;
@@ -450,6 +393,7 @@
       || imuHeading === undefined
       || plannedLeg === undefined
       || localDetourRoute === undefined
+      || advisoryWaypoint === undefined
       || (
         plannedLeg?.scope === "SEARCH_POSITION_ONLY"
         && finalGoal.navigationEnforced !== false
@@ -501,6 +445,7 @@
       finalGoal,
       imuHeading,
       plannedLeg,
+      advisoryWaypoint,
       localDetourRoute,
       planarScanViews: Object.freeze(planarScanViews),
     });

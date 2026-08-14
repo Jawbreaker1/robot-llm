@@ -25,6 +25,17 @@
     "ordinal", "kind", "x_mm", "y_mm", "heading_mdeg", "fact_key",
     "status",
   ]);
+  const FINAL_GOAL_FIELDS = Object.freeze([
+    "kind", "navigation_enforced", "origin_x_mm", "origin_y_mm",
+    "target_x_mm", "target_y_mm", "goal_radius_mm",
+    "distance_to_goal_mm", "desired_heading_mdeg",
+    "minimum_forward_progress_mm", "heading_tolerance_mdeg",
+    "current_forward_progress_mm", "current_lateral_offset_mm",
+    "remaining_forward_progress_mm",
+  ]);
+  const ADVISORY_WAYPOINT_FIELDS = Object.freeze([
+    "x_mm", "y_mm", "purpose", "source", "read_only",
+  ]);
   const SCAN_SIDES = new Set([
     "center", "left_near", "left_far", "right_near", "right_far",
     "left_1", "left_2", "left_3", "left_4",
@@ -90,6 +101,87 @@
       provisional: true, routeId, version, status: route.status,
       detourSide: route.detour_side, activeIndex,
       waypoints: Object.freeze(waypoints),
+    });
+  }
+
+  function normalizeFinalGoal(value, geometryToleranceMm, helpers) {
+    const goal = helpers.record(value);
+    const originX = helpers.coordinate(goal.origin_x_mm);
+    const originY = helpers.coordinate(goal.origin_y_mm);
+    const targetX = helpers.coordinate(goal.target_x_mm);
+    const targetY = helpers.coordinate(goal.target_y_mm);
+    const desiredHeadingMdeg = helpers.heading(goal.desired_heading_mdeg);
+    const minimumForwardProgressMm = helpers.positive(
+      goal.minimum_forward_progress_mm,
+    );
+    const headingToleranceMdeg = helpers.positive(
+      goal.heading_tolerance_mdeg,
+    );
+    const currentForwardProgressMm = helpers.coordinate(
+      goal.current_forward_progress_mm,
+    );
+    const currentLateralOffsetMm = helpers.coordinate(
+      goal.current_lateral_offset_mm,
+    );
+    const remainingForwardProgressMm = helpers.nonnegativeInteger(
+      goal.remaining_forward_progress_mm,
+    );
+    const distanceToGoalMm = helpers.nonnegativeInteger(
+      goal.distance_to_goal_mm,
+    );
+    const goalRadiusMm = helpers.nonnegativeInteger(goal.goal_radius_mm);
+    if (
+      !hasExactFields(goal, FINAL_GOAL_FIELDS)
+      || goal.kind !== "DIRECTIONAL_HEADING"
+      || typeof goal.navigation_enforced !== "boolean"
+      || [originX, originY, targetX, targetY, desiredHeadingMdeg,
+        minimumForwardProgressMm, headingToleranceMdeg,
+        currentForwardProgressMm, currentLateralOffsetMm,
+        remainingForwardProgressMm, distanceToGoalMm,
+        goalRadiusMm].some((item) => item === null)
+      || minimumForwardProgressMm > helpers.maxCoordinateMm
+      || headingToleranceMdeg > 180000
+      || goalRadiusMm < 45 || goalRadiusMm > 500
+      || distanceToGoalMm > 2 * helpers.maxCoordinateMm
+    ) return null;
+    const heading = desiredHeadingMdeg / 1000 * Math.PI / 180;
+    const expectedX = originX + minimumForwardProgressMm * Math.cos(heading);
+    const expectedY = originY + minimumForwardProgressMm * Math.sin(heading);
+    const expectedRemaining = Math.max(
+      0, minimumForwardProgressMm - currentForwardProgressMm,
+    );
+    const expectedDistance = Math.round(Math.hypot(
+      minimumForwardProgressMm - currentForwardProgressMm,
+      currentLateralOffsetMm,
+    ));
+    if (
+      Math.abs(targetX - expectedX) > geometryToleranceMm
+      || Math.abs(targetY - expectedY) > geometryToleranceMm
+      || Math.abs(remainingForwardProgressMm - expectedRemaining) > 1
+      || Math.abs(distanceToGoalMm - expectedDistance) > 1
+    ) return null;
+    return Object.freeze({
+      kind: goal.kind, navigationEnforced: goal.navigation_enforced,
+      originX, originY, targetX, targetY, goalRadiusMm, distanceToGoalMm,
+      desiredHeadingMdeg, minimumForwardProgressMm, headingToleranceMdeg,
+      currentForwardProgressMm, currentLateralOffsetMm,
+      remainingForwardProgressMm,
+    });
+  }
+
+  function normalizeAdvisoryWaypoint(value, helpers) {
+    if (value === null || value === undefined) return null;
+    const waypoint = helpers.record(value);
+    const xMm = helpers.coordinate(waypoint.x_mm);
+    const yMm = helpers.coordinate(waypoint.y_mm);
+    const purpose = helpers.strictText(waypoint.purpose, 120);
+    if (
+      !hasExactFields(waypoint, ADVISORY_WAYPOINT_FIELDS)
+      || xMm === null || yMm === null || purpose === null
+      || waypoint.source !== "GEMMA_MODEL" || waypoint.read_only !== true
+    ) return undefined;
+    return Object.freeze({
+      xMm, yMm, purpose, source: "GEMMA_MODEL", readOnly: true,
     });
   }
 
@@ -177,6 +269,18 @@
     route.waypoints.forEach((item) => addPoint(item.xMm, item.yMm));
   }
 
+  function appendGoalPoints(goal, addPoint) {
+    addPoint(goal.originX, goal.originY);
+    addPoint(goal.targetX - goal.goalRadiusMm, goal.targetY);
+    addPoint(goal.targetX + goal.goalRadiusMm, goal.targetY);
+    addPoint(goal.targetX, goal.targetY - goal.goalRadiusMm);
+    addPoint(goal.targetX, goal.targetY + goal.goalRadiusMm);
+  }
+
+  function appendAdvisoryWaypointPoint(waypoint, addPoint) {
+    if (waypoint) addPoint(waypoint.xMm, waypoint.yMm);
+  }
+
   function appendObstaclePoints(hypothesis, addPoint) {
     if (hypothesis?.classification !== CLASSIFICATION) return;
     const { xMm, yMm, supportRadiusMm: radius } = hypothesis;
@@ -252,6 +356,112 @@
     layer.appendChild(group);
   }
 
+  function renderGoal(layer, goal, projection, ui) {
+    const origin = projection.point(goal.originX, goal.originY);
+    const target = projection.point(goal.targetX, goal.targetY);
+    const edge = projection.point(
+      goal.targetX + goal.goalRadiusMm, goal.targetY,
+    );
+    const radius = Math.max(8, Math.abs(edge.x - target.x));
+    const enforced = goal.navigationEnforced === true;
+    const group = ui.svg("g", {
+      class: "map-final-goal", "data-kind": goal.kind,
+      "data-navigation-enforced": String(enforced),
+      "data-goal-radius-mm": goal.goalRadiusMm,
+      "data-distance-to-goal-mm": goal.distanceToGoalMm,
+      "data-current-lateral-offset-mm": goal.currentLateralOffsetMm,
+      "data-minimum-forward-progress-mm": goal.minimumForwardProgressMm,
+      "data-current-forward-progress-mm": goal.currentForwardProgressMm,
+      "data-remaining-forward-progress-mm": goal.remainingForwardProgressMm,
+      "data-desired-heading-mdeg": goal.desiredHeadingMdeg,
+      "data-heading-tolerance-mdeg": goal.headingToleranceMdeg,
+    });
+    ui.title(group, [
+      ui.t(enforced
+        ? "map.navigation_trace.final_goal_enforced_title"
+        : "map.navigation_trace.final_goal_title"),
+      ui.t("map.navigation_trace.goal_distance", {
+        distance: ui.format(goal.distanceToGoalMm),
+        radius: ui.format(goal.goalRadiusMm),
+        lateral: ui.format(goal.currentLateralOffsetMm),
+      }),
+      ui.t("map.navigation_trace.goal_progress", {
+        current: ui.format(goal.currentForwardProgressMm),
+        target: ui.format(goal.minimumForwardProgressMm),
+        remaining: ui.format(goal.remainingForwardProgressMm),
+      }),
+      ui.t("map.navigation_trace.goal_heading", {
+        heading: ui.format(goal.desiredHeadingMdeg / 1000, {
+          maximumFractionDigits: 1,
+        }),
+        tolerance: ui.format(goal.headingToleranceMdeg / 1000, {
+          maximumFractionDigits: 1,
+        }),
+      }),
+    ]);
+    group.appendChild(ui.svg("line", {
+      x1: origin.x, y1: origin.y, x2: target.x, y2: target.y,
+      class: "map-final-goal-line",
+    }));
+    group.appendChild(ui.svg("circle", {
+      cx: target.x, cy: target.y, r: radius, class: "map-final-goal-zone",
+    }));
+    group.appendChild(ui.svg("circle", {
+      cx: target.x, cy: target.y, r: 11, class: "map-final-goal-target",
+    }));
+    group.appendChild(ui.svg("path", {
+      d: ui.heading(
+        target, goal.desiredHeadingMdeg / 1000 * Math.PI / 180, 48,
+      ),
+      class: "map-final-goal-heading",
+    }));
+    const label = ui.svg("text", {
+      x: target.x + radius + 8, y: target.y - 10,
+      class: "map-navigation-trace-label map-final-goal-label",
+    });
+    label.textContent = ui.t(enforced
+      ? "map.navigation_trace.final_goal_enforced_label"
+      : "map.navigation_trace.final_goal_label", {
+      distance: ui.format(goal.distanceToGoalMm),
+    });
+    group.appendChild(label); layer.appendChild(group);
+  }
+
+  function renderAdvisoryWaypoint(layer, waypoint, robotPose, projection, ui) {
+    if (!waypoint) return;
+    const point = projection.point(waypoint.xMm, waypoint.yMm);
+    const group = ui.svg("g", {
+      class: "map-advisory-waypoint", "data-source": waypoint.source,
+      "data-read-only": "true", "data-purpose": waypoint.purpose,
+    });
+    ui.title(group, [
+      ui.t("map.navigation_trace.advisory_waypoint_title"),
+      waypoint.purpose,
+      ui.t("map.navigation_trace.advisory_waypoint_pose", {
+        x: ui.format(waypoint.xMm), y: ui.format(waypoint.yMm),
+      }),
+      ui.t("map.navigation_trace.advisory_waypoint_read_only"),
+    ]);
+    if (robotPose) {
+      const robot = projection.point(robotPose.xMm, robotPose.yMm);
+      group.appendChild(ui.svg("line", {
+        x1: robot.x, y1: robot.y, x2: point.x, y2: point.y,
+        class: "map-advisory-waypoint-line",
+      }));
+    }
+    group.appendChild(ui.svg("rect", {
+      x: point.x - 8, y: point.y - 8, width: 16, height: 16,
+      transform: `rotate(45 ${point.x} ${point.y})`,
+      class: "map-advisory-waypoint-marker",
+    }));
+    const label = ui.svg("text", {
+      x: point.x + 15, y: point.y - 15,
+      class: "map-navigation-trace-label map-advisory-waypoint-label",
+    });
+    label.textContent = ui.t("map.navigation_trace.advisory_waypoint_label");
+    group.appendChild(label); layer.appendChild(group);
+  }
+
   function renderObstacles(layer, hypotheses, projection, ui) {
     hypotheses.filter((item) => item.classification === CLASSIFICATION)
       .forEach((item) => {
@@ -311,8 +521,10 @@
 
   global.RobotBlastMapSemantics = Object.freeze({
     CLASSIFICATION, GEOMETRY_KIND, SCAN_SIDES,
-    appendObstaclePoints, appendRoutePoints, appendSharedObstaclePoints,
-    normalizeObstacle, normalizeRoute, objectEntries,
-    renderObstacles, renderRoute, renderSharedObstacles,
+    appendAdvisoryWaypointPoint, appendGoalPoints, appendObstaclePoints,
+    appendRoutePoints, appendSharedObstaclePoints, normalizeAdvisoryWaypoint,
+    normalizeFinalGoal, normalizeObstacle, normalizeRoute, objectEntries,
+    renderAdvisoryWaypoint, renderGoal, renderObstacles, renderRoute,
+    renderSharedObstacles,
   });
 })(typeof window === "undefined" ? globalThis : window);

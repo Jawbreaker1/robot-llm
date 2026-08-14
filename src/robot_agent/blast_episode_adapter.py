@@ -1339,6 +1339,12 @@ class BlastEpisodeRuntimeAdapter:
                 action_source = step["action_source"]
                 observation = step["observation"]
                 active_waypoint = step["active_waypoint"]
+                map_trace.set_advisory_waypoint(
+                    active_waypoint,
+                    pose=motion_executor.pose,
+                    observation=observation["sensors"],
+                    observed_at_unix_ms=observation["observed_at_unix_ms"],
+                )
                 scan_pose = motion_executor.pose if action == SCAN_FRONT_ARC else None
                 observation, outcome = admit_blast_spoken_action(
                     self, speech, step, observation, motion_executor,

@@ -157,9 +157,11 @@ def _pose(value) -> bool:
 def _final_goal(value) -> bool:
     fields = (
         "kind", "origin_x_mm", "origin_y_mm", "target_x_mm",
-        "target_y_mm", "desired_heading_mdeg",
+        "target_y_mm", "goal_radius_mm", "distance_to_goal_mm",
+        "desired_heading_mdeg",
         "minimum_forward_progress_mm", "heading_tolerance_mdeg",
-        "current_forward_progress_mm", "remaining_forward_progress_mm",
+        "current_forward_progress_mm", "current_lateral_offset_mm",
+        "remaining_forward_progress_mm",
         "navigation_enforced",
     )
     if not _exact(value, fields) or not (
@@ -169,10 +171,14 @@ def _final_goal(value) -> bool:
         and _integer(value["origin_y_mm"], -1_000_000, 1_000_000)
         and _integer(value["target_x_mm"], -1_000_000, 1_000_000)
         and _integer(value["target_y_mm"], -1_000_000, 1_000_000)
+        and _integer(value["goal_radius_mm"], 45, 500)
+        and _integer(value["distance_to_goal_mm"], 0, 2_000_000)
         and _integer(value["desired_heading_mdeg"], -180_000, 179_999)
         and _integer(value["minimum_forward_progress_mm"], 1, 2_000)
         and _integer(value["heading_tolerance_mdeg"], 1_000, 45_000)
         and _integer(value["current_forward_progress_mm"], -1_000_000,
+                     1_000_000)
+        and _integer(value["current_lateral_offset_mm"], -1_000_000,
                      1_000_000)
         and _integer(value["remaining_forward_progress_mm"], 0, 1_000_000)
     ):
@@ -184,10 +190,33 @@ def _final_goal(value) -> bool:
     expected_remaining = max(
         0, distance - value["current_forward_progress_mm"]
     )
+    expected_goal_distance = round(math.hypot(
+        distance - value["current_forward_progress_mm"],
+        value["current_lateral_offset_mm"],
+    ))
     return (
         abs(value["target_x_mm"] - expected_x) <= 1.5
         and abs(value["target_y_mm"] - expected_y) <= 1.5
         and value["remaining_forward_progress_mm"] == expected_remaining
+        and value["distance_to_goal_mm"] == expected_goal_distance
+    )
+
+
+def _advisory_waypoint(value) -> bool:
+    if value is None:
+        return True
+    return (
+        _exact(value, (
+            "x_mm", "y_mm", "purpose", "source", "read_only",
+        ))
+        and _integer(value["x_mm"], -5_000, 5_000)
+        and _integer(value["y_mm"], -5_000, 5_000)
+        and value["source"] == "GEMMA_MODEL"
+        and value["read_only"] is True
+        and isinstance(value["purpose"], str)
+        and value["purpose"] == value["purpose"].strip()
+        and 1 <= len(value["purpose"]) <= 120
+        and not any(ord(character) < 32 for character in value["purpose"])
     )
 
 
@@ -366,7 +395,7 @@ def _scan_view(value, now_unix_ms) -> bool:
 
 def _trace_inputs(final_goal, planned_leg, imu_heading,
                   planar_scan_views, now_unix_ms,
-                  local_detour_route=None) -> bool:
+                  local_detour_route=None, advisory_waypoint=None) -> bool:
     try:
         encoded = json.dumps(
             {
@@ -375,6 +404,7 @@ def _trace_inputs(final_goal, planned_leg, imu_heading,
                 "imu_heading": imu_heading,
                 "planar_scan_views": planar_scan_views,
                 "local_detour_route": local_detour_route,
+                "advisory_waypoint": advisory_waypoint,
             },
             allow_nan=False,
             ensure_ascii=False,
@@ -386,6 +416,7 @@ def _trace_inputs(final_goal, planned_leg, imu_heading,
     if len(encoded) > _MAX_TRACE_BYTES or not (
         _final_goal(final_goal)
         and _planned_leg(planned_leg)
+        and _advisory_waypoint(advisory_waypoint)
         and _imu_heading(imu_heading, now_unix_ms)
         and _local_detour_route(local_detour_route)
         and isinstance(planar_scan_views, (tuple, list))
@@ -873,6 +904,7 @@ class BlastSpatialMapBridge:
     def offer_trace(
         self, *, episode_id: str, final_goal: Mapping[str, object],
         planned_leg: Optional[Mapping[str, object]] = None,
+        advisory_waypoint: Optional[Mapping[str, object]] = None,
         imu_heading: Optional[Mapping[str, object]] = None,
         planar_scan_views=(),
         local_detour_route: Optional[Mapping[str, object]] = None,
@@ -885,7 +917,7 @@ class BlastSpatialMapBridge:
         )
         if not _trace_inputs(
             final_goal, planned_leg, imu_heading, planar_scan_views, now_unix,
-            local_detour_route,
+            local_detour_route, advisory_waypoint,
         ):
             raise ValueError("BLAST navigation trace is invalid")
         with self._lock:
@@ -908,6 +940,10 @@ class BlastSpatialMapBridge:
                 ),
                 "planned_leg": (
                     None if planned_leg is None else deepcopy(dict(planned_leg))
+                ),
+                "advisory_waypoint": (
+                    None if advisory_waypoint is None
+                    else deepcopy(dict(advisory_waypoint))
                 ),
                 "local_detour_route": (
                     None

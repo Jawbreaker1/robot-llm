@@ -141,8 +141,10 @@
       if (!trace) {
         return;
       }
-      addPoint(trace.finalGoal.originX, trace.finalGoal.originY);
-      addPoint(trace.finalGoal.targetX, trace.finalGoal.targetY);
+      blastMapSemantics.appendGoalPoints(trace.finalGoal, addPoint);
+      blastMapSemantics.appendAdvisoryWaypointPoint(
+        trace.advisoryWaypoint, addPoint,
+      );
       if (trace.plannedLeg) {
         addPoint(
           trace.plannedLeg.bindPose.xMm,
@@ -443,81 +445,9 @@
         return;
       }
 
-      const goal = trace.finalGoal;
-      const goalOrigin = projection.point(goal.originX, goal.originY);
-      const goalTarget = projection.point(goal.targetX, goal.targetY);
-      const goalHeading = goal.desiredHeadingMdeg / 1000 * Math.PI / 180;
-      const goalEnforced = goal.navigationEnforced === true;
-      const goalGroup = createSvgElement("g", {
-        class: "map-final-goal",
-        "data-kind": goal.kind,
-        "data-navigation-enforced": String(goalEnforced),
-        "data-minimum-forward-progress-mm": (
-          goal.minimumForwardProgressMm
-        ),
-        "data-current-forward-progress-mm": (
-          goal.currentForwardProgressMm
-        ),
-        "data-remaining-forward-progress-mm": (
-          goal.remainingForwardProgressMm
-        ),
-        "data-desired-heading-mdeg": goal.desiredHeadingMdeg,
-        "data-heading-tolerance-mdeg": goal.headingToleranceMdeg,
-      });
-      appendSvgTitle(goalGroup, [
-        t(
-          goalEnforced
-            ? "map.navigation_trace.final_goal_enforced_title"
-            : "map.navigation_trace.final_goal_title",
-        ),
-        t("map.navigation_trace.goal_progress", {
-          current: formatNumber(goal.currentForwardProgressMm),
-          target: formatNumber(goal.minimumForwardProgressMm),
-          remaining: formatNumber(goal.remainingForwardProgressMm),
-        }),
-        t("map.navigation_trace.goal_heading", {
-          heading: formatNumber(goal.desiredHeadingMdeg / 1000, {
-            maximumFractionDigits: 1,
-          }),
-          tolerance: formatNumber(goal.headingToleranceMdeg / 1000, {
-            maximumFractionDigits: 1,
-          }),
-        }),
-      ]);
-      goalGroup.appendChild(createSvgElement("line", {
-        x1: goalOrigin.x,
-        y1: goalOrigin.y,
-        x2: goalTarget.x,
-        y2: goalTarget.y,
-        class: "map-final-goal-line",
-      }));
-      goalGroup.appendChild(createSvgElement("circle", {
-        cx: goalTarget.x,
-        cy: goalTarget.y,
-        r: 11,
-        class: "map-final-goal-target",
-      }));
-      goalGroup.appendChild(createSvgElement("path", {
-        d: headingArrowPath(goalTarget, goalHeading, 48),
-        class: "map-final-goal-heading",
-      }));
-      const goalLabel = createSvgElement("text", {
-        x: goalTarget.x + 15,
-        y: goalTarget.y - 15,
-        class: "map-navigation-trace-label map-final-goal-label",
-      });
-      goalLabel.textContent = t(
-        goalEnforced
-          ? "map.navigation_trace.final_goal_enforced_label"
-          : "map.navigation_trace.final_goal_label",
-        {
-          heading: formatNumber(goal.desiredHeadingMdeg / 1000, {
-            maximumFractionDigits: 1,
-          }),
-        },
+      blastMapSemantics.renderGoal(
+        layer, trace.finalGoal, projection, blastRenderUi(),
       );
-      goalGroup.appendChild(goalLabel);
-      layer.appendChild(goalGroup);
 
       const leg = trace.plannedLeg;
       if (leg) {
@@ -594,6 +524,11 @@
         group.appendChild(label);
         layer.appendChild(group);
       }
+
+      blastMapSemantics.renderAdvisoryWaypoint(
+        layer, trace.advisoryWaypoint, map.robotPose,
+        projection, blastRenderUi(),
+      );
 
       blastMapSemantics.renderRoute(
         layer,
