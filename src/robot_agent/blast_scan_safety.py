@@ -143,15 +143,15 @@ def blast_scan_sweep_is_clear(scan_view, pose) -> bool:
 
 def issue_blast_scan_permit(
     *, controller, action, distance_mm, geometry_checked, pose,
-    prior_receipt, expected_drive_angles,
+    prior_receipt, expected_drive_angles, perception_only=False,
 ):
-    """Issue one anchor-bound permit; NVD retains its geometry gate."""
+    """Issue one anchor-bound permit for navigation or perception."""
 
     action_permit = None
     if action == SCAN_FRONT_ARC:
         allow_no_return = (
             blast_range_state(distance_mm) == RANGE_STATE_NO_VALID_DISTANCE
-            and geometry_checked
+            and (geometry_checked or perception_only)
         )
         issue = getattr(controller, "issue_no_return_scan_permit", None)
         if callable(issue):
@@ -161,6 +161,7 @@ def issue_blast_scan_permit(
                 geometry_checked=geometry_checked,
                 expected_drive_angles=expected_drive_angles,
                 allow_no_return=allow_no_return,
+                perception_only=perception_only,
             )
         if action_permit is None and (callable(issue) or allow_no_return):
             raise BlastScanPermitUnavailable(

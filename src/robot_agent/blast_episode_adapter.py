@@ -535,7 +535,7 @@ class BlastEpisodeRuntimeAdapter:
         self, *, action, observation, geometry_checked, motion_executor,
         prior_receipt,
         allow_turn_no_valid_with_bounded_evidence, context, deadline_ms,
-        map_trace=None,
+        map_trace=None, perception_only_scan=False,
     ):
         outcome = self._control_outcome(
             context, deadline_ms, blast_action_deadline_headroom_ms(action),
@@ -561,6 +561,7 @@ class BlastEpisodeRuntimeAdapter:
                 expected_drive_angles=(
                     motion_executor.expected_start_angles
                 ),
+                perception_only=perception_only_scan,
             )
             try:
                 command_result, execution = self._dispatch_action(
@@ -818,7 +819,7 @@ class BlastEpisodeRuntimeAdapter:
         }, None
     def _scan_action_permit(
         self, *, action, observation, geometry_checked, pose, prior_receipt,
-        expected_drive_angles=None,
+        expected_drive_angles=None, perception_only=False,
     ):
         try:
             return issue_blast_scan_permit(
@@ -829,6 +830,7 @@ class BlastEpisodeRuntimeAdapter:
                 pose=pose,
                 prior_receipt=prior_receipt,
                 expected_drive_angles=expected_drive_angles,
+                perception_only=perception_only,
             )
         except BlastScanPermitUnavailable as error:
             raise BlastEpisodeError(error.code, str(error)) from None
@@ -1060,22 +1062,6 @@ class BlastEpisodeRuntimeAdapter:
                 action, observation, latest_scan_view,
                 motion_executor.pose,
             )
-            if (
-                action == SCAN_FRONT_ARC
-                and blast_range_state(
-                    observation["sensors"].get("distance_mm")
-                ) == RANGE_STATE_NO_VALID_DISTANCE
-                and not geometry_checked
-            ):
-                return (
-                    observation, available_actions, scan_allows_turn,
-                    latest_scan_view,
-                    self._outcome(
-                        "blast_startup_perception_incomplete", False,
-                        "BLAST startup scan lacks verified rotation "
-                        "clearance",
-                    ),
-                )
             command_result, execution, observation, outcome = (
                 self._dispatch_episode_action(
                     action=action,
@@ -1093,6 +1079,7 @@ class BlastEpisodeRuntimeAdapter:
                     context=context,
                     deadline_ms=deadline_ms,
                     map_trace=map_trace,
+                    perception_only_scan=(action == SCAN_FRONT_ARC),
                 )
             )
             if outcome is not None:

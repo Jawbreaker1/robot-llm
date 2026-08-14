@@ -3941,6 +3941,43 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         monitor.close()
 
+    def test_perception_only_permit_starts_no_return_scan_without_map(self):
+        class NoReturnRuntime(FakeRuntime):
+            async def observe(self):
+                observation = await super().observe()
+                observation["distance_mm"] = 2_000
+                return observation
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=NoReturnRuntime,
+        )
+        monitor.start()
+        snapshot = self.wait_for(monitor, "online")
+        while snapshot["observation"] is None:
+            time.sleep(0.005)
+            snapshot = monitor.snapshot()
+        runtime = FakeRuntime.instances[-1]
+        runtime.calls.clear()
+
+        permit = monitor.issue_no_return_scan_permit(
+            geometry_checked=False,
+            expected_drive_angles=snapshot["observation"][
+                "motor_angles_deg"
+            ],
+            allow_no_return=True,
+            perception_only=True,
+        )
+        self.assertIsNotNone(permit)
+        result = monitor.command(SCAN_COMMAND, action_permit=permit)
+
+        self.assertTrue(result["completed"])
+        self.assertEqual(
+            len([call for call in runtime.calls if call[0] == "turn_pulse"]),
+            16,
+        )
+        monitor.close()
+
     def test_scan_settling_recovers_after_one_no_valid_center_sample(self):
         class TransientCenterRuntime(FakeRuntime):
             center_samples = None

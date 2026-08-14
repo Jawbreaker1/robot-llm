@@ -687,20 +687,54 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(controller.commands, ["scan_front_arc"])
         self.assertEqual(planner.contexts, [])
 
-    def test_no_return_cannot_start_bootstrap_without_prior_geometry(self):
-        controller = FakeScanController(2_000)
+    def test_no_return_startup_scan_uses_perception_only_permit(self):
+        class NoReturnStartupController(FakeScanController):
+            def __init__(self):
+                super().__init__(2_000)
+                self.permits = []
+                self.turn_count = 0
+
+            def issue_no_return_scan_permit(self, **values):
+                self.permits.append(values)
+                return object()
+
+            def command(
+                self, command, *, cancel_requested=None,
+                action_permit=None,
+            ):
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command in ("turn_left", "turn_right"):
+                    self.turn_count += 1
+                    if self.turn_count == 16:
+                        result["observation"]["distance_mm"] = 500
+                        self.snapshot_value["observation"] = result[
+                            "observation"
+                        ]
+                return result
+
+        controller = NoReturnStartupController()
         planner = Planner([decision(ADVANCE)])
 
         result = self.adapter(
-            controller, planner, startup_perception=True,
+            controller, planner, max_decisions=1,
+            startup_perception=True,
         ).run(episode_context()[0])
 
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(len(controller.permits), 2)
+        self.assertTrue(all(
+            permit["perception_only"] is True
+            and permit["geometry_checked"] is False
+            for permit in controller.permits
+        ))
+        self.assertEqual(controller.commands.count("scan_front_arc"), 2)
+        self.assertEqual(controller.turn_count, 16)
+        self.assertEqual(len(planner.contexts), 1)
         self.assertEqual(
-            result.terminal_reason,
-            "blast_startup_perception_incomplete",
+            len(planner.contexts[0].local_map_evidence["scan_views"]), 2,
         )
-        self.assertEqual(controller.commands, [])
-        self.assertEqual(planner.contexts, [])
 
     def test_stop_or_deadline_after_bootstrap_result_prevents_next_action(self):
         for control, expected in (

@@ -247,7 +247,7 @@ class BlastObservationMonitor:
 
     def issue_no_return_scan_permit(
         self, *, pose=None, prior_receipt=None, geometry_checked=False,
-        expected_drive_angles=None, allow_no_return=True,
+        expected_drive_angles=None, allow_no_return=True, perception_only=False,
     ):
         """Issue one short-lived token from an exact trusted scan anchor."""
 
@@ -293,6 +293,8 @@ class BlastObservationMonitor:
         )
         if not (
             snapshot.get("state") == "online"
+            and type(perception_only) is bool
+            and (not perception_only or allow_no_return)
             and anchor_matched
             and isinstance(observed_ms, int)
             and 0 <= now_ns // 1_000_000 - observed_ms <= 3_000
@@ -300,6 +302,7 @@ class BlastObservationMonitor:
             and observation.get("motion_active") is False
             and (
                 not allow_no_return
+                or perception_only is True
                 or geometry_checked is True
                 and valid_pose
                 and isinstance(prior_receipt, Mapping)
