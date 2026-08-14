@@ -4132,6 +4132,41 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertFalse(result["observation"]["motion_active"])
         monitor.close()
 
+    def test_turn_remeasures_only_one_safe_unsettled_window(self):
+        for distance, attempts, settled in (
+            (500, 2, True),
+            (40, 1, False),
+        ):
+            with self.subTest(distance=distance):
+                class RemeasureMonitor(BlastObservationMonitor):
+                    async def _observe_until_settled(
+                        self, runtime, *, generation, initial_observation,
+                        timeout_seconds=None,
+                    ):
+                        self.settle_attempts = getattr(
+                            self, "settle_attempts", 0,
+                        ) + 1
+                        observation = dict(initial_observation)
+                        observation["distance_mm"] = distance
+                        observation["motion_active"] = False
+                        self._settling_samples = (
+                            (float(distance), 0.0, 0.0),
+                        ) * 5
+                        return observation, self.settle_attempts > 1
+
+                monitor = RemeasureMonitor(
+                    poll_interval_seconds=0.05,
+                    runtime_factory=FakeRuntime,
+                )
+                monitor.start()
+                self.wait_for(monitor, "online")
+
+                result = monitor.command("turn_right")
+
+                self.assertEqual(monitor.settle_attempts, attempts)
+                self.assertIs(result["observation_settled"], settled)
+                monitor.close()
+
     def test_stop_wins_at_the_final_settled_sample(self):
         stable_return_reached = threading.Event()
         allow_final_check = threading.Event()

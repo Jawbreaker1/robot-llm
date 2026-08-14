@@ -1466,22 +1466,23 @@ class BlastObservationMonitor:
             stop_only=command == "stop",
         )
         observation_settled = None
-        if (
-            command in NAVIGATION_MOTION_COMMANDS
-            or command == SETTLED_OBSERVATION_COMMAND
+        if command in NAVIGATION_MOTION_COMMANDS or (
+            command == SETTLED_OBSERVATION_COMMAND
         ):
-            observation, observation_settled = (
-                await self._observe_until_settled(
-                    runtime,
-                    generation=generation,
+            turn_command = command in ("turn_left", "turn_right")
+            for _attempt in range(2 if turn_command else 1):
+                observation, observation_settled = await self._observe_until_settled(
+                    runtime, generation=generation,
                     initial_observation=observation,
                     timeout_seconds=(
                         SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS
-                        if command in ("turn_left", "turn_right")
-                        else None
+                        if turn_command else None
                     ),
                 )
-            )
+                if observation_settled is True or not turn_command or not (
+                    self._scan_sweep_window_allows_continuation(observation)
+                ):
+                    break
         result = {
             "schema": COMMAND_RESULT_SCHEMA,
             "robot_id": ROBOT_ID,
