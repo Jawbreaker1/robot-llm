@@ -320,6 +320,7 @@ recognize the dog, turn toward it, and answer, “woof right back at you.”
 | Document | Contents |
 |---|---|
 | [Architecture](docs/ARCHITECTURE.md) | Agent runtime, authority, parallelism, memory, and multi-controller design |
+| [Navigation simplification plan](docs/NAVIGATION_SIMPLIFICATION_PLAN.md) | Fixed three-stage plan for aligning BLAST and EV3 without a new framework |
 | [Dashboard](docs/DASHBOARD.md) | Live UI, STT, map, settings, and persistence |
 | [EV3 Wi-Fi](docs/EV3_WIFI.md) | Network onboarding and recovery |
 | [EV3 runtime deployment](docs/EV3_RUNTIME_DEPLOYMENT.md) | Worker deployment, preflight, transport, speech, and physical checks |
