@@ -9,9 +9,6 @@ import threading
 import time
 from typing import Callable, Mapping
 
-from .blast_agentic_recovery import (
-    BlastAgenticRecovery,
-)
 from .blast_action_admission import (
     admit_blast_spoken_action,
     fresh_blast_action_observation,
@@ -53,9 +50,6 @@ from .blast_navigation_motion_execution import (
     BlastNavigationMotionExecutor,
 )
 from .blast_mission_completion import blast_directional_completion_allowed
-from .blast_navigation_state import (
-    PlannerNavigationState,
-)
 from .blast_turn_safety import blast_turn_slice_allows_continuation
 from .lm_studio_controller_action import (
     ABORT,
@@ -1073,7 +1067,7 @@ class BlastEpisodeRuntimeAdapter:
     def _run_startup_perception(
         self, *, observation, available_actions, scan_allows_turn,
         latest_scan_view, history, motion_executor, episode_start_heading,
-        map_trace, navigation_state, recovery, context, deadline_ms,
+        map_trace, context, deadline_ms,
     ):
         """Acquire one complete encoder-measured view before Gemma decides."""
 
@@ -1192,9 +1186,7 @@ class BlastEpisodeRuntimeAdapter:
             _runtime, outcome,
         ) = begin_blast_iteration(
             self, context=context, deadline_ms=deadline_ms,
-            index=1, history=history, selected_detour_side=None,
-            navigation_state=navigation_state,
-            latest_scan_view=latest_scan_view, recovery=recovery,
+            index=1, history=history, latest_scan_view=latest_scan_view,
             motion_executor=motion_executor,
             episode_start_heading=episode_start_heading,
             motion_executor_factory=BlastNavigationMotionExecutor,
@@ -1217,7 +1209,7 @@ class BlastEpisodeRuntimeAdapter:
                 self.speech_runtime_factory if self._speech_available else None)
         history, episode_start_heading, motion_executor = [], None, None
         active_waypoint = None
-        navigation_state, recovery, latest_scan_view = PlannerNavigationState(), BlastAgenticRecovery(), None
+        latest_scan_view = None
         map_trace = None
         speech = BlastEpisodeSpeech(
             factory=speech_factory,
@@ -1245,9 +1237,7 @@ class BlastEpisodeRuntimeAdapter:
                  iteration_runtime, outcome) = begin_blast_iteration(
                     self, context=context, deadline_ms=deadline_ms,
                     index=_index, history=history,
-                    selected_detour_side=None,
-                    navigation_state=navigation_state,
-                    latest_scan_view=latest_scan_view, recovery=recovery,
+                    latest_scan_view=latest_scan_view,
                     motion_executor=motion_executor,
                     episode_start_heading=episode_start_heading,
                     motion_executor_factory=BlastNavigationMotionExecutor,
@@ -1273,8 +1263,6 @@ class BlastEpisodeRuntimeAdapter:
                         motion_executor=motion_executor,
                         episode_start_heading=episode_start_heading,
                         map_trace=map_trace,
-                        navigation_state=navigation_state,
-                        recovery=recovery,
                         context=context,
                         deadline_ms=deadline_ms,
                     )
@@ -1298,9 +1286,7 @@ class BlastEpisodeRuntimeAdapter:
                         motion_executor=motion_executor,
                         episode_start_heading=episode_start_heading,
                         history=history,
-                        selected_detour_side=None,
-                        navigation_state=navigation_state,
-                        latest_scan_view=latest_scan_view, recovery=recovery,
+                        latest_scan_view=latest_scan_view,
                     ))
                     if outcome is not None: return outcome
                     if refreshed_turns is not None:

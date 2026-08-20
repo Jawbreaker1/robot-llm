@@ -273,10 +273,9 @@ def read_episode_observation(
 
 
 def prepare_blast_iteration_actions(
-    adapter, *, observation, history, selected_detour_side,
-    navigation_state, latest_scan_view, recovery, motion_executor,
+    adapter, *, observation, history, latest_scan_view,
 ):
-    """Apply scan-side and agentic-recovery filters in one reusable step."""
+    """Apply current-scan action filters in one reusable step."""
 
     available_actions = adapter._available_actions(
         observation, history, latest_scan_view,
@@ -291,16 +290,12 @@ def prepare_blast_iteration_actions(
             action for action in available_actions
             if action not in (TURN_LEFT_90, TURN_RIGHT_90)
         )
-    observation, available_actions = recovery.enrich_planner_iteration(
-        adapter, observation, available_actions,
-        navigation_state, latest_scan_view,
-    )
     return observation, available_actions, scan_allows_turn
 
 
 def begin_blast_iteration(
     adapter, *, context, deadline_ms, index, history,
-    selected_detour_side, navigation_state, latest_scan_view, recovery,
+    latest_scan_view,
     motion_executor=None, episode_start_heading=None,
     motion_executor_factory=None, minimum_rotation_clearance_mm=None,
 ):
@@ -326,10 +321,7 @@ def begin_blast_iteration(
     observation, available_actions, scan_allows_turn = (
         prepare_blast_iteration_actions(
             adapter, observation=observation, history=history,
-            selected_detour_side=selected_detour_side,
-            navigation_state=navigation_state,
-            latest_scan_view=latest_scan_view, recovery=recovery,
-            motion_executor=motion_executor,
+            latest_scan_view=latest_scan_view,
         )
     )
     return (
@@ -367,8 +359,7 @@ def recover_planner_soft_no_action(
 def recover_planner_iteration_actions(
     adapter, *, observation, available_actions, completion_allowed,
     context, deadline_ms, motion_executor, episode_start_heading,
-    history, selected_detour_side, navigation_state, latest_scan_view,
-    recovery,
+    history, latest_scan_view,
 ):
     """Refresh one planner-owned no-action iteration when evidence is soft."""
 
@@ -392,10 +383,7 @@ def recover_planner_iteration_actions(
     observation, available_actions, scan_allows_turn = (
         prepare_blast_iteration_actions(
             adapter, observation=recovered.observation, history=history,
-            selected_detour_side=selected_detour_side,
-            navigation_state=navigation_state,
-            latest_scan_view=latest_scan_view, recovery=recovery,
-            motion_executor=motion_executor,
+            latest_scan_view=latest_scan_view,
         )
     )
     return observation, available_actions, scan_allows_turn, None
