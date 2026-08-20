@@ -1,6 +1,6 @@
 # Navigation simplification plan
 
-Status: accepted direction; implementation has not started.
+Status: accepted direction; stage 1 cleanup is in progress.
 
 Baseline: `fb359f7` on `main`, published on 2026-08-20. This plan starts from
 that clean checkpoint. It complements [Navigation ownership](NAVIGATION_OWNERSHIP.md),
@@ -109,27 +109,32 @@ Acceptance:
 - the test count decreases because tests for deleted behavior are deleted, not
   rewritten to preserve it.
 
-### 2. Make EV3 use the same agentic rhythm as BLAST
+### 2. Make both robots meet one behavioral contract
 
 This is the only stage that intentionally changes navigation ownership.
+BLAST is closer to the target ownership model, but it is not a reference
+implementation and its remaining behavior must not be copied into EV3.
 
-- Make the planner return one semantic action plus an optional tentative
-  waypoint from the latest observation.
-- Return to Gemma after each completed or interrupted semantic primitive.
-- Remove host policy that selects and follows local-detour waypoints, maneuver
-  commitments, or plan tails without a new model decision.
-- Retain the EV3 sensor adapter, bounded motion executor, motor supervisor,
+- Define the same four black-box scenarios for both robots: clear path,
+  opening-left, opening-right, and transient bad sensor evidence.
+- First make BLAST satisfy those outcomes and complete one physical checkpoint.
+- Then make EV3 satisfy the same outcomes and complete its physical checkpoint.
+- On EV3, remove host policy that selects and follows local-detour waypoints,
+  maneuver commitments, or plan tails without a new model decision.
+- On both robots, return to Gemma after each completed or interrupted semantic
+  primitive. Do not make Gemma decide individual motor pulses.
+- Retain each robot's sensor adapter, bounded motion executor, motor supervisor,
   collision checks, and truthful pose updates.
-- Do not make Gemma decide individual motor pulses.
 
 Acceptance:
 
 - EV3 and BLAST expose equivalent goal/world-view/action/waypoint concepts;
-- no EV3 host component selects a substitute direction or route step;
+- no host component selects a substitute direction or route step for either
+  robot;
 - clear path, opening-left, opening-right, and transient-bad-sensor scenarios
   finish or make bounded progress without hidden host navigation;
 - focused EV3 tests and the full hardware-free suite pass;
-- one controlled physical EV3 validation is completed before stage 3.
+- controlled physical BLAST and EV3 validations are completed before stage 3.
 
 ### 3. Extract the genuinely shared agent layer
 
@@ -225,3 +230,25 @@ The refactor is complete when all of the following are true:
 
 No fourth refactoring stage is implied. New work after these criteria is a
 separate product decision supported by new evidence.
+
+## Product path after the refactor
+
+The larger two-robot goal is intentionally separate from the navigation
+refactor. It proceeds through three product checkpoints:
+
+1. **Shared world view.** Keep each robot's raw observations and identity, then
+   publish them in one calibrated coordinate frame. Reuse the existing compact
+   map evidence; do not introduce SLAM or a fleet planner.
+2. **Shared knowledge and dialogue.** Give both robot agents the same bounded
+   goal, event, and map summary. Add explicitly addressed robot-to-robot
+   messages to the existing conversation services so both robots and the user
+   can see who said what. Do not create an unbounded agent-chat loop.
+3. **Coordinated simultaneous autonomy.** Keep both robots online, reasoning,
+   observing, and talking concurrently. Permit concurrent physical episodes
+   only after they share a coordinate frame and a small conflict check can
+   reject overlapping motion. This replaces the current global episode gate;
+   it is not a general fleet scheduler.
+
+Each checkpoint is separately validated and published. Shared-map or dialogue
+work does not start while the two navigation loops still disagree about who
+chooses the next semantic action.
