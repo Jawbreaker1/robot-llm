@@ -574,8 +574,26 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         return adapter
 
     def test_startup_perception_precedes_first_planner_decision(self):
-        controller = FakeScanController(500)
-        planner = Planner([decision(ADVANCE)])
+        class FullTurnStartupController(FakeController):
+            def command(self, command, *, cancel_requested=None):
+                center = copy.deepcopy(self.snapshot_value["observation"])
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    scan, final = surroundings_scan_result(center)
+                    result.update({
+                        "receipt": {"turn_count": 16},
+                        "observation": copy.deepcopy(final),
+                        "scan": scan,
+                    })
+                    self.snapshot_value["observation"] = copy.deepcopy(
+                        final
+                    )
+                return result
+
+        controller = FullTurnStartupController(500)
+        planner = Planner([decision(TURN_RIGHT_90)])
         context, updates = episode_context()
 
         result = self.adapter(
@@ -589,7 +607,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         expected_bootstrap_commands = ["scan_front_arc"]
         self.assertEqual(
             controller.commands,
-            [*expected_bootstrap_commands, "drive_forward"],
+            [*expected_bootstrap_commands, *(["turn_right"] * 4)],
         )
         first = planner.contexts[0]
         self.assertEqual(
@@ -600,13 +618,15 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             first.history[0]["action_source"], "STARTUP_PERCEPTION",
         )
         self.assertEqual(first.history[0]["scan_view_count"], 1)
+        self.assertEqual(first.history[0]["scan_state"], "complete")
+        self.assertEqual(first.history[0]["sweep_coverage_deg"], 352.8)
         published_actions = [
             update.get("current_action") for update in updates
             if "current_action" in update
         ]
         self.assertNotIn(TURN_LEFT_90, published_actions)
-        self.assertNotIn(TURN_RIGHT_90, published_actions)
         self.assertIn("SCAN_SURROUNDINGS", published_actions)
+        self.assertEqual(published_actions.count(TURN_RIGHT_90), 2)
         self.assertIsNone([
             update["scan"] for update in updates if "scan" in update
         ][-1])
@@ -633,7 +653,8 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             first.local_map_evidence["robot_pose"]["y_mm"], 0,
         )
         self.assertEqual(
-            first.local_map_evidence["robot_pose"]["heading_mdeg"], 0,
+            first.local_map_evidence["robot_pose"]["heading_mdeg"],
+            -7_200,
         )
 
     def test_partial_startup_scan_reaches_gemma_with_true_pose_and_map(self):

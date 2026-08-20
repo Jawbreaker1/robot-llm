@@ -140,8 +140,10 @@ Stage 2 starts from an explicit, incomplete baseline rather than compatibility
 tests that pretend the target is already met:
 
 - BLAST already carries `goal`, compact map evidence, available actions, and an
-  advisory Gemma waypoint on every decision. Its current startup acquisition
-  publishes one broad front scan view, not a verified full-surroundings view.
+  advisory Gemma waypoint on every decision. Its single startup acquisition is
+  one encoder-verified 350–390 degree sweep, published as one surroundings
+  view; the old `scan_front_arc` command name is retained only for wire
+  compatibility.
 - EV3 already carries the same user goal as `mission.user_goal` and can execute
   several short pulses for one model-authored forward primitive. It has no
   mandatory startup surroundings acquisition and its local-detour route

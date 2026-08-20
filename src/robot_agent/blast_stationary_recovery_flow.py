@@ -282,7 +282,9 @@ def prepare_blast_iteration_actions(
     )
     scan_is_current = adapter._scan_is_current(history)
     scan_allows_turn = (
-        adapter._current_scan_allows_quarter_turn(history)
+        adapter._current_scan_allows_quarter_turn(
+            history, latest_scan_view,
+        )
         and latest_scan_view is not None
     )
     if scan_is_current and not scan_allows_turn:

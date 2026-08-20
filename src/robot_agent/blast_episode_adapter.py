@@ -270,7 +270,7 @@ class BlastEpisodeRuntimeAdapter:
     def _scan_is_current(history) -> bool:
         for item in reversed(history):
             action = item.get("action")
-            if action == SCAN_FRONT_ARC:
+            if action in (SCAN_FRONT_ARC, _STARTUP_SURROUNDINGS_ACTION):
                 return True
             if action in ACTION_COMMANDS:
                 return False
@@ -298,10 +298,21 @@ class BlastEpisodeRuntimeAdapter:
         )
 
     @staticmethod
-    def _current_scan_allows_quarter_turn(history) -> bool:
-        if not history or history[-1].get("action") != SCAN_FRONT_ARC:
+    def _current_scan_allows_quarter_turn(
+        history, latest_scan_view=None,
+    ) -> bool:
+        if not history:
             return False
-        scan = history[-1].get("scan")
+        action = history[-1].get("action")
+        if action == SCAN_FRONT_ARC:
+            scan = history[-1].get("scan")
+        elif (
+            action == _STARTUP_SURROUNDINGS_ACTION
+            and isinstance(latest_scan_view, Mapping)
+        ):
+            scan = latest_scan_view.get("scan")
+        else:
+            return False
         if (
             isinstance(scan, Mapping)
             and scan.get("sweep_coverage_deg") is not None
@@ -469,7 +480,9 @@ class BlastEpisodeRuntimeAdapter:
                 history, latest_scan_view,
             ):
                 available.append(ADVANCE)
-            if self._current_scan_allows_quarter_turn(history):
+            if self._current_scan_allows_quarter_turn(
+                history, latest_scan_view,
+            ):
                 available.extend((TURN_LEFT_90, TURN_RIGHT_90))
         if (
             self._current_observation_allows_action(
