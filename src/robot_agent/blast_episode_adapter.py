@@ -82,7 +82,7 @@ _SCAN_REFUSAL_CODES = frozenset(("scan_start_clearance_unverified",
                                  "scan_sweep_observation_unverified"))
 
 
-def _side_search_encoder_correlated(observation, motion_executor) -> bool:
+def _encoder_anchor_correlated(observation, motion_executor) -> bool:
     sensors = (
         observation.get("sensors")
         if isinstance(observation, Mapping) else None
@@ -589,7 +589,7 @@ class BlastEpisodeRuntimeAdapter:
         control_requested = lambda: self._control_outcome(
             context, deadline_ms) is not None
         for attempt in range(2):
-            if not _side_search_encoder_correlated(
+            if not _encoder_anchor_correlated(
                 observation, motion_executor,
             ):
                 raise BlastEpisodeError(
@@ -712,7 +712,7 @@ class BlastEpisodeRuntimeAdapter:
             motion_executor=motion_executor,
             cancel_requested=cancel_requested,
             episode_error_type=BlastEpisodeError,
-            encoder_anchor_correlated=_side_search_encoder_correlated,
+            encoder_anchor_correlated=_encoder_anchor_correlated,
             navigation_body_matched=_navigation_body_matched,
             allow_no_valid_with_bounded_evidence=(
                 allow_no_valid_with_bounded_evidence

@@ -103,25 +103,7 @@ def admit_blast_spoken_action(
     )
 
 
-def blast_action_phase_flags(
-    side_search_progress, detour_guidance, detour_scan_role, action,
-):
-    return (
-        side_search_progress is not None
-        and side_search_progress["phase"] == "REORIENT"
-        and action in (TURN_LEFT_90, TURN_RIGHT_90),
-        side_search_progress is not None
-        and side_search_progress["phase"] == "RESCAN"
-        and action == SCAN_FRONT_ARC,
-        detour_guidance is not None
-        and detour_scan_role == "PASS" and action == SCAN_FRONT_ARC,
-        detour_guidance is not None
-        and detour_scan_role == "FINAL" and action == SCAN_FRONT_ARC,
-    )
-
-
 __all__ = (
     "admit_blast_spoken_action",
-    "blast_action_phase_flags",
     "fresh_blast_action_observation",
 )

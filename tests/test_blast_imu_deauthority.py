@@ -4,7 +4,7 @@ import unittest
 from robot_agent.blast_episode_adapter import (
     BlastEpisodeError,
     BlastEpisodeRuntimeAdapter,
-    _side_search_encoder_correlated,
+    _encoder_anchor_correlated,
 )
 from robot_agent.blast_navigation_motion_execution import (
     BlastNavigationMotionExecutor,
@@ -81,7 +81,7 @@ class BlastIMUDeauthorityTests(unittest.TestCase):
             "heading_deg": 38.96,
         })
         observation = adapter._observation()
-        self.assertTrue(_side_search_encoder_correlated(
+        self.assertTrue(_encoder_anchor_correlated(
             observation, executor,
         ))
         admitted = adapter._fresh_planner_action_observation(
@@ -94,7 +94,7 @@ class BlastIMUDeauthorityTests(unittest.TestCase):
 
         controller.observation["motor_angles_deg"]["left_drive"] += 2
         drifted = adapter._observation()
-        self.assertFalse(_side_search_encoder_correlated(drifted, executor))
+        self.assertFalse(_encoder_anchor_correlated(drifted, executor))
         with self.assertRaises(BlastEpisodeError) as raised:
             adapter._fresh_planner_action_observation(
                 action=TURN_LEFT_90,
