@@ -1,6 +1,5 @@
 from copy import deepcopy
 import math
-import time
 from unittest import TestCase
 
 from robot_agent.blast_episode_map_trace import _BlastEpisodeMapTrace
@@ -383,45 +382,17 @@ class BlastSpatialMapBridgeTests(TestCase):
                 self.assertTrue(trace["final_goal"]["navigation_enforced"])
                 self.assertEqual(trace["planned_leg"], leg)
 
-    def test_terminal_trace_invalidates_active_route_without_erasing_it(self):
+    def test_trace_retains_latest_sixteen_scans_without_host_route(self):
         bridge = BlastSpatialMapBridge()
-        observed_at_unix_ms = time.time_ns() // 1_000_000
         trace = _BlastEpisodeMapTrace(
             bridge=bridge,
             episode_id="episode-a",
             pose=PhysicalPose(),
             observation=observation(),
-            observed_at_unix_ms=observed_at_unix_ms,
+            observed_at_unix_ms=1_000,
             episode_start_heading=0.0,
             minimum_forward_progress_mm=420,
         )
-        trace.navigation_enforced = True
-        trace.planned_leg = planned_leg(
-            kind="REACQUIRE_GOAL_HEADING",
-            scope="LOCAL_DETOUR_ROUTE",
-            route_eligible=True,
-        )
-        trace.local_detour_route = {
-            "schema": "robot-local-detour-route/v1",
-            "read_only": True,
-            "provisional": True,
-            "route_id": "route-a",
-            "version": 2,
-            "status": "ACTIVE",
-            "detour_side": "RIGHT_OF_GOAL",
-            "active_index": 1,
-            "waypoints": [
-                {"ordinal": 0, "kind": "LATERAL_CLEARANCE",
-                 "x_mm": 0, "y_mm": -225, "heading_mdeg": -90_000,
-                 "fact_key": None, "status": "COMPLETED"},
-                {"ordinal": 1, "kind": "REACQUIRE_GOAL_HEADING",
-                 "x_mm": 0, "y_mm": -225, "heading_mdeg": 0,
-                 "fact_key": "GOAL_HEADING_ALIGNED", "status": "ACTIVE"},
-                {"ordinal": 2, "kind": "PASS_BEYOND_TARGET",
-                 "x_mm": 500, "y_mm": -225, "heading_mdeg": 0,
-                 "fact_key": "TARGET_BEHIND", "status": "UPCOMING"},
-            ],
-        }
         scan_view = {
             "scan_pose": {"x_mm": 0, "y_mm": 0, "heading_mdeg": 0},
             "planar_projection": {
@@ -439,41 +410,28 @@ class BlastSpatialMapBridgeTests(TestCase):
                 pose=PhysicalPose(),
                 observation=observation(),
                 pose_observed=False,
-                selected_side=None,
-                waypoint=None,
-                bind_pose=PhysicalPose(),
                 scan_view=scan_view,
             )
 
-        active = bridge.snapshot()["navigation_trace"]
-        self.assertEqual(len(active["planar_scan_views"]), 16)
+        value = bridge.snapshot()["navigation_trace"]
+        self.assertEqual(len(value["planar_scan_views"]), 16)
         self.assertEqual(
-            [view["scan_id"] for view in active["planar_scan_views"]],
+            [view["scan_id"] for view in value["planar_scan_views"]],
             [f"episode-a-scan-{index}" for index in range(2, 18)],
         )
         self.assertEqual(
-            len({view["scan_id"] for view in active["planar_scan_views"]}),
+            len({view["scan_id"] for view in value["planar_scan_views"]}),
             16,
         )
-        self.assertEqual(active["local_detour_route"]["status"], "ACTIVE")
-
-        self.assertTrue(trace.finalize())
-
-        value = bridge.snapshot()["navigation_trace"]
-        self.assertEqual(value["local_detour_route"]["status"], "INVALID")
-        self.assertEqual(
-            [item["status"] for item in value["local_detour_route"]["waypoints"]],
-            ["COMPLETED", "UPCOMING", "UPCOMING"],
-        )
+        self.assertIsNone(value["local_detour_route"])
         self.assertIsNone(value["planned_leg"])
         self.assertFalse(value["final_goal"]["navigation_enforced"])
 
-        self.assertTrue(trace.clear_route(
-            pose=PhysicalPose(), observation=observation(),
-        ))
-        self.assertIsNone(
-            bridge.snapshot()["navigation_trace"]["local_detour_route"]
-        )
+        self.assertTrue(trace.finalize())
+        final = bridge.snapshot()["navigation_trace"]
+        self.assertIsNone(final["local_detour_route"])
+        self.assertIsNone(final["planned_leg"])
+        self.assertFalse(final["final_goal"]["navigation_enforced"])
 
     def test_planner_map_evidence_is_compact_echo_only_and_detached(self):
         trace = _BlastEpisodeMapTrace(

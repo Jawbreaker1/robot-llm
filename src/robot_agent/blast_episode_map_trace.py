@@ -12,9 +12,7 @@ from .blast_mission_completion import (
     BLAST_GOAL_HEADING_TOLERANCE_MDEG,
     BLAST_GOAL_RADIUS_MM,
 )
-from .blast_side_observation import side_search_planned_leg
 from .blast_spatial_map import MAX_PLANAR_SCAN_VIEWS
-from .local_detour_route import ROUTE_ACTIVE, ROUTE_COMPLETE, ROUTE_INVALID
 from .physical_navigation_mission import DirectionalMission
 from .physical_navigation_contract import (
     ADVANCE, REVERSE, SCAN_FRONT_ARC, TURN_LEFT_90, TURN_RIGHT_90,
@@ -59,12 +57,9 @@ class _BlastEpisodeMapTrace:
             pose=pose,
             heading_tolerance_mdeg=BLAST_GOAL_HEADING_TOLERANCE_MDEG,
         )
-        self.navigation_enforced = False
         self.advisory_waypoint = None
-        self.planned_leg = None
         self.planar_scan_views = []
         self._scan_sequence = 0
-        self.local_detour_route = None
         self._last_pose = pose
         self._last_observation = copy.deepcopy(observation)
         self._last_observed_at_unix_ms = observed_at_unix_ms
@@ -88,7 +83,7 @@ class _BlastEpisodeMapTrace:
         target_x, target_y = self.mission.target_point()
         return {
             "kind": "DIRECTIONAL_HEADING",
-            "navigation_enforced": self.navigation_enforced,
+            "navigation_enforced": False,
             "origin_x_mm": self.mission.origin_x_mm,
             "origin_y_mm": self.mission.origin_y_mm,
             "target_x_mm": target_x,
@@ -135,13 +130,13 @@ class _BlastEpisodeMapTrace:
             "offer_trace",
             episode_id=self.episode_id,
             final_goal=self._final_goal(pose),
-            planned_leg=self.planned_leg,
+            planned_leg=None,
             advisory_waypoint=self.advisory_waypoint,
             imu_heading=self._imu_heading(
                 observation, observed_at_unix_ms
             ),
             planar_scan_views=tuple(self.planar_scan_views),
-            local_detour_route=self.local_detour_route,
+            local_detour_route=None,
         )
 
     def planner_local_map_evidence(self, pose):
@@ -229,32 +224,6 @@ class _BlastEpisodeMapTrace:
         self.advisory_waypoint = candidate
         return self._offer_trace(pose, observation, observed_at_unix_ms)
 
-    def clear_planned_leg(
-        self, *, pose, observation, observed_at_unix_ms=None,
-    ):
-        """Publish that no transient leg remains at the supplied pose."""
-
-        if not isinstance(observation, Mapping):
-            return False
-        if observed_at_unix_ms is None:
-            observed_at_unix_ms = self._last_observed_at_unix_ms
-        self.planned_leg = None
-        return self._offer_trace(pose, observation, observed_at_unix_ms)
-
-    def clear_route(
-        self, *, pose, observation, observed_at_unix_ms=None,
-    ):
-        """Publish a causal route reset before recovery replans."""
-
-        if not isinstance(observation, Mapping):
-            return False
-        if observed_at_unix_ms is None:
-            observed_at_unix_ms = self._last_observed_at_unix_ms
-        self.navigation_enforced = False
-        self.planned_leg = None
-        self.local_detour_route = None
-        return self._offer_trace(pose, observation, observed_at_unix_ms)
-
     def invalidate_localization(self):
         """Make an ambiguous post-motion pose explicitly unavailable."""
 
@@ -265,7 +234,7 @@ class _BlastEpisodeMapTrace:
     def finalize(
         self, *, pose=None, observation=None, observed_at_unix_ms=None,
     ):
-        """End transient guidance without erasing diagnostic route history."""
+        """Publish the final diagnostic pose, scan history and waypoint."""
 
         pose = self._last_pose if pose is None else pose
         observation = (
@@ -275,53 +244,7 @@ class _BlastEpisodeMapTrace:
             return False
         if observed_at_unix_ms is None:
             observed_at_unix_ms = self._last_observed_at_unix_ms
-        self.planned_leg = None
-        if (
-            self.local_detour_route is not None
-            and self.local_detour_route["status"] == ROUTE_ACTIVE
-        ):
-            route = copy.deepcopy(self.local_detour_route)
-            route["status"] = ROUTE_INVALID
-            for waypoint in route["waypoints"]:
-                if waypoint["status"] == "ACTIVE":
-                    waypoint["status"] = "UPCOMING"
-            self.local_detour_route = route
-            self.navigation_enforced = False
-        elif self.local_detour_route is None:
-            self.navigation_enforced = False
         return self._offer_trace(pose, observation, observed_at_unix_ms)
-
-    @staticmethod
-    def _route_trace(route):
-        value = route.to_dict()
-        status = value["status"]
-        active_index = value["active_index"]
-        waypoints = []
-        for index, source in enumerate(value["waypoints"]):
-            if status == ROUTE_COMPLETE or index < active_index:
-                waypoint_status = "COMPLETED"
-            elif status == ROUTE_ACTIVE and index == active_index:
-                waypoint_status = "ACTIVE"
-            else:
-                waypoint_status = "UPCOMING"
-            waypoints.append({
-                key: source[key]
-                for key in (
-                    "ordinal", "kind", "x_mm", "y_mm", "heading_mdeg",
-                    "fact_key",
-                )
-            } | {"status": waypoint_status})
-        return {
-            "schema": value["schema"],
-            "read_only": True,
-            "provisional": True,
-            "route_id": value["route_id"],
-            "version": value["version"],
-            "status": status,
-            "detour_side": value["detour_side"],
-            "active_index": active_index,
-            "waypoints": waypoints,
-        }
 
     def record(
         self,
@@ -329,11 +252,7 @@ class _BlastEpisodeMapTrace:
         pose,
         observation,
         pose_observed,
-        selected_side,
-        waypoint,
-        bind_pose,
         scan_view,
-        route=None,
     ):
         if not isinstance(observation, Mapping):
             return
@@ -345,39 +264,6 @@ class _BlastEpisodeMapTrace:
                 pose=pose,
                 observation=observation,
             )
-        next_leg = side_search_planned_leg(
-            selected_side, waypoint, bind_pose)
-        if next_leg is not None and (
-            self.planned_leg is None
-            or self.planned_leg.get("waypoint") != next_leg["waypoint"]
-        ):
-            self.planned_leg = next_leg
-        if route is not None:
-            self.navigation_enforced = True
-            if route.status in (ROUTE_ACTIVE, ROUTE_COMPLETE, ROUTE_INVALID):
-                self.local_detour_route = self._route_trace(route)
-            if route.status == ROUTE_COMPLETE:
-                self.planned_leg = None
-            else:
-                active = route.active_waypoint
-                self.planned_leg = {
-                    "kind": active.kind,
-                    "scope": "LOCAL_DETOUR_ROUTE",
-                    "clearance_proven": False,
-                    "passage_proven": False,
-                    "route_eligible": True,
-                    "selected_side": (
-                        "LEFT"
-                        if route.detour_side == "LEFT_OF_GOAL"
-                        else "RIGHT"
-                    ),
-                    "bind_pose": _map_pose(pose),
-                    "waypoint": {
-                        "x_mm": active.x_mm,
-                        "y_mm": active.y_mm,
-                        "heading_mdeg": active.heading_mdeg,
-                    },
-                }
         if isinstance(scan_view, Mapping):
             self._scan_sequence += 1
             self.planar_scan_views.append({
@@ -398,8 +284,7 @@ class _BlastEpisodeMapTrace:
         self._offer_trace(pose, observation, observed_at_unix_ms)
 
     def record_action(
-        self, action, pose, observation, selected_side, waypoint,
-        scan_view, route=None, pose_observed=None,
+        self, action, pose, observation, scan_view, pose_observed=None,
     ):
         self.record(
             pose=pose,
@@ -408,11 +293,7 @@ class _BlastEpisodeMapTrace:
                 action in _MOTION_ACTIONS
                 if pose_observed is None else pose_observed
             ),
-            selected_side=selected_side,
-            waypoint=waypoint,
-            bind_pose=pose,
             scan_view=(scan_view if action == SCAN_FRONT_ARC else None),
-            route=route,
         )
 
 

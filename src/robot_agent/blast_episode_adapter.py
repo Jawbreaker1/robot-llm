@@ -1050,7 +1050,7 @@ class BlastEpisodeRuntimeAdapter:
                 }
         map_trace.record_action(
             action, motion_executor.pose, result_observation,
-            None, None, latest_scan_view,
+            latest_scan_view,
             pose_observed=(action in ACTION_COMMANDS or
                            action == SCAN_FRONT_ARC),
         )
