@@ -1281,7 +1281,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 )
                 self.assertEqual(calls, [True])
 
-    def test_replans_after_each_bounded_action_without_early_completion(self):
+    def test_clear_path_keeps_goal_across_bounded_agent_actions(self):
         controller = FakeController(500)
         planner = Planner([
             decision(
@@ -1304,6 +1304,10 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertEqual(controller.commands, ["drive_forward"] * 2)
         self.assertEqual(len(planner.contexts), 2)
+        self.assertEqual(
+            [item.goal for item in planner.contexts],
+            ["Approach the obstacle"] * 2,
+        )
         self.assertEqual(
             planner.contexts[1].history[0]["action"],
             "ADVANCE",

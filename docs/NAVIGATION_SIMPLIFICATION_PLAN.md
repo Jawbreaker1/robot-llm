@@ -1,6 +1,7 @@
 # Navigation simplification plan
 
-Status: accepted direction; stage 1 cleanup is in progress.
+Status: stage 1 cleanup is complete; stage 2 behavioral alignment is in
+progress.
 
 Baseline: `fb359f7` on `main`, published on 2026-08-20. This plan starts from
 that clean checkpoint. It complements [Navigation ownership](NAVIGATION_OWNERSHIP.md),
@@ -125,6 +126,31 @@ implementation and its remaining behavior must not be copied into EV3.
   primitive. Do not make Gemma decide individual motor pulses.
 - Retain each robot's sensor adapter, bounded motion executor, motor supervisor,
   collision checks, and truthful pose updates.
+
+The four scenarios use the same observable contract for both robots:
+
+| Scenario | Required outcome |
+| --- | --- |
+| Clear path | The first planner context contains the user goal and surroundings evidence. Gemma may choose one bounded `ADVANCE` primitive whose executor emits several short forward pulses, then control returns to Gemma before any different semantic action. |
+| Opening left | The world view shows the left opening and keeps the original goal. Gemma chooses the turn or advisory waypoint; the host neither invents a side nor substitutes a route step. |
+| Opening right | The mirrored left-opening contract applies without a fixed or preferred first side. |
+| Transient bad sensor | No motion starts from invalid evidence. A bounded re-observation returns recovered evidence to Gemma in the same episode instead of terminating the mission or starting a second recovery workflow. |
+
+Stage 2 starts from an explicit, incomplete baseline rather than compatibility
+tests that pretend the target is already met:
+
+- BLAST already carries `goal`, compact map evidence, available actions, and an
+  advisory Gemma waypoint on every decision. Its current startup acquisition
+  publishes one broad front scan view, not a verified full-surroundings view.
+- EV3 already carries the same user goal as `mission.user_goal` and can execute
+  several short pulses for one model-authored forward primitive. It has no
+  mandatory startup surroundings acquisition and its local-detour route
+  executive still selects follow-up waypoint motion without a new model
+  decision.
+- The clear-path tests lock goal continuity and bounded same-direction pulse
+  batching first. Opening-left, opening-right, and transient-evidence tests are
+  added only with the corresponding behavior slice; they are not mocked green
+  in advance.
 
 Acceptance:
 
