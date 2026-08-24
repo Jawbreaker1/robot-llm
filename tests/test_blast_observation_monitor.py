@@ -2933,7 +2933,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(monitor.settle_calls, 3)
         monitor.close()
 
-    def test_scan_continues_after_same_pose_settle_recovery(self):
+    def test_scan_continues_from_noisy_center_and_same_pose_recovery(self):
         class RecoveredTurnMonitor(BlastObservationMonitor):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -2948,7 +2948,17 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 timeout_seconds=None,
             ):
                 self.settle_calls += 1
+                if self.settle_calls == 1:
+                    self._settling_samples = (
+                        (321.0, 0.0, 0.0),
+                        (2_000.0, 0.0, 0.0),
+                        (740.0, 0.0, 0.0),
+                        (2_000.0, 0.0, 0.0),
+                        (321.0, 0.0, 0.0),
+                    )
+                    return initial_observation, False
                 if self.settle_calls == 2:
+                    self._settling_samples = ()
                     return initial_observation, False
                 if self.settle_calls == 3:
                     self._settling_samples = (

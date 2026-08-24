@@ -1289,6 +1289,7 @@ class BlastObservationMonitor:
             initial_observation=center,
             timeout_seconds=SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
         )
+        center_settled |= self._scan_sweep_window_allows_continuation(center)
         sensor = (
             BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
             .range_sensor_extrinsics
@@ -1338,8 +1339,7 @@ class BlastObservationMonitor:
         ):
             raise BlastControllerError(
                 "scan_start_clearance_unverified",
-                "BLAST scan cannot rotate without a settled measured "
-                "front clearance and navigation sensor pose",
+                "BLAST scan lacks usable idle range evidence or sensor pose",
                 motion_started=False,
             )
         sweep_samples = []
