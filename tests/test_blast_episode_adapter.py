@@ -2623,7 +2623,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             (),
         )
 
-    def test_full_scan_brackets_one_bounded_advance_at_no_return(self):
+    def test_full_scan_supports_completed_straight_advances_at_no_return(self):
         controller = FakeController(2_000)
         adapter = self.adapter(controller, Planner([]))
         observation = adapter._observation()
@@ -2651,6 +2651,27 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             (*history, {"action": ADVANCE}),
             latest_scan_view,
         ))
+        completed_advance = {
+            "action": ADVANCE,
+            "motion": {"command_completed": True},
+        }
+        self.assertIn(ADVANCE, adapter._available_actions(
+            observation,
+            (*history, completed_advance, completed_advance),
+            latest_scan_view,
+        ))
+        for interruption in (
+            {"action": TURN_RIGHT_90,
+             "motion": {"command_completed": True}},
+            {"action": ADVANCE,
+             "motion": {"command_completed": False}},
+        ):
+            with self.subTest(interruption=interruption):
+                self.assertNotIn(ADVANCE, adapter._available_actions(
+                    observation,
+                    (*history, completed_advance, interruption),
+                    latest_scan_view,
+                ))
 
         for side, change in (
             ("left_1", {"observation_settled": False}),
@@ -2672,7 +2693,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     {"scan": blocked},
                 ))
 
-    def test_agentic_full_scan_can_advance_once_at_no_return(self):
+    def test_agentic_full_scan_can_continue_straight_at_no_return(self):
         class FullNoReturnScanController(FakeController):
             def issue_no_return_scan_permit(self, **_values):
                 return object()
@@ -2712,17 +2733,20 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         planner = Planner([
             decision(SCAN_FRONT_ARC),
             decision(ADVANCE),
+            decision(ADVANCE),
         ])
 
         result = self.adapter(
-            controller, planner, max_decisions=2,
+            controller, planner, max_decisions=3,
         ).run(episode_context()[0])
 
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertEqual(
-            controller.commands, ["scan_front_arc", "drive_forward"],
+            controller.commands,
+            ["scan_front_arc", "drive_forward", "drive_forward"],
         )
         self.assertIn(ADVANCE, planner.contexts[1].available_actions)
+        self.assertIn(ADVANCE, planner.contexts[2].available_actions)
 
     def test_full_scan_turns_use_settled_rays_around_unknown_echoes(self):
         adapter = self.adapter(FakeController(), Planner([]))

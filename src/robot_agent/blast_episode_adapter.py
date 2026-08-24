@@ -299,6 +299,23 @@ class BlastEpisodeRuntimeAdapter:
         )
 
     @staticmethod
+    def _scan_supports_straight_follow_through(history) -> bool:
+        """Whether a full scan is followed only by completed advances."""
+
+        for item in reversed(history):
+            action = item.get("action")
+            if action in (SCAN_FRONT_ARC, _STARTUP_SURROUNDINGS_ACTION):
+                return True
+            motion = item.get("motion")
+            if not (
+                action == ADVANCE
+                and isinstance(motion, Mapping)
+                and motion.get("command_completed") is True
+            ):
+                return False
+        return False
+
+    @staticmethod
     def _current_scan_allows_quarter_turn(
         history, latest_scan_view=None,
     ) -> bool:
@@ -365,10 +382,10 @@ class BlastEpisodeRuntimeAdapter:
     def _current_scan_allows_bounded_advance(
         self, history, latest_scan_view,
     ) -> bool:
-        """Whether a current full scan has no block in its forward fan."""
+        """Whether a full scan supports another straight bounded advance."""
 
         if (
-            not self._scan_evidence_is_fresh(history)
+            not self._scan_supports_straight_follow_through(history)
             or not isinstance(latest_scan_view, Mapping)
         ):
             return False
