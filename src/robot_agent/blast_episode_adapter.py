@@ -10,6 +10,7 @@ import time
 from typing import Callable, Mapping
 
 from .blast_action_admission import (
+    BlastActionEvidenceChanged,
     admit_blast_spoken_action,
     fresh_blast_action_observation,
 )
@@ -1310,26 +1311,29 @@ class BlastEpisodeRuntimeAdapter:
                         False,
                         "BLAST has no currently observed safe motion or scan",
                     )
-                step, outcome = self._planner_step(
-                    planner=planner, context=context,
-                    observation=observation, history=history,
-                    available_actions=available_actions,
-                    completion_allowed=completion_allowed,
-                    scan_allows_turn=scan_allows_turn,
-                    latest_scan_view=latest_scan_view,
-                    motion_executor=motion_executor,
-                    episode_start_heading=episode_start_heading,
-                    deadline_ms=deadline_ms,
-                    abort_allowed=(
-                        not available_actions and not completion_allowed
-                    ),
-                    local_map_evidence=(
-                        map_trace.planner_local_map_evidence(
-                            motion_executor.pose
-                        )
-                    ),
-                    active_waypoint=active_waypoint,
-                )
+                try:
+                    step, outcome = self._planner_step(
+                        planner=planner, context=context,
+                        observation=observation, history=history,
+                        available_actions=available_actions,
+                        completion_allowed=completion_allowed,
+                        scan_allows_turn=scan_allows_turn,
+                        latest_scan_view=latest_scan_view,
+                        motion_executor=motion_executor,
+                        episode_start_heading=episode_start_heading,
+                        deadline_ms=deadline_ms,
+                        abort_allowed=(
+                            not available_actions and not completion_allowed
+                        ),
+                        local_map_evidence=(
+                            map_trace.planner_local_map_evidence(
+                                motion_executor.pose
+                            )
+                        ),
+                        active_waypoint=active_waypoint,
+                    )
+                except BlastActionEvidenceChanged:
+                    continue
                 if outcome is not None:
                     return outcome
                 action = step["action"]
@@ -1345,10 +1349,14 @@ class BlastEpisodeRuntimeAdapter:
                     observed_at_unix_ms=observation["observed_at_unix_ms"],
                 )
                 scan_pose = motion_executor.pose if action == SCAN_FRONT_ARC else None
-                observation, outcome = admit_blast_spoken_action(
-                    self, speech, step, observation, motion_executor,
-                    episode_start_heading, context, deadline_ms,
-                    len(history) + 1)
+                try:
+                    observation, outcome = admit_blast_spoken_action(
+                        self, speech, step, observation, motion_executor,
+                        episode_start_heading, context, deadline_ms,
+                        len(history) + 1)
+                except BlastActionEvidenceChanged:
+                    context.publish({"current_action": None, "plan": []})
+                    continue
                 if outcome is not None:
                     return outcome
                 no_return_scan_geometry_checked = (

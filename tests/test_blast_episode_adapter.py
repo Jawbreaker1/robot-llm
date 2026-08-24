@@ -1089,7 +1089,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertEqual(controller.commands, ["scan_front_arc"])
 
-    def test_obstacle_during_speech_preload_blocks_motor(self):
+    def test_obstacle_during_speech_preload_replans_without_motor(self):
         clock = {"now": 1_000}
 
         class FreshController(FakeController):
@@ -1140,8 +1140,8 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         worker.join(1)
 
         self.assertFalse(worker.is_alive())
-        self.assertEqual(result, [])
-        self.assertEqual(errors[0].code, "blast_action_start_unverified")
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0].terminal_reason, "no_safe_blast_action")
         self.assertEqual(controller.commands, [])
 
     def test_post_speech_uses_fresh_monitor_observation(self):
@@ -3247,18 +3247,16 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     SCAN_FRONT_ARC, planner.contexts[0].available_actions,
                 )
 
-    def test_action_safety_is_rechecked_after_model_latency(self):
-        for action, change, code in (
-            ("ADVANCE", ("distance_mm", 40), "blast_action_start_unverified"),
+    def test_action_evidence_change_after_model_latency_replans_without_motor(self):
+        for action, change in (
+            ("ADVANCE", ("distance_mm", 40)),
             (
                 TURN_LEFT_90,
                 ("distance_mm", 2_000),
-                "blast_action_start_unverified",
             ),
             (
                 TURN_LEFT_90,
                 ("body", 156),
-                "blast_action_start_unverified",
             ),
         ):
             with self.subTest(action=action):
@@ -3280,12 +3278,13 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
                 planner = SafetyChangesPlanner([decision(action)])
 
-                with self.assertRaises(BlastEpisodeError) as raised:
-                    self.adapter(controller, planner).run(
-                        episode_context()[0]
-                    )
+                result = self.adapter(
+                    controller, planner, max_decisions=1,
+                ).run(episode_context()[0])
 
-                self.assertEqual(raised.exception.code, code)
+                self.assertEqual(
+                    result.terminal_reason, "decision_budget_exhausted",
+                )
                 self.assertEqual(controller.commands, [])
 
     def test_scan_monitor_settling_can_recover_a_transient_snapshot(self):

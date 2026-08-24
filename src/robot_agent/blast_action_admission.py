@@ -15,6 +15,10 @@ from .physical_navigation_contract import (
 )
 
 
+class BlastActionEvidenceChanged(RuntimeError):
+    """The selected action no longer matches the latest idle observation."""
+
+
 def _interrupted() -> BlastControllerError:
     return BlastControllerError(
         "controller_command_interrupted",
@@ -69,10 +73,7 @@ def fresh_blast_action_observation(
         and not exact_nvd_bounded_action
         and not adapter._current_observation_allows_action(action, observation)
     ):
-        raise episode_error_type(
-            "blast_action_start_unverified",
-            "BLAST action lost current motion safety evidence",
-        )
+        raise BlastActionEvidenceChanged
     return observation
 
 
@@ -104,6 +105,7 @@ def admit_blast_spoken_action(
 
 
 __all__ = (
+    "BlastActionEvidenceChanged",
     "admit_blast_spoken_action",
     "fresh_blast_action_observation",
 )
