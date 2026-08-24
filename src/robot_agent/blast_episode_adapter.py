@@ -1307,6 +1307,8 @@ class BlastEpisodeRuntimeAdapter:
                         or self._scan_evidence_is_fresh(history)
                     ),
                 )
+                if completion_allowed:
+                    available_actions = ()
                 if not available_actions and not completion_allowed:
                     observation, available_actions, refreshed_turns, outcome = (
                         recover_planner_iteration_actions(

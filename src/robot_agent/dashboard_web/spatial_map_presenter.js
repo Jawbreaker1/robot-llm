@@ -649,9 +649,11 @@
         class: "map-local-layer-note",
       });
       layerNote.textContent = t(
-        map.navigationTrace
-          ? "map.navigation_trace.layer_note"
-          : "map.local_odometry.layer_note",
+        map.reasonCode === "localization_lost"
+          ? "map.local_odometry.localization_lost_note"
+          : map.navigationTrace
+            ? "map.navigation_trace.layer_note"
+            : "map.local_odometry.layer_note",
       );
       layer.appendChild(layerNote);
 
@@ -1750,6 +1752,10 @@
       const localOdometrySceneValue = sharedMap
         ? { points: [], cues: [], latestScans: [] }
         : localOdometryScene(map);
+      const retainedLostLocalization = (
+        map.status === "unavailable"
+        && map.reasonCode === "localization_lost"
+      );
       const localOdometryDrawable = (
         map.contractValid
         && map.frameKind === LOCAL_ODOMETRY
@@ -1757,6 +1763,7 @@
           map.status === "pose_only"
           || map.status === "qualitative_only"
           || map.status === "degraded"
+          || retainedLostLocalization
         )
         && map.bounds === null
         && localOdometrySceneValue.points.length > 0
@@ -1784,6 +1791,9 @@
       } else if (mapDrawable || sharedDrawable) {
         status.className = "state-chip state-ready";
         status.textContent = t("map.status.live");
+      } else if (retainedLostLocalization) {
+        status.className = "state-chip state-locked";
+        status.textContent = t("map.status.localization_lost");
       } else if (map.status === "qualitative_only") {
         status.className = "state-chip state-ready";
         status.textContent = t("map.status.qualitative_only");

@@ -1521,7 +1521,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertFalse(blast_directional_completion_allowed(
             mission=mission,
-            pose=PhysicalPose(x_mm=299),
+            pose=PhysicalPose(x_mm=419),
             localization_valid=True,
             scan_fresh=True,
         ))
@@ -1551,7 +1551,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         ))
         self.assertTrue(blast_directional_completion_allowed(
             mission=mission,
-            pose=PhysicalPose(x_mm=420, y_mm=120),
+            pose=PhysicalPose(x_mm=700, y_mm=120),
             localization_valid=True,
             scan_fresh=True,
         ))
@@ -1573,9 +1573,9 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(result.completed)
         self.assertEqual(result.terminal_reason, "completed")
         self.assertEqual(controller.commands, ["drive_forward"] * 10)
-        self.assertFalse(planner.contexts[6].completion_allowed)
-        self.assertTrue(planner.contexts[7].completion_allowed)
+        self.assertFalse(planner.contexts[-2].completion_allowed)
         self.assertTrue(planner.contexts[-1].completion_allowed)
+        self.assertEqual(planner.contexts[-1].available_actions, ())
         self.assertEqual(
             planner.contexts[-1].observation["odometry"]["x_mm"],
             450,

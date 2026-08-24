@@ -648,6 +648,9 @@ const translations = {
   ),
   "map.local_odometry.layer_label": "PROVISIONAL LOCAL ODOMETRY",
   "map.local_odometry.layer_note": "Angular IR cue · no measured distance",
+  "map.local_odometry.localization_lost_note": (
+    "Last verified path and scan · current pose unknown"
+  ),
   "map.local_odometry.nonmetric": "No metric IR distance",
   "map.local_odometry.robot_title": "Provisional robot pose",
   "map.path.title": "Estimated path from odometry",
@@ -673,6 +676,7 @@ const translations = {
   "map.status.empty": "No map",
   "map.status.invalid": "Invalid",
   "map.status.live": "Live",
+  "map.status.localization_lost": "Localization lost · history retained",
   "map.status.offline": "Offline",
   "map.status.pose_only": "Pose only",
   "map.status.qualitative_only": "Qualitative IR available",
@@ -860,6 +864,41 @@ const poseResult = {
 presenter.render({
   schema: "robot-spatial-map/v1",
   read_only: true,
+  status: "unavailable",
+  reason_code: "localization_lost",
+  robot_id: "robot-1",
+  frame_id: "LOCAL_ODOMETRY",
+  frame_kind: "LOCAL_ODOMETRY",
+  map_version: 3,
+  bounds: null,
+  robot_pose: null,
+  pose_history: [{
+    x_mm: 0,
+    y_mm: 0,
+    heading_mdeg: 0,
+    frame_id: "LOCAL_ODOMETRY",
+  }, {
+    x_mm: 90,
+    y_mm: 0,
+    heading_mdeg: 0,
+    frame_id: "LOCAL_ODOMETRY",
+  }],
+  cells: [],
+  sensor_rays: [],
+  object_hypotheses: [],
+  qualitative_observations: [],
+}, "connected", 2000);
+const localizationLostResult = {
+  connection: nodes["map-connection-status"].textContent,
+  emptyHidden: nodes["map-empty-state"].hidden,
+  localTags: nodes["map-local-odometry-layer"].children
+    .map((node) => node.tag),
+  localText: nodes["map-local-odometry-layer"].textContent,
+};
+
+presenter.render({
+  schema: "robot-spatial-map/v1",
+  read_only: true,
   status: "available",
   robot_id: "robot-1",
   frame_id: "SIM_WORLD",
@@ -934,6 +973,7 @@ try {
 process.stdout.write(JSON.stringify({
   qualitativeResult,
   poseResult,
+  localizationLostResult,
   metricResult,
   invalidDependenciesRejected,
 }));
@@ -1067,6 +1107,21 @@ process.stdout.write(JSON.stringify({
         self.assertIn(
             "Path points2 shown · 2 older removed",
             pose["metadataText"],
+        )
+
+        localization_lost = result["localizationLostResult"]
+        self.assertEqual(
+            localization_lost["connection"],
+            "Localization lost · history retained",
+        )
+        self.assertTrue(localization_lost["emptyHidden"])
+        self.assertEqual(
+            localization_lost["localTags"],
+            ["text", "text", "path", "circle"],
+        )
+        self.assertIn(
+            "current pose unknown",
+            localization_lost["localText"],
         )
 
         metric = result["metricResult"]
