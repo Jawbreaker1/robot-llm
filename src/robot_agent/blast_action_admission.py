@@ -9,6 +9,7 @@ from .blast_observation_monitor import (
 )
 from .physical_navigation_contract import (
     ADVANCE,
+    REVERSE,
     SCAN_FRONT_ARC,
     TURN_LEFT_90,
     TURN_RIGHT_90,
@@ -60,17 +61,23 @@ def fresh_blast_action_observation(
         == RANGE_STATE_NO_VALID_DISTANCE
         and navigation_body_matched(observation["sensors"])
     )
-    exact_nvd_bounded_action = (
+    bounded_evidence_action = (
         allow_no_valid_with_bounded_evidence is True
-        and action in (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90)
-        and blast_range_state(observation["sensors"].get("distance_mm"))
-        == RANGE_STATE_NO_VALID_DISTANCE
         and navigation_body_matched(observation["sensors"])
+        and (
+            action == REVERSE
+            or (
+                action in (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90)
+                and blast_range_state(
+                    observation["sensors"].get("distance_mm")
+                ) == RANGE_STATE_NO_VALID_DISTANCE
+            )
+        )
     )
     if (
         action != SCAN_FRONT_ARC
         and not exact_nvd_scan
-        and not exact_nvd_bounded_action
+        and not bounded_evidence_action
         and not adapter._current_observation_allows_action(action, observation)
     ):
         raise BlastActionEvidenceChanged

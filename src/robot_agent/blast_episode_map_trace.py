@@ -171,6 +171,8 @@ class _BlastEpisodeMapTrace:
                         "target_x_mm", "target_y_mm",
                         "desired_heading_mdeg",
                         "goal_radius_mm", "distance_to_goal_mm",
+                        "minimum_forward_progress_mm",
+                        "current_forward_progress_mm",
                         "current_lateral_offset_mm",
                         "remaining_forward_progress_mm",
                     )

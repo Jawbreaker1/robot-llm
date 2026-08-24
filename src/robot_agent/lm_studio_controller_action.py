@@ -55,8 +55,19 @@ _SYSTEM_PROMPT = (
     "ranges on the other side can show a broad obstacle. NO_VALID_DISTANCE and "
     "UNRESOLVED_SWEEP_ONLY mean unknown, never clear or long-range clearance. "
     "The host does not rank or choose the turn side. "
-    "After scan-guided motion, use a fresh scan from the resulting pose before "
-    "claiming passage complete. "
+    "ADVANCE is semantic forward progress, not a request for only one motor "
+    "pulse. When your plan is ADVANCE then COMPLETE, the host may repeat its "
+    "existing bounded pulses while the current front evidence remains usable, "
+    "the robot remains aligned, and neither the goal nor a new obstacle has "
+    "been reached. New evidence still returns control to you. "
+    "REVERSE is a bounded retreat for creating space or undoing a problematic "
+    "advance, never a generic exploration choice. When the direct path toward "
+    "the goal is clear and aligned, prefer ADVANCE over REVERSE or another "
+    "scan. Do not rescan after every clear straight advance; scan when the "
+    "surroundings needed for the next strategic choice are unknown or changed. "
+    "After scan-guided turning or an obstacle detour, use a fresh scan from the "
+    "resulting pose before claiming passage complete. Straight ADVANCE "
+    "continuation does not require a full scan after every bounded pulse. "
     "For a multi-step detour, maintain one advisory waypoint in episode-local "
     "x_mm/y_mm coordinates. Keep it while making useful progress; replace it "
     "only when reached, blocked, or when the next waypoint better serves the "
@@ -65,8 +76,12 @@ _SYSTEM_PROMPT = (
     "Pick "
     "COMPLETE only when the observation and history support that the goal is "
     "satisfied. Pick ABORT only when progress is no longer reasonable. Otherwise "
-    "pick one available action and provide a short tentative remaining plan whose "
-    "first item is that action. Reconsider the plan after every new observation. "
+    "pick one available action and provide a short tentative plan whose first "
+    "item is that action. plan_actions is the robot's full planning vocabulary, "
+    "so later plan items may name actions that are not available at the current "
+    "pose. active_plan is the unexecuted tail of your previous hypothesis. Keep "
+    "it when the new evidence still supports it, or return a revised full plan. "
+    "Reconsider the plan after every new observation. "
     "Do not invent sensor readings, objects, motion, capabilities, or success. "
     "Assessment and optional utterance must use the requested locale. The "
     "utterance may be expressive, but must never change the physical decision. "
@@ -237,6 +252,8 @@ class ControllerActionContext:
     robot_relative_side_scan: Mapping[str, object] | None = None
     local_map_evidence: Mapping[str, object] | None = None
     active_waypoint: Mapping[str, object] | None = None
+    plan_actions: tuple[str, ...] = ()
+    active_plan: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _safe_text("Controller goal", self.goal, MAX_GOAL_CHARS)
@@ -279,6 +296,27 @@ class ControllerActionContext:
         _strict_value(self.history)
         _strict_value(self.robot_relative_side_scan)
         _strict_value(self.local_map_evidence)
+        plan_actions = _actions(
+            self.plan_actions or self.available_actions,
+            allow_empty=True,
+        )
+        if any(action not in plan_actions for action in self.available_actions):
+            raise _lm.LMStudioInputError(
+                "Controller planning actions are invalid"
+            )
+        if (
+            not isinstance(self.active_plan, tuple)
+            or len(self.active_plan) > MAX_PLAN_STEPS
+            or any(
+                action not in plan_actions + (COMPLETE,)
+                for action in self.active_plan
+            )
+        ):
+            raise _lm.LMStudioInputError(
+                "Controller active plan is invalid"
+            )
+        object.__setattr__(self, "plan_actions", plan_actions)
+        object.__setattr__(self, "active_plan", tuple(self.active_plan))
         try:
             object.__setattr__(
                 self, "active_waypoint", _waypoint(self.active_waypoint),
@@ -299,6 +337,8 @@ class ControllerActionContext:
             "history": _strict_value(self.history),
             "completion_allowed": self.completion_allowed,
             "abort_allowed": self.abort_allowed,
+            "plan_actions": list(self.plan_actions),
+            "active_plan": list(self.active_plan),
         }
         if self.robot_relative_side_scan is not None:
             value["robot_relative_side_scan"] = _strict_value(
@@ -387,6 +427,7 @@ class LMStudioControllerActionPlanner:
             )
         )
         choices = list(context.available_actions + terminal_actions)
+        plan_choices = list(context.plan_actions + (COMPLETE,))
         properties = {
             "action": {"type": "string", "enum": choices},
             "confidence_milli": {
@@ -401,7 +442,7 @@ class LMStudioControllerActionPlanner:
             },
             "plan": {
                 "type": "array",
-                "items": {"type": "string", "enum": choices},
+                "items": {"type": "string", "enum": plan_choices},
                 "maxItems": MAX_PLAN_STEPS,
             },
             "utterance": {
@@ -583,6 +624,7 @@ class LMStudioControllerActionPlanner:
                 or action == ABORT and context.abort_allowed
             )
         )
+        plan_allowed = context.plan_actions + (COMPLETE,)
         if (
             action not in allowed
             or isinstance(confidence, bool)
@@ -594,7 +636,7 @@ class LMStudioControllerActionPlanner:
             or len(assessment) > MAX_ASSESSMENT_CHARS
             or not isinstance(plan, list)
             or len(plan) > MAX_PLAN_STEPS
-            or any(item not in allowed for item in plan)
+            or any(item not in plan_allowed for item in plan)
             or action in TERMINAL_ACTIONS
             and plan not in ([], [action])
             or action not in TERMINAL_ACTIONS

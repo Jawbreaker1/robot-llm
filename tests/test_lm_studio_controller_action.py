@@ -132,6 +132,10 @@ class ControllerActionPlannerTests(unittest.TestCase):
             ],
         )
         self.assertEqual(request["reasoning_effort"], "none")
+        system_prompt = request["messages"][0]["content"]
+        self.assertIn("ADVANCE is semantic forward progress", system_prompt)
+        self.assertIn("REVERSE is a bounded retreat", system_prompt)
+        self.assertIn("Do not rescan after every clear", system_prompt)
         utterance_schema = request["response_format"]["json_schema"][
             "schema"
         ]["properties"]["utterance"]["oneOf"][0]
@@ -593,6 +597,36 @@ class ControllerActionPlannerTests(unittest.TestCase):
         }))
         with self.assertRaises(LMStudioProtocolError):
             planner.decide(context())
+
+    def test_plan_can_hypothesize_actions_not_available_at_current_pose(self):
+        future = (TURN_RIGHT_90, "DRIVE_FORWARD", TURN_LEFT_90)
+        planner, transport = self.planner(completion({
+            "action": TURN_RIGHT_90,
+            "confidence_milli": 900,
+            "assessment": "Öppningen finns åt höger.",
+            "plan": [*future, COMPLETE],
+            "utterance": None,
+        }))
+
+        result = planner.decide(context(
+            available_actions=(TURN_RIGHT_90,),
+            plan_actions=future,
+            active_plan=("DRIVE_FORWARD", TURN_LEFT_90, COMPLETE),
+        ))
+
+        self.assertEqual(result.decision.plan, (*future, COMPLETE))
+        request = json.loads(transport.calls[0][1])
+        supplied = json.loads(request["messages"][1]["content"])
+        self.assertEqual(supplied["available_actions"], [TURN_RIGHT_90])
+        self.assertEqual(supplied["plan_actions"], list(future))
+        self.assertEqual(
+            supplied["active_plan"],
+            ["DRIVE_FORWARD", TURN_LEFT_90, COMPLETE],
+        )
+        plan_schema = request["response_format"]["json_schema"][
+            "schema"
+        ]["properties"]["plan"]
+        self.assertIn("DRIVE_FORWARD", plan_schema["items"]["enum"])
 
     def test_model_cannot_invent_an_action(self):
         planner, _ = self.planner(completion({
