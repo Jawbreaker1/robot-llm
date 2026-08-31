@@ -259,6 +259,9 @@ class MultiRobotNavigationSimulator:
         self,
         robot_id: str,
         relative_headings_mdeg: Sequence[int],
+        *,
+        origin_forward_mm: int = 0,
+        origin_left_mm: int = 0,
     ) -> tuple[tuple[int, int, str | None], ...]:
         """Return ``(bearing, clearance, object_id)`` without route hints."""
 
@@ -266,10 +269,18 @@ class MultiRobotNavigationSimulator:
             if not relative_headings_mdeg or any(
                 type(value) is not int or not -180_000 <= value <= 180_000
                 for value in relative_headings_mdeg
+            ) or any(
+                type(value) is not int or not -2_000 <= value <= 2_000
+                for value in (origin_forward_mm, origin_left_mm)
             ):
                 raise ValueError("simulation scan bearings are invalid")
             readings = tuple(
-                self._ray_reading(robot_id, relative)
+                self._ray_reading(
+                    robot_id,
+                    relative,
+                    origin_forward_mm=origin_forward_mm,
+                    origin_left_mm=origin_left_mm,
+                )
                 for relative in relative_headings_mdeg
             )
             self._record(robot_id, "scan", len(readings))
@@ -279,17 +290,31 @@ class MultiRobotNavigationSimulator:
         self,
         robot_id: str,
         relative_heading_mdeg: int,
+        *,
+        origin_forward_mm: int,
+        origin_left_mm: int,
     ) -> tuple[int, int, str | None]:
         pose = self._poses[robot_id]
         spec = self._robot_specs[robot_id]
+        body_heading = math.radians(pose.heading_mdeg / 1_000.0)
+        origin_x = (
+            pose.x_mm
+            + origin_forward_mm * math.cos(body_heading)
+            - origin_left_mm * math.sin(body_heading)
+        )
+        origin_y = (
+            pose.y_mm
+            + origin_forward_mm * math.sin(body_heading)
+            + origin_left_mm * math.cos(body_heading)
+        )
         absolute = math.radians(
             (pose.heading_mdeg + relative_heading_mdeg) / 1_000.0
         )
         dx, dy = math.cos(absolute), math.sin(absolute)
         step_mm = 10
         for distance in range(0, spec.sensor_range_mm + 1, step_mm):
-            x_mm = pose.x_mm + distance * dx
-            y_mm = pose.y_mm + distance * dy
+            x_mm = origin_x + distance * dx
+            y_mm = origin_y + distance * dy
             min_x, min_y, max_x, max_y = self.bounds
             if not (min_x <= x_mm <= max_x and min_y <= y_mm <= max_y):
                 return relative_heading_mdeg, distance, "world-boundary"
