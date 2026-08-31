@@ -3,6 +3,7 @@ import unittest
 from robot_agent.blast_navigation_action_profile import (
     BLAST_NAVIGATION_COMMANDS,
     DRIVE_ENCODER_DEGREES,
+    SCAN_TRIM_ENCODER_DEGREES_PER_PULSE,
     SCAN_TURN_ENCODER_DEGREES_PER_PULSE,
     SCAN_TURN_PULSES_PER_SIDE,
     TURN_ENCODER_DEGREES_PER_PULSE,
@@ -106,6 +107,7 @@ class BlastNavigationActionProfileTests(unittest.TestCase):
 
         self.assertEqual(SCAN_TURN_PULSES_PER_SIDE, 4)
         self.assertEqual(SCAN_TURN_ENCODER_DEGREES_PER_PULSE, 45)
+        self.assertEqual(SCAN_TRIM_ENCODER_DEGREES_PER_PULSE, 15)
         self.assertEqual(
             TURN_EXPECTED_ACTUAL_OPPOSED_ENCODER_DEGREES_PER_QUARTER_TURN
             * BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry

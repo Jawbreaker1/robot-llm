@@ -171,6 +171,11 @@ class FakeHub:
                 "accepted": True,
                 "direction": request["args"]["direction"],
             }
+        elif operation == "scan_trim_pulse":
+            result = {
+                "accepted": True,
+                "direction": request["args"]["direction"],
+            }
         elif operation == "claw_pulse":
             result = {
                 "accepted": True,
@@ -361,6 +366,12 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "direction"):
             await runtime.scan_turn_pulse("forward")
         self.assertEqual(
+            await runtime.scan_trim_pulse("left"),
+            {"accepted": True, "direction": "left"},
+        )
+        with self.assertRaisesRegex(ValueError, "direction"):
+            await runtime.scan_trim_pulse("forward")
+        self.assertEqual(
             await runtime.claw_pulse("open"),
             {"accepted": True, "direction": "open"},
         )
@@ -402,14 +413,22 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
             hub.writes[4],
             {
                 "id": 5,
-                "op": "claw_pulse",
-                "args": {"direction": "open"},
+                "op": "scan_trim_pulse",
+                "args": {"direction": "left"},
             },
         )
         self.assertEqual(
             hub.writes[5],
             {
                 "id": 6,
+                "op": "claw_pulse",
+                "args": {"direction": "open"},
+            },
+        )
+        self.assertEqual(
+            hub.writes[6],
+            {
+                "id": 7,
                 "op": "body_pulse",
                 "args": {"direction": "left"},
             },

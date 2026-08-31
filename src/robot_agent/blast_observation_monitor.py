@@ -34,6 +34,7 @@ from .blast_navigation_calibration import (
 )
 from .blast_navigation_action_profile import (
     SCAN_TURN_ENCODER_DEGREES_PER_PULSE,
+    SCAN_TRIM_ENCODER_DEGREES_PER_PULSE,
     TURN_SPEED_DPS,
 )
 from .blast_scan_observation import (
@@ -1150,6 +1151,7 @@ class BlastObservationMonitor:
         direction,
         *,
         start_drive_angles,
+        trim=False,
     ):
         if await self._service_preempt_stop(runtime, generation):
             raise BlastControllerError(
@@ -1157,7 +1159,14 @@ class BlastObservationMonitor:
                 "BLAST scan was interrupted by stop",
                 motion_started=False,
             )
-        receipt = await runtime.scan_turn_pulse(direction)
+        expected_wheel_angle = (
+            SCAN_TRIM_ENCODER_DEGREES_PER_PULSE
+            if trim else SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+        )
+        receipt = await (
+            runtime.scan_trim_pulse(direction)
+            if trim else runtime.scan_turn_pulse(direction)
+        )
         try:
             observation = await self._observe_until_idle(
                 runtime,
@@ -1202,7 +1211,7 @@ class BlastObservationMonitor:
             and receipt.get("direction") == direction
             and receipt.get("speed_dps") == TURN_SPEED_DPS
             and receipt.get("wheel_angle_deg")
-            == SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+            == expected_wheel_angle
             and isinstance(before_angles, Mapping)
             and set(before_angles) == {"left_drive", "right_drive"}
             and all(type(before_angles.get(role)) is int for role in (
@@ -1223,7 +1232,7 @@ class BlastObservationMonitor:
             receipt_profile_valid = all(
                 pulse_delta[role] * expected_signs[role] > 0
                 and abs(pulse_delta[role])
-                <= 4 * SCAN_TURN_ENCODER_DEGREES_PER_PULSE
+                <= 4 * expected_wheel_angle
                 for role in ("left_drive", "right_drive")
             )
         if (
@@ -1406,15 +1415,28 @@ class BlastObservationMonitor:
                 "observation_settled": final_settled,
                 "scan": scan,
             }
+        final_sample = sweep_samples[-1]
+        turn_count = len(sweep_samples)
         coverage = abs(encoder_sweep_bearing_deg(
-            sweep_samples[-1][1], start_drive_angles) or 0.0)
-        if not 350.0 <= coverage <= 390.0:
+            final_sample[1], start_drive_angles) or 0.0)
+        if coverage < 360.0:
+            final_sample = await self._scan_turn(
+                runtime,
+                generation,
+                "left",
+                start_drive_angles=start_drive_angles,
+                trim=True,
+            )
+            turn_count += 1
+            coverage = abs(encoder_sweep_bearing_deg(
+                final_sample[1], start_drive_angles) or 0.0)
+        if not 360.0 <= coverage <= 390.0:
             raise BlastControllerError(
                 "scan_sweep_observation_unverified",
                 "BLAST surroundings scan did not complete one encoder turn",
                 motion_started=True,
             )
-        _receipt, final, final_settled, _evidence = sweep_samples[-1]
+        _receipt, final, final_settled, _evidence = final_sample
         final_body_verified = sensor.matches_navigation_body_angle(
             _body_motor_angle(final))
         try:
@@ -1424,6 +1446,7 @@ class BlastObservationMonitor:
                 sweep_samples=sweep_samples,
                 final=final, final_settled=final_settled,
                 final_body_verified=final_body_verified,
+                sweep_turn_count=turn_count,
             )
         except ValueError as error:
             raise BlastControllerError(
@@ -1438,7 +1461,10 @@ class BlastObservationMonitor:
             "command": SCAN_COMMAND,
             "accepted": True,
             "completed": True,
-            "receipt": {"turn_count": len(sweep_samples)},
+            "receipt": {
+                "turn_count": turn_count,
+                "coverage_complete": True,
+            },
             "observation": final,
             "observation_settled": final_settled,
             "scan": scan,

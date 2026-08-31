@@ -50,11 +50,14 @@ A navigation result is useful only when:
 Fast scripted planners may still be used in narrow executor unit tests, but
 their results must never be reported as navigation validation.
 
-## Known failing condition
+## BLAST full-turn correction
 
-BLAST's current calibrated surroundings sequence uses sixteen 45-degree wheel
-pulses. At 490 body-millidegrees per opposed encoder degree this covers 352.8
-body degrees, not 360. The simulator therefore reports
-`coverage_complete: false`. A production navigation gate must remain failed
-until the physical scan provides verified full coverage and an honest final
-heading.
+BLAST's sixteen normal scan pulses cover slightly less than one body rotation.
+The surroundings command therefore ends with one fixed, short trim pulse. The
+trim completes the rotation but is not added as another map ray: the starting
+ray already represents that direction.
+
+The shared simulator measures 360.15 degrees of encoder-derived coverage and
+ends 0.15 degrees from the starting heading. Production accepts a surroundings
+scan only after its own encoders confirm at least one complete turn. Physical
+validation on BLAST remains required after deploying the updated hub runtime.

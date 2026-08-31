@@ -417,7 +417,7 @@ def validate_blast_scan_ray_contract(scan):
         and abs(final_bearing or 0.0) <= SCAN_RESTORATION_TOLERANCE_DEG
     )
     surroundings_pose_verified = (
-        sweep_coverage is not None and 350.0 <= sweep_coverage <= 390.0
+        sweep_coverage is not None and 360.0 <= sweep_coverage <= 390.0
     )
     expected_restored = (
         restoration_contract
@@ -643,7 +643,7 @@ def scan_ray(
 
 def build_blast_encoder_scan(
     *, center, center_settled, start_drive_angles, sweep_samples,
-    final, final_settled, final_body_verified,
+    final, final_settled, final_body_verified, sweep_turn_count=None,
 ):
     """Build nine representative rays from one encoder-measured full turn."""
 
@@ -670,7 +670,7 @@ def build_blast_encoder_scan(
         and common_mode_residue is not None
         and final.get("motion_active") is False
         and final_body_verified
-        and 350.0 <= sweep_coverage <= 390.0
+        and 360.0 <= sweep_coverage <= 390.0
     )
     candidates = []
     for sample in sweep_samples:
@@ -730,7 +730,10 @@ def build_blast_encoder_scan(
         "restoration_verified": restoration_verified,
         "sweep_coverage_deg": sweep_coverage,
         "sweep_direction": "left",
-        "sweep_turn_count": len(sweep_samples),
+        "sweep_turn_count": (
+            len(sweep_samples)
+            if sweep_turn_count is None else sweep_turn_count
+        ),
         "encoder_start_angles_deg": start_drive_angles,
         "encoder_final_angles_deg": final_drive_angles,
         "encoder_restoration": {

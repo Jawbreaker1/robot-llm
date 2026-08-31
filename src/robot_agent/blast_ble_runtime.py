@@ -229,6 +229,14 @@ class BlastBLERuntime:
             {"direction": direction},
         )
 
+    async def scan_trim_pulse(self, direction: str) -> Dict[str, object]:
+        if direction not in ("left", "right"):
+            raise ValueError("direction must be left or right")
+        return await self._request(
+            "scan_trim_pulse",
+            {"direction": direction},
+        )
+
     async def claw_pulse(self, direction: str) -> Dict[str, object]:
         if direction not in ("open", "close"):
             raise ValueError("direction must be open or close")
@@ -608,6 +616,7 @@ class BlastBLERuntime:
             "drive_pulse",
             "turn_pulse",
             "scan_turn_pulse",
+            "scan_trim_pulse",
             "claw_pulse",
             "body_pulse",
             "shutdown",

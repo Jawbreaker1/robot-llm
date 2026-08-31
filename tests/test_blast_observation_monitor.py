@@ -29,6 +29,7 @@ from robot_agent.blast_observation_monitor import (
     validate_blast_scan_ray_contract,
 )
 from robot_agent.blast_navigation_action_profile import (
+    SCAN_TRIM_ENCODER_DEGREES_PER_PULSE,
     SCAN_TURN_ENCODER_DEGREES_PER_PULSE,
     TURN_SPEED_DPS,
 )
@@ -154,6 +155,28 @@ class FakeRuntime:
             "direction": direction,
             "speed_dps": TURN_SPEED_DPS,
             "wheel_angle_deg": SCAN_TURN_ENCODER_DEGREES_PER_PULSE,
+            "before_angles_deg": before,
+        }
+
+    async def scan_trim_pulse(self, direction):
+        before = {
+            "left_drive": self.left_drive_angle,
+            "right_drive": self.right_drive_angle,
+        }
+        self.calls.append(("scan_trim_pulse", direction))
+        self.motion_observations = 1
+        sign = 1 if direction == "left" else -1
+        self.left_drive_angle -= (
+            sign * SCAN_TRIM_ENCODER_DEGREES_PER_PULSE
+        )
+        self.right_drive_angle += (
+            sign * SCAN_TRIM_ENCODER_DEGREES_PER_PULSE
+        )
+        return {
+            "accepted": True,
+            "direction": direction,
+            "speed_dps": TURN_SPEED_DPS,
+            "wheel_angle_deg": SCAN_TRIM_ENCODER_DEGREES_PER_PULSE,
             "before_angles_deg": before,
         }
 
@@ -2654,7 +2677,15 @@ class BlastObservationMonitorTests(unittest.TestCase):
             [("turn_pulse", "left")] * 16,
         )
         self.assertEqual(result["command"], SCAN_COMMAND)
-        self.assertEqual(result["receipt"], {"turn_count": 16})
+        self.assertEqual(result["receipt"], {
+            "turn_count": 17,
+            "coverage_complete": True,
+        })
+        self.assertEqual(
+            [call for call in runtime.calls
+             if call[0] == "scan_trim_pulse"],
+            [("scan_trim_pulse", "left")],
+        )
         self.assertEqual(result["observation"]["imu"]["heading_deg"], 3.0)
         scan = result["scan"]
         self.assertEqual(scan["schema"], SCAN_RESULT_SCHEMA)
@@ -2690,8 +2721,8 @@ class BlastObservationMonitorTests(unittest.TestCase):
             [ray["relative_heading_deg"] for ray in scan["rays"]],
             [0.0, -88.2, -176.4, 95.4, 161.55],
         )
-        self.assertEqual(scan["restoration_error_deg"], 7.2)
-        self.assertEqual(scan["sweep_coverage_deg"], 352.8)
+        self.assertEqual(scan["restoration_error_deg"], -0.15)
+        self.assertEqual(scan["sweep_coverage_deg"], 360.15)
         self.assertTrue(scan["restoration_verified"])
         self.assertTrue(scan["all_observations_settled"])
         self.assertEqual(
@@ -2733,7 +2764,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )["scan"]
 
         self.assertTrue(scan["restoration_verified"])
-        self.assertEqual(scan["restoration_error_deg"], 7.2)
+        self.assertEqual(scan["restoration_error_deg"], -0.15)
         self.assertEqual(
             scan["imu_heading_diagnostics"],
             {
@@ -2796,8 +2827,8 @@ class BlastObservationMonitorTests(unittest.TestCase):
              52.77, 100.3, 123.82, 170.86],
         )
         self.assertTrue(scan["restoration_verified"])
-        self.assertEqual(scan["restoration_error_deg"], 5.73)
-        self.assertEqual(scan["sweep_coverage_deg"], 354.27)
+        self.assertEqual(scan["restoration_error_deg"], -1.62)
+        self.assertEqual(scan["sweep_coverage_deg"], 361.62)
         monitor.close()
 
     def test_scan_and_turns_use_a_longer_settle_window_than_driving(self):
@@ -2836,9 +2867,9 @@ class BlastObservationMonitorTests(unittest.TestCase):
         monitor.command("turn_left")
         monitor.command("drive_forward")
 
-        self.assertEqual(monitor.settle_timeouts[:17], [
+        self.assertEqual(monitor.settle_timeouts[:18], [
             SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
-            *([SCAN_PULSE_POST_MOTION_SETTLE_TIMEOUT_SECONDS] * 16),
+            *([SCAN_PULSE_POST_MOTION_SETTLE_TIMEOUT_SECONDS] * 17),
         ])
         self.assertEqual(
             monitor.settle_timeouts[-2:],
@@ -2984,13 +3015,21 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
         runtime = FakeRuntime.instances[0]
         self.assertEqual(result["scan"]["state"], "complete")
-        self.assertEqual(result["receipt"], {"turn_count": 16})
+        self.assertEqual(result["receipt"], {
+            "turn_count": 17,
+            "coverage_complete": True,
+        })
         self.assertEqual(
             [call for call in runtime.calls if call[0] == "turn_pulse"],
             [("turn_pulse", "left")] * 16,
         )
+        self.assertEqual(
+            [call for call in runtime.calls
+             if call[0] == "scan_trim_pulse"],
+            [("scan_trim_pulse", "left")],
+        )
         self.assertIn(("stop",), runtime.calls)
-        self.assertEqual(monitor.settle_calls, 18)
+        self.assertEqual(monitor.settle_calls, 19)
         monitor.close()
 
     def test_scan_continues_past_one_safe_unsettled_echo(self):
@@ -3033,7 +3072,10 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
 
         self.assertEqual(result["scan"]["state"], "complete")
-        self.assertEqual(result["receipt"], {"turn_count": 16})
+        self.assertEqual(result["receipt"], {
+            "turn_count": 17,
+            "coverage_complete": True,
+        })
         self.assertFalse(result["scan"]["all_observations_settled"])
         unsettled = [
             ray for ray in result["scan"]["angular_rays"]
@@ -3048,6 +3090,11 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(
             [call for call in runtime.calls if call[0] == "turn_pulse"],
             [("turn_pulse", "left")] * 16,
+        )
+        self.assertEqual(
+            [call for call in runtime.calls
+             if call[0] == "scan_trim_pulse"],
+            [("scan_trim_pulse", "left")],
         )
         monitor.close()
 

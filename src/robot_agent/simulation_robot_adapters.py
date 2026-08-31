@@ -18,6 +18,7 @@ from .active_ir_scan import ActiveIrScanExecutor
 from .blast_navigation_action_profile import (
     DRIVE_ENCODER_DEGREES,
     DRIVE_SPEED_DPS,
+    SCAN_TRIM_ENCODER_DEGREES_PER_PULSE,
     TURN_DURATION_MS_PER_PULSE,
     TURN_ENCODER_DEGREES_PER_PULSE,
     TURN_SPEED_DPS,
@@ -182,17 +183,19 @@ class SharedWorldBlastController:
         self._observed_ms += TURN_DURATION_MS_PER_PULSE
         return self._observation()
 
-    def _turn_scan_pulse(self, direction: str):
+    def _turn_scan_pulse(
+        self,
+        direction: str,
+        wheel_angle_deg: int = TURN_ENCODER_DEGREES_PER_PULSE,
+    ):
         left = direction == "left"
         before = self._observation()["motor_angles_deg"]
         observation = self._apply_encoder_motion(
             left_delta_deg=(
-                -TURN_ENCODER_DEGREES_PER_PULSE
-                if left else TURN_ENCODER_DEGREES_PER_PULSE
+                -wheel_angle_deg if left else wheel_angle_deg
             ),
             right_delta_deg=(
-                TURN_ENCODER_DEGREES_PER_PULSE
-                if left else -TURN_ENCODER_DEGREES_PER_PULSE
+                wheel_angle_deg if left else -wheel_angle_deg
             ),
         )
         return (
@@ -200,7 +203,7 @@ class SharedWorldBlastController:
                 "accepted": True,
                 "direction": direction,
                 "speed_dps": TURN_SPEED_DPS,
-                "wheel_angle_deg": TURN_ENCODER_DEGREES_PER_PULSE,
+                "wheel_angle_deg": wheel_angle_deg,
                 "before_angles_deg": {
                     role: before[role]
                     for role in ("left_drive", "right_drive")
@@ -219,7 +222,11 @@ class SharedWorldBlastController:
         }
         if surroundings:
             samples = [self._turn_scan_pulse("left") for _ in range(16)]
-            final = samples[-1][1]
+            trim_sample = self._turn_scan_pulse(
+                "left",
+                SCAN_TRIM_ENCODER_DEGREES_PER_PULSE,
+            )
+            final = trim_sample[1]
             scan = build_blast_encoder_scan(
                 center=center,
                 center_settled=True,
@@ -228,9 +235,10 @@ class SharedWorldBlastController:
                 final=final,
                 final_settled=True,
                 final_body_verified=True,
+                sweep_turn_count=len(samples) + 1,
             )
             receipt = {
-                "turn_count": 16,
+                "turn_count": len(samples) + 1,
                 "coverage_complete": (
                     scan["sweep_coverage_deg"] >= 360.0
                 ),

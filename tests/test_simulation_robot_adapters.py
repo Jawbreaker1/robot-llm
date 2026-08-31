@@ -182,7 +182,7 @@ class SimulationRobotAdapterTests(unittest.TestCase):
         self.assertFalse(hasattr(blast, "route"))
         self.assertFalse(hasattr(ev3, "waypoints"))
 
-    def test_blast_does_not_claim_a_352_degree_scan_is_complete(self):
+    def test_blast_trim_completes_one_surroundings_rotation(self):
         world = shared_world()
         blast = SharedWorldBlastController(world, world_robot_id="blast")
         angles = blast.snapshot()["observation"]["motor_angles_deg"]
@@ -192,8 +192,12 @@ class SimulationRobotAdapterTests(unittest.TestCase):
 
         result = blast.scan_surroundings(action_permit=permit)
 
-        self.assertEqual(result["scan"]["sweep_coverage_deg"], 352.8)
-        self.assertFalse(result["receipt"]["coverage_complete"])
+        self.assertEqual(result["scan"]["sweep_coverage_deg"], 360.15)
+        self.assertEqual(result["receipt"], {
+            "turn_count": 17,
+            "coverage_complete": True,
+        })
+        self.assertEqual(world.pose("blast").heading_mdeg, 150)
 
 
 if __name__ == "__main__":

@@ -280,7 +280,11 @@ def surroundings_scan_result(
             else 500
         )
         sweep_samples.append(({}, observation, True, "SETTLED_RANGE"))
-    final = sweep_samples[-1][1]
+    final = copy.deepcopy(sweep_samples[-1][1])
+    final["motor_angles_deg"].update({
+        "left_drive": start["left_drive"] - 735,
+        "right_drive": start["right_drive"] + 735,
+    })
     return build_blast_encoder_scan(
         center=center,
         center_settled=True,
@@ -289,6 +293,7 @@ def surroundings_scan_result(
         final=final,
         final_settled=True,
         final_body_verified=True,
+        sweep_turn_count=17,
     ), final
 
 
@@ -621,7 +626,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(first.history[0]["scan_view_count"], 1)
         self.assertEqual(first.history[0]["scan_state"], "complete")
-        self.assertEqual(first.history[0]["sweep_coverage_deg"], 352.8)
+        self.assertEqual(first.history[0]["sweep_coverage_deg"], 360.15)
         published_actions = [
             update.get("current_action") for update in updates
             if "current_action" in update
@@ -656,7 +661,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             first.local_map_evidence["robot_pose"]["heading_mdeg"],
-            -7_200,
+            150,
         )
 
     def test_partial_startup_scan_reaches_gemma_with_true_pose_and_map(self):
