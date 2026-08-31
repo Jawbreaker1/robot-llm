@@ -229,7 +229,12 @@ class SharedWorldBlastController:
                 final_settled=True,
                 final_body_verified=True,
             )
-            receipt = {"turn_count": 16, "coverage_complete": True}
+            receipt = {
+                "turn_count": 16,
+                "coverage_complete": (
+                    scan["sweep_coverage_deg"] >= 360.0
+                ),
+            }
         else:
             left_outbound = [
                 self._turn_scan_pulse("left") for _ in range(4)
