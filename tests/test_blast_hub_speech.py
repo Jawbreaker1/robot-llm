@@ -18,6 +18,7 @@ from robot_agent.blast_hub_speech import (
     BLAST_ADPCM_MAX_BYTES,
     BLAST_ADPCM_MAX_SAMPLES,
     BLAST_ADPCM_SAMPLE_RATE_HZ,
+    BLAST_ENGLISH_VOICE,
     BLAST_PIPER_PROFILE,
     BlastHubSpeaker,
     _encode_ima_adpcm_stream,
@@ -80,11 +81,12 @@ def load_hub_audio_namespace():
 
 
 class BlastHubSpeechTests(unittest.TestCase):
-    def test_blast_has_its_own_swedish_piper_voice(self):
+    def test_blast_has_its_own_voices(self):
         self.assertIsInstance(BLAST_PIPER_PROFILE, PiperSpeechProfile)
         self.assertEqual(BLAST_PIPER_PROFILE.model, "piper-sv")
         self.assertEqual(BLAST_PIPER_PROFILE.voices, (("sv", "lisa-bright"),))
         self.assertEqual(BLAST_PIPER_PROFILE.speed, 0.98)
+        self.assertEqual(BLAST_ENGLISH_VOICE, "Samantha")
         self.assertEqual(PiperSpeechProfile().voices, (("sv", "nst-deep"),))
         self.assertEqual(PiperSpeechProfile().speed, 1.0)
 

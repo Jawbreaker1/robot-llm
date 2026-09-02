@@ -29,7 +29,11 @@ from .blast_episode_adapter import (
     BLAST_PROFILE_ID,
     BlastEpisodeRuntimeAdapter,
 )
-from .blast_hub_speech import BLAST_PIPER_PROFILE, BlastHubSpeaker
+from .blast_hub_speech import (
+    BLAST_ENGLISH_VOICE,
+    BLAST_PIPER_PROFILE,
+    BlastHubSpeaker,
+)
 from .blast_personality import BLAST_PERSONA_BY_LOCALE
 from .ev3rstorm_profile import (
     DEFAULT_EV3RSTORM_MEMORY_PATH,
@@ -677,7 +681,9 @@ def _configured_blast_runtime_adapter(args, blast_monitor):
                 "sv": PiperLoopbackSynthesizer(
                     profile=BLAST_PIPER_PROFILE,
                 ),
-                "en": MacOSSayWAVSynthesizer(),
+                "en": MacOSSayWAVSynthesizer(
+                    voice=BLAST_ENGLISH_VOICE,
+                ),
             }
         )
         return RobotSpeechRuntime(

@@ -338,7 +338,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
             mock.patch(
                 "robot_agent.dashboard_cli.MacOSSayWAVSynthesizer",
                 return_value="say-wav",
-            ),
+            ) as english_synthesizer_type,
             mock.patch(
                 "robot_agent.dashboard_cli.BlastHubSpeaker",
                 return_value=speaker,
@@ -391,6 +391,9 @@ class DashboardRobotProfileTests(unittest.TestCase):
             )
             piper_type.assert_called_once_with(
                 profile=BLAST_PIPER_PROFILE,
+            )
+            english_synthesizer_type.assert_called_once_with(
+                voice="Samantha",
             )
             speaker_type.assert_called_once_with(
                 synthesizer,
