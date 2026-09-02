@@ -178,9 +178,98 @@ def navigation_validation_scenarios():
     )
 
 
+def _blast_gemma_scenario(
+    scenario_id: str,
+    obstacles: tuple[RectangleObstacle, ...],
+) -> NavigationSimulationScenario:
+    """Build one route-free BLAST case around its current 800 mm mission."""
+
+    blast_footprint, _sensor = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    )
+    return NavigationSimulationScenario(
+        scenario_id=scenario_id,
+        bounds=(-500, -900, 1_250, 900),
+        obstacles=obstacles,
+        robots=(SimulatedRobot(
+            "blast",
+            PoseEstimate(0, 0, 0),
+            blast_footprint,
+            2_000,
+        ),),
+        goals=(SimulationGoal("blast", 800, 0),),
+    )
+
+
+def blast_box_front() -> NavigationSimulationScenario:
+    return _blast_gemma_scenario(
+        "blast-box-front",
+        (RectangleObstacle("front-box", 320, -180, 520, 180),),
+    )
+
+
+def blast_box_at_side() -> NavigationSimulationScenario:
+    return _blast_gemma_scenario(
+        "blast-box-at-side",
+        (RectangleObstacle("side-box", 250, 220, 550, 500),),
+    )
+
+
+def blast_boxes_both_sides() -> NavigationSimulationScenario:
+    return _blast_gemma_scenario(
+        "blast-boxes-both-sides",
+        (
+            RectangleObstacle("left-box", 150, 260, 650, 650),
+            RectangleObstacle("right-box", 150, -650, 650, -260),
+        ),
+    )
+
+
+def blast_straight_corridor() -> NavigationSimulationScenario:
+    return _blast_gemma_scenario(
+        "blast-straight-corridor",
+        (
+            RectangleObstacle("left-wall", -200, 350, 1_050, 700),
+            RectangleObstacle("right-wall", -200, -700, 1_050, -350),
+        ),
+    )
+
+
+def blast_bent_corridor() -> NavigationSimulationScenario:
+    """A dogleg requires leaving the goal axis and returning after a corner."""
+
+    return _blast_gemma_scenario(
+        "blast-bent-corridor",
+        (
+            RectangleObstacle("upper-wall", -200, 450, 1_050, 700),
+            RectangleObstacle("lower-entry-wall", -200, -700, 0, -450),
+            RectangleObstacle("corner-block", 450, -100, 650, 450),
+            RectangleObstacle("lower-exit-wall", 650, -800, 1_050, -650),
+        ),
+    )
+
+
+def blast_gemma_validation_scenarios():
+    """Small strategic cases; none contains a route or waypoint answer."""
+
+    return (
+        blast_box_front(),
+        blast_box_at_side(),
+        blast_boxes_both_sides(),
+        blast_straight_corridor(),
+        blast_bent_corridor(),
+    )
+
+
 __all__ = (
     "EV3_SIMULATION_FOOTPRINT",
     "NavigationSimulationScenario",
+    "blast_bent_corridor",
+    "blast_box_at_side",
+    "blast_box_front",
+    "blast_boxes_both_sides",
+    "blast_gemma_validation_scenarios",
+    "blast_straight_corridor",
     "concurrent_clear_room",
     "dead_end_room",
     "navigation_validation_scenarios",

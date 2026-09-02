@@ -199,6 +199,34 @@ class SimulationRobotAdapterTests(unittest.TestCase):
         })
         self.assertEqual(world.pose("blast").heading_mdeg, 150)
 
+    def test_blast_body_block_retains_partial_encoder_progress(self):
+        world = MultiRobotNavigationSimulator(
+            bounds=(-1_000, -1_000, 2_000, 1_000),
+            obstacles=(RectangleObstacle("box", 180, -100, 400, 100),),
+            robots=(SimulatedRobot(
+                "blast", PoseEstimate(0, 0, 0), footprint(), 1_500,
+            ),),
+            goals=(SimulationGoal("blast", 1_000, 0),),
+        )
+        blast = SharedWorldBlastController(world, world_robot_id="blast")
+
+        partial = blast.command("drive_forward")
+        stopped = blast.command("drive_forward")
+
+        self.assertEqual(world.pose("blast").x_mm, 10)
+        self.assertEqual(
+            partial["observation"]["motor_angles_deg"]["left_drive"],
+            20,
+        )
+        self.assertEqual(
+            stopped["observation"]["motor_angles_deg"]["left_drive"],
+            20,
+        )
+        self.assertEqual(
+            sum(event.kind == "blocked" for event in world.events),
+            2,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

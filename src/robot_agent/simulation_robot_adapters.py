@@ -157,6 +157,8 @@ class SharedWorldBlastController:
         right_delta_deg: int,
     ) -> Mapping[str, object]:
         calibration = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
+        applied_left_deg = left_delta_deg
+        applied_right_deg = right_delta_deg
         if left_delta_deg == right_delta_deg:
             requested_mm = int(round(
                 left_delta_deg * calibration.linear_mm_per_encoder_degree
@@ -166,11 +168,11 @@ class SharedWorldBlastController:
                 requested_mm,
             )
             if moved_mm != requested_mm:
-                raise BlastControllerError(
-                    "simulation_collision_oracle",
-                    "BLAST's simulated body reached an obstacle",
-                    motion_started=moved_mm != 0,
-                )
+                applied_deg = int(round(
+                    moved_mm / calibration.linear_mm_per_encoder_degree
+                ))
+                applied_left_deg = applied_deg
+                applied_right_deg = applied_deg
         else:
             turn_mdeg = int(round(
                 (right_delta_deg - left_delta_deg)
@@ -178,8 +180,8 @@ class SharedWorldBlastController:
                 * calibration.turn_mdeg_per_opposed_encoder_degree
             ))
             self.simulation.rotate(self.world_robot_id, turn_mdeg)
-        self._left_encoder_deg += left_delta_deg
-        self._right_encoder_deg += right_delta_deg
+        self._left_encoder_deg += applied_left_deg
+        self._right_encoder_deg += applied_right_deg
         self._observed_ms += TURN_DURATION_MS_PER_PULSE
         return self._observation()
 

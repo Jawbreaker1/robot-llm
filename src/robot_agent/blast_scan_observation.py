@@ -38,14 +38,8 @@ SCAN_RAY_SIDES = (
 )
 SCAN_ANGULAR_RAY_SIDES = (
     "center",
-    "left_1",
-    "left_2",
-    "left_3",
-    "left_4",
-    "right_1",
-    "right_2",
-    "right_3",
-    "right_4",
+    *("left_{}".format(index) for index in range(1, 9)),
+    *("right_{}".format(index) for index in range(1, 9)),
 )
 ROBOT_RELATIVE_SIDE_SCAN_SCHEMA = "blast-robot-relative-side-scan/v2"
 ROBOT_RELATIVE_SIDE_RAYS = (
@@ -290,7 +284,7 @@ def validate_blast_scan_ray_contract(scan):
             label for label in labels if isinstance(label, str)
             and label.startswith("right_")
         ])
-        expected_partial_labels = (
+        expected_labels = (
             ("center",)
             + tuple("left_{}".format(index) for index in range(
                 1, left_count + 1,
@@ -299,20 +293,16 @@ def validate_blast_scan_ray_contract(scan):
                 1, right_count + 1,
             ))
         )
-        side_count = left_count if partial_scan else 4
-        left = relative[1:1 + side_count]
-        right = relative[1 + side_count:]
+        left = relative[1:1 + left_count]
+        right = relative[1 + left_count:]
         angular_invalid = (
             not isinstance(angular_rays, list)
-            or labels != (
-                expected_partial_labels
-                if partial_scan else SCAN_ANGULAR_RAY_SIDES
-            )
+            or labels != expected_labels
             or any(ray_invalid(ray) for ray in angular_rays)
             or len(relative) != (1 + left_count + right_count)
-            or not (partial_scan or len(relative) == 9)
-            or left_count > 4
-            or right_count > 4
+            or left_count > (4 if partial_scan else 8)
+            or right_count > (4 if partial_scan else 8)
+            or not partial_scan and (left_count < 4 or right_count < 4)
             or any(value is None for value in relative)
             or not (
                 relative and relative[0] == 0.0
@@ -338,11 +328,10 @@ def validate_blast_scan_ray_contract(scan):
             or (
                 not partial_scan and (
                     len(rays) != 5
-                    or not all(
-                        same_ray(rays[canonical], angular_rays[dense])
-                        for canonical, dense in (
-                            (0, 0), (1, 2), (2, 4), (3, 6), (4, 8),
-                        )
+                    or not same_ray(rays[0], angular_rays[0])
+                    or any(
+                        not any(same_ray(ray, dense) for dense in angular_rays)
+                        for ray in rays[1:]
                     )
                 )
             )
@@ -641,11 +630,107 @@ def scan_ray(
     }
 
 
+def build_blast_front_arc_scan(
+    *, center, center_settled, start_drive_angles,
+    left_outbound, right_outbound, final, final_settled,
+    final_body_verified,
+):
+    """Build a front-half-space scan that returns to its start heading."""
+
+    left_rays = [
+        scan_ray(
+            "left_{}".format(index), sample[1], start_drive_angles,
+            sample[2], sample[3],
+        )
+        for index, sample in enumerate(left_outbound, 1)
+    ]
+    right_rays = [
+        scan_ray(
+            "right_{}".format(index), sample[1], start_drive_angles,
+            sample[2], sample[3],
+        )
+        for index, sample in enumerate(right_outbound, 1)
+    ]
+    if len(left_rays) != 4 or len(right_rays) != 4:
+        raise ValueError("BLAST front scan coverage is incomplete")
+
+    center_ray = scan_ray(
+        "center", center, start_drive_angles, center_settled,
+        (
+            SCAN_RAY_EVIDENCE_SETTLED
+            if center_settled else SCAN_RAY_EVIDENCE_SWEEP_ONLY
+        ),
+    )
+    angular_rays = [center_ray, *left_rays, *right_rays]
+    final_drive_angles = drive_encoder_angles(final)
+    restoration_error = encoder_relative_bearing_deg(
+        final, start_drive_angles,
+    )
+    common_mode_residue = encoder_common_mode_residue_mm(
+        final_drive_angles, start_drive_angles,
+    )
+    start_imu_heading = scan_heading(center)
+    final_imu_heading = scan_heading(final)
+    restoration_verified = (
+        restoration_error is not None
+        and common_mode_residue is not None
+        and abs(common_mode_residue)
+        <= SCAN_RESTORATION_COMMON_MODE_TOLERANCE_MM
+        and abs(restoration_error) <= SCAN_RESTORATION_TOLERANCE_DEG
+        and final.get("motion_active") is False
+        and final_settled is True
+        and final_body_verified
+    )
+    scan = {
+        "schema": SCAN_RESULT_SCHEMA,
+        "state": "complete",
+        "result": (
+            "restored" if restoration_verified
+            else "restoration_unverified"
+        ),
+        "bearing_source": SCAN_BEARING_SOURCE,
+        "bearing_frame": SCAN_BEARING_FRAME,
+        "start_heading_deg": 0.0,
+        "final_heading_deg": restoration_error,
+        "restoration_error_deg": restoration_error,
+        "restoration_verified": restoration_verified,
+        "encoder_start_angles_deg": start_drive_angles,
+        "encoder_final_angles_deg": final_drive_angles,
+        "encoder_restoration": {
+            "common_mode_residue_mm": common_mode_residue,
+            "opposed_residue_deg": restoration_error,
+            "motion_stopped": final.get("motion_active") is False,
+            "observation_settled": final_settled is True,
+            "body_pose_verified": final_body_verified,
+        },
+        "imu_heading_diagnostics": {
+            "authority": SCAN_IMU_DIAGNOSTIC_AUTHORITY,
+            "start_heading_deg": start_imu_heading,
+            "final_heading_deg": final_imu_heading,
+            "restoration_error_deg": scan_heading_delta(
+                final_imu_heading, start_imu_heading,
+            ),
+        },
+        "all_observations_settled": all(
+            ray["observation_settled"] for ray in angular_rays
+        ),
+        "rays": [
+            center_ray,
+            {**left_rays[1], "side": "left_near"},
+            {**left_rays[3], "side": "left_far"},
+            {**right_rays[1], "side": "right_near"},
+            {**right_rays[3], "side": "right_far"},
+        ],
+        "angular_rays": angular_rays,
+    }
+    return validate_blast_scan_ray_contract(scan)
+
+
 def build_blast_encoder_scan(
     *, center, center_settled, start_drive_angles, sweep_samples,
     final, final_settled, final_body_verified, sweep_turn_count=None,
 ):
-    """Build nine representative rays from one encoder-measured full turn."""
+    """Preserve the settled rays from one encoder-measured full turn."""
 
     start_imu_heading = scan_heading(center)
     final_imu_heading = scan_heading(final)
@@ -696,24 +781,51 @@ def build_blast_encoder_scan(
             start_drive_angles, settled, evidence_use,
         )
 
-    left_rays = [
+    def dense_side(side):
+        values = sorted(
+            (
+                item for item in candidates
+                if (item[0] < 0 if side == "left" else item[0] > 0)
+            ),
+            key=lambda item: abs(item[0]),
+        )
+        if len(values) > 8:
+            values = [
+                values[round(index * (len(values) - 1) / 7)]
+                for index in range(8)
+            ]
+        return [
+            scan_ray(
+                "{}_{}".format(side, index), item[1],
+                start_drive_angles, item[2], item[3],
+            )
+            for index, item in enumerate(values, 1)
+        ]
+
+    representative_left = [
         representative("left", index, target)
         for index, target in enumerate((-45.0, -90.0, -135.0, -175.0), 1)
     ]
-    right_rays = [
+    representative_right = [
         representative("right", index, target)
         for index, target in enumerate((45.0, 90.0, 135.0, 175.0), 1)
     ]
+    left_rays = dense_side("left")
+    right_rays = dense_side("right")
     center_ray = scan_ray(
         "center", center, start_drive_angles, center_settled,
+        (
+            SCAN_RAY_EVIDENCE_SETTLED
+            if center_settled else SCAN_RAY_EVIDENCE_SWEEP_ONLY
+        ),
     )
     angular_rays = [center_ray, *left_rays, *right_rays]
     rays = [
         center_ray,
-        {**left_rays[1], "side": "left_near"},
-        {**left_rays[3], "side": "left_far"},
-        {**right_rays[1], "side": "right_near"},
-        {**right_rays[3], "side": "right_far"},
+        {**representative_left[1], "side": "left_near"},
+        {**representative_left[3], "side": "left_far"},
+        {**representative_right[1], "side": "right_near"},
+        {**representative_right[3], "side": "right_far"},
     ]
     scan = {
         "schema": SCAN_RESULT_SCHEMA,
@@ -796,6 +908,10 @@ def build_blast_partial_scan(
 
     center_ray = scan_ray(
         "center", center, start_drive_angles, center_settled,
+        (
+            SCAN_RAY_EVIDENCE_SETTLED
+            if center_settled else SCAN_RAY_EVIDENCE_SWEEP_ONLY
+        ),
     )
     angular_rays = [
         center_ray, *bounded_side("left"), *bounded_side("right"),
@@ -872,6 +988,7 @@ __all__ = (
     "blast_range_state",
     "body_motor_angle",
     "build_blast_encoder_scan",
+    "build_blast_front_arc_scan",
     "build_blast_partial_scan",
     "current_side_scan",
     "drive_encoder_angles",

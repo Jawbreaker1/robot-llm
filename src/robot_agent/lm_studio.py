@@ -22,7 +22,7 @@ from .http_transport import (
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
-DEFAULT_MODEL = "google/gemma-4-26b-a4b"
+DEFAULT_MODEL = "qwen/qwen3.8-27b"
 CHAT_PATH = "/api/v1/chat"
 REQUEST_TIMEOUT_SECONDS = 3.0
 MAX_RESPONSE_BYTES = 64 * 1024

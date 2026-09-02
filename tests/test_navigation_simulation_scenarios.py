@@ -1,6 +1,7 @@
 import unittest
 
 from robot_agent.navigation_simulation_scenarios import (
+    blast_gemma_validation_scenarios,
     navigation_validation_scenarios,
 )
 
@@ -36,6 +37,33 @@ class NavigationSimulationScenarioTests(unittest.TestCase):
             scenarios[3].scenario_id,
             "dead-end-and-backtrack-room",
         )
+
+    def test_blast_gemma_suite_matches_the_current_mission_without_routes(self):
+        scenarios = blast_gemma_validation_scenarios()
+
+        self.assertEqual(len(scenarios), 5)
+        self.assertEqual(
+            {scenario.scenario_id for scenario in scenarios},
+            {
+                "blast-box-front",
+                "blast-box-at-side",
+                "blast-boxes-both-sides",
+                "blast-straight-corridor",
+                "blast-bent-corridor",
+            },
+        )
+        for scenario in scenarios:
+            self.assertEqual(
+                {robot.robot_id for robot in scenario.robots},
+                {"blast"},
+            )
+            self.assertEqual(
+                [(goal.x_mm, goal.y_mm) for goal in scenario.goals],
+                [(800, 0)],
+            )
+            self.assertFalse(hasattr(scenario, "route"))
+            self.assertFalse(hasattr(scenario, "waypoints"))
+            self.assertEqual(set(scenario.build().goals), {"blast"})
 
 
 if __name__ == "__main__":

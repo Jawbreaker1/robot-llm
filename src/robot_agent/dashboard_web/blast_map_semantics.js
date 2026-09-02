@@ -450,12 +450,12 @@
       }));
     }
     group.appendChild(ui.svg("rect", {
-      x: point.x - 8, y: point.y - 8, width: 16, height: 16,
+      x: point.x - 12, y: point.y - 12, width: 24, height: 24,
       transform: `rotate(45 ${point.x} ${point.y})`,
       class: "map-advisory-waypoint-marker",
     }));
     const label = ui.svg("text", {
-      x: point.x + 15, y: point.y - 15,
+      x: point.x + 20, y: point.y - 20,
       class: "map-navigation-trace-label map-advisory-waypoint-label",
     });
     label.textContent = ui.t("map.navigation_trace.advisory_waypoint_label");

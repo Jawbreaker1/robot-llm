@@ -1,22 +1,20 @@
 """Host-owned terminal eligibility for one BLAST directional mission."""
 
 
-BLAST_GOAL_RADIUS_MM = 120
+# One coarse navigation-grid cell: intentionally roomy for a LEGO platform.
+BLAST_GOAL_RADIUS_MM = 150
 BLAST_GOAL_HEADING_TOLERANCE_MDEG = 20_000
 
 
 def blast_directional_completion_allowed(
-    *, mission, pose, localization_valid, scan_fresh,
+    *, mission, pose, localization_valid,
 ) -> bool:
-    """Require a verified goal-line crossing before exposing COMPLETE."""
+    """Expose COMPLETE inside the coarse verified LEGO goal region."""
 
     return (
         localization_valid is True
-        and scan_fresh is True
         and mission.heading_aligned(pose)
-        and mission.longitudinal_progress_mm(pose)
-        >= mission.minimum_forward_progress_mm
-        and abs(mission.lateral_offset_mm(pose)) <= BLAST_GOAL_RADIUS_MM
+        and mission.distance_to_target_mm(pose) <= BLAST_GOAL_RADIUS_MM
     )
 
 

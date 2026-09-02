@@ -35,9 +35,6 @@ class BlastTurnSafetyTests(unittest.TestCase):
         safe = turn_result()
         mutations = (
             lambda value: value.update(completed=False),
-            lambda value: value["observation"].update(
-                rotation_sweep_window_verified=False,
-            ),
             lambda value: value["observation"].update(motion_active=True),
             lambda value: value["observation"]["motor_angles_deg"].update(
                 body=120,
@@ -49,6 +46,13 @@ class BlastTurnSafetyTests(unittest.TestCase):
             candidate = copy.deepcopy(safe)
             mutate(candidate)
             self.assertFalse(blast_turn_slice_allows_continuation(candidate))
+
+    def test_settling_window_does_not_truncate_a_clear_bounded_turn(self):
+        result = turn_result()
+        result["observation_settled"] = False
+        result["observation"]["rotation_sweep_window_verified"] = False
+
+        self.assertTrue(blast_turn_slice_allows_continuation(result))
 
     def test_no_valid_range_still_needs_explicit_bounded_evidence(self):
         result = turn_result(2_000)

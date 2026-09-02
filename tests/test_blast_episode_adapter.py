@@ -8,6 +8,8 @@ from robot_agent.blast_episode_adapter import (
     ACTION_COMMANDS,
     BlastEpisodeError,
     BlastEpisodeRuntimeAdapter,
+    _planner_history,
+    _planner_map_with_route_feedback,
 )
 from robot_agent.blast_observation_monitor import BlastControllerError
 from robot_agent.blast_observation_monitor import (
@@ -38,6 +40,7 @@ from robot_agent.lm_studio_controller_action import (
     COMPLETE,
     ControllerActionDecision,
     ControllerActionPlannerResult,
+    FOLLOW_WAYPOINT,
 )
 from robot_agent.physical_navigation_contract import (
     ADVANCE,
@@ -55,6 +58,7 @@ from robot_agent.robot_speech_runtime import SpeechAdmission
 
 def decision(
     action, *, plan=(), assessment="ok", utterance=None, waypoint=None,
+    following_waypoints=(),
 ):
     return ControllerActionPlannerResult(
         decision=ControllerActionDecision(
@@ -64,6 +68,7 @@ def decision(
             plan=tuple(plan),
             utterance=utterance,
             waypoint=waypoint,
+            following_waypoints=tuple(following_waypoints),
         ),
         latency_ms=12,
     )
@@ -599,6 +604,15 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     )
                 return result
 
+            def scan_surroundings(
+                self, *, cancel_requested=None, action_permit=None,
+            ):
+                result = self.command(
+                    "scan_front_arc", cancel_requested=cancel_requested,
+                )
+                self.commands[-1] = "scan_surroundings"
+                return result
+
         controller = FullTurnStartupController(500)
         planner = Planner([decision(TURN_RIGHT_90)])
         context, updates = episode_context()
@@ -611,7 +625,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertEqual(len(planner.contexts), 1)
-        expected_bootstrap_commands = ["scan_front_arc"]
+        expected_bootstrap_commands = ["scan_surroundings"]
         self.assertEqual(
             controller.commands,
             [*expected_bootstrap_commands, *(["turn_right"] * 4)],
@@ -652,7 +666,23 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 {"action": ADVANCE},
             ))
         )
-        self.assertEqual(len(first.local_map_evidence["scan_views"]), 1)
+        self.assertTrue(
+            BlastEpisodeRuntimeAdapter._scan_evidence_is_fresh((
+                *first.history,
+                {"action": ADVANCE, "pose": {
+                    "x_mm": 45, "y_mm": 0,
+                }},
+            ))
+        )
+        self.assertFalse(
+            BlastEpisodeRuntimeAdapter._scan_evidence_is_fresh((
+                *first.history,
+                {"action": ADVANCE, "pose": {
+                    "x_mm": 315, "y_mm": 0,
+                }},
+            ))
+        )
+        self.assertNotIn("scan_views", first.local_map_evidence)
         self.assertEqual(
             first.local_map_evidence["robot_pose"]["x_mm"], 0,
         )
@@ -660,8 +690,63 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             first.local_map_evidence["robot_pose"]["y_mm"], 0,
         )
         self.assertEqual(
-            first.local_map_evidence["robot_pose"]["heading_mdeg"],
-            150,
+            first.local_map_evidence["robot_pose"]["heading_deg"],
+            0,
+        )
+
+    def test_startup_scan_coarsely_restores_large_imu_heading_error(self):
+        class DriftingFullTurnController(FakeController):
+            def command(self, command, *, cancel_requested=None):
+                center = copy.deepcopy(self.snapshot_value["observation"])
+                result = super().command(
+                    command, cancel_requested=cancel_requested,
+                )
+                if command == "scan_front_arc":
+                    scan, final = surroundings_scan_result(center)
+                    final["imu"]["heading_deg"] = 38.0
+                    scan["imu_heading_diagnostics"].update({
+                        "final_heading_deg": 38.0,
+                        "restoration_error_deg": 38.0,
+                    })
+                    result.update({
+                        "receipt": {"turn_count": 16},
+                        "observation": copy.deepcopy(final),
+                        "scan": scan,
+                    })
+                    self.snapshot_value["observation"] = copy.deepcopy(
+                        final
+                    )
+                return result
+
+            def scan_surroundings(
+                self, *, cancel_requested=None, action_permit=None,
+            ):
+                result = self.command(
+                    "scan_front_arc", cancel_requested=cancel_requested,
+                )
+                self.commands[-1] = "scan_surroundings"
+                return result
+
+        controller = DriftingFullTurnController(500)
+        planner = Planner([decision(ADVANCE)])
+        result = self.adapter(
+            controller, planner, max_decisions=1,
+            startup_perception=True,
+        ).run(episode_context()[0])
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(
+            controller.commands[:2],
+            ["scan_surroundings", "turn_left"],
+        )
+        first = planner.contexts[0]
+        restoration = first.history[0]["heading_restoration"]
+        self.assertEqual(restoration["action"], TURN_LEFT_90)
+        self.assertEqual(restoration["initial_error_deg"], -38)
+        self.assertLessEqual(abs(restoration["final_error_deg"]), 20)
+        self.assertLessEqual(
+            abs(first.local_map_evidence["robot_pose"]["heading_deg"]),
+            20,
         )
 
     def test_partial_startup_scan_reaches_gemma_with_true_pose_and_map(self):
@@ -720,10 +805,10 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(len(planner.contexts), 1)
         context = planner.contexts[0]
         self.assertEqual(context.history[0]["scan_state"], "partial")
-        self.assertEqual(len(context.local_map_evidence["scan_views"]), 1)
+        self.assertNotIn("scan_views", context.local_map_evidence)
         self.assertEqual(
-            context.local_map_evidence["robot_pose"]["heading_mdeg"],
-            22_050,
+            context.local_map_evidence["robot_pose"]["heading_deg"],
+            22,
         )
         self.assertEqual(
             map_pose_at_decision[0]["heading_mdeg"], 22_050,
@@ -735,7 +820,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             22_050,
         )
 
-    def test_unsafe_startup_perception_stops_before_planner(self):
+    def test_close_center_after_startup_still_offers_scan_supported_turn(self):
         class UnsafeAfterFirstScan(FakeScanController):
             def command(self, command, *, cancel_requested=None):
                 result = super().command(
@@ -749,18 +834,19 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 return result
 
         controller = UnsafeAfterFirstScan(500)
-        planner = Planner([decision(ADVANCE)])
+        planner = Planner([decision(TURN_LEFT_90)])
 
         result = self.adapter(
-            controller, planner, startup_perception=True,
+            controller, planner, startup_perception=True, max_decisions=1,
         ).run(episode_context()[0])
 
         self.assertEqual(
             result.terminal_reason,
-            "no_safe_blast_action",
+            "decision_budget_exhausted",
         )
         self.assertEqual(controller.commands, ["scan_front_arc"])
-        self.assertEqual(planner.contexts, [])
+        self.assertEqual(len(planner.contexts), 1)
+        self.assertIn(TURN_LEFT_90, planner.contexts[0].available_actions)
 
     def test_no_return_startup_scan_uses_perception_only_permit(self):
         class NoReturnStartupController(FakeScanController):
@@ -803,8 +889,8 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         ))
         self.assertEqual(controller.commands.count("scan_front_arc"), 1)
         self.assertEqual(len(planner.contexts), 1)
-        self.assertEqual(
-            len(planner.contexts[0].local_map_evidence["scan_views"]), 1,
+        self.assertNotIn(
+            "scan_views", planner.contexts[0].local_map_evidence,
         )
 
     def test_stop_or_deadline_after_bootstrap_result_prevents_next_action(self):
@@ -1341,24 +1427,14 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             planner.contexts[1].history[0]["action"],
             "ADVANCE",
         )
-        self.assertEqual(
-            planner.contexts[1].history[0]["plan"],
-            ["ADVANCE", TURN_LEFT_90, COMPLETE],
+        self.assertNotIn("assessment", planner.contexts[1].history[0])
+        self.assertNotIn("plan", planner.contexts[1].history[0])
+        self.assertNotIn(
+            "result_observation", planner.contexts[1].history[0],
         )
-        self.assertEqual(
-            planner.contexts[1].active_plan,
-            (TURN_LEFT_90, COMPLETE),
-        )
+        self.assertEqual(planner.contexts[1].active_plan, ())
         self.assertIn("ADVANCE", planner.contexts[1].plan_actions)
         self.assertIn("REVERSE", planner.contexts[1].plan_actions)
-        self.assertIsInstance(
-            planner.contexts[1].history[0]["plan"],
-            list,
-        )
-        self.assertIsNot(
-            planner.contexts[1].history[0]["plan"],
-            updates[0]["plan"],
-        )
         self.assertTrue(
             planner.contexts[1].history[0]["observation_settled"]
         )
@@ -1370,13 +1446,11 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             updates[0]["plan"],
             ["ADVANCE", TURN_LEFT_90, COMPLETE],
         )
-        self.assertEqual(
-            planner.contexts[0].observation["navigation_reference"],
-            {
-                "episode_start_heading_deg": 0.0,
-                "current_heading_deg": 0.0,
-                "heading_error_deg": 0.0,
-            },
+        self.assertNotIn(
+            "navigation_reference", planner.contexts[0].observation,
+        )
+        self.assertNotIn(
+            "imu", planner.contexts[0].observation["sensors"],
         )
         self.assertEqual(
             planner.contexts[1].history[0]["motion"][
@@ -1406,7 +1480,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             ["drive_forward", "drive_reverse"],
         )
         self.assertIn(REVERSE, planner.contexts[1].available_actions)
-        self.assertEqual(planner.contexts[1].active_plan, (REVERSE,))
+        self.assertEqual(planner.contexts[1].active_plan, ())
 
     def test_startup_scan_supports_semantic_advance_to_distant_goal(self):
         class FullTurnStartupController(FakeController):
@@ -1448,7 +1522,12 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(len(planner.contexts), 2)
         self.assertTrue(planner.contexts[1].completion_allowed)
-        self.assertEqual(planner.contexts[1].active_plan, (COMPLETE,))
+        self.assertEqual(planner.contexts[1].active_plan, ())
+        self.assertEqual(
+            [item["action"] for item in planner.contexts[1].history],
+            ["SCAN_SURROUNDINGS", ADVANCE],
+        )
+        self.assertTrue(planner.contexts[1].history[1]["continued"])
 
     def test_advance_is_not_offered_after_a_missed_goal_line(self):
         controller = FakeController(500)
@@ -1497,16 +1576,31 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertNotIn(ADVANCE, planner.contexts[1].available_actions)
         self.assertIn(REVERSE, planner.contexts[1].available_actions)
 
-    def test_gemma_waypoint_persists_without_creating_a_host_route(self):
+    def test_gemma_waypoint_plan_persists_as_read_only_map_hypothesis(self):
         waypoint = {
-            "x_mm": 120,
-            "y_mm": -280,
-            "purpose": "Pass the obstacle on its open right side",
+            "x_mm": 500,
+            "y_mm": 300,
+            "purpose": "Continue toward the declared waypoint",
         }
+        following = ({
+            "x_mm": 800,
+            "y_mm": 300,
+            "purpose": "Pass beyond the obstacle",
+        }, {
+            "x_mm": 800,
+            "y_mm": 0,
+            "purpose": "Return toward the final goal",
+        })
         controller = FakeController(500)
         planner = Planner([
-            decision(ADVANCE, waypoint=waypoint),
-            decision(ADVANCE, waypoint=waypoint),
+            decision(
+                ADVANCE, waypoint=waypoint,
+                following_waypoints=following,
+            ),
+            decision(
+                REVERSE, waypoint=waypoint,
+                following_waypoints=following,
+            ),
         ])
         adapter = self.adapter(controller, planner, max_decisions=2)
 
@@ -1515,6 +1609,10 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertIsNone(planner.contexts[0].active_waypoint)
         self.assertEqual(planner.contexts[1].active_waypoint, waypoint)
+        self.assertEqual(
+            planner.contexts[1].active_waypoint_plan,
+            (waypoint, *following),
+        )
         self.assertIsNot(planner.contexts[1].active_waypoint, waypoint)
         trace = adapter.spatial_map_provider.snapshot()["navigation_trace"]
         self.assertEqual(trace["advisory_waypoint"], {
@@ -1523,8 +1621,176 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             "read_only": True,
         })
         self.assertIsNone(trace["planned_leg"])
-        self.assertIsNone(trace["local_detour_route"])
+        route = trace["local_detour_route"]
+        self.assertEqual(route["status"], "ACTIVE")
+        self.assertEqual(route["active_index"], 0)
+        self.assertEqual(
+            [(item["x_mm"], item["y_mm"]) for item in route["waypoints"]],
+            [(500, 300), (800, 300), (800, 0)],
+        )
         self.assertFalse(trace["final_goal"]["navigation_enforced"])
+
+    def test_reached_gemma_waypoint_is_cleared_before_next_decision(self):
+        waypoint = {
+            "x_mm": 90,
+            "y_mm": 0,
+            "purpose": "Reach the next coarse navigation point",
+        }
+        controller = FakeController(500)
+        planner = Planner([
+            decision(ADVANCE, waypoint=waypoint),
+            decision(ADVANCE),
+        ])
+        adapter = self.adapter(controller, planner, max_decisions=2)
+
+        result = adapter.run(episode_context()[0])
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertIsNone(planner.contexts[0].active_waypoint)
+        self.assertIsNone(planner.contexts[1].active_waypoint)
+        trace = adapter.spatial_map_provider.snapshot()["navigation_trace"]
+        self.assertIsNone(trace["advisory_waypoint"])
+
+    def test_final_goal_is_only_filtered_after_entering_goal_corridor(self):
+        final_goal = {
+            "x_mm": 800,
+            "y_mm": 0,
+            "purpose": "final goal",
+        }
+        mission = DirectionalMission.begin(
+            episode_id="waypoint-goal-region",
+            minimum_forward_progress_mm=800,
+            pose=PhysicalPose(),
+        )
+
+        self.assertEqual(
+            BlastEpisodeRuntimeAdapter._intermediate_waypoint_plan(
+                mission, PhysicalPose(), (final_goal,),
+            ),
+            (final_goal,),
+        )
+        self.assertEqual(
+            BlastEpisodeRuntimeAdapter._intermediate_waypoint_plan(
+                mission,
+                PhysicalPose(x_mm=820, y_mm=80),
+                (final_goal,),
+            ),
+            (),
+        )
+
+    def test_coarsely_reached_waypoint_promotes_next_model_planned_leg(self):
+        first = {
+            "x_mm": 70,
+            "y_mm": 0,
+            "purpose": "Finish the first coarse leg",
+        }
+        second = {
+            "x_mm": 300,
+            "y_mm": 0,
+            "purpose": "Continue beyond the obstacle",
+        }
+        planner = Planner([
+            decision(
+                SCAN_FRONT_ARC,
+                waypoint=first,
+                following_waypoints=(second,),
+            ),
+            decision(FOLLOW_WAYPOINT, waypoint=second),
+        ])
+
+        result = self.adapter(
+            FakeScanController(500), planner, max_decisions=2,
+        ).run(episode_context()[0])
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(planner.contexts[1].active_waypoint, second)
+        self.assertEqual(planner.contexts[1].active_waypoint_plan, (second,))
+
+    def test_advance_continues_in_bounded_pulses_toward_gemma_waypoint(self):
+        waypoint = {
+            "x_mm": 300,
+            "y_mm": 0,
+            "purpose": "Reach the next open-space waypoint",
+        }
+        controller = FakeController(500)
+        planner = Planner([decision(ADVANCE, waypoint=waypoint)])
+
+        result = self.adapter(
+            controller, planner, max_decisions=1,
+        ).run(episode_context()[0])
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertGreater(controller.commands.count("drive_forward"), 1)
+        self.assertEqual(
+            set(controller.commands), {"drive_forward"},
+        )
+        self.assertEqual(len(planner.contexts), 1)
+
+    def test_advance_does_not_substitute_turn_toward_diagonal_waypoint(self):
+        waypoint = {
+            "x_mm": 300,
+            "y_mm": -300,
+            "purpose": "Create lateral clearance",
+        }
+        controller = FakeController(500)
+        planner = Planner([decision(ADVANCE, waypoint=waypoint)])
+
+        result = self.adapter(
+            controller, planner, max_decisions=1,
+        ).run(episode_context()[0])
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertNotIn("turn_left", controller.commands)
+        self.assertNotIn("turn_right", controller.commands)
+        self.assertGreater(controller.commands.count("drive_forward"), 1)
+        self.assertEqual(len(planner.contexts), 1)
+
+    def test_active_waypoint_context_includes_derived_geometry(self):
+        waypoint = {
+            "x_mm": 300,
+            "y_mm": -300,
+            "purpose": "Use the open right-side corridor",
+        }
+        planner = Planner([
+            decision(SCAN_FRONT_ARC, waypoint=waypoint),
+            decision(FOLLOW_WAYPOINT, waypoint=waypoint),
+        ])
+
+        result = self.adapter(
+            FakeScanController(500), planner, max_decisions=2,
+        ).run(episode_context()[0])
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(planner.contexts[1].active_waypoint, waypoint)
+        self.assertEqual(planner.contexts[1].active_waypoint_geometry, {
+            "distance_mm": 424,
+            "bearing_deg": -45,
+            "heading_error_deg": -45,
+        })
+        self.assertTrue(planner.contexts[1].waypoint_required)
+
+    def test_direct_goal_blockage_requires_waypoint_while_advance_is_available(
+        self,
+    ):
+        planner = Planner([
+            decision(SCAN_FRONT_ARC),
+            decision(TURN_LEFT_90),
+        ])
+
+        result = self.adapter(
+            FakeScanController(500), planner, max_decisions=2,
+        ).run(episode_context()[0])
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertFalse(planner.contexts[0].waypoint_required)
+        blocked_context = planner.contexts[1]
+        self.assertIn(ADVANCE, blocked_context.available_actions)
+        self.assertIsNotNone(
+            blocked_context.local_map_evidence.get(
+                "direct_goal_blockage"
+            )
+        )
+        self.assertTrue(blocked_context.waypoint_required)
 
     def test_live_dense_scan_cannot_complete_with_328_mm_remaining(self):
         class LiveContradictionController(FakeScanController):
@@ -1617,13 +1883,13 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         final_context = planner.contexts[-1]
         self.assertEqual(final_context.observation["odometry"]["x_mm"], 92)
         self.assertEqual(
-            final_context.observation["odometry"]["heading_mdeg"],
-            -980,
+            final_context.observation["odometry"]["heading_deg"],
+            -1,
         )
         self.assertFalse(final_context.completion_allowed)
         self.assertEqual(
             final_context.available_actions,
-            (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90),
+            (FOLLOW_WAYPOINT, ADVANCE, TURN_LEFT_90, TURN_RIGHT_90, REVERSE),
         )
         final_goal = adapter.spatial_map_provider.snapshot()[
             "navigation_trace"
@@ -1643,45 +1909,34 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertFalse(blast_directional_completion_allowed(
             mission=mission,
-            pose=PhysicalPose(x_mm=419),
+            pose=PhysicalPose(x_mm=269),
             localization_valid=True,
-            scan_fresh=True,
         ))
         self.assertFalse(blast_directional_completion_allowed(
             mission=mission,
-            pose=PhysicalPose(x_mm=420, y_mm=121),
+            pose=PhysicalPose(x_mm=420, y_mm=151),
             localization_valid=True,
-            scan_fresh=True,
         ))
         self.assertFalse(blast_directional_completion_allowed(
             mission=mission,
             pose=PhysicalPose(x_mm=420, heading_mdeg=5_001),
             localization_valid=True,
-            scan_fresh=True,
         ))
         self.assertFalse(blast_directional_completion_allowed(
             mission=mission,
             pose=PhysicalPose(x_mm=420),
             localization_valid=False,
-            scan_fresh=True,
-        ))
-        self.assertFalse(blast_directional_completion_allowed(
-            mission=mission,
-            pose=PhysicalPose(x_mm=420),
-            localization_valid=True,
-            scan_fresh=False,
         ))
         self.assertTrue(blast_directional_completion_allowed(
             mission=mission,
-            pose=PhysicalPose(x_mm=700, y_mm=120),
+            pose=PhysicalPose(x_mm=500, y_mm=100),
             localization_valid=True,
-            scan_fresh=True,
         ))
 
     def test_directional_episode_completes_after_verified_minimum_progress(self):
         controller = FakeController(1_000)
         planner = Planner(
-            [decision("ADVANCE") for _index in range(10)]
+            [decision("ADVANCE") for _index in range(6)]
             + [decision(COMPLETE, assessment="Verified goal reached.")]
         )
 
@@ -1694,13 +1949,13 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertTrue(result.completed)
         self.assertEqual(result.terminal_reason, "completed")
-        self.assertEqual(controller.commands, ["drive_forward"] * 10)
+        self.assertEqual(controller.commands, ["drive_forward"] * 6)
         self.assertFalse(planner.contexts[-2].completion_allowed)
         self.assertTrue(planner.contexts[-1].completion_allowed)
         self.assertEqual(planner.contexts[-1].available_actions, ())
         self.assertEqual(
             planner.contexts[-1].observation["odometry"]["x_mm"],
-            450,
+            270,
         )
 
     def test_directional_episode_can_complete_with_no_safe_motion_at_goal(self):
@@ -1728,7 +1983,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             controller,
             planner,
             enforce_directional_completion=True,
-            minimum_forward_progress_mm=420,
+            minimum_forward_progress_mm=600,
         ).run(episode_context()[0])
 
         self.assertTrue(result.completed)
@@ -1763,18 +2018,18 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             [0, 45],
         )
         trace = spatial_map["navigation_trace"]
-        self.assertEqual(trace["final_goal"]["target_x_mm"], 420)
+        self.assertEqual(trace["final_goal"]["target_x_mm"], 800)
         self.assertEqual(
             trace["final_goal"]["current_forward_progress_mm"], 45
         )
         self.assertEqual(
-            trace["final_goal"]["remaining_forward_progress_mm"], 375
+            trace["final_goal"]["remaining_forward_progress_mm"], 755
         )
         planner_goal = planner.contexts[0].local_map_evidence[
             "directional_goal"
         ]
-        self.assertEqual(planner_goal["minimum_forward_progress_mm"], 420)
-        self.assertEqual(planner_goal["current_forward_progress_mm"], 0)
+        self.assertEqual(planner_goal["target_x_mm"], 800)
+        self.assertEqual(planner_goal["remaining_forward_progress_mm"], 800)
         self.assertIsNone(trace["planned_leg"])
         self.assertEqual(trace["imu_heading"]["heading_mdeg"], 0)
         self.assertEqual(spatial_map["cells"], [])
@@ -1809,14 +2064,23 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(controller.commands, ["drive_forward"])
         self.assertEqual(len(planner.contexts), 1)
 
-    def test_scripted_semantic_actions_use_four_pulse_turn_and_carry_pose(self):
+    def test_waypoint_turns_use_coarse_pulses_and_carry_pose(self):
         controller = FakeScanController(1_000)
+        waypoint = {
+            "x_mm": 90,
+            "y_mm": 225,
+            "purpose": "Continue toward the declared side target",
+        }
         planner = Planner([
             decision("ADVANCE"),
             decision("ADVANCE"),
-            decision(TURN_LEFT_90),
-            decision("ADVANCE"),
-            decision("ADVANCE"),
+            decision(TURN_LEFT_90, waypoint=waypoint),
+            decision(FOLLOW_WAYPOINT, waypoint=waypoint),
+            decision(TURN_RIGHT_90, waypoint={
+                "x_mm": 300,
+                "y_mm": 180,
+                "purpose": "Begin returning toward the final goal",
+            }),
         ])
         context, updates = episode_context()
 
@@ -1826,16 +2090,18 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertFalse(result.completed)
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
-        self.assertEqual(
-            controller.commands,
-            ["drive_forward"] * 2
-            + ["turn_left"] * 4
-            + ["drive_forward"] * 2,
+        self.assertEqual(controller.commands[:2], ["drive_forward"] * 2)
+        self.assertTrue(1 <= controller.commands.count("turn_left") <= 4)
+        self.assertGreater(controller.commands.count("turn_right"), 0)
+        self.assertGreaterEqual(
+            controller.commands.count("drive_forward"), 4,
         )
         final_pose = planner.contexts[-1].observation["odometry"]
-        self.assertLessEqual(abs(final_pose["x_mm"] - 90), 10)
-        self.assertLessEqual(abs(final_pose["y_mm"] - 45), 10)
-        self.assertEqual(final_pose["verified_motion_count"], 4)
+        self.assertGreater(final_pose["x_mm"], 0)
+        self.assertGreater(final_pose["y_mm"], 0)
+        self.assertGreater(final_pose["verified_motion_count"], 2)
+        self.assertFalse(planner.contexts[2].waypoint_required)
+        self.assertTrue(planner.contexts[3].waypoint_required)
         self.assertNotIn("pose", updates[-2])
         runtime_update = None
         for update in updates:
@@ -1844,7 +2110,146 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 runtime_update,
             )
 
-    def test_scan_is_one_agent_action_with_stable_heading_reference(self):
+    def test_model_selected_turn_continues_until_coarsely_waypoint_aligned(self):
+        controller = FakeScanController(1_000)
+        waypoint = {
+            "x_mm": 0,
+            "y_mm": 450,
+            "purpose": "Reach the substantial lateral detour waypoint",
+        }
+        planner = Planner([
+            decision(TURN_LEFT_90, waypoint=waypoint),
+        ])
+
+        result = self.adapter(
+            controller, planner, max_decisions=1,
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(controller.commands.count("turn_left"), 4)
+        self.assertEqual(controller.commands.count("turn_right"), 0)
+
+    def test_turn_away_from_retained_waypoint_keeps_quarter_turn_contract(self):
+        controller = FakeScanController(1_000)
+        waypoint = {
+            "x_mm": 0,
+            "y_mm": 450,
+            "purpose": "Reach the substantial lateral detour waypoint",
+        }
+        planner = Planner([
+            decision(TURN_RIGHT_90, waypoint=waypoint),
+        ])
+
+        result = self.adapter(
+            controller, planner, max_decisions=1,
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(controller.commands.count("turn_right"), 4)
+        self.assertEqual(controller.commands.count("turn_left"), 0)
+
+    def test_blocked_follow_waypoint_turns_then_returns_to_model(self):
+        controller = FakeScanController(1_000)
+        waypoint = {
+            "x_mm": 0,
+            "y_mm": 450,
+            "purpose": "Follow the model-owned left detour waypoint",
+        }
+        planner = Planner([
+            decision(TURN_RIGHT_90, waypoint=waypoint),
+            decision(FOLLOW_WAYPOINT, waypoint=waypoint),
+        ])
+        _context, updates = episode_context()
+
+        result = self.adapter(
+            controller, planner, max_decisions=2,
+        ).run(_context)
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertIn(FOLLOW_WAYPOINT, planner.contexts[1].available_actions)
+        self.assertNotIn(ADVANCE, planner.contexts[1].available_actions)
+        self.assertNotIn(TURN_LEFT_90, planner.contexts[1].available_actions)
+        self.assertNotIn(TURN_RIGHT_90, planner.contexts[1].available_actions)
+        self.assertEqual(controller.commands.count("turn_right"), 8)
+        self.assertEqual(controller.commands.count("turn_left"), 0)
+        self.assertNotIn("drive_forward", controller.commands)
+        self.assertEqual(len(planner.contexts), 2)
+        self.assertIn(
+            FOLLOW_WAYPOINT,
+            [update.get("current_action") for update in updates],
+        )
+
+    def test_aligned_blocked_waypoint_is_not_executable(self):
+        self.assertIsNone(
+            BlastEpisodeRuntimeAdapter._waypoint_follow_motion_action(
+                PhysicalPose(heading_mdeg=-29_000),
+                {"x_mm": 450, "y_mm": -300},
+                (TURN_LEFT_90, TURN_RIGHT_90, REVERSE),
+            )
+        )
+
+    def test_one_pulse_heading_error_can_align_blocked_waypoint(self):
+        self.assertEqual(
+            BlastEpisodeRuntimeAdapter._waypoint_follow_motion_action(
+                PhysicalPose(x_mm=65, y_mm=-215, heading_mdeg=-73_000),
+                {"x_mm": 0, "y_mm": -600},
+                (TURN_LEFT_90, TURN_RIGHT_90, REVERSE),
+            ),
+            TURN_RIGHT_90,
+        )
+
+    def test_blocked_waypoint_leg_is_explicit_in_next_model_context(self):
+        controller = FakeScanController(165)
+        waypoint = {
+            "x_mm": 450,
+            "y_mm": 0,
+            "purpose": "Continue the straight leg",
+        }
+        planner = Planner([
+            decision(FOLLOW_WAYPOINT, waypoint=waypoint),
+            decision(REVERSE, waypoint=waypoint),
+        ])
+
+        result = self.adapter(
+            controller, planner, max_decisions=2,
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(len(planner.contexts), 2)
+        interruption = planner.contexts[1].history[-1][
+            "route_interruption"
+        ]
+        self.assertEqual(
+            interruption["reason"], "FORWARD_CLEARANCE_UNAVAILABLE",
+        )
+        self.assertEqual(interruption["waypoint"], waypoint)
+        self.assertEqual(
+            planner.contexts[1].history[-1][
+                "active_waypoint_geometry_after"
+            ]["distance_mm"],
+            405,
+        )
+
+    def test_advance_is_not_offered_when_declared_target_is_behind(self):
+        controller = FakeScanController(1_000)
+        planner = Planner([
+            decision(TURN_LEFT_90),
+            decision(TURN_RIGHT_90),
+        ])
+
+        result = self.adapter(
+            controller, planner, max_decisions=2,
+        ).run(episode_context()[0])
+
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertFalse(planner.contexts[0].waypoint_required)
+        self.assertTrue(planner.contexts[1].waypoint_required)
+        self.assertNotIn(ADVANCE, planner.contexts[1].available_actions)
+
+    def test_scan_is_one_agent_action_with_stable_map_heading(self):
         class ScanController(FakeScanController):
             def __init__(self):
                 super().__init__(300)
@@ -1894,16 +2299,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         scan = planner.contexts[1].history[0]["scan"]
         self.assertTrue(scan["restoration_verified"])
-        self.assertEqual(
-            [ray["range_state"] for ray in scan["rays"]],
-            [
-                RANGE_STATE_MEASURED,
-                RANGE_STATE_MEASURED,
-                RANGE_STATE_NO_VALID_DISTANCE,
-                RANGE_STATE_MEASURED,
-                RANGE_STATE_NO_VALID_DISTANCE,
-            ],
-        )
+        self.assertNotIn("rays", scan)
         runtime_scan = [
             update["scan"] for update in updates if "scan" in update
         ][0]
@@ -1925,7 +2321,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             planner.contexts[1].available_actions,
-            (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90),
+            (FOLLOW_WAYPOINT, ADVANCE, TURN_LEFT_90, TURN_RIGHT_90),
         )
         side_scan = planner.contexts[1].robot_relative_side_scan
         self.assertIsNone(
@@ -1935,13 +2331,11 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             side_scan["rays"]["left"][1]["range_state"],
             RANGE_STATE_NO_VALID_DISTANCE,
         )
-        self.assertEqual(
-            planner.contexts[1].observation["navigation_reference"],
-            {
-                "episode_start_heading_deg": 179.0,
-                "current_heading_deg": -179.0,
-                "heading_error_deg": 2.0,
-            },
+        self.assertNotIn(
+            "navigation_reference", planner.contexts[1].observation,
+        )
+        self.assertNotIn(
+            "imu", planner.contexts[1].observation["sensors"],
         )
         runtime_update = None
         for update in updates:
@@ -1980,7 +2374,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertIsNone(planner.contexts[0].robot_relative_side_scan)
         self.assertEqual(
             planner.contexts[1].available_actions,
-            (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90),
+            (FOLLOW_WAYPOINT, ADVANCE, TURN_LEFT_90, TURN_RIGHT_90),
         )
         side_scan = planner.contexts[1].robot_relative_side_scan
         self.assertEqual(
@@ -2092,14 +2486,6 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             [ray["absolute_bearing_deg"] for ray in side_rays["left"]],
             [10.78, 22.05, 32.83, 44.1],
         )
-        planner_dense = planner.contexts[1].history[0]["scan"][
-            "angular_rays"
-        ]
-        self.assertIsNone(planner_dense[2]["distance_mm"])
-        self.assertEqual(
-            planner_dense[2]["range_state"],
-            RANGE_STATE_NO_VALID_DISTANCE,
-        )
         runtime_dense = next(
             update["scan"]["angular_rays"]
             for update in updates if "scan" in update
@@ -2156,15 +2542,6 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertFalse(result.completed)
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
-        planner_rays = planner.contexts[1].history[0]["scan"]["rays"]
-        self.assertEqual(
-            [ray["distance_mm"] for ray in planner_rays],
-            [259, 300, None, 251, 1_029],
-        )
-        self.assertEqual(
-            planner_rays[2]["range_state"],
-            RANGE_STATE_NO_VALID_DISTANCE,
-        )
         side_scan = planner.contexts[1].robot_relative_side_scan["rays"]
         self.assertIsNone(side_scan["left"][1]["distance_mm"])
         self.assertEqual(
@@ -2321,6 +2698,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(len(planner.contexts), 2)
         self.assertIn("ADVANCE", planner.contexts[1].available_actions)
         self.assertIn("scan", planner.contexts[1].history[0])
+        self.assertNotIn("rays", planner.contexts[1].history[0]["scan"])
         runtime_scan = [
             update["scan"] for update in updates if "scan" in update
         ][0]
@@ -2356,11 +2734,6 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertFalse(result.completed)
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
-        planner_ray = planner.contexts[1].history[0]["scan"]["rays"][1]
-        self.assertIsNone(planner_ray["distance_mm"])
-        self.assertEqual(
-            planner_ray["range_state"], "UNRESOLVED_SWEEP_ONLY",
-        )
         summarized_ray = planner.contexts[1].robot_relative_side_scan[
             "rays"
         ]["left"][0]
@@ -2395,7 +2768,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(len(planner.contexts), 2)
         self.assertEqual(
             planner.contexts[1].available_actions,
-            (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90),
+            (FOLLOW_WAYPOINT, ADVANCE, TURN_LEFT_90, TURN_RIGHT_90),
         )
         self.assertFalse(planner.contexts[1].completion_allowed)
 
@@ -2437,19 +2810,14 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertEqual(len(planner.contexts), 3)
-        self.assertEqual(
-            planner.contexts[0].local_map_evidence["scan_views"], [],
-        )
-        self.assertEqual(
-            len(planner.contexts[1].local_map_evidence["scan_views"]), 1,
-        )
-        self.assertEqual(
-            len(planner.contexts[2].local_map_evidence["scan_views"]), 1,
-        )
+        self.assertTrue(all(
+            "scan_views" not in item.local_map_evidence
+            for item in planner.contexts
+        ))
         self.assertNotEqual(
             planner.contexts[2].local_map_evidence[
                 "robot_pose"
-            ]["heading_mdeg"],
+            ]["heading_deg"],
             0,
         )
         self.assertEqual(
@@ -2458,7 +2826,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             planner.contexts[2].available_actions,
-            (TURN_LEFT_90, TURN_RIGHT_90, SCAN_FRONT_ARC),
+            (FOLLOW_WAYPOINT, TURN_LEFT_90, TURN_RIGHT_90, SCAN_FRONT_ARC),
         )
         self.assertNotIn(
             "side_search_progress",
@@ -2651,7 +3019,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             ]
         )
         self.assertEqual(
-            planner.contexts[1].observation["odometry"]["heading_mdeg"],
+            planner.contexts[1].observation["odometry"]["heading_deg"],
             0,
         )
         self.assertEqual(len(planner.contexts), 2)
@@ -2706,7 +3074,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             allow_no_valid_distance_with_bounded_evidence=True,
         ))
 
-        for fault in ("close", "invalid", "body", "unsettled"):
+        for fault in ("close", "invalid", "body"):
             with self.subTest(fault=fault):
                 candidate = copy.deepcopy(result)
                 if fault == "close":
@@ -2717,14 +3085,18 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                     candidate["observation"]["motor_angles_deg"][
                         "body"
                     ] = 156
-                else:
-                    candidate["observation"][
-                        "rotation_sweep_window_verified"
-                    ] = False
                 self.assertFalse(blast_turn_slice_allows_continuation(
                     candidate,
                     allow_no_valid_distance_with_bounded_evidence=True,
                 ))
+
+        unsettled = copy.deepcopy(result)
+        unsettled["observation_settled"] = False
+        unsettled["observation"]["rotation_sweep_window_verified"] = False
+        self.assertTrue(blast_turn_slice_allows_continuation(
+            unsettled,
+            allow_no_valid_distance_with_bounded_evidence=True,
+        ))
 
     def test_full_surroundings_scan_offers_turns_at_no_return(self):
         controller = FakeController(2_000)
@@ -2750,6 +3122,24 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             (),
         )
 
+    def test_restored_body_scan_offers_turns_despite_close_center_ray(self):
+        controller = FakeController(40)
+        adapter = self.adapter(controller, Planner([]))
+        observation = adapter._observation()
+        scan = dense_scan_result(
+            (40, 900, 2_000, 2_000, 2_000,
+             900, 2_000, 2_000, 2_000),
+            (0, -22, -44, -66, -88, 22, 44, 66, 88),
+        )
+
+        available = adapter._available_actions(observation, ({
+            "action": SCAN_FRONT_ARC,
+            "scan": scan,
+        },))
+
+        self.assertIn(TURN_LEFT_90, available)
+        self.assertIn(TURN_RIGHT_90, available)
+
     def test_full_scan_supports_completed_straight_advances_at_no_return(self):
         controller = FakeController(2_000)
         adapter = self.adapter(controller, Planner([]))
@@ -2762,6 +3152,16 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertIn(ADVANCE, adapter._available_actions(
             observation, history, latest_scan_view,
+        ))
+        front_arc = dense_scan_result(
+            (2_000,) * 9,
+            (0, -22, -44, -66, -88, 22, 44, 66, 88),
+        )
+        self.assertNotIn("sweep_coverage_deg", front_arc)
+        self.assertIn(ADVANCE, adapter._available_actions(
+            observation,
+            ({"action": SCAN_FRONT_ARC, "scan": front_arc},),
+            {"scan": front_arc},
         ))
         unknown_flank = copy.deepcopy(scan)
         unknown_flank["angular_rays"][1].update({
@@ -2846,6 +3246,54 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             observation, history, {"scan": blocked},
         ))
 
+    def test_verified_advance_retains_reverse_after_scan_and_turns(self):
+        controller = FakeController(2_000)
+        adapter = self.adapter(controller, Planner([]))
+        observation = adapter._observation()
+        completed = {"motion": {"command_completed": True}}
+        bounded_turn = {"motion": {
+            "command_completed": False,
+            "verified_slice_count": 1,
+            "observed_slice_count": 1,
+        }}
+        history = (
+            {"action": ADVANCE, **completed},
+            {"action": SCAN_FRONT_ARC},
+            {"action": TURN_LEFT_90, **bounded_turn},
+            {"action": TURN_LEFT_90, **bounded_turn},
+        )
+
+        self.assertIn(REVERSE, adapter._available_actions(
+            observation, history,
+        ))
+
+    def test_reverse_can_undo_each_verified_forward_pulse_once(self):
+        controller = FakeController(2_000)
+        adapter = self.adapter(controller, Planner([]))
+        observation = adapter._observation()
+        completed = {"motion": {"command_completed": True}}
+        route_rejection = {
+            "action": FOLLOW_WAYPOINT,
+            "action_source": "ROUTE_VALIDATION",
+        }
+        one_retreat = (
+            {"action": ADVANCE, **completed},
+            {"action": ADVANCE, **completed},
+            {"action": REVERSE, **completed},
+            route_rejection,
+        )
+        fully_undone = (
+            *one_retreat,
+            {"action": REVERSE, **completed},
+        )
+
+        self.assertIn(REVERSE, adapter._available_actions(
+            observation, one_retreat,
+        ))
+        self.assertNotIn(REVERSE, adapter._available_actions(
+            observation, fully_undone,
+        ))
+
     def test_agentic_full_scan_can_continue_straight_at_no_return(self):
         class FullNoReturnScanController(FakeController):
             def issue_no_return_scan_permit(self, **_values):
@@ -2901,7 +3349,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertIn(ADVANCE, planner.contexts[1].available_actions)
         self.assertIn(ADVANCE, planner.contexts[2].available_actions)
 
-    def test_full_scan_turns_use_settled_rays_around_unknown_echoes(self):
+    def test_restored_sweep_authorizes_turn_despite_incomplete_ranges(self):
         adapter = self.adapter(FakeController(), Planner([]))
         scan = scan_result(center_distance_mm=81)
         scan["sweep_coverage_deg"] = 353.29
@@ -2913,7 +3361,77 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(adapter._current_scan_allows_quarter_turn(history))
 
         scan["rays"][4]["observation_settled"] = False
+        self.assertTrue(adapter._current_scan_allows_quarter_turn(history))
+
+        scan["restoration_verified"] = False
         self.assertFalse(adapter._current_scan_allows_quarter_turn(history))
+
+    def test_route_validation_does_not_hide_current_turn_scan(self):
+        adapter = self.adapter(FakeController(), Planner([]))
+        scan = scan_result(center_distance_mm=81)
+        scan["sweep_coverage_deg"] = 353.29
+        history = (
+            {"action": SCAN_FRONT_ARC, "scan": scan},
+            {
+                "action": FOLLOW_WAYPOINT,
+                "action_source": "ROUTE_VALIDATION",
+                "route_rejection": {
+                    "reason": "KNOWN_ECHO_CLEARANCE_INTERSECTION",
+                },
+            },
+        )
+
+        self.assertTrue(adapter._current_scan_allows_quarter_turn(history))
+
+    def test_planner_history_compacts_identical_route_rejections(self):
+        rejection = {
+            "action": FOLLOW_WAYPOINT,
+            "action_source": "ROUTE_VALIDATION",
+            "pose": {"x_mm": 35, "y_mm": 220, "heading_mdeg": 81_000},
+            "route_rejection": {
+                "reason": "KNOWN_ECHO_CLEARANCE_INTERSECTION",
+                "blocking_echo_point": {"x_mm": 330, "y_mm": 80},
+            },
+            "waypoint_plan": [{
+                "x_mm": 600, "y_mm": -450,
+                "purpose": "Try the revised detour",
+            }],
+        }
+
+        compact = _planner_history((rejection, rejection, rejection))
+
+        self.assertEqual(len(compact), 1)
+        self.assertEqual(compact[0]["repeat_count"], 3)
+        self.assertEqual(compact[0]["waypoint_plan"], rejection["waypoint_plan"])
+
+    def test_latest_route_rejection_is_prominent_beside_the_map(self):
+        rejection = {
+            "action": FOLLOW_WAYPOINT,
+            "action_source": "ROUTE_VALIDATION",
+            "pose": {"x_mm": 0, "y_mm": 0, "heading_mdeg": 0},
+            "route_rejection": {
+                "reason": "KNOWN_ECHO_CLEARANCE_INTERSECTION",
+                "blocking_echo_point": {"x_mm": 330, "y_mm": 80},
+            },
+            "waypoint_plan": [{
+                "x_mm": 0,
+                "y_mm": 300,
+                "purpose": "Rejected narrow clearance",
+            }],
+        }
+
+        enriched = _planner_map_with_route_feedback(
+            {"robot_pose": rejection["pose"]},
+            (rejection, rejection),
+        )
+
+        feedback = enriched["latest_route_rejection"]
+        self.assertEqual(feedback["repeat_count"], 2)
+        self.assertFalse(feedback["pose_or_evidence_changed"])
+        self.assertEqual(
+            feedback["rejected_waypoint_plan"],
+            rejection["waypoint_plan"],
+        )
 
     def test_agentic_scan_guided_turn_continues_at_no_return(self):
         class NoReturnAfterScanController(FakeScanController):
@@ -2996,7 +3514,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "blast_planner_action_invalid")
         self.assertEqual(
             controller.commands,
-            ["scan_front_arc", "drive_forward", "scan_front_arc"],
+            ["scan_front_arc", "drive_forward"],
         )
 
     def test_scan_without_measured_center_does_not_select_detour(self):
@@ -3271,6 +3789,34 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertIn(SCAN_FRONT_ARC, available)
 
+    def test_small_straight_progress_does_not_offer_redundant_scan(self):
+        adapter = self.adapter(FakeController(), Planner([]))
+        observation = {
+            "sensors": {
+                "distance_mm": 300,
+                "imu": {"heading_deg": 0},
+                "motor_angles_deg": {
+                    "left_drive": 90,
+                    "right_drive": 90,
+                    "body": 158,
+                },
+            }
+        }
+
+        available = adapter._available_actions(
+            observation,
+            (
+                {"action": SCAN_FRONT_ARC, "pose": {
+                    "x_mm": 0, "y_mm": 0,
+                }},
+                {"action": ADVANCE, "pose": {
+                    "x_mm": 45, "y_mm": 0,
+                }},
+            ),
+        )
+
+        self.assertNotIn(SCAN_FRONT_ARC, available)
+
     def test_unobserved_or_too_close_state_authorizes_no_action(self):
         for distance, body, observes in (
             (53, 158, 0),
@@ -3534,6 +4080,110 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(controller.scan_attempts, 2)
         self.assertEqual(len(planner.contexts), 1)
+
+    def test_scan_start_refusal_after_advance_returns_control_to_gemma(self):
+        controller = ScanStartRetryController(scan_failures=2)
+        planner = Planner([
+            decision(ADVANCE),
+            decision(SCAN_FRONT_ARC),
+            decision(REVERSE),
+        ])
+
+        result = self.adapter(
+            controller, planner, max_decisions=3,
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(
+            controller.commands,
+            [
+                "drive_forward",
+                "scan_front_arc",
+                SETTLED_OBSERVATION_COMMAND,
+                "scan_front_arc",
+                "drive_reverse",
+            ],
+        )
+        self.assertEqual(len(planner.contexts), 3)
+        self.assertIn(REVERSE, planner.contexts[2].available_actions)
+        self.assertEqual(
+            planner.contexts[2].history[-1]["scan_refusal"],
+            {
+                "code": "scan_start_clearance_unverified",
+                "motion_started": False,
+            },
+        )
+
+    def test_close_partial_scan_keeps_map_and_returns_control_to_gemma(self):
+        class ClosePartialScanController(FakeScanController):
+            def command(self, command, *, cancel_requested=None):
+                if command != "scan_front_arc":
+                    return super().command(
+                        command, cancel_requested=cancel_requested,
+                    )
+                center = copy.deepcopy(self.snapshot_value["observation"])
+                result = FakeController.command(
+                    self, command, cancel_requested=cancel_requested,
+                )
+                start = {
+                    role: center["motor_angles_deg"][role]
+                    for role in ("left_drive", "right_drive")
+                }
+                final = copy.deepcopy(result["observation"])
+                final["motor_angles_deg"].update({
+                    "left_drive": start["left_drive"] - 45,
+                    "right_drive": start["right_drive"] + 45,
+                })
+                final["distance_mm"] = 40
+                self.snapshot_value["observation"] = final
+                result.update({
+                    "observation": final,
+                    "observation_settled": True,
+                    "receipt": {
+                        "turn_count": 1,
+                        "coverage_complete": False,
+                        "reason_code": "scan_sweep_clearance_lost",
+                    },
+                    "scan": build_blast_partial_scan(
+                        center=center,
+                        center_settled=True,
+                        start_drive_angles=start,
+                        sweep_samples=((
+                            {}, final, True, "SETTLED_RANGE",
+                        ),),
+                        final=final,
+                        final_settled=True,
+                        final_body_verified=True,
+                    ),
+                })
+                return result
+
+        controller = ClosePartialScanController(500)
+        planner = Planner([
+            decision(ADVANCE),
+            decision(SCAN_FRONT_ARC),
+            decision(REVERSE),
+        ])
+
+        result = self.adapter(
+            controller, planner, max_decisions=3,
+        ).run(episode_context()[0])
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
+        self.assertEqual(
+            controller.commands,
+            ["drive_forward", "scan_front_arc", "drive_reverse"],
+        )
+        self.assertIn(REVERSE, planner.contexts[2].available_actions)
+        self.assertEqual(
+            planner.contexts[2].history[-1]["scan"]["state"],
+            "partial",
+        )
+        self.assertNotIn(
+            "scan_views", planner.contexts[2].local_map_evidence,
+        )
         self.assertEqual(len(planner.contexts[0].history), 0)
 
         controller = ScanStartRetryController(scan_failures=2)

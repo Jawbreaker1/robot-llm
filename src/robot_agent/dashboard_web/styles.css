@@ -2292,16 +2292,34 @@ textarea:focus-visible,
 }
 
 .map-advisory-waypoint-line {
-  stroke: var(--model);
-  stroke-dasharray: 7 6;
+  stroke: var(--ready);
+  stroke-dasharray: 10 6;
   stroke-linecap: round;
-  stroke-width: 3;
+  stroke-width: 5;
 }
 
 .map-advisory-waypoint-marker {
-  fill: rgb(122 162 247 / 22%);
-  stroke: var(--model);
-  stroke-width: 4;
+  fill: rgb(9 18 21 / 92%);
+  stroke: var(--ready);
+  stroke-width: 6;
+}
+
+.map-navigation-overlay-layer {
+  filter: drop-shadow(0 0 5px rgb(9 18 21 / 88%));
+}
+
+.map-coarse-obstacle-cell {
+  stroke: rgb(242 184 75 / 34%);
+  stroke-width: 1;
+}
+
+.map-coarse-obstacle-cell.is-keep-out {
+  fill: rgb(242 184 75 / 13%);
+}
+
+.map-coarse-obstacle-cell.is-echo {
+  fill: rgb(255 107 98 / 30%);
+  stroke: rgb(255 107 98 / 58%);
 }
 
 .map-planned-leg[data-route-eligible="true"] .map-planned-leg-line {
@@ -2377,19 +2395,20 @@ textarea:focus-visible,
 }
 
 .map-blast-scan-ray-line {
-  stroke: rgb(116 167 255 / 62%);
+  stroke: rgb(116 167 255 / 24%);
   stroke-linecap: round;
-  stroke-width: 3;
+  stroke-width: 2;
 }
 
 .map-blast-scan-origin {
   fill: var(--evidence);
+  opacity: 0.36;
 }
 
 .map-blast-scan-echo {
-  fill: rgb(255 107 98 / 46%);
-  stroke: var(--danger);
-  stroke-width: 3;
+  fill: rgb(255 107 98 / 24%);
+  stroke: rgb(255 107 98 / 50%);
+  stroke-width: 2;
 }
 
 .map-provisional-ultrasonic-obstacle-envelope {
@@ -2406,9 +2425,7 @@ textarea:focus-visible,
 }
 
 .map-provisional-ultrasonic-obstacle-label {
-  fill: var(--warning);
-  font-size: 11px;
-  font-weight: 750;
+  display: none;
 }
 
 .map-navigation-trace-label {
@@ -2436,12 +2453,13 @@ textarea:focus-visible,
 }
 
 .map-advisory-waypoint-label {
-  fill: var(--model);
-  font-size: 11px;
+  fill: var(--ready);
+  font-size: 14px;
+  font-weight: 800;
 }
 
 .map-blast-scan-label {
-  fill: var(--evidence);
+  display: none;
 }
 
 .map-local-layer-label,
@@ -2797,6 +2815,11 @@ textarea:focus-visible,
   border-color: var(--warning);
 }
 
+.legend-swatch.is-coarse-obstacle {
+  background: rgb(242 184 75 / 18%);
+  border-color: rgb(255 107 98 / 68%);
+}
+
 .legend-line {
   width: 16px;
   height: 2px;
@@ -2866,6 +2889,13 @@ textarea:focus-visible,
 
 .map-metadata-panel .telemetry-list {
   padding-bottom: 15px;
+}
+
+.map-metadata-panel .map-coarse-grid {
+  white-space: pre;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.35;
 }
 
 .map-object-list,

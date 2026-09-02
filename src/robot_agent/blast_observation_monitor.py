@@ -50,6 +50,7 @@ from .blast_scan_observation import (
     blast_range_state,
     body_motor_angle as _body_motor_angle,
     build_blast_encoder_scan,
+    build_blast_front_arc_scan,
     build_blast_partial_scan,
     drive_encoder_angles,
     encoder_relative_bearing_deg,
@@ -86,6 +87,7 @@ SAMPLED_AUDIO_RESULT_SCHEMA = "controller-sampled-audio-result/v1"
 SAMPLED_AUDIO_TIMEOUT_SECONDS = 60.0
 SAMPLED_AUDIO_MAX_TOTAL_SECONDS = 15.0 * 60.0
 SCAN_COMMAND = "scan_front_arc"
+SURROUNDINGS_SCAN_COMMAND = "scan_surroundings"
 SETTLED_OBSERVATION_COMMAND = "observe_settled"
 COMMANDS = {
     "drive_forward": ("drive_pulse", "forward"),
@@ -97,6 +99,7 @@ COMMANDS = {
     "body_left": ("body_pulse", "left"),
     "body_right": ("body_pulse", "right"),
     SCAN_COMMAND: (None, None),
+    SURROUNDINGS_SCAN_COMMAND: (None, None),
     SETTLED_OBSERVATION_COMMAND: (None, None),
     "stop": ("stop", None),
 }
@@ -352,14 +355,14 @@ class BlastObservationMonitor:
         ) or (
             action_permit is not None
             and not (
-                command == SCAN_COMMAND
+                command in (SCAN_COMMAND, SURROUNDINGS_SCAN_COMMAND)
                 and isinstance(action_permit, _BlastNoReturnScanPermit)
             )
         ):
             raise ValueError("unsupported BLAST command")
         timeout_seconds = (
             SCAN_COMMAND_TIMEOUT_SECONDS
-            if command == SCAN_COMMAND
+            if command in (SCAN_COMMAND, SURROUNDINGS_SCAN_COMMAND)
             else COMMAND_TIMEOUT_SECONDS
         )
         with self._lock:
@@ -452,6 +455,17 @@ class BlastObservationMonitor:
                 "controller_command_timeout",
                 "BLAST command did not finish in time",
             ) from None
+
+    def scan_surroundings(
+        self, *, cancel_requested=None, action_permit=None,
+    ):
+        """Run the startup-only full surroundings scan."""
+
+        return self.command(
+            SURROUNDINGS_SCAN_COMMAND,
+            cancel_requested=cancel_requested,
+            action_permit=action_permit,
+        )
 
     def play_pcm(self, payload: bytes, *, cancel_requested=None):
         """Preload one bounded utterance on the owned BLE session."""
@@ -1065,7 +1079,7 @@ class BlastObservationMonitor:
                 return False
             internal_timeout = (
                 SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS
-                if command == SCAN_COMMAND
+                if command in (SCAN_COMMAND, SURROUNDINGS_SCAN_COMMAND)
                 else INTERNAL_COMMAND_TIMEOUT_SECONDS
             )
             value = await asyncio.wait_for(
@@ -1257,11 +1271,10 @@ class BlastObservationMonitor:
                 motion_started=True,
                 evidence_uncertain=True,
             )
-        if sweep_only and not self._scan_sweep_window_allows_continuation(
-                observation):
+        if observation.get("motion_active") is not False:
             raise BlastControllerError(
                 "scan_sweep_observation_unverified",
-                "BLAST scan could not verify a safe sweep window",
+                "BLAST scan pulse did not reach an idle observation",
                 motion_started=True, evidence_uncertain=True,
             )
         if range_state == RANGE_STATE_MEASURED and float(distance) <= (
@@ -1317,7 +1330,8 @@ class BlastObservationMonitor:
             and all(
                 isinstance(value, (int, float))
                 and not isinstance(value, bool)
-                and float(value) == expected
+                and abs(float(value) - expected)
+                <= _SCAN_PERMIT_EXPECTED_ANCHOR_TOLERANCE_DEG
                 for value, expected in zip(
                     center_drive, action_permit.drive_angles_deg
                 )
@@ -1339,8 +1353,135 @@ class BlastObservationMonitor:
             and center_state == RANGE_STATE_NO_VALID_DISTANCE
         )
         if not (
-            center_settled
-            and start_drive_angles is not None
+            start_drive_angles is not None
+            and sensor.matches_navigation_body_angle(
+                _body_motor_angle(center)
+            )
+            and range_allows_start
+        ):
+            raise BlastControllerError(
+                "scan_start_clearance_unverified",
+                "BLAST scan lacks usable idle range evidence or sensor pose",
+                motion_started=False,
+            )
+
+        left_outbound = [
+            await self._scan_turn(
+                runtime, generation, "left",
+                start_drive_angles=start_drive_angles,
+            )
+            for _index in range(4)
+        ]
+        for _index in range(4):
+            await self._scan_turn(
+                runtime, generation, "right",
+                start_drive_angles=start_drive_angles,
+            )
+        right_outbound = [
+            await self._scan_turn(
+                runtime, generation, "right",
+                start_drive_angles=start_drive_angles,
+            )
+            for _index in range(4)
+        ]
+        for _index in range(3):
+            await self._scan_turn(
+                runtime, generation, "left",
+                start_drive_angles=start_drive_angles,
+            )
+        _receipt, final, final_settled, _evidence = await self._scan_turn(
+            runtime, generation, "left",
+            start_drive_angles=start_drive_angles,
+        )
+        try:
+            scan = build_blast_front_arc_scan(
+                center=center,
+                center_settled=center_settled,
+                start_drive_angles=start_drive_angles,
+                left_outbound=left_outbound,
+                right_outbound=right_outbound,
+                final=final,
+                final_settled=final_settled,
+                final_body_verified=sensor.matches_navigation_body_angle(
+                    _body_motor_angle(final)
+                ),
+            )
+        except ValueError as error:
+            raise BlastControllerError(
+                "scan_sweep_observation_unverified",
+                "BLAST front scan encoder geometry was invalid",
+                motion_started=True,
+            ) from error
+        return {
+            "schema": COMMAND_RESULT_SCHEMA,
+            "robot_id": ROBOT_ID,
+            "controller_id": CONTROLLER_ID,
+            "command": SCAN_COMMAND,
+            "accepted": True,
+            "completed": True,
+            "receipt": {"turn_count": 16, "coverage": "front_arc"},
+            "observation": final,
+            "observation_settled": final_settled,
+            "scan": scan,
+        }
+
+    async def _perform_scan_surroundings(
+        self, runtime, generation, *, action_permit=None,
+    ):
+        center = await self._observe_until_idle(
+            runtime,
+            generation=generation,
+            stop_only=False,
+        )
+        center, center_settled = await self._observe_until_settled(
+            runtime,
+            generation=generation,
+            initial_observation=center,
+            timeout_seconds=SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
+        )
+        center_settled |= self._scan_sweep_window_allows_continuation(center)
+        sensor = (
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+            .range_sensor_extrinsics
+        )
+        center_distance = center.get("distance_mm")
+        center_motors = center.get("motor_angles_deg")
+        center_drive = tuple(center_motors.get(role)
+                             if isinstance(center_motors, Mapping) else None
+                             for role in ("left_drive", "right_drive"))
+        start_drive_angles = drive_encoder_angles(center)
+        permit_anchor_matched = (
+            isinstance(action_permit, _BlastNoReturnScanPermit)
+            and action_permit.runtime_generation == generation
+            and time.monotonic_ns()
+            <= action_permit.expires_at_monotonic_ns
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and abs(float(value) - expected)
+                <= _SCAN_PERMIT_EXPECTED_ANCHOR_TOLERANCE_DEG
+                for value, expected in zip(
+                    center_drive, action_permit.drive_angles_deg
+                )
+            )
+        )
+        permit_allows_no_return = (
+            permit_anchor_matched and action_permit.allow_no_return
+        )
+        center_state = blast_range_state(center_distance)
+        range_allows_start = (
+            permit_anchor_matched
+            and center_state == RANGE_STATE_MEASURED
+            and float(center_distance) > (
+                BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+                .minimum_rotation_clearance_mm()
+            )
+        ) or (
+            permit_allows_no_return
+            and center_state == RANGE_STATE_NO_VALID_DISTANCE
+        )
+        if not (
+            start_drive_angles is not None
             and sensor.matches_navigation_body_angle(
                 _body_motor_angle(center)
             )
@@ -1360,7 +1501,8 @@ class BlastObservationMonitor:
                     start_drive_angles=start_drive_angles,
                 ))
             except BlastControllerError as error:
-                if not error.evidence_uncertain:
+                close_obstacle = error.code == "scan_sweep_clearance_lost"
+                if not error.evidence_uncertain and not close_obstacle:
                     raise
                 await runtime.stop()
                 final = await self._observe_until_idle(
@@ -1384,7 +1526,10 @@ class BlastObservationMonitor:
                     {"stopped_after_uncertain_evidence": True},
                     final, final_settled, evidence,
                 ))
-                if not self._scan_sweep_window_allows_continuation(final):
+                if (
+                    close_obstacle
+                    or not self._scan_sweep_window_allows_continuation(final)
+                ):
                     partial_reason = error.code
                     break
             if abs(encoder_sweep_bearing_deg(
@@ -1475,6 +1620,10 @@ class BlastObservationMonitor:
     ):
         if command == SCAN_COMMAND:
             return await self._perform_scan_front_arc(
+                runtime, generation, action_permit=action_permit,
+            )
+        if command == SURROUNDINGS_SCAN_COMMAND:
+            return await self._perform_scan_surroundings(
                 runtime, generation, action_permit=action_permit,
             )
         if command == SETTLED_OBSERVATION_COMMAND:

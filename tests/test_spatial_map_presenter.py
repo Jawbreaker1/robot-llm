@@ -127,6 +127,20 @@ const map = {
       passage_proven: false, route_eligible: true, selected_side: "RIGHT",
       bind_pose: { x_mm: 0, y_mm: -225, heading_mdeg: -90000 },
       waypoint: { x_mm: 0, y_mm: -225, heading_mdeg: 0 } },
+    coarse_grid: {
+      schema: "robot-coarse-navigation-grid/v1",
+      frame: "EPISODE_START", cell_size_mm: 150,
+      top_is: "START_FORWARD", left_is: "START_LEFT",
+      rows: [
+        "...........", "...........", "...........", "...........",
+        ".....G.....", "...........", "......?....", ".....B.....",
+        "...........", "...........", "...........",
+      ],
+      robots: [{ symbol: "B", robot_id: "blast-01", row: 7,
+        column: 5, heading: "UP" }],
+      legend: ".=UNKNOWN o=OBSERVED_CLEAR_RAY #=ROBOT_KEEP_OUT ?=POSSIBLE_OBSTACLE G=GOAL W=WAYPOINT X=GOAL_AND_WAYPOINT x=WAYPOINT_ON_BLOCKED B=BLAST E=EV3 2=BOTH_ROBOTS",
+      cropped: false,
+    },
     imu_heading: null, local_detour_route: route,
     planar_scan_views: [{ scan_id: "dense-scan", observed_at_unix_ms: 1900,
       scan_pose: { x_mm: 0, y_mm: 0, heading_mdeg: 0 },
@@ -167,9 +181,11 @@ process.stdout.write(JSON.stringify({
   )),
   obstacle: withClass("map-provisional-ultrasonic-obstacle")[0].attributes,
   obstacleCount: exactClass("map-provisional-ultrasonic-obstacle").length,
+  coarseObstacleCount: withClass("map-coarse-obstacle-cell").length,
   scanViewCount: exactClass("map-blast-scan-view").length,
   rawRayCount: exactClass("map-blast-scan-ray").length,
   obstacleItemText: obstacleItem.textContent,
+  metadataText: nodes["map-metadata"].textContent,
 }));
 """
         completed = subprocess.run(
@@ -205,8 +221,12 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(result["rawRayCount"], 1)
         self.assertEqual(result["scanViewCount"], 2)
         self.assertEqual(result["obstacleCount"], 1)
+        self.assertEqual(result["coarseObstacleCount"], 1)
         self.assertIn("PROVISIONAL INFERENCE", result["obstacleItemText"])
         self.assertNotIn("nvd-only-scan", result["obstacleItemText"])
+        self.assertIn(".....G.....", result["metadataText"])
+        self.assertIn(".....B.....", result["metadataText"])
+        self.assertIn("B blast-01 UP", result["metadataText"])
 
     def test_asymmetric_footprint_and_pose_based_scan_cues_are_honest(self):
         script = r"""
@@ -1356,6 +1376,7 @@ process.stdout.write(JSON.stringify({
   imuAttributes: byClass("map-local-imu-heading").attributes,
   rayAttributes: byClass("map-blast-scan-ray").attributes,
   hasEcho: Boolean(byClass("map-blast-scan-echo")),
+  topLayer: nodes["map-local-odometry-layer"].children.at(-1).attributes.class,
   distanceRatio: lineLength(rayLine) / lineLength(goalLine),
   localText: nodes["map-local-odometry-layer"].textContent,
   invalidFrame: invalidFrame.navigationTrace,
@@ -1431,6 +1452,10 @@ process.stdout.write(JSON.stringify({
             "400",
         )
         self.assertTrue(result["hasEcho"])
+        self.assertEqual(
+            result["topLayer"],
+            "map-navigation-overlay-layer",
+        )
         self.assertAlmostEqual(result["distanceRatio"], 2 / 3)
         self.assertIn("PROVISIONAL_ENCODER_ODOMETRY", result["localText"])
         self.assertIn("SEARCH POSITION ONLY", result["localText"])

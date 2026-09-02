@@ -107,6 +107,20 @@ class BlastNavigationMotionExecutor:
     def localization_valid(self) -> bool:
         return self._localization_valid
 
+    def reanchor_heading(self, heading_mdeg: int) -> None:
+        """Fuse one episode-relative IMU heading without moving the pose."""
+
+        if type(heading_mdeg) is not int:
+            raise ValueError("BLAST heading reanchor is invalid")
+        self._pose = PhysicalPose(
+            x_mm=self._pose.x_mm,
+            y_mm=self._pose.y_mm,
+            heading_mdeg=heading_mdeg,
+            verified_motion_count=self._pose.verified_motion_count,
+            total_forward_mm=self._pose.total_forward_mm,
+            total_turn_mdeg=self._pose.total_turn_mdeg,
+        )
+
     def observation_matches_anchor(self, observation) -> bool:
         """Whether exact drive encoders still match the trusted pose anchor."""
 
