@@ -8,10 +8,9 @@ from .physical_odometry import normalize_heading_mdeg
 
 GRID_SCHEMA = "robot-coarse-navigation-grid/v1"
 GRID_CELL_SIZE_MM = 150
-# BLAST's body radius including its existing margin is about 163 mm. Round up
-# to 200 mm for LEGO-scale uncertainty. Orthogonal route legs separately
-# prevent the diagonal corner-cutting that previously needed more inflation.
-ROUTE_CLEARANCE_MM = 200
+# Roughly 100 mm of body plus LEGO-scale breathing room. This is a
+# robot-centre-to-echo distance, not 150 mm of empty air beside the body.
+ROUTE_CLEARANCE_MM = 150
 # Planned motion is Manhattan-style on the existing coarse map. Half a cell of
 # cross-axis drift is accepted so LEGO odometry is not treated as exact geometry,
 # without accepting a complete 150 x 150 mm diagonal as an orthogonal leg.
@@ -82,16 +81,30 @@ def _robot_heading(heading_mdeg):
 
 
 def _keep_out_cell_indexes(possible_obstacles):
+    """Return grid centres that actually enter the metric clearance circle.
+
+    A blanket 3 x 3 expansion turns every single echo into a 450 mm square.
+    Several sparse room echoes then make a whole side look blocked even though
+    the continuous route guard would accept it. The grid is only a coarse view
+    of that same metric guard, so mark cell centres by distance instead.
+    """
+
     cells = set()
+    index_reach = math.ceil(ROUTE_CLEARANCE_MM / GRID_CELL_SIZE_MM) + 1
     for point in possible_obstacles:
         forward_cell = _nearest_cell(point[0])
         left_cell = _nearest_cell(point[1])
-        for forward_delta in (-1, 0, 1):
-            for left_delta in (-1, 0, 1):
-                cells.add((
+        for forward_delta in range(-index_reach, index_reach + 1):
+            for left_delta in range(-index_reach, index_reach + 1):
+                candidate = (
                     forward_cell + forward_delta,
                     left_cell + left_delta,
-                ))
+                )
+                if math.hypot(
+                    candidate[0] * GRID_CELL_SIZE_MM - point[0],
+                    candidate[1] * GRID_CELL_SIZE_MM - point[1],
+                ) <= ROUTE_CLEARANCE_MM:
+                    cells.add(candidate)
     return cells
 
 
@@ -140,24 +153,24 @@ def build_coarse_navigation_grid(
                 if cells[row][column] == _UNKNOWN:
                     cells[row][column] = _OBSERVED_CLEAR
 
-    # One 150 mm neighbour around an echo is a coarse robot-centre keep-out
-    # area for BLAST's roughly 200 mm wide body.
+    # Draw the metric robot-centre clearance first, then put each measured echo
+    # on top. The exact continuous route check uses the same clearance value.
+    for forward_cell, left_cell in keep_out_indexes:
+        result = position((
+            forward_cell * GRID_CELL_SIZE_MM,
+            left_cell * GRID_CELL_SIZE_MM,
+        ))
+        if result is None:
+            continue
+        row, column = result
+        if cells[row][column] in (_UNKNOWN, _OBSERVED_CLEAR):
+            cells[row][column] = _ROBOT_KEEP_OUT
+
     for point in possible_obstacles:
         result = position(point)
         if result is None:
             continue
         row, column = result
-        for row_delta in (-1, 0, 1):
-            for column_delta in (-1, 0, 1):
-                candidate_row = row + row_delta
-                candidate_column = column + column_delta
-                if (
-                    0 <= candidate_row < GRID_SIZE
-                    and 0 <= candidate_column < GRID_SIZE
-                    and cells[candidate_row][candidate_column]
-                    in (_UNKNOWN, _OBSERVED_CLEAR)
-                ):
-                    cells[candidate_row][candidate_column] = _ROBOT_KEEP_OUT
         cells[row][column] = _POSSIBLE_OBSTACLE
 
     # Goal, waypoint and robot symbols are visual overlays. Preserve the

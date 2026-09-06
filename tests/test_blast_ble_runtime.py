@@ -161,7 +161,7 @@ class FakeHub:
                 "accepted": True,
                 "direction": request["args"]["direction"],
             }
-        elif operation == "turn_pulse":
+        elif operation in ("turn_pulse", "turn_trim_pulse"):
             result = {
                 "accepted": True,
                 "direction": request["args"]["direction"],
@@ -314,6 +314,21 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
             await runtime.connect()
 
         self.assertEqual(hub.disconnect_count, 1)
+
+    async def test_trim_turn_uses_the_bounded_hub_primitive(self):
+        hub = FakeHub()
+        async def finder(_name):
+            return "device"
+        runtime = BlastBLERuntime(program_path=self.program_path,
+                                  device_finder=finder, hub_factory=lambda device: hub)
+        await runtime.connect()
+        try:
+            result = await runtime.turn_trim_pulse("right")
+            self.assertEqual(result, {"accepted": True, "direction": "right"})
+            with self.assertRaisesRegex(ValueError, "direction"):
+                await runtime.turn_trim_pulse("forward")
+        finally:
+            await runtime.disconnect()
 
     async def test_disconnect_releases_ble_without_hub_command(self):
         hub = FakeHub()

@@ -21,6 +21,7 @@ from .blast_navigation_action_profile import (
     SCAN_TRIM_ENCODER_DEGREES_PER_PULSE,
     TURN_DURATION_MS_PER_PULSE,
     TURN_ENCODER_DEGREES_PER_PULSE,
+    TURN_TRIM_ENCODER_DEGREES,
     TURN_SPEED_DPS,
 )
 from .blast_navigation_calibration import (
@@ -38,6 +39,8 @@ from .blast_scan_observation import (
     SCAN_RAY_EVIDENCE_SETTLED,
     build_blast_encoder_scan,
     build_blast_front_arc_scan,
+    build_blast_partial_scan,
+    surroundings_scan_next_turn,
 )
 from .multi_robot_navigation_simulator import (
     MultiRobotNavigationSimulator,
@@ -72,7 +75,11 @@ class SharedWorldBlastController:
         simulation: MultiRobotNavigationSimulator,
         *,
         world_robot_id: str,
+        startup_scan: Mapping[str, object] | None = None,
+        range_dropout_reads: int = 0,
     ) -> None:
+        if type(range_dropout_reads) is not int or not 0 <= range_dropout_reads <= 100:
+            raise ValueError("simulation range dropout length is invalid")
         self.simulation = simulation
         self.world_robot_id = world_robot_id
         self._initial_heading_mdeg = simulation.pose(
@@ -84,6 +91,10 @@ class SharedWorldBlastController:
         self._generation = 1
         self.commands: list[str] = []
         self.scan_count = 0
+        self._startup_scan = deepcopy(startup_scan)
+        self._range_dropout_reads = range_dropout_reads
+        self._drop_remaining = 0
+        self._drop_injected = False
 
     def monotonic_ms(self) -> int:
         return self._observed_ms
@@ -92,6 +103,9 @@ class SharedWorldBlastController:
         return self._generation
 
     def _distance_mm(self) -> int:
+        if self._drop_remaining:
+            self._drop_remaining -= 1
+            return 2_000  # BLAST's no-valid-return sentinel, never free space.
         _footprint, sensor = (
             BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
         )
@@ -179,7 +193,13 @@ class SharedWorldBlastController:
                 / 2.0
                 * calibration.turn_mdeg_per_opposed_encoder_degree
             ))
-            self.simulation.rotate(self.world_robot_id, turn_mdeg)
+            before_heading = self.simulation.pose(self.world_robot_id).heading_mdeg
+            after = self.simulation.rotate(self.world_robot_id, turn_mdeg)
+            actual_turn = normalize_heading_mdeg(after.heading_mdeg - before_heading)
+            if actual_turn != turn_mdeg:
+                ratio = actual_turn / turn_mdeg if turn_mdeg else 0.0
+                applied_left_deg = round(left_delta_deg * ratio)
+                applied_right_deg = round(right_delta_deg * ratio)
         self._left_encoder_deg += applied_left_deg
         self._right_encoder_deg += applied_right_deg
         self._observed_ms += TURN_DURATION_MS_PER_PULSE
@@ -217,19 +237,41 @@ class SharedWorldBlastController:
         )
 
     def _scan_result(self, *, surroundings: bool):
+        if surroundings and self._startup_scan is not None:
+            return self._recorded_startup_scan_result()
         center = self._observation()
         start = {
             role: center["motor_angles_deg"][role]
             for role in ("left_drive", "right_drive")
         }
-        if surroundings:
-            samples = [self._turn_scan_pulse("left") for _ in range(16)]
-            trim_sample = self._turn_scan_pulse(
-                "left",
-                SCAN_TRIM_ENCODER_DEGREES_PER_PULSE,
+        def pulse_completed(sample):
+            receipt, observation = sample[:2]
+            before = receipt["before_angles_deg"]
+            after = observation["motor_angles_deg"]
+            return all(abs(after[role] - before[role]) >= receipt["wheel_angle_deg"]
+                       for role in before)
+
+        def partial(samples, final):
+            return build_blast_partial_scan(
+                center=center, center_settled=True, start_drive_angles=start,
+                sweep_samples=samples, final=final, final_settled=True,
+                final_body_verified=True,
             )
-            final = trim_sample[1]
-            scan = build_blast_encoder_scan(
+
+        if surroundings:
+            samples, final = [], center
+            while (next_turn := surroundings_scan_next_turn(
+                center, start, final, len(samples),
+            )) is not None:
+                sample = self._turn_scan_pulse(
+                    next_turn[0], SCAN_TRIM_ENCODER_DEGREES_PER_PULSE
+                    if next_turn[1] == "trim" else TURN_ENCODER_DEGREES_PER_PULSE,
+                )
+                samples.append(sample)
+                final = sample[1]
+                if not pulse_completed(sample):
+                    break
+            scan = partial(samples, final) if samples and not pulse_completed(samples[-1]) else build_blast_encoder_scan(
                 center=center,
                 center_settled=True,
                 start_drive_angles=start,
@@ -237,38 +279,35 @@ class SharedWorldBlastController:
                 final=final,
                 final_settled=True,
                 final_body_verified=True,
-                sweep_turn_count=len(samples) + 1,
+                sweep_turn_count=len(samples),
             )
             receipt = {
-                "turn_count": len(samples) + 1,
+                "turn_count": len(samples),
                 "coverage_complete": (
-                    scan["sweep_coverage_deg"] >= 360.0
+                    scan["state"] == "complete"
                 ),
             }
         else:
-            left_outbound = [
-                self._turn_scan_pulse("left") for _ in range(4)
-            ]
-            for _ in range(4):
-                self._turn_scan_pulse("right")
-            right_outbound = [
-                self._turn_scan_pulse("right") for _ in range(4)
-            ]
-            for _ in range(3):
-                self._turn_scan_pulse("left")
-            final_sample = self._turn_scan_pulse("left")
-            final = final_sample[1]
-            scan = build_blast_front_arc_scan(
+            samples = []
+            for direction in ("left",) * 4 + ("right",) * 8 + ("left",) * 4:
+                sample = self._turn_scan_pulse(direction)
+                samples.append(sample)
+                if not pulse_completed(sample):
+                    break
+            final = samples[-1][1]
+            # Match physical recovery: a stopped, incomplete sweep is useful
+            # partial evidence, never a fabricated complete 16-pulse scan.
+            scan = partial(samples, final) if not pulse_completed(samples[-1]) else build_blast_front_arc_scan(
                 center=center,
                 center_settled=True,
                 start_drive_angles=start,
-                left_outbound=left_outbound,
-                right_outbound=right_outbound,
+                left_outbound=samples[:4],
+                right_outbound=samples[8:12],
                 final=final,
                 final_settled=True,
                 final_body_verified=True,
             )
-            receipt = {"turn_count": 16, "coverage": "front_arc"}
+            receipt = {"turn_count": len(samples), "coverage": "front_arc"}
         return {
             "schema": COMMAND_RESULT_SCHEMA,
             "robot_id": ROBOT_ID,
@@ -304,6 +343,35 @@ class SharedWorldBlastController:
         self.scan_count += 1
         return self._scan_result(surroundings=True)
 
+    def _recorded_startup_scan_result(self):
+        """Replay measured startup evidence, not a route or later world truth."""
+
+        scan = deepcopy(self._startup_scan)
+        scan.pop("planar_projection", None)
+        original = scan["encoder_start_angles_deg"]
+        current = self._observation()["motor_angles_deg"]
+        final = {
+            role: current[role] + scan["encoder_final_angles_deg"][role] - original[role]
+            for role in original
+        }
+        scan["encoder_start_angles_deg"] = {role: current[role] for role in original}
+        scan["encoder_final_angles_deg"] = final
+        self._left_encoder_deg = final["left_drive"]
+        self._right_encoder_deg = final["right_drive"]
+        imu = scan["imu_heading_diagnostics"]
+        self.simulation.rotate(self.world_robot_id, normalize_heading_mdeg(round(
+            -(imu["final_heading_deg"] - imu["start_heading_deg"]) * 1_000
+        )))
+        self._observed_ms += 40_000
+        return {
+            "schema": COMMAND_RESULT_SCHEMA,
+            "robot_id": ROBOT_ID, "controller_id": CONTROLLER_ID,
+            "command": SCAN_COMMAND, "accepted": True, "completed": True,
+            "receipt": {"turn_count": scan["sweep_turn_count"], "coverage_complete": True},
+            "observation": self._observation(), "observation_settled": True,
+            "scan": scan,
+        }
+
     def command(
         self,
         command: str,
@@ -318,6 +386,9 @@ class SharedWorldBlastController:
                 motion_started=False,
             )
         self.commands.append(command)
+        if command == "drive_forward" and not self._drop_injected:
+            self._drop_injected = True
+            self._drop_remaining = self._range_dropout_reads
         if command == SETTLED_OBSERVATION_COMMAND:
             self._observed_ms += 1
             observation = self._observation()
@@ -345,12 +416,12 @@ class SharedWorldBlastController:
                     -DRIVE_ENCODER_DEGREES,
                     -DRIVE_ENCODER_DEGREES,
                 )
-            elif command in ("turn_left", "turn_right"):
-                is_left = command == "turn_left"
+            elif command in ("turn_left", "turn_right", "turn_left_trim", "turn_right_trim"):
+                is_left = command.startswith("turn_left")
+                turn_degrees = TURN_TRIM_ENCODER_DEGREES if command.endswith("_trim") else TURN_ENCODER_DEGREES_PER_PULSE
                 direction = "left" if is_left else "right"
                 left = (
-                    -TURN_ENCODER_DEGREES_PER_PULSE
-                    if is_left else TURN_ENCODER_DEGREES_PER_PULSE
+                    -turn_degrees if is_left else turn_degrees
                 )
                 right = -left
             else:
@@ -369,8 +440,7 @@ class SharedWorldBlastController:
                 "direction": direction,
                 "speed_dps": TURN_SPEED_DPS if turning else DRIVE_SPEED_DPS,
                 "wheel_angle_deg" if turning else "angle_deg": (
-                    TURN_ENCODER_DEGREES_PER_PULSE
-                    if turning else DRIVE_ENCODER_DEGREES
+                    turn_degrees if turning else DRIVE_ENCODER_DEGREES
                 ),
                 "before_angles_deg": {
                     role: before[role]
@@ -555,7 +625,14 @@ class SharedWorldEV3Transport:
                 / 2.0
                 * self.odometry.turn_mdeg_per_opposed_encoder_degree
             ))
-            self.simulation.rotate(self.world_robot_id, turn_mdeg)
+            before_heading = self.simulation.pose(self.world_robot_id).heading_mdeg
+            after = self.simulation.rotate(self.world_robot_id, turn_mdeg)
+            actual_turn = normalize_heading_mdeg(after.heading_mdeg - before_heading)
+            if actual_turn != turn_mdeg:
+                blocked = True
+                ratio = actual_turn / turn_mdeg if turn_mdeg else 0.0
+                left_delta = round(left_delta * ratio)
+                right_delta = round(right_delta * ratio)
 
         self._left += left_delta
         self._right += right_delta
@@ -696,17 +773,19 @@ class _SharedWorldEV3ScanRig:
         self._local_heading_mdeg = request.start_pose.heading_mdeg
 
     def turn_relative_mdeg(self, delta, _calibration, _deadline_ms):
-        self.transport.simulation.rotate(
+        before = self.transport.simulation.pose(self.transport.world_robot_id)
+        after = self.transport.simulation.rotate(
             self.transport.world_robot_id,
             delta,
         )
+        actual = normalize_heading_mdeg(after.heading_mdeg - before.heading_mdeg)
         self._local_heading_mdeg = normalize_heading_mdeg(
-            self._local_heading_mdeg + delta
+            self._local_heading_mdeg + actual
         )
         self.transport._advance_state(max(1, abs(delta) // 100))
         return {
             "requested_delta_mdeg": delta,
-            "actual_delta_mdeg": delta,
+            "actual_delta_mdeg": actual,
             "completed_at_ms": self.transport.clock_ms(),
             "stop_confirmed": True,
         }

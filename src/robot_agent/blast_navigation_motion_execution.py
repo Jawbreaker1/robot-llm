@@ -17,6 +17,8 @@ from .blast_observation_monitor import (
 )
 from .blast_scan_observation import (
     SCAN_RESTORATION_COMMON_MODE_TOLERANCE_MM,
+    scan_heading,
+    scan_heading_delta,
     encoder_common_mode_residue_mm,
     encoder_relative_bearing_deg,
     validate_blast_scan_ray_contract,
@@ -26,7 +28,7 @@ from .physical_navigation_contract import (
 )
 from .physical_odometry import (
     PhysicalPose, VerifiedMotion, apply_verified_motion,
-    verified_motion_from_result,
+    verified_motion_from_result, normalize_heading_mdeg,
 )
 
 
@@ -170,6 +172,7 @@ class BlastNavigationMotionExecutor:
 
     def reanchor_after_restored_scan(self, command_result) -> bool:
         """Apply the verified encoder endpoint of one scan."""
+        start_heading_mdeg = self._pose.heading_mdeg
         if not self._localization_valid:
             _fail("blast_navigation_localization_invalid",
                   "BLAST encoder localization must be restarted")
@@ -251,13 +254,6 @@ class BlastNavigationMotionExecutor:
             and recomputed_opposed_deg is not None
             and encoder_restoration.get("motion_stopped") is True
             and encoder_restoration.get("body_pose_verified") is True
-            and (
-                verified_sweep
-                or (
-                    encoder_restoration.get("observation_settled") is True
-                    and command_result.get("observation_settled") is True
-                )
-            )
         )
         if not encoder_scan_contract_valid:
             self._invalidate(
@@ -283,6 +279,14 @@ class BlastNavigationMotionExecutor:
                 BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
             )
         self._expected_start_angles = angles
+        imu = scan.get("imu_heading_diagnostics", {})
+        local_yaw = scan_heading_delta(
+            imu.get("final_heading_deg"), imu.get("start_heading_deg"),
+        )
+        if local_yaw is not None:
+            self.reanchor_heading(normalize_heading_mdeg(
+                start_heading_mdeg - round(local_yaw * 1000),
+            ))
         return True
 
     def execute(
@@ -291,6 +295,7 @@ class BlastNavigationMotionExecutor:
         *,
         cancel_requested=None,
         continue_requested=None,
+        trim_turn=False,
     ):
         if action not in BLAST_NAVIGATION_COMMANDS:
             _fail("invalid_blast_motion_action",
@@ -303,6 +308,10 @@ class BlastNavigationMotionExecutor:
             _fail("blast_navigation_localization_invalid",
                   "BLAST encoder localization must be restarted")
         snapshot = self._controller.snapshot()
+        # Absolute gyro yaw includes drift during motorless LLM waits. Only
+        # the short command-local yaw change belongs to this physical motion.
+        start_imu = scan_heading(snapshot.get("observation", {}))
+        start_heading = self._pose.heading_mdeg
         observed_start = _encoder_angles(
             snapshot.get("observation")
             if isinstance(snapshot, Mapping) else None
@@ -335,6 +344,10 @@ class BlastNavigationMotionExecutor:
         command_attempted = False
         try:
             commands = BLAST_NAVIGATION_COMMANDS[action]
+            if trim_turn:
+                if action not in (TURN_LEFT_90, TURN_RIGHT_90):
+                    raise ValueError("Only turns have a correction pulse")
+                commands = (commands[0] + "_trim",)
             for command_index, command in enumerate(commands):
                 if cancel_requested is not None and cancel_requested():
                     if not results:
@@ -385,10 +398,17 @@ class BlastNavigationMotionExecutor:
         # Only advance the trusted anchor after every boundary above passed.
         self._expected_start_angles = final_angles
         self._pose = pose
+        yaw_delta = scan_heading_delta(
+            scan_heading(results[-1].get("observation", {})), start_imu,
+        )
+        if yaw_delta is not None and motion.verified_slice_count > 0:
+            self.reanchor_heading(normalize_heading_mdeg(
+                start_heading - round(yaw_delta * 1000),
+            ))
         return BlastNavigationMotionExecution(
             controller_results=tuple(deepcopy(results)),
             motion=motion,
-            pose=pose,
+            pose=self._pose,
         )
 __all__ = ("MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES",
            "MAX_RESTORED_SCAN_OPPOSED_RESIDUE_DEGREES",

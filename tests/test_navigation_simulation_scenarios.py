@@ -41,11 +41,12 @@ class NavigationSimulationScenarioTests(unittest.TestCase):
     def test_blast_gemma_suite_matches_the_current_mission_without_routes(self):
         scenarios = blast_gemma_validation_scenarios()
 
-        self.assertEqual(len(scenarios), 5)
+        self.assertEqual(len(scenarios), 6)
         self.assertEqual(
             {scenario.scenario_id for scenario in scenarios},
             {
                 "blast-box-front",
+                "blast-measured-box-and-chair",
                 "blast-box-at-side",
                 "blast-boxes-both-sides",
                 "blast-straight-corridor",

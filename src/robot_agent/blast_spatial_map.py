@@ -249,14 +249,24 @@ def _planned_leg(value) -> bool:
     return False
 
 
+MODEL_WAYPOINT = "MODEL_WAYPOINT"
+
+
 def _route_waypoint(value) -> bool:
+    model_waypoint = isinstance(value, Mapping) and value.get("kind") == MODEL_WAYPOINT
     return (
         _exact(value, (
             "ordinal", "kind", "x_mm", "y_mm", "heading_mdeg",
             "fact_key", "status",
-        ))
+        ) + (("purpose",) if model_waypoint else ()))
         and _integer(value["ordinal"], 0, 8)
-        and value["kind"] in WAYPOINT_KINDS
+        and (model_waypoint or value["kind"] in WAYPOINT_KINDS)
+        and (not model_waypoint or (
+            isinstance(value["purpose"], str)
+            and value["purpose"] == value["purpose"].strip()
+            and 1 <= len(value["purpose"]) <= 120
+            and not any(ord(character) < 32 for character in value["purpose"])
+        ))
         and _integer(value["x_mm"], -1_000_000, 1_000_000)
         and _integer(value["y_mm"], -1_000_000, 1_000_000)
         and _integer(value["heading_mdeg"], -180_000, 179_999)

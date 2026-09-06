@@ -8,6 +8,11 @@ from typing import Mapping
 
 PERSONA_LOCALES = ("sv", "en")
 MAX_PERSONA_CHARS = 600
+# Shared live/simulation prompt limits; the hub accepts eight seconds of audio.
+BLAST_MAX_NAVIGATION_UTTERANCE_CHARS = 72
+BLAST_NAVIGATION_OUTPUT_TOKENS = 8_192
+BLAST_NAVIGATION_REASONING_EFFORT = "low"
+BLAST_NAVIGATION_TIMEOUT_SECONDS = 60.0
 
 BLAST_PERSONA_BY_LOCALE = MappingProxyType({
     "sv": (

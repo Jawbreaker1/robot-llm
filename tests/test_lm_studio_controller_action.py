@@ -139,6 +139,12 @@ class ControllerActionPlannerTests(unittest.TestCase):
             ],
         )
         self.assertEqual(request["reasoning_effort"], "none")
+        self.assertEqual(request["temperature"], 1.0)
+        self.assertEqual(request["top_p"], 0.95)
+        self.assertEqual(request["top_k"], 20)
+        self.assertEqual(request["min_p"], 0.0)
+        self.assertEqual(request["presence_penalty"], 0.0)
+        self.assertEqual(request["repeat_penalty"], 1.0)
 
     def test_preserves_provider_reasoning_for_diagnostics(self):
         response = json.loads(completion({
@@ -149,7 +155,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
             "utterance": None,
         }))
         response["choices"][0]["message"]["reasoning_content"] = (
-            "  The observed route is clear, so advance.  "
+            "  " + "The observed route is clear, so advance. " * 150 + "  "
         )
         planner, transport = self.planner(
             json.dumps(response).encode("utf-8")
@@ -159,31 +165,18 @@ class ControllerActionPlannerTests(unittest.TestCase):
 
         self.assertEqual(
             result.reasoning_content,
-            "The observed route is clear, so advance.",
+            ("The observed route is clear, so advance. " * 150).strip(),
         )
         request = json.loads(transport.calls[0][1])
         system_prompt = request["messages"][0]["content"]
         self.assertIn("ADVANCE is semantic forward progress", system_prompt)
         self.assertIn("REVERSE is a bounded retreat", system_prompt)
-        self.assertIn("Do not rescan after every clear", system_prompt)
-        self.assertIn("KNOWN_ECHO_CLEARANCE_INTERSECTION", system_prompt)
-        self.assertIn("NON_ORTHOGONAL_ROUTE_LEG", system_prompt)
         self.assertIn("change x or y, not both", system_prompt)
-        self.assertIn("WAYPOINT_ALREADY_REACHED", system_prompt)
-        self.assertIn("Never repeat the identical rejected route", system_prompt)
-        self.assertIn("FOLLOW_WAYPOINT remains available", system_prompt)
-        self.assertIn("blocking_echo_point", system_prompt)
-        self.assertIn("executor refuses the leg", system_prompt)
-        self.assertNotIn("geometry_feedback", system_prompt)
-        self.assertIn("FORWARD_CLEARANCE_UNAVAILABLE", system_prompt)
-        self.assertIn("do not alternate one reverse pulse", system_prompt)
-        self.assertIn("REQUIRED_STEERING_UNAVAILABLE", system_prompt)
-        self.assertIn("active_waypoint_geometry_after", system_prompt)
-        self.assertIn("host supplies no obstacle recipe", system_prompt)
-        self.assertIn("first part of a longer route", system_prompt)
-        self.assertIn("known_clear_axis_reach_mm", system_prompt)
-        self.assertIn("backtracking from a dead end", system_prompt)
-        self.assertNotIn("keep x near the robot's current x", system_prompt)
+        self.assertIn("RANGE_MEASUREMENT_UNAVAILABLE", system_prompt)
+        self.assertIn("following_waypoints are hypotheses", system_prompt)
+        self.assertIn("may extend into unknown space", system_prompt)
+        self.assertIn("not to limit future hypotheses", system_prompt)
+        self.assertNotIn("Do not commit a waypoint leg", system_prompt)
         utterance_schema = request["response_format"]["json_schema"][
             "schema"
         ]["properties"]["utterance"]["oneOf"][0]
@@ -246,30 +239,67 @@ class ControllerActionPlannerTests(unittest.TestCase):
         supplied = json.loads(request["messages"][1]["content"])
         self.assertEqual(supplied["waypoint_reached_radius_mm"], 75)
         self.assertIn(
-            "leave additional LEGO-scale room",
+            "a corner may begin that far before its coordinates",
             request["messages"][0]["content"],
         )
 
     def test_output_token_budget_can_expand_for_reasoning_models(self):
+        response = json.loads(completion({
+            "action": "DRIVE_FORWARD",
+            "confidence_milli": 940,
+            "assessment": "The route is clear.",
+            "plan": ["DRIVE_FORWARD"],
+            "utterance": None,
+        }))
+        reasoning = "Measured geometry. " * 2000
+        response["choices"][0]["message"]["reasoning_content"] = reasoning
         planner, transport = self.planner(
-            completion({
-                "action": "DRIVE_FORWARD",
-                "confidence_milli": 940,
-                "assessment": "The route is clear.",
-                "plan": ["DRIVE_FORWARD"],
-                "utterance": None,
-            }),
-            max_output_tokens=2_048,
+            json.dumps(response).encode(),
+            max_output_tokens=8_192,
+            reasoning_effort="low",
         )
 
-        planner.decide(context())
+        result = planner.decide(context())
 
         request = json.loads(transport.calls[0][1])
-        self.assertEqual(request["max_tokens"], 2_048)
+        self.assertEqual(request["max_tokens"], 8_192)
+        self.assertEqual(request["reasoning_effort"], "low")
+        self.assertEqual(result.reasoning_content, reasoning.strip())
+
+    def test_invalid_choice_reports_finish_reason_and_bounded_reasoning(self):
+        response = json.loads(completion({
+            "action": "DRIVE_FORWARD",
+            "confidence_milli": 940,
+            "assessment": "The route is clear.",
+            "plan": ["DRIVE_FORWARD"],
+            "utterance": None,
+        }))
+        response["choices"][0]["finish_reason"] = "length"
+        response["choices"][0]["message"]["reasoning_content"] = (
+            "I still need to choose a route. " * 150 + "End of reasoning."
+        )
+        planner, _transport = self.planner(
+            json.dumps(response).encode("utf-8")
+        )
+
+        with self.assertRaisesRegex(
+            LMStudioProtocolError,
+            "finish_reason='length'.*I still need to choose a route",
+        ):
+            with self.assertLogs("robot_agent.navigation_diagnostics", "INFO") as logs:
+                planner.decide(context())
+        request_record, response_record = [
+            json.loads(record.getMessage()) for record in logs.records
+        ]
+        self.assertEqual(request_record["event"], "planner_request")
+        self.assertEqual(response_record["event"], "planner_response")
+        self.assertEqual(request_record["request_id"], response_record["request_id"])
+        self.assertEqual(json.loads(response_record["raw_response"]), response)
 
     def test_rejects_invalid_output_token_budget(self):
-        with self.assertRaises(LMStudioConfigurationError):
-            LMStudioControllerActionPlanner(max_output_tokens=0)
+        for budget in (0, 8_193):
+            with self.subTest(budget=budget), self.assertRaises(LMStudioConfigurationError):
+                LMStudioControllerActionPlanner(max_output_tokens=budget)
 
     def test_rejects_unknown_reasoning_effort(self):
         with self.assertRaises(LMStudioConfigurationError):
@@ -398,7 +428,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         self.assertIn(BLAST_PERSONA_BY_LOCALE["en"], english_prompt)
         self.assertNotIn(BLAST_PERSONA_BY_LOCALE["sv"], english_prompt)
 
-    def test_terminal_decision_normalizes_one_redundant_terminal_step(self):
+    def test_terminal_decision_discards_valid_stale_plan_tail(self):
         planner, _ = self.planner(completion({
             "action": COMPLETE,
             "confidence_milli": 900,
@@ -423,15 +453,14 @@ class ControllerActionPlannerTests(unittest.TestCase):
             (),
         )
 
-        invalid, _ = self.planner(completion({
+        stale, _ = self.planner(completion({
             "action": COMPLETE,
             "confidence_milli": 900,
             "assessment": "Målet är uppnått.",
             "plan": ["TURN_LEFT"],
             "utterance": None,
         }))
-        with self.assertRaises(LMStudioProtocolError):
-            invalid.decide(context())
+        self.assertEqual(stale.decide(context()).decision.plan, ())
 
     def test_completion_can_be_withheld_by_the_host(self):
         planner, transport = self.planner(completion({
@@ -595,16 +624,11 @@ class ControllerActionPlannerTests(unittest.TestCase):
         )
         system_prompt = request["messages"][0]["content"]
         for instruction in (
-            "left and right arrays",
-            "authoritative physical sides",
-            "smallest to largest absolute_bearing_deg",
-            "Ignore conflicting raw heading signs",
-            "complete angular pattern on both sides",
-            "larger distance_mm means a farther return",
-            "far-angle measured opening",
+            "physical left/right at scan start",
+            "full angular pattern on both sides",
             "NO_VALID_DISTANCE",
             "mean unknown",
-            "host does not rank or choose the turn side",
+            "you choose the route, detour side",
         ):
             self.assertIn(instruction, system_prompt)
 
@@ -643,27 +667,18 @@ class ControllerActionPlannerTests(unittest.TestCase):
         supplied = json.loads(request["messages"][1]["content"])
         self.assertEqual(supplied["local_map_evidence"], local_map)
         system_prompt = request["messages"][0]["content"]
-        self.assertIn("body-aware coarse grid", system_prompt)
-        self.assertIn("Unobserved space is unknown, never free", system_prompt)
-        self.assertIn("has not selected a corridor", system_prompt)
-        self.assertIn(
-            "coarse_grid is a rolling low-resolution window", system_prompt,
-        )
-        self.assertIn("Each rows[i] object puts its exact x coordinate", system_prompt)
-        self.assertIn("column_y_mm[j] is the exact y coordinate", system_prompt)
+        self.assertLess(len(system_prompt), 6_000)
+        self.assertIn("SAME fixed episode frame", system_prompt)
+        self.assertIn("x is rows[i].x_mm and y is column_y_mm[j]", system_prompt)
         self.assertIn("+x is starting forward", system_prompt)
         self.assertIn("+y is starting left", system_prompt)
         self.assertIn("-y is starting right", system_prompt)
         self.assertIn("direct_goal_blockage", system_prompt)
-        self.assertIn("The #/? cells are", system_prompt)
-        self.assertIn("g means the goal cell", system_prompt)
-        self.assertIn("conservative visual planning aid", system_prompt)
-        self.assertIn("Repeated cells in visited_cells", system_prompt)
-        self.assertIn("blocking_echo_point gives", system_prompt)
-        self.assertIn("clearance_mm gives", system_prompt)
-        self.assertIn("Every planned leg must be axis-aligned", system_prompt)
-        self.assertNotIn("keep_out_regions summarizes", system_prompt)
-        self.assertNotIn("create rear clearance at", system_prompt)
+        self.assertIn("visited_cells", system_prompt)
+        self.assertIn("current_echo_clusters", system_prompt)
+        self.assertIn("robot_center_keep_out_bounds_mm", system_prompt)
+        self.assertIn("direct_detour_axis_candidates", system_prompt)
+        self.assertIn("not a chosen route", system_prompt)
         self.assertNotIn("local_map_evidence", context().to_dict())
 
         with self.assertRaises(LMStudioInputError):
@@ -718,41 +733,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
             supplied["active_waypoint_plan"], [waypoint, *following],
         )
         self.assertIn(
-            "waypoint is memory for your decisions",
-            request["messages"][0]["content"],
-        )
-        self.assertIn(
-            "ADVANCE moves in the robot's current heading",
-            request["messages"][0]["content"],
-        )
-        self.assertIn(
-            "Express a navigation hypothesis as one current waypoint",
-            request["messages"][0]["content"],
-        )
-        self.assertIn(
-            "Never plan ADVANCE then COMPLETE while the robot heading points "
-            "away from the final goal",
-            request["messages"][0]["content"],
-        )
-        self.assertIn(
-            "distinct intermediate position at the end of the next detour leg",
-            request["messages"][0]["content"],
-        )
-        self.assertIn(
-            "entirely lateral or backward",
-            request["messages"][0]["content"],
-        )
-        self.assertIn(
-            "following_waypoints",
-            request["messages"][0]["content"],
-        )
-        self.assertIn(
-            "active_waypoint_geometry",
-            request["messages"][0]["content"],
-        )
-        self.assertIn(
-            "A short straight advance does not by itself make the accumulated "
-            "map unknown",
+            "Keep the route until reached, blocked or disproved",
             request["messages"][0]["content"],
         )
         self.assertIn(
@@ -885,9 +866,8 @@ class ControllerActionPlannerTests(unittest.TestCase):
         self.assertEqual(result.decision.waypoint, waypoint)
         request = json.loads(transport.calls[0][1])
         prompt = request["messages"][0]["content"]
-        self.assertIn("explicitly delegates", prompt)
-        self.assertIn("every strategic waypoint", prompt)
-        self.assertIn("executor refuses the leg", prompt)
+        self.assertIn("follows only the current waypoint", prompt)
+        self.assertIn("you choose the route, detour side, waypoints", prompt)
 
         invalid, _ = self.planner(completion({
             "action": FOLLOW_WAYPOINT,

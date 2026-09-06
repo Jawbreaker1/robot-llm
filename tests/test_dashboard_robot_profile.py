@@ -8,6 +8,7 @@ from unittest import mock
 
 from robot_agent.dashboard_cli import (
     BLAST_MAX_NAVIGATION_UTTERANCE_CHARS,
+    BLAST_NAVIGATION_OUTPUT_TOKENS,
     ROBOT_PROFILE_DISABLED,
     _configured_robot_control_target,
     _configured_robot_runtime_adapter,
@@ -24,13 +25,26 @@ from robot_agent.robot_control_contract import RobotControlTarget
 
 
 class DashboardRobotProfileTests(unittest.TestCase):
+    def setUp(self):
+        diagnostics = mock.patch(
+            "robot_agent.dashboard_cli.enable_navigation_diagnostics"
+        )
+        self.addCleanup(diagnostics.stop)
+        diagnostics.start()
+
     def test_default_profile_remains_disabled(self):
         args = _parser().parse_args([])
 
         self.assertEqual(args.robot_profile, ROBOT_PROFILE_DISABLED)
         self.assertEqual(args.model, DEFAULT_MODEL)
         self.assertIsNone(args.robot_target)
-        self.assertEqual(args.robot_planner_timeout_seconds, 30.0)
+        self.assertEqual(args.robot_planner_timeout_seconds, 60.0)
+        self.assertEqual(args.blast_reasoning_effort, "low")
+        from robot_agent.blast_navigation_simulation import _parser as simulation_parser
+        simulated = simulation_parser().parse_args([])
+        self.assertEqual(simulated.timeout_seconds, args.robot_planner_timeout_seconds)
+        self.assertEqual(simulated.reasoning_effort, args.blast_reasoning_effort)
+        self.assertEqual(simulated.max_output_tokens, BLAST_NAVIGATION_OUTPUT_TOKENS)
         self.assertEqual(args.robot_input_timeout_seconds, 10.0)
         self.assertIsNone(args.shared_peer_port)
         self.assertIsNone(args.shared_peer_access_key_file)
@@ -310,6 +324,8 @@ class DashboardRobotProfileTests(unittest.TestCase):
             "BLAST-TEST",
             "--robot-planner-timeout-seconds",
             "6.5",
+            "--blast-reasoning-effort",
+            "low",
         ])
         monitor = object()
         adapter = object()
@@ -366,6 +382,8 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 base_url=args.lm_studio_url,
                 model="model-b",
                 timeout_seconds=6.5,
+                reasoning_effort="low",
+                max_output_tokens=BLAST_NAVIGATION_OUTPUT_TOKENS,
                 utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
                 max_utterance_chars=(
                     BLAST_MAX_NAVIGATION_UTTERANCE_CHARS

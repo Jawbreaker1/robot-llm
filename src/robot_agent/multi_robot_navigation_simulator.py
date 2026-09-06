@@ -96,9 +96,9 @@ class SimulationEvent:
 class MultiRobotNavigationSimulator:
     """One synchronized world shared by all simulated robots.
 
-    A conservative circle around each measured robot footprint is used for
-    collision checks.  This intentionally leaves LEGO-scale breathing room
-    without pretending that millimetre-perfect motion is realistic.
+    Each measured rectangular robot footprint is rotated with its pose for
+    collision checks. The footprint's own margin leaves LEGO-scale breathing
+    room without turning ordinary side passages into false collisions.
     """
 
     def __init__(
@@ -147,39 +147,80 @@ class MultiRobotNavigationSimulator:
         )
 
     @staticmethod
-    def _point_rectangle_distance(
-        x_mm: float,
-        y_mm: float,
-        obstacle: RectangleObstacle,
-    ) -> float:
-        dx = max(obstacle.min_x_mm - x_mm, 0.0, x_mm - obstacle.max_x_mm)
-        dy = max(obstacle.min_y_mm - y_mm, 0.0, y_mm - obstacle.max_y_mm)
-        return math.hypot(dx, dy)
+    def _footprint_polygon(pose, footprint):
+        margin = footprint.clearance_margin_mm
+        local_corners = (
+            (footprint.front_extent_mm + margin,
+             footprint.left_extent_mm + margin),
+            (-footprint.rear_extent_mm - margin,
+             footprint.left_extent_mm + margin),
+            (-footprint.rear_extent_mm - margin,
+             -footprint.right_extent_mm - margin),
+            (footprint.front_extent_mm + margin,
+             -footprint.right_extent_mm - margin),
+        )
+        heading = math.radians(pose.heading_mdeg / 1_000.0)
+        cosine, sine = math.cos(heading), math.sin(heading)
+        return tuple((
+            pose.x_mm + forward * cosine - left * sine,
+            pose.y_mm + forward * sine + left * cosine,
+        ) for forward, left in local_corners)
+
+    @staticmethod
+    def _obstacle_polygon(obstacle):
+        return (
+            (obstacle.min_x_mm, obstacle.min_y_mm),
+            (obstacle.min_x_mm, obstacle.max_y_mm),
+            (obstacle.max_x_mm, obstacle.max_y_mm),
+            (obstacle.max_x_mm, obstacle.min_y_mm),
+        )
+
+    @staticmethod
+    def _polygons_intersect(first, second):
+        """Use the separating-axis test for two convex rectangles."""
+
+        for polygon in (first, second):
+            for index, point in enumerate(polygon):
+                following = polygon[(index + 1) % len(polygon)]
+                axis_x = -(following[1] - point[1])
+                axis_y = following[0] - point[0]
+                first_projection = tuple(
+                    x * axis_x + y * axis_y for x, y in first
+                )
+                second_projection = tuple(
+                    x * axis_x + y * axis_y for x, y in second
+                )
+                if (
+                    max(first_projection) < min(second_projection)
+                    or max(second_projection) < min(first_projection)
+                ):
+                    return False
+        return True
 
     def _pose_collides(self, robot_id: str, pose: PoseEstimate) -> bool:
-        radius = self._radius(self._robot_specs[robot_id])
+        robot_polygon = self._footprint_polygon(
+            pose, self._robot_specs[robot_id].footprint,
+        )
         min_x, min_y, max_x, max_y = self.bounds
-        if (
-            pose.x_mm - radius <= min_x
-            or pose.y_mm - radius <= min_y
-            or pose.x_mm + radius >= max_x
-            or pose.y_mm + radius >= max_y
+        if any(
+            x <= min_x or y <= min_y or x >= max_x or y >= max_y
+            for x, y in robot_polygon
         ):
             return True
         if any(
-            self._point_rectangle_distance(pose.x_mm, pose.y_mm, obstacle)
-            <= radius
+            self._polygons_intersect(
+                robot_polygon, self._obstacle_polygon(obstacle),
+            )
             for obstacle in self.obstacles
         ):
             return True
         for peer_id, peer_pose in self._poses.items():
             if peer_id == robot_id:
                 continue
-            peer_radius = self._radius(self._robot_specs[peer_id])
-            if math.hypot(
-                pose.x_mm - peer_pose.x_mm,
-                pose.y_mm - peer_pose.y_mm,
-            ) <= radius + peer_radius:
+            peer_polygon = self._footprint_polygon(
+                peer_pose, self._robot_specs[peer_id].footprint,
+            )
+            if self._polygons_intersect(robot_polygon, peer_polygon):
                 return True
         return False
 
@@ -212,20 +253,32 @@ class MultiRobotNavigationSimulator:
             ) <= goal.tolerance_mm
 
     def rotate(self, robot_id: str, delta_mdeg: int) -> PoseEstimate:
+        """Rotate only through collision-free poses, including between endpoints."""
         if type(delta_mdeg) is not int or not -360_000 <= delta_mdeg <= 360_000:
             raise ValueError("simulation rotation is invalid")
         with self._lock:
-            current = self._poses[robot_id]
-            updated = PoseEstimate(
-                x_mm=current.x_mm,
-                y_mm=current.y_mm,
-                heading_mdeg=normalize_heading_mdeg(
-                    current.heading_mdeg + delta_mdeg
-                ),
-            )
-            self._poses[robot_id] = updated
+            start = self._poses[robot_id]
+            direction = 1 if delta_mdeg >= 0 else -1
+            remaining = abs(delta_mdeg)
+            turned = 0
+            # Match translation's 10 mm sampling at the outermost body corner.
+            radius = self._robot_specs[robot_id].footprint.maximum_corner_radius_mm
+            step_mdeg = max(1, min(5_000, round(math.degrees(10 / radius) * 1000)))
+            while remaining:
+                step = min(step_mdeg, remaining)
+                attempted = turned + direction * step
+                candidate = PoseEstimate(
+                    x_mm=start.x_mm, y_mm=start.y_mm,
+                    heading_mdeg=normalize_heading_mdeg(start.heading_mdeg + attempted),
+                )
+                if self._pose_collides(robot_id, candidate):
+                    self._record(robot_id, "blocked", turned)
+                    return self._poses[robot_id]
+                self._poses[robot_id] = candidate
+                turned = attempted
+                remaining -= step
             self._record(robot_id, "rotate", delta_mdeg)
-            return updated
+            return self._poses[robot_id]
 
     def move(self, robot_id: str, distance_mm: int) -> int:
         """Move until the requested distance or the first blocked substep."""

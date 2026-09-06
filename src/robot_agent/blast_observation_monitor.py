@@ -38,6 +38,7 @@ from .blast_navigation_action_profile import (
     TURN_SPEED_DPS,
 )
 from .blast_scan_observation import (
+    MINIMUM_SURROUNDINGS_SCAN_COVERAGE_DEG,
     PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM,
     RANGE_STATE_INVALID,
     RANGE_STATE_MEASURED,
@@ -52,9 +53,12 @@ from .blast_scan_observation import (
     build_blast_encoder_scan,
     build_blast_front_arc_scan,
     build_blast_partial_scan,
+    scan_sweep_bearing_deg,
+    scan_heading,
+    surroundings_scan_next_turn,
     drive_encoder_angles,
     encoder_relative_bearing_deg,
-    encoder_sweep_bearing_deg, validate_blast_scan_ray_contract,
+    validate_blast_scan_ray_contract,
 )
 
 
@@ -94,6 +98,8 @@ COMMANDS = {
     "drive_reverse": ("drive_pulse", "reverse"),
     "turn_left": ("turn_pulse", "left"),
     "turn_right": ("turn_pulse", "right"),
+    "turn_left_trim": ("turn_trim_pulse", "left"),
+    "turn_right_trim": ("turn_trim_pulse", "right"),
     "claw_open": ("claw_pulse", "open"),
     "claw_close": ("claw_pulse", "close"),
     "body_left": ("body_pulse", "left"),
@@ -108,6 +114,8 @@ NAVIGATION_MOTION_COMMANDS = {
     "drive_reverse",
     "turn_left",
     "turn_right",
+    "turn_left_trim",
+    "turn_right_trim",
 }
 
 
@@ -1118,6 +1126,8 @@ class BlastObservationMonitor:
                     "BLAST command failed",
                 )
             )
+            if failure is not error:
+                failure.__cause__ = error
             self._finish_command(result, error=failure)
             if failure.code in (
                 "controller_command_interrupted",
@@ -1158,6 +1168,47 @@ class BlastObservationMonitor:
             for sample in samples
         )
 
+    async def _recover_scan_turn(self, runtime, generation, error, sensor):
+        """Stop and retain one moved scan pulse when its range is uncertain."""
+
+        close_obstacle = error.code == "scan_sweep_clearance_lost"
+        if not error.evidence_uncertain and not close_obstacle:
+            raise error
+        await runtime.stop()
+        final = await self._observe_until_idle(
+            runtime, generation=generation, stop_only=True,
+        )
+        final, final_settled = await self._observe_until_settled(
+            runtime, generation=generation,
+            initial_observation=final,
+            timeout_seconds=SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
+        )
+        if (
+            final.get("motion_active") is not False
+            or drive_encoder_angles(final) is None
+            or not sensor.matches_navigation_body_angle(
+                _body_motor_angle(final)
+            )
+        ):
+            raise error
+        evidence = (
+            SCAN_RAY_EVIDENCE_SETTLED
+            if final_settled is True
+            else SCAN_RAY_EVIDENCE_SWEEP_ONLY
+        )
+        sample = (
+            {"stopped_after_uncertain_evidence": True},
+            final,
+            final_settled,
+            evidence,
+        )
+        can_continue = (
+            error.code != "controller_command_failed"
+            and not close_obstacle
+            and self._scan_sweep_window_allows_continuation(final)
+        )
+        return sample, can_continue
+
     async def _scan_turn(
         self,
         runtime,
@@ -1177,20 +1228,16 @@ class BlastObservationMonitor:
             SCAN_TRIM_ENCODER_DEGREES_PER_PULSE
             if trim else SCAN_TURN_ENCODER_DEGREES_PER_PULSE
         )
-        receipt = await (
-            runtime.scan_trim_pulse(direction)
-            if trim else runtime.scan_turn_pulse(direction)
-        )
         try:
+            receipt = await (
+                runtime.scan_trim_pulse(direction)
+                if trim else runtime.scan_turn_pulse(direction)
+            )
             observation = await self._observe_until_idle(
                 runtime,
                 generation=generation,
                 stop_only=False,
             )
-        except BlastControllerError as error:
-            error.motion_started = True
-            raise
-        try:
             observation, observation_settled = (
                 await self._observe_until_settled(
                     runtime, generation=generation,
@@ -1201,8 +1248,21 @@ class BlastObservationMonitor:
                 )
             )
         except BlastControllerError as error:
-            error.motion_started = True
+            if error.motion_started is None:
+                error.motion_started = True
             raise
+        except Exception as error:
+            # A pulse or its following read can fail after physical movement.
+            # Both use the existing stop/read/partial-scan recovery.
+            logger.warning(
+                "BLAST scan pulse/read failed direction=%s trim=%s error_type=%s",
+                direction, trim, type(error).__name__,
+            )
+            raise BlastControllerError(
+                "controller_command_failed",
+                "BLAST scan pulse or observation transport failed",
+                evidence_uncertain=True,
+            ) from error
         distance = observation.get("distance_mm")
         sweep_only = observation_settled is not True
         sensor = (
@@ -1365,34 +1425,58 @@ class BlastObservationMonitor:
                 motion_started=False,
             )
 
-        left_outbound = [
-            await self._scan_turn(
-                runtime, generation, "left",
-                start_drive_angles=start_drive_angles,
-            )
-            for _index in range(4)
-        ]
-        for _index in range(4):
-            await self._scan_turn(
-                runtime, generation, "right",
-                start_drive_angles=start_drive_angles,
-            )
-        right_outbound = [
-            await self._scan_turn(
-                runtime, generation, "right",
-                start_drive_angles=start_drive_angles,
-            )
-            for _index in range(4)
-        ]
-        for _index in range(3):
-            await self._scan_turn(
-                runtime, generation, "left",
-                start_drive_angles=start_drive_angles,
-            )
-        _receipt, final, final_settled, _evidence = await self._scan_turn(
-            runtime, generation, "left",
-            start_drive_angles=start_drive_angles,
+        sweep_samples = []
+        partial_reason = None
+        directions = (
+            *("left",) * 4,
+            *("right",) * 8,
+            *("left",) * 4,
         )
+        for direction in directions:
+            try:
+                sample = await self._scan_turn(
+                    runtime, generation, direction,
+                    start_drive_angles=start_drive_angles,
+                )
+            except BlastControllerError as error:
+                sample, can_continue = await self._recover_scan_turn(
+                    runtime, generation, error, sensor,
+                )
+                if not can_continue:
+                    partial_reason = error.code
+            sweep_samples.append(sample)
+            if partial_reason is not None:
+                break
+        _receipt, final, final_settled, _evidence = sweep_samples[-1]
+        if partial_reason is not None:
+            scan = build_blast_partial_scan(
+                center=center,
+                center_settled=center_settled,
+                start_drive_angles=start_drive_angles,
+                sweep_samples=sweep_samples,
+                final=final,
+                final_settled=final_settled,
+                final_body_verified=True,
+            )
+            return {
+                "schema": COMMAND_RESULT_SCHEMA,
+                "robot_id": ROBOT_ID,
+                "controller_id": CONTROLLER_ID,
+                "command": SCAN_COMMAND,
+                "accepted": True,
+                "completed": True,
+                "receipt": {
+                    "turn_count": len(sweep_samples),
+                    "coverage": "partial_front_arc",
+                    "coverage_complete": False,
+                    "reason_code": partial_reason,
+                },
+                "observation": final,
+                "observation_settled": final_settled,
+                "scan": scan,
+            }
+        left_outbound = sweep_samples[:4]
+        right_outbound = sweep_samples[8:12]
         try:
             scan = build_blast_front_arc_scan(
                 center=center,
@@ -1494,48 +1578,25 @@ class BlastObservationMonitor:
             )
         sweep_samples = []
         partial_reason = None
-        for _index in range(17):
+        final = center
+        while (next_turn := surroundings_scan_next_turn(
+            center, start_drive_angles, final, len(sweep_samples),
+        )) is not None:
             try:
                 sweep_samples.append(await self._scan_turn(
-                    runtime, generation, "left",
+                    runtime, generation, next_turn[0],
                     start_drive_angles=start_drive_angles,
+                    trim=next_turn[1] == "trim",
                 ))
             except BlastControllerError as error:
-                close_obstacle = error.code == "scan_sweep_clearance_lost"
-                if not error.evidence_uncertain and not close_obstacle:
-                    raise
-                await runtime.stop()
-                final = await self._observe_until_idle(
-                    runtime, generation=generation, stop_only=True,
+                sample, can_continue = await self._recover_scan_turn(
+                    runtime, generation, error, sensor,
                 )
-                final, final_settled = await self._observe_until_settled(
-                    runtime, generation=generation,
-                    initial_observation=final,
-                    timeout_seconds=SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
-                )
-                if (final.get("motion_active") is not False
-                    or drive_encoder_angles(final) is None
-                    or not sensor.matches_navigation_body_angle(
-                        _body_motor_angle(final))):
-                    raise
-                evidence = (
-                    SCAN_RAY_EVIDENCE_SETTLED if final_settled is True
-                    else SCAN_RAY_EVIDENCE_SWEEP_ONLY
-                )
-                sweep_samples.append((
-                    {"stopped_after_uncertain_evidence": True},
-                    final, final_settled, evidence,
-                ))
-                if (
-                    close_obstacle
-                    or not self._scan_sweep_window_allows_continuation(final)
-                ):
+                sweep_samples.append(sample)
+                if not can_continue:
                     partial_reason = error.code
                     break
-            if abs(encoder_sweep_bearing_deg(
-                sweep_samples[-1][1], start_drive_angles,
-            ) or 0.0) >= 350.0:
-                break
+            final = sweep_samples[-1][1]
         if partial_reason is not None:
             final = sweep_samples[-1][1]
             final_settled = sweep_samples[-1][2]
@@ -1562,25 +1623,8 @@ class BlastObservationMonitor:
             }
         final_sample = sweep_samples[-1]
         turn_count = len(sweep_samples)
-        coverage = abs(encoder_sweep_bearing_deg(
-            final_sample[1], start_drive_angles) or 0.0)
-        if coverage < 360.0:
-            final_sample = await self._scan_turn(
-                runtime,
-                generation,
-                "left",
-                start_drive_angles=start_drive_angles,
-                trim=True,
-            )
-            turn_count += 1
-            coverage = abs(encoder_sweep_bearing_deg(
-                final_sample[1], start_drive_angles) or 0.0)
-        if not 360.0 <= coverage <= 390.0:
-            raise BlastControllerError(
-                "scan_sweep_observation_unverified",
-                "BLAST surroundings scan did not complete one encoder turn",
-                motion_started=True,
-            )
+        coverage = abs(scan_sweep_bearing_deg(
+            final_sample[1], start_drive_angles, scan_heading(center)) or 0.0)
         _receipt, final, final_settled, _evidence = final_sample
         final_body_verified = sensor.matches_navigation_body_angle(
             _body_motor_angle(final))
@@ -1642,7 +1686,7 @@ class BlastObservationMonitor:
             stop_only=command == "stop",
         )
         observation_settled = None
-        turn_command = command in ("turn_left", "turn_right")
+        turn_command = command.startswith("turn_")
         if command in NAVIGATION_MOTION_COMMANDS or command == SETTLED_OBSERVATION_COMMAND:
             observation, observation_settled = await self._observe_until_settled(
                 runtime, generation=generation,

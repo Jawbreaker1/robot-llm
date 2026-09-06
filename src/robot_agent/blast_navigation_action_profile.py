@@ -23,6 +23,7 @@ DRIVE_ENCODER_DEGREES = 90
 DRIVE_DURATION_MS = 750
 TURN_SPEED_DPS = 180
 TURN_ENCODER_DEGREES_PER_PULSE = 45
+TURN_TRIM_ENCODER_DEGREES = 15
 TURN_DURATION_MS_PER_PULSE = 250
 # Four bounded pulses are the closest existing semantic quarter turn. The
 # encoder-derived 93.96-degree result remains authoritative over the label.
@@ -30,6 +31,7 @@ TURN_PULSES_PER_QUARTER_TURN = 4
 # Four fixed scan pulses per side use the calibrated turn pulse and expose an
 # approximately 190-degree encoder-measured front arc (about +/-95 degrees).
 SCAN_TURN_ENCODER_DEGREES_PER_PULSE = 45
+# Small closing pulses; measured yaw decides whether another is needed.
 SCAN_TRIM_ENCODER_DEGREES_PER_PULSE = 15
 SCAN_TURN_PULSES_PER_SIDE = 4
 TURN_ENCODER_DEGREES_PER_QUARTER_TURN = (

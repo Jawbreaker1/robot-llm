@@ -10,18 +10,20 @@ from .blast_mission_completion import (
     BLAST_GOAL_HEADING_TOLERANCE_MDEG,
     BLAST_GOAL_RADIUS_MM,
 )
-from .blast_spatial_map import MAX_PLANAR_SCAN_VIEWS
+from .blast_spatial_map import (
+    MAX_PLANAR_SCAN_VIEWS,
+    MODEL_WAYPOINT,
+    provisional_obstacle_hypotheses,
+)
 from .coarse_navigation_grid import (
     GRID_CELL_SIZE_MM,
+    ROUTE_CLEARANCE_MM,
     build_coarse_navigation_grid,
     known_clear_axis_reach_mm,
     model_route_blockage,
     route_blockage_from_echoes,
 )
 from .local_detour_route import (
-    LATERAL_CLEARANCE,
-    MERGE_GOAL_AXIS,
-    PASS_BEYOND_TARGET,
     ROUTE_ACTIVE,
     ROUTE_SCHEMA,
 )
@@ -73,6 +75,7 @@ class _BlastEpisodeMapTrace:
         self.advisory_waypoint_plan = ()
         self._waypoint_plan_version = 0
         self.planar_scan_views = []
+        self._obstacle_points = []
         self.visited_cells = []
         self._scan_sequence = 0
         self._last_pose = pose
@@ -127,13 +130,10 @@ class _BlastEpisodeMapTrace:
             or type(observed_at_unix_ms) is not int
         ):
             return None
-        relative = (
-            float(heading) - float(self.episode_start_heading) + 180.0
-        ) % 360.0 - 180.0
         return {
-            "heading_mdeg": normalize_heading_mdeg(
-                -round(relative * 1_000)
-            ),
+            # Display the same motion-local heading used for driving. Raw gyro
+            # drift during a planner pause must not rotate a second map arrow.
+            "heading_mdeg": self._last_pose.heading_mdeg,
             "reference": "EPISODE_START",
             "observed_at_unix_ms": observed_at_unix_ms,
         }
@@ -165,21 +165,16 @@ class _BlastEpisodeMapTrace:
         start = (pose.x_mm, pose.y_mm)
         previous = start
         waypoints = []
-        count = len(self.advisory_waypoint_plan)
         for index, waypoint in enumerate(self.advisory_waypoint_plan):
             delta_x = waypoint["x_mm"] - previous[0]
             delta_y = waypoint["y_mm"] - previous[1]
             heading = normalize_heading_mdeg(round(
                 math.degrees(math.atan2(delta_y, delta_x)) * 1_000
             ))
-            kind = (
-                LATERAL_CLEARANCE if index == 0
-                else MERGE_GOAL_AXIS if index == count - 1
-                else PASS_BEYOND_TARGET
-            )
             waypoints.append({
                 "ordinal": index,
-                "kind": kind,
+                "kind": MODEL_WAYPOINT,
+                "purpose": waypoint["purpose"],
                 "x_mm": waypoint["x_mm"],
                 "y_mm": waypoint["y_mm"],
                 "heading_mdeg": heading,
@@ -239,15 +234,48 @@ class _BlastEpisodeMapTrace:
             self.visited_cells.append(cell)
             del self.visited_cells[:-_VISITED_CELL_LIMIT]
 
+    def _remember_obstacles(self, points):
+        """Missing echoes do not erase objects; measured free rays can.
+
+        Nearby repeat hits replace previous evidence instead of inflating the
+        same box on every scan. This is map memory, not route selection.
+        """
+        spacing = GRID_CELL_SIZE_MM / 2
+        retained = []
+        for old in self._obstacle_points:
+            ox, oy = old["nominal_echo_x_mm"], old["nominal_echo_y_mm"]
+            replaced = False
+            for point in points:
+                ex, ey = point["nominal_echo_x_mm"], point["nominal_echo_y_mm"]
+                if math.hypot(ex - ox, ey - oy) <= spacing:
+                    replaced = True
+                    break
+                if not all(k in point for k in (
+                    "sensor_origin_x_mm", "sensor_origin_y_mm",
+                )):
+                    continue
+                sx, sy = point["sensor_origin_x_mm"], point["sensor_origin_y_mm"]
+                dx, dy = ex - sx, ey - sy
+                length = math.hypot(dx, dy)
+                if length == 0:
+                    continue
+                along = ((ox - sx) * dx + (oy - sy) * dy) / length
+                across = abs((ox - sx) * dy - (oy - sy) * dx) / length
+                if 0 < along < length - spacing and across < spacing:
+                    replaced = True
+                    break
+            if not replaced:
+                retained.append(old)
+        self._obstacle_points = retained + copy.deepcopy(points)
+
     def _coarse_navigation_observations(self):
-        possible_obstacles = []
+        """Use retained obstacles and measured rays, never no-return as free."""
+        possible_obstacles = [self._episode_axes(
+            point["nominal_echo_x_mm"], point["nominal_echo_y_mm"],
+        ) for point in self._obstacle_points]
         clear_segments = []
         for view in self.planar_scan_views:
             for point in view["projection"]["points"]:
-                possible_obstacles.append(self._episode_axes(
-                    point["nominal_echo_x_mm"],
-                    point["nominal_echo_y_mm"],
-                ))
                 if all(key in point for key in (
                     "sensor_origin_x_mm", "sensor_origin_y_mm",
                 )):
@@ -294,6 +322,93 @@ class _BlastEpisodeMapTrace:
             clear_segments=clear_segments,
             window_center=robot_position,
         )
+
+    def _current_echo_clusters(self):
+        """Summarize retained echo evidence without choosing a route or side."""
+
+        if not self.planar_scan_views:
+            return []
+        try:
+            hypotheses = provisional_obstacle_hypotheses(
+                ({"scan_id": "episode-map-memory",
+                  "observed_at_unix_ms": self._last_observed_at_unix_ms,
+                  "projection": {
+                    "points": self._obstacle_points,
+                }},)
+            )
+            values = []
+            for ordinal, hypothesis in enumerate(hypotheses, 1):
+                points = [
+                    self._episode_axes(point["x_mm"], point["y_mm"])
+                    for point in hypothesis["support_points"]
+                ]
+                x_values = [point[0] for point in points]
+                y_values = [point[1] for point in points]
+                echo_bounds = {
+                    "x_min_mm": round(min(x_values)),
+                    "x_max_mm": round(max(x_values)),
+                    "y_min_mm": round(min(y_values)),
+                    "y_max_mm": round(max(y_values)),
+                }
+                values.append({
+                    "cluster": ordinal,
+                    "provisional": True,
+                    "evidence_count": hypothesis["evidence_count"],
+                    "echo_bounds_mm": echo_bounds,
+                    "robot_center_keep_out_bounds_mm": {
+                        "x_min_mm": (
+                            echo_bounds["x_min_mm"] - ROUTE_CLEARANCE_MM
+                        ),
+                        "x_max_mm": (
+                            echo_bounds["x_max_mm"] + ROUTE_CLEARANCE_MM
+                        ),
+                        "y_min_mm": (
+                            echo_bounds["y_min_mm"] - ROUTE_CLEARANCE_MM
+                        ),
+                        "y_max_mm": (
+                            echo_bounds["y_max_mm"] + ROUTE_CLEARANCE_MM
+                        ),
+                    },
+                })
+            return values
+        except (KeyError, TypeError, ValueError):
+            return []
+
+    @staticmethod
+    def _direct_detour_axis_candidates(robot_position, target_position, clusters):
+        """Expose both nearest lateral grid lines; never select one."""
+
+        start_x, start_y = robot_position
+        target_x, target_y = target_position
+        x_min, x_max = sorted((start_x, target_x))
+        y_min, y_max = sorted((start_y, target_y))
+        blockers = []
+        for cluster in clusters:
+            bounds = cluster["robot_center_keep_out_bounds_mm"]
+            if (
+                bounds["x_max_mm"] >= x_min
+                and bounds["x_min_mm"] <= x_max
+                and bounds["y_max_mm"] >= y_min
+                and bounds["y_min_mm"] <= y_max
+            ):
+                blockers.append(bounds)
+        if not blockers:
+            return None
+
+        left_boundary = max(item["y_max_mm"] for item in blockers)
+        right_boundary = min(item["y_min_mm"] for item in blockers)
+        return {
+            "basis": "CURRENT_SCAN_ECHO_BOUNDS",
+            "side_selected": False,
+            "left_y_mm": (
+                math.ceil(left_boundary / GRID_CELL_SIZE_MM)
+                * GRID_CELL_SIZE_MM
+            ),
+            "right_y_mm": (
+                math.floor(right_boundary / GRID_CELL_SIZE_MM)
+                * GRID_CELL_SIZE_MM
+            ),
+        }
 
     def planner_local_map_evidence(self, pose):
         """Return a compact echo-point map with no inferred free space."""
@@ -349,6 +464,7 @@ class _BlastEpisodeMapTrace:
                     "heading_positive": "LEFT_CCW",
                 },
                 "unobserved_space": "UNKNOWN_NOT_FREE",
+                "route_clearance_mm": ROUTE_CLEARANCE_MM,
                 "coarse_grid": planner_grid,
                 "known_clear_axis_reach_mm": (
                     known_clear_axis_reach_mm(coarse_grid)
@@ -390,6 +506,16 @@ class _BlastEpisodeMapTrace:
                     ),
                 },
             }
+            current_echo_clusters = self._current_echo_clusters()
+            if current_echo_clusters:
+                evidence["current_echo_clusters"] = current_echo_clusters
+                detour_candidates = self._direct_detour_axis_candidates(
+                    robot_position, target_position, current_echo_clusters,
+                )
+                if detour_candidates is not None:
+                    evidence["direct_detour_axis_candidates"] = (
+                        detour_candidates
+                    )
             if direct_goal_blockage is not None:
                 evidence["direct_goal_blockage"] = direct_goal_blockage
             return evidence
@@ -492,6 +618,7 @@ class _BlastEpisodeMapTrace:
             )
         if isinstance(scan_view, Mapping):
             self._scan_sequence += 1
+            self._remember_obstacles(scan_view["planar_projection"]["points"])
             self.planar_scan_views.append({
                 "scan_id": "{}-scan-{}".format(
                     self.episode_id,

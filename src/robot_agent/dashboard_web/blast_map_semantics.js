@@ -8,6 +8,7 @@
     "SETTLED_MEASURED_ULTRASONIC + PROVISIONAL_YAW_ONLY"
   );
   const ROUTE_KINDS = new Set([
+    "MODEL_WAYPOINT",
     "LATERAL_CLEARANCE",
     "REACQUIRE_GOAL_HEADING",
     "PASS_BEYOND_TARGET",
@@ -72,9 +73,12 @@
       const pose = helpers.normalizeTracePose(waypoint);
       const factKey = waypoint.fact_key === null
         ? null : helpers.identifier(waypoint.fact_key);
+      const modelWaypoint = waypoint.kind === "MODEL_WAYPOINT";
+      const purpose = modelWaypoint ? helpers.strictText(waypoint.purpose, 120) : null;
       if (
-        !hasExactFields(waypoint, WAYPOINT_FIELDS)
+        !hasExactFields(waypoint, modelWaypoint ? [...WAYPOINT_FIELDS, "purpose"] : WAYPOINT_FIELDS)
         || waypoint.ordinal !== index || !ROUTE_KINDS.has(waypoint.kind)
+        || modelWaypoint && purpose === null
         || pose === null || factKey === null && waypoint.fact_key !== null
         || !WAYPOINT_STATUSES.has(waypoint.status)
       ) return null;
@@ -89,6 +93,7 @@
         ordinal: index, kind: waypoint.kind,
         xMm: pose.xMm, yMm: pose.yMm, headingMdeg: pose.headingMdeg,
         factKey, status: waypoint.status,
+        ...(modelWaypoint ? {purpose} : {}),
       });
     });
     if (
@@ -307,7 +312,7 @@
     ));
   }
 
-  function renderRoute(layer, route, projection, ui) {
+  function renderRoute(layer, route, projection, ui, robotPose) {
     if (!route) return;
     const group = ui.svg("g", {
       class: "map-local-detour-route", "data-route-id": route.routeId,
@@ -319,8 +324,12 @@
       ui.t("map.navigation_trace.route_provisional"),
     ]);
     const projected = route.waypoints.map((item) => projection.point(item.xMm, item.yMm));
-    if (projected.length > 1) group.appendChild(ui.svg("polyline", {
-      points: projected.map((point) => `${point.x},${point.y}`).join(" "),
+    const remaining = projected.slice(route.activeIndex);
+    if (robotPose && route.status === "ACTIVE") {
+      remaining.unshift(projection.point(robotPose.xMm, robotPose.yMm));
+    }
+    if (remaining.length > 1) group.appendChild(ui.svg("polyline", {
+      points: remaining.map((point) => `${point.x},${point.y}`).join(" "),
       class: "map-local-detour-route-line",
     }));
     route.waypoints.forEach((item, index) => {
@@ -330,7 +339,7 @@
         "data-ordinal": item.ordinal, "data-kind": item.kind,
         "data-status": item.status, "data-fact-key": item.factKey || "",
       });
-      const name = ui.t(`mission.route.waypoint.${item.kind}`);
+      const name = item.purpose || ui.t(`mission.route.waypoint.${item.kind}`);
       ui.title(node, [name,
         ui.t(`map.navigation_trace.route_waypoint_status.${item.status}`),
         ui.t("map.navigation_trace.route_waypoint_pose", {

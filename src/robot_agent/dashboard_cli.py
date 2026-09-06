@@ -34,7 +34,13 @@ from .blast_hub_speech import (
     BLAST_PIPER_PROFILE,
     BlastHubSpeaker,
 )
-from .blast_personality import BLAST_PERSONA_BY_LOCALE
+from .blast_personality import (
+    BLAST_PERSONA_BY_LOCALE,
+    BLAST_MAX_NAVIGATION_UTTERANCE_CHARS,
+    BLAST_NAVIGATION_OUTPUT_TOKENS,
+    BLAST_NAVIGATION_TIMEOUT_SECONDS,
+    BLAST_NAVIGATION_REASONING_EFFORT,
+)
 from .ev3rstorm_profile import (
     DEFAULT_EV3RSTORM_MEMORY_PATH,
     EV3RSTORM_PROFILE_ID,
@@ -43,10 +49,17 @@ from .ev3rstorm_profile import (
 )
 from .lm_studio import DEFAULT_BASE_URL, DEFAULT_MODEL
 from .lm_studio_navigation import LMStudioNavigationPlanner
-from .lm_studio_controller_action import LMStudioControllerActionPlanner
+from .lm_studio_controller_action import (
+    LMStudioControllerActionPlanner,
+    REASONING_EFFORTS,
+)
 from .lm_studio_robot_input import (
     LMStudioRobotInputModel,
     REQUEST_TIMEOUT_SECONDS as ROBOT_INPUT_TIMEOUT_SECONDS,
+)
+from .navigation_diagnostics import (
+    enable_navigation_diagnostics,
+    record_navigation_diagnostic,
 )
 from .host_piper_speech import (
     LocaleSpeechSynthesizer,
@@ -81,9 +94,6 @@ ROBOT_PROFILE_CHOICES = (
     EV3RSTORM_PROFILE_ID,
     BLAST_PROFILE_ID,
 )
-# BLAST can upload at most eight seconds of ADPCM.  Keep navigation remarks
-# short enough to leave synthesis headroom for natural Swedish pauses.
-BLAST_MAX_NAVIGATION_UTTERANCE_CHARS = 72
 
 
 def _configured_robot_control_target(
@@ -505,8 +515,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--robot-planner-timeout-seconds",
         type=float,
-        default=30.0,
+        default=BLAST_NAVIGATION_TIMEOUT_SECONDS,
         help="Structured physical planner timeout (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--blast-reasoning-effort",
+        choices=REASONING_EFFORTS,
+        default=BLAST_NAVIGATION_REASONING_EFFORT,
+        help=(
+            "Reasoning effort for BLAST navigation diagnostics "
+            "(default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--robot-input-timeout-seconds",
@@ -669,6 +688,8 @@ def _configured_blast_runtime_adapter(args, blast_monitor):
             base_url=args.lm_studio_url,
             model=model,
             timeout_seconds=args.robot_planner_timeout_seconds,
+            reasoning_effort=args.blast_reasoning_effort,
+            max_output_tokens=BLAST_NAVIGATION_OUTPUT_TOKENS,
             utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
             max_utterance_chars=(
                 BLAST_MAX_NAVIGATION_UTTERANCE_CHARS
@@ -910,6 +931,15 @@ def _run(
             raise ValueError(
                 "--simulation-map-demo cannot be combined with a physical "
                 "robot runtime"
+            )
+        if runtime_entries:
+            enable_navigation_diagnostics(
+                Path("local-artifacts/navigation-dashboard.jsonl")
+            )
+            record_navigation_diagnostic(
+                "runtime_started", source="dashboard", model=args.model,
+                blast_reasoning_effort=args.blast_reasoning_effort,
+                blast_max_output_tokens=BLAST_NAVIGATION_OUTPUT_TOKENS,
             )
         if args.simulation_map_demo:
             from .spatial_mapping_demo import (

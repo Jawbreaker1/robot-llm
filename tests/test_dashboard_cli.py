@@ -104,6 +104,13 @@ class AcceptingRouter:
 
 
 class DashboardCLITests(unittest.TestCase):
+    def setUp(self):
+        diagnostics = mock.patch(
+            "robot_agent.dashboard_cli.enable_navigation_diagnostics"
+        )
+        self.addCleanup(diagnostics.stop)
+        diagnostics.start()
+
     def test_sigterm_handler_routes_through_keyboard_interrupt_cleanup(self):
         with self.assertRaises(KeyboardInterrupt):
             _raise_termination_interrupt(15, None)

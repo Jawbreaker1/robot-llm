@@ -448,17 +448,17 @@
       trace.final_goal,
       geometryToleranceMm,
     );
-    const imuHeading = normalizeImuHeading(trace.imu_heading, nowUnixMs);
-    const plannedLeg = normalizePlannedLeg(trace.planned_leg);
-    const localDetourRoute = blastMapSemantics.normalizeRoute(
+    let imuHeading = normalizeImuHeading(trace.imu_heading, nowUnixMs);
+    let plannedLeg = normalizePlannedLeg(trace.planned_leg);
+    let localDetourRoute = blastMapSemantics.normalizeRoute(
       trace.local_detour_route,
-      { record, identifier, nonnegativeInteger, normalizeTracePose },
+      { record, identifier, nonnegativeInteger, normalizeTracePose, strictText },
     );
-    const advisoryWaypoint = blastMapSemantics.normalizeAdvisoryWaypoint(
+    let advisoryWaypoint = blastMapSemantics.normalizeAdvisoryWaypoint(
       trace.advisory_waypoint,
       { record, coordinate: localCoordinate, strictText },
     );
-    const coarseGrid = normalizeCoarseNavigationGrid(trace.coarse_grid);
+    let coarseGrid = normalizeCoarseNavigationGrid(trace.coarse_grid);
     const transformProvenance = shared
       ? trace.transform_provenance
       : null;
@@ -489,25 +489,27 @@
         !== "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY"
       || !sharedIdentityValid
       || finalGoal === null
-      || imuHeading === undefined
-      || plannedLeg === undefined
-      || localDetourRoute === undefined
-      || advisoryWaypoint === undefined
-      || coarseGrid === undefined
-      || (
-        plannedLeg?.scope === "SEARCH_POSITION_ONLY"
-        && finalGoal.navigationEnforced !== false
-      )
-      || (
-        plannedLeg?.scope === "LOCAL_DETOUR_ROUTE"
-        && finalGoal.navigationEnforced !== true
-      )
       || !Array.isArray(trace.planar_scan_views)
       || trace.planar_scan_views.length > MAX_NAVIGATION_SCAN_VIEWS
     ) {
       return null;
     }
-    const planarScanViews = trace.planar_scan_views.map((scan) => (
+    const plannedLegMatchesGoal = !plannedLeg || (
+      plannedLeg.scope === "SEARCH_POSITION_ONLY"
+      && finalGoal.navigationEnforced === false
+    ) || (
+      plannedLeg.scope === "LOCAL_DETOUR_ROUTE"
+      && finalGoal.navigationEnforced === true
+    );
+    const optionalFieldsValid = (
+      imuHeading !== undefined
+      && plannedLeg !== undefined
+      && plannedLegMatchesGoal
+      && localDetourRoute !== undefined
+      && advisoryWaypoint !== undefined
+      && coarseGrid !== undefined
+    );
+    const normalizedScanViews = trace.planar_scan_views.map((scan) => (
       normalizePlanarScanView(
         scan,
         nowUnixMs,
@@ -516,13 +518,33 @@
         geometryToleranceMm,
       )
     ));
-    if (
-      planarScanViews.some((scan) => scan === null)
-      || new Set(planarScanViews.map((scan) => scan.scanId)).size
-        !== planarScanViews.length
-    ) {
+    const scansValid = (
+      normalizedScanViews.every((scan) => scan !== null)
+      && new Set(normalizedScanViews.map((scan) => scan.scanId)).size
+        === normalizedScanViews.length
+    );
+    if (shared && (!optionalFieldsValid || !scansValid)) {
       return null;
     }
+    if (!shared) {
+      imuHeading = imuHeading === undefined ? null : imuHeading;
+      plannedLeg = (
+        plannedLeg === undefined || !plannedLegMatchesGoal
+      ) ? null : plannedLeg;
+      localDetourRoute = localDetourRoute === undefined
+        ? null : localDetourRoute;
+      advisoryWaypoint = advisoryWaypoint === undefined
+        ? null : advisoryWaypoint;
+      coarseGrid = coarseGrid === undefined ? null : coarseGrid;
+    }
+    const seenScanIds = new Set();
+    const planarScanViews = normalizedScanViews.filter((scan) => {
+      if (scan === null || seenScanIds.has(scan.scanId)) {
+        return false;
+      }
+      seenScanIds.add(scan.scanId);
+      return true;
+    });
     return Object.freeze({
       schema: NAVIGATION_TRACE_SCHEMA,
       readOnly: true,

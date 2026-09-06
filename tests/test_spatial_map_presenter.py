@@ -171,7 +171,36 @@ const exactClass = (name) => rendered.filter((node) => (
   String(node.attributes.class || "") === name
 ));
 const obstacleItem = nodes["map-object-list"].children[0];
+const modelPoints = [
+  { x_mm: 600, y_mm: -300, purpose: "forward along right side" },
+  { x_mm: 600, y_mm: 0, purpose: "return to center line" },
+];
+function modelRoute(remaining, robotPose) {
+  const value = { ...route, active_index: 0, waypoints: remaining.map((p, i) => ({
+    ...p, ordinal: i, kind: "MODEL_WAYPOINT", heading_mdeg: 0,
+    fact_key: null, status: i === 0 ? "ACTIVE" : "UPCOMING",
+  })) };
+  const normalized = context.RobotDashboardLogic.normalizeSpatialMap({
+    ...map, navigation_trace: { ...map.navigation_trace, local_detour_route: value },
+  }, 2000).navigationTrace.localDetourRoute;
+  const layer = new FakeNode("g");
+  const ui = {
+    svg(tag, attrs) { const n = new FakeNode(tag); Object.entries(attrs).forEach(([k,v]) => n.setAttribute(k,v)); return n; },
+    title() {}, t: translate, format: String, heading: () => "",
+  };
+  context.RobotBlastMapSemantics.renderRoute(
+    layer, normalized, { point: (x,y) => ({x,y}) }, ui, robotPose,
+  );
+  const all = descendants(layer);
+  return {
+    line: all.find(n => n.tag === "polyline")?.attributes.points || null,
+    labels: all.filter(n => n.tag === "text").map(n => n.textContent),
+  };
+}
 process.stdout.write(JSON.stringify({
+  modelRoute: modelRoute(modelPoints, {xMm:80,yMm:-279}),
+  remainingPoint: modelRoute(modelPoints.slice(1), {xMm:600,yMm:-300}),
+  unknownPose: modelRoute(modelPoints.slice(1), null),
   route: withClass("map-local-detour-route")[0].attributes,
   waypointStatuses: withClass("map-local-detour-waypoint ").map((node) => (
     node.attributes["data-status"]
@@ -181,6 +210,7 @@ process.stdout.write(JSON.stringify({
   )),
   obstacle: withClass("map-provisional-ultrasonic-obstacle")[0].attributes,
   obstacleCount: exactClass("map-provisional-ultrasonic-obstacle").length,
+  coarseGridCellCount: withClass("map-coarse-grid-cell").length,
   coarseObstacleCount: withClass("map-coarse-obstacle-cell").length,
   scanViewCount: exactClass("map-blast-scan-view").length,
   rawRayCount: exactClass("map-blast-scan-ray").length,
@@ -210,6 +240,14 @@ process.stdout.write(JSON.stringify({
         )
         self.assertEqual(len(result["waypointLabels"]), 3)
         self.assertIn("PASS BEYOND TARGET", result["waypointLabels"][2])
+        self.assertEqual(result["modelRoute"], {
+            "line": "80,-279 600,-300 600,0",
+            "labels": ["1. forward along right side", "2. return to center line"],
+        })
+        self.assertEqual(result["remainingPoint"], {
+            "line": "600,-300 600,0", "labels": ["1. return to center line"],
+        })
+        self.assertIsNone(result["unknownPose"]["line"])
         self.assertEqual(
             result["obstacle"]["data-classification"],
             "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
@@ -221,6 +259,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(result["rawRayCount"], 1)
         self.assertEqual(result["scanViewCount"], 2)
         self.assertEqual(result["obstacleCount"], 1)
+        self.assertEqual(result["coarseGridCellCount"], 121)
         self.assertEqual(result["coarseObstacleCount"], 1)
         self.assertIn("PROVISIONAL INFERENCE", result["obstacleItemText"])
         self.assertNotIn("nvd-only-scan", result["obstacleItemText"])
@@ -1371,6 +1410,7 @@ process.stdout.write(JSON.stringify({
   goalAttributes: byClass("map-final-goal").attributes,
   goalZoneAttributes: byClass("map-final-goal-zone").attributes,
   advisoryAttributes: byClass("map-advisory-waypoint").attributes,
+  advisoryLine: byClass("map-advisory-waypoint-line").attributes,
   hasAdvisoryMarker: Boolean(byClass("map-advisory-waypoint-marker")),
   legAttributes: byClass("map-planned-leg").attributes,
   imuAttributes: byClass("map-local-imu-heading").attributes,
@@ -1443,6 +1483,10 @@ process.stdout.write(JSON.stringify({
         )
         self.assertEqual(result["advisoryAttributes"]["data-read-only"], "true")
         self.assertTrue(result["hasAdvisoryMarker"])
+        # Episode +x points right on this view; -y (starting right) points down.
+        line = result["advisoryLine"]
+        self.assertGreater(float(line["x2"]), float(line["x1"]))
+        self.assertGreater(float(line["y2"]), float(line["y1"]))
         self.assertEqual(
             result["rayAttributes"]["data-quality"],
             "PROVISIONAL_YAW_ONLY",
@@ -1461,7 +1505,7 @@ process.stdout.write(JSON.stringify({
         self.assertIn("SEARCH POSITION ONLY", result["localText"])
         self.assertIn("GEMMA WAYPOINT", result["localText"])
         self.assertIsNone(result["invalidFrame"])
-        self.assertIsNone(result["invalidEcho"])
+        self.assertEqual(result["invalidEcho"]["planarScanViews"], [])
         self.assertIsNone(result["overCapacity"])
 
     def test_shared_world_renders_separate_robots_without_local_evidence(self):

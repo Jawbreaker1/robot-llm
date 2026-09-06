@@ -2308,6 +2308,17 @@ textarea:focus-visible,
   filter: drop-shadow(0 0 5px rgb(9 18 21 / 88%));
 }
 
+.map-coarse-grid-cell {
+  fill: transparent;
+  stroke: rgb(138 158 162 / 13%);
+  stroke-width: 1;
+}
+
+.map-coarse-grid-cell.is-observed-clear {
+  fill: rgb(100 218 202 / 4%);
+  stroke: rgb(100 218 202 / 18%);
+}
+
 .map-coarse-obstacle-cell {
   stroke: rgb(242 184 75 / 34%);
   stroke-width: 1;

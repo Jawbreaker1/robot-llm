@@ -199,9 +199,10 @@ PYTHONPATH=src .venv/bin/python -m unittest \
 Those deterministic tests validate the simulator and execution contracts, not
 the language model's planning quality. The separate Qwen-in-the-loop runner
 sends the same bounded context and action schema used by physical BLAST to the
-real LM Studio model. With `qwen/qwen3.8-27b` loaded on port 1234, run all five
-current BLAST cases—box ahead, box at the side, boxes on both sides, straight
-corridor, and bent corridor—with:
+real LM Studio model, including BLAST's production persona and output budget.
+With `qwen/qwen3.8-27b` loaded on port 1234, run the six current BLAST cases—box
+ahead, the physical box/chair approximation, box at the side, boxes on both
+sides, straight corridor, and bent corridor—with:
 
 ```sh
 PYTHONPATH=src .venv/bin/python \
@@ -209,11 +210,37 @@ PYTHONPATH=src .venv/bin/python \
   --model 'qwen/qwen3.8-27b' --compact
 ```
 
+BLAST live navigation and this simulator default to `reasoning_effort=low`
+and an 8192-token total output ceiling, with a 60-second request timeout. The
+ceiling leaves room for both reasoning and the final decision; it does not
+require the model to use all those tokens. BLAST retries an incomplete or
+invalidly structured reply once, with the same goal, route, pose and observation,
+without scanning or moving between attempts. Two unusable replies still fail
+the episode; this is not an unbounded model loop. The shared navigation planner uses Qwen's thinking-mode
+sampling: temperature 1.0, top-p 0.95, top-k 20, min-p 0, presence penalty 0
+and repeat penalty 1.0. Future
+waypoints are tentative route memory; only the current leg is executable.
+Complete planner requests and raw replies (including
+reasoning), controller results, and original controller errors are saved locally
+under `local-artifacts/navigation-dashboard.jsonl` or
+`local-artifacts/navigation-simulation.jsonl`. These ignored diagnostic files
+contain goals and sensor context; they are not inputs to robot decisions.
+
 For one short diagnostic run, add for example
 `--scenario blast-box-front`. The Qwen gate currently exercises BLAST; the
 shared simulator already supports concurrent BLAST and EV3 execution, but
 model-driven EV3 parity is still pending. Simulator success does not replace
 physical calibration or live navigation trials.
+
+The simulated scan adapter still assumes settled observations and a gyro tied
+exactly to simulated pose. It does not execute the physical scan monitor's
+per-pulse checks. A passing route therefore does not validate that physical
+scan/feedback chain; its observed failures must also be reproduced and tested.
+
+The [simulator notes](docs/MULTI_ROBOT_NAVIGATION_SIMULATION.md) also describe
+replaying a recorded BLAST startup scan with transient missing range readings.
+Reaching the goal is not sufficient if the trace contains collisions or
+unexplained scan loops.
 
 ## Start the robot console
 

@@ -208,6 +208,34 @@ def blast_box_front() -> NavigationSimulationScenario:
     )
 
 
+def blast_measured_box_and_chair() -> NavigationSimulationScenario:
+    """Regression world based on the 2026-09-02 physical BLAST run.
+
+    The box face was about 280 mm ahead of the forward-mounted sensor. A chair
+    foot sat farther to the right, where an unnecessarily wide detour collided
+    with it. The useful route is the short gap between those two obstacles.
+    """
+
+    blast_footprint, _sensor = (
+        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.require_complete()
+    )
+    return NavigationSimulationScenario(
+        scenario_id="blast-measured-box-and-chair",
+        bounds=(-600, -1_400, 1_400, 1_000),
+        obstacles=(
+            RectangleObstacle("front-box", 390, -190, 620, 260),
+            RectangleObstacle("chair-foot", -80, -760, 120, -680),
+        ),
+        robots=(SimulatedRobot(
+            "blast",
+            PoseEstimate(0, 0, 0),
+            blast_footprint,
+            2_000,
+        ),),
+        goals=(SimulationGoal("blast", 800, 0),),
+    )
+
+
 def blast_box_at_side() -> NavigationSimulationScenario:
     return _blast_gemma_scenario(
         "blast-box-at-side",
@@ -254,6 +282,7 @@ def blast_gemma_validation_scenarios():
 
     return (
         blast_box_front(),
+        blast_measured_box_and_chair(),
         blast_box_at_side(),
         blast_boxes_both_sides(),
         blast_straight_corridor(),
@@ -267,6 +296,7 @@ __all__ = (
     "blast_bent_corridor",
     "blast_box_at_side",
     "blast_box_front",
+    "blast_measured_box_and_chair",
     "blast_boxes_both_sides",
     "blast_gemma_validation_scenarios",
     "blast_straight_corridor",

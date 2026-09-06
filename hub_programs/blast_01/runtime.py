@@ -369,6 +369,10 @@ def turn_pulse(direction):
     return fixed_turn_pulse(direction, TURN_PULSE_ANGLE_DEG)
 
 
+def turn_trim_pulse(direction):
+    return fixed_turn_pulse(direction, 15)
+
+
 def scan_turn_pulse(direction):
     return fixed_turn_pulse(direction, SCAN_TURN_PULSE_ANGLE_DEG)
 
@@ -477,6 +481,9 @@ while True:
         elif operation == "turn_pulse":
             arguments = request.get("args", {})
             result = turn_pulse(arguments.get("direction"))
+        elif operation == "turn_trim_pulse":
+            arguments = request.get("args", {})
+            result = turn_trim_pulse(arguments.get("direction"))
         elif operation == "scan_turn_pulse":
             arguments = request.get("args", {})
             result = scan_turn_pulse(arguments.get("direction"))

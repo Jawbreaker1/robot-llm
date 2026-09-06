@@ -9,6 +9,7 @@ from .blast_navigation_action_profile import (
     DRIVE_ENCODER_DEGREES,
     DRIVE_SPEED_DPS,
     TURN_ENCODER_DEGREES_PER_PULSE,
+    TURN_TRIM_ENCODER_DEGREES,
     TURN_SPEED_DPS,
 )
 from .blast_observation_monitor import (
@@ -57,11 +58,11 @@ def _command_profile(command):
         direction = command.removeprefix("drive_")
         signs = (1, 1) if direction == "forward" else (-1, -1)
         return direction, DRIVE_SPEED_DPS, "angle_deg", DRIVE_ENCODER_DEGREES, signs
-    direction = command.removeprefix("turn_")
+    direction = command.removeprefix("turn_").removesuffix("_trim")
     signs = (-1, 1) if direction == "left" else (1, -1)
     return (
         direction, TURN_SPEED_DPS, "wheel_angle_deg",
-        TURN_ENCODER_DEGREES_PER_PULSE, signs,
+        TURN_TRIM_ENCODER_DEGREES if command.endswith("_trim") else TURN_ENCODER_DEGREES_PER_PULSE, signs,
     )
 
 
@@ -280,6 +281,8 @@ def build_blast_navigation_motion_result(
     durations = BLAST_NAVIGATION_ACTION_SPECS[action]["slice_durations_ms"]
     slices = []
     for index, (command, result) in enumerate(zip(commands, command_results), 1):
+        if command.startswith("turn_") and result.get("command") == command + "_trim":
+            command += "_trim"
         before, after, _deltas, checks = _decode_result(command, result)
         settling_checks = None
         if before != previous_after:
@@ -310,7 +313,8 @@ def build_blast_navigation_motion_result(
         slices.append(_slice(
             index,
             len(commands),
-            durations[index - 1],
+            round(durations[index - 1] * TURN_TRIM_ENCODER_DEGREES / TURN_ENCODER_DEGREES_PER_PULSE)
+            if command.endswith("_trim") else durations[index - 1],
             previous_after,
             before,
             after,

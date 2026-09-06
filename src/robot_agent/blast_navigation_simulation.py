@@ -5,13 +5,25 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from pathlib import Path
 import threading
 from typing import Callable
 
 from . import lm_studio as _lm
 from .blast_episode_adapter import BlastEpisodeRuntimeAdapter
+from .blast_personality import (
+    BLAST_PERSONA_BY_LOCALE,
+    BLAST_MAX_NAVIGATION_UTTERANCE_CHARS,
+    BLAST_NAVIGATION_OUTPUT_TOKENS,
+    BLAST_NAVIGATION_TIMEOUT_SECONDS,
+    BLAST_NAVIGATION_REASONING_EFFORT,
+)
 from .lm_studio_controller_action import LMStudioControllerActionPlanner
 from .lm_studio_controller_action import REASONING_EFFORTS
+from .navigation_diagnostics import (
+    enable_navigation_diagnostics,
+    record_navigation_diagnostic,
+)
 from .navigation_simulation_scenarios import (
     NavigationSimulationScenario,
     blast_gemma_validation_scenarios,
@@ -77,6 +89,16 @@ class _RecordingPlanner:
                 getattr(decision, "following_waypoints", ())
             ),
             "available_actions": list(context.available_actions),
+            "range_evidence": {
+                key: context.observation.get("sensors", {}).get(key)
+                for key in ("distance_mm", "range_state")
+            },
+            "active_waypoint": context.active_waypoint,
+            "active_waypoint_geometry": context.active_waypoint_geometry,
+            "route_interruption": next((
+                item["route_interruption"] for item in reversed(context.history)
+                if "route_interruption" in item
+            ), None),
             "robot_pose": evidence.get("robot_pose"),
             "direct_goal_blockage": evidence.get(
                 "direct_goal_blockage"
@@ -94,10 +116,13 @@ def run_blast_gemma_scenario(
     *,
     model: str = DEFAULT_MODEL,
     max_decisions: int = 32,
-    reasoning_effort: str = "none",
-    max_output_tokens: int = 512,
-    timeout_seconds: float = 20.0,
+    reasoning_effort: str = BLAST_NAVIGATION_REASONING_EFFORT,
+    max_output_tokens: int = BLAST_NAVIGATION_OUTPUT_TOKENS,
+    timeout_seconds: float = BLAST_NAVIGATION_TIMEOUT_SECONDS,
     planner_factory: Callable[[str], object] | None = None,
+    startup_scan: dict | None = None,
+    range_dropout_reads: int = 0,
+    goal: str = DEFAULT_GOAL,
 ) -> dict[str, object]:
     """Run the real BLAST episode loop; only hardware is simulated."""
 
@@ -120,6 +145,8 @@ def run_blast_gemma_scenario(
                 timeout_seconds=timeout_seconds,
                 reasoning_effort=reasoning_effort,
                 max_output_tokens=max_output_tokens,
+                utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
+                max_utterance_chars=BLAST_MAX_NAVIGATION_UTTERANCE_CHARS,
                 transport=recording_transport,
             )
         )
@@ -128,13 +155,15 @@ def run_blast_gemma_scenario(
     controller = SharedWorldBlastController(
         world,
         world_robot_id="blast",
+        startup_scan=startup_scan,
+        range_dropout_reads=range_dropout_reads,
     )
     updates: list[dict[str, object]] = []
     planner_records: list[dict[str, object]] = []
     context = RobotEpisodeContext(
         episode_id="simulation-{}".format(scenario.scenario_id),
         request=RobotEpisodeStart(
-            goal=DEFAULT_GOAL,
+            goal=goal,
             locale="en",
             client_request_id="simulation-{}".format(
                 scenario.scenario_id
@@ -219,6 +248,10 @@ def run_blast_gemma_scenario(
     ]
     return {
         "scenario_id": scenario.scenario_id,
+        "sensor_profile": {
+            "recorded_startup_scan": startup_scan is not None,
+            "transient_range_dropout_reads": range_dropout_reads,
+        },
         "completed": outcome.completed if outcome is not None else False,
         "terminal_reason": (
             outcome.terminal_reason
@@ -233,6 +266,7 @@ def run_blast_gemma_scenario(
             "y_mm": pose.y_mm,
             "heading_mdeg": pose.heading_mdeg,
         },
+        "estimated_pose": map_snapshot.get("robot_pose"),
         "distance_to_goal_mm": round(math.hypot(
             pose.x_mm - goal.x_mm,
             pose.y_mm - goal.y_mm,
@@ -261,10 +295,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reasoning-effort",
         choices=REASONING_EFFORTS,
-        default="none",
+        default=BLAST_NAVIGATION_REASONING_EFFORT,
     )
-    parser.add_argument("--max-output-tokens", type=int, default=512)
-    parser.add_argument("--timeout-seconds", type=float, default=20.0)
+    parser.add_argument("--max-output-tokens", type=int, default=BLAST_NAVIGATION_OUTPUT_TOKENS)
+    parser.add_argument("--startup-scan-json", type=Path,
+                        help="Replay a recorded startup scan; later sensing uses world geometry")
+    parser.add_argument("--range-dropout-reads", type=int, default=0,
+                        help="Transient invalid readings around the first forward pulse")
+    parser.add_argument("--goal", default=DEFAULT_GOAL)
+    parser.add_argument("--timeout-seconds", type=float, default=BLAST_NAVIGATION_TIMEOUT_SECONDS)
     parser.add_argument(
         "--compact",
         action="store_true",
@@ -297,6 +336,8 @@ def _compact_cli_result(result: dict[str, object]) -> dict[str, object]:
                 "following_waypoints",
                 "latest_route_rejection",
                 "model_reasoning",
+                "range_evidence",
+                "route_interruption",
             )
         }
         reasoning = item.get("model_reasoning")
@@ -317,6 +358,17 @@ def _compact_cli_result(result: dict[str, object]) -> dict[str, object]:
 
 def main() -> None:
     args = _parser().parse_args()
+    enable_navigation_diagnostics(
+        Path("local-artifacts/navigation-simulation.jsonl")
+    )
+    record_navigation_diagnostic(
+        "runtime_started", source="simulation", model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        max_output_tokens=args.max_output_tokens,
+    )
+    startup_scan = None
+    if args.startup_scan_json is not None:
+        startup_scan = json.loads(args.startup_scan_json.read_text())["scans"][0]
     scenarios = blast_gemma_validation_scenarios()
     selected_ids = set(args.scenario or ())
     if selected_ids:
@@ -338,6 +390,9 @@ def main() -> None:
             max_decisions=args.max_decisions,
             reasoning_effort=args.reasoning_effort,
             max_output_tokens=args.max_output_tokens,
+            startup_scan=startup_scan,
+            range_dropout_reads=args.range_dropout_reads,
+            goal=args.goal,
             timeout_seconds=args.timeout_seconds,
         )
         if args.compact:

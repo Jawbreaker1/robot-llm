@@ -1,5 +1,150 @@
 # Navigation simplification plan
 
+## Latest physical checkpoint — September 7: box baseline accepted
+
+After reloading the tested host, physical BLAST episode
+`episode-f37cff92ccec6cae569de559` completed the left-side box detour and stopped
+at its 800 mm goal. Estimated residual: 27 mm. The operator independently
+confirmed startup direction, map/reality alignment during travel and physical
+arrival at the intended goal beyond the box.
+
+One surroundings scan and two later front scans; the last was partial, and the
+same episode realigned and continued. Ten actual Qwen decisions, no logged
+controller-action failure, final speech status completed. No navigation code
+was changed during the test. This is an accepted single-box physical baseline,
+not general navigation/EV3 acceptance. Preserve it as a clear checkpoint before
+more changes; no commit/push/merge has been performed by this validation.
+See [the physical validation report](NAVIGATION_VALIDATION_20260905.md).
+
+Known limitation after arrival: the operator saw a straighter return leg than
+the recorded map path. The planned leg was orthogonal; the remaining
+heading/odometry discrepancy is documented in the report for separate follow-up.
+
+## Latest checkpoint — September 6: failed physical run, active-path audit
+
+The physical box detour failed despite passing startup scan validation. BLAST
+lost the box from the map, rescanned repeatedly, returned towards the start and
+had an operator-observed heading discrepancy. Stopped at the user's request;
+do not treat the earlier startup pass as full navigation approval.
+
+The following bounded audit corrected three linked information contracts:
+command-local yaw instead of absolute gyro drift across planner pauses; retained
+obstacle memory rather than newest-scan-only forgetting; directional evidence
+reuse rather than named scan-side/complete-scan prerequisites. Qwen still owns
+route and side selection. Recorded-data regression tests and targeted suites
+pass (340 tests). A final actual-Qwen run with recorded startup and injected
+dropouts reached the goal within 42 mm, with one scan and a model-selected
+reverse after six blocked pulses. This is recovery, not contact-free or physical
+success. Final Qwen and physical acceptance are recorded in the
+[validation report](NAVIGATION_VALIDATION_20260905.md). Do not merge or claim
+flawless navigation on the basis of these component tests.
+
+## Earlier September 6 checkpoint — scan endpoint
+
+Scope: startup scan endpoint and numeric validation only. The closing pulse is
+small again, and the shared simulator/hardware completion helper can trim in
+either direction to return within 5 degrees of the start. Angle validation now
+respects six-decimal bearing serialization, including older recorded scans.
+244 targeted tests pass. In physical episode `episode-0eacdb97b7a5fc279faa17a2`,
+startup completed at 357.52 measured degrees and reached Qwen. A later incomplete
+range observation led to a front scan in the same mission, with route retained.
+Full obstacle navigation is not yet approved. Do not broaden this checkpoint
+into another planner or new scan rules. See the September 6 section of the
+[validation report](NAVIGATION_VALIDATION_20260905.md).
+
+## Current implementation checkpoints — 2026-09-05
+
+The review and operator approval on September 5 supersede conflicting details
+in the historical stages below. Qwen3.8 is the configured navigation model.
+Complete and report each checkpoint before broadening implementation:
+
+Checkpoint 1 is implemented and execution-tested (588 passing tests). A real
+Qwen rerun and physical validation remain pending: the local LM Studio server
+returned an empty model list on September 5. Checkpoints 2–4 are not implemented
+by this change. See the September 5 worklog for scope and remaining limitations.
+
+**Later September 5 validation:** Qwen became available. The real-model box
+tests did not pass cleanly; course correction caused a corner contact, and a
+rotation-slip probe exposed encoder-only scan angles. Checkpoint 1 is therefore
+not physically validated. Address these demonstrated contracts before expanding
+route continuation; see [the validation report](NAVIGATION_VALIDATION_20260905.md).
+
+**Correction checkpoint, later September 5:** the scan now uses measured gyro
+yaw, with encoders retained for continuity, winding and missing-gyro fallback.
+The physical observation monitor and simulator share the full-sweep completion
+rule. Waypoint course feedback now uses a smaller fixed execution pulse; route
+selection and ordinary 90-degree actions are unchanged. All 604 targeted
+regressions pass, including the previously failing box-side leg. A real Qwen
+rerun reached its first waypoint without blockage but failed on a truncated
+second reply. Therefore full box navigation is still not approved. Next scope:
+checkpoint 2 reply recovery, then a bounded real-model rerun. The new internal
+turn pulse requires reloading the hub program before physical validation.
+
+**Reply-recovery slice, later September 5:** checkpoint 2 is only partly
+implemented. BLAST retries an unusable structured model reply once with the
+identical context, preserving goal, route, pose and observations; stop/deadline
+checks still apply and no motion or scan occurs between attempts. No route
+continuation redesign was included. Low reasoning remains the default, with
+8192 total output tokens of headroom and the same 60-second model timeout in
+web-started physical BLAST and the simulator. A real-Qwen simulated box detour
+with one deliberately replayed truncated reply completed 49 mm from the goal,
+with six real model calls, one scan and no blockage. All six real replies used
+under 4096 tokens: this does not establish that the higher ceiling caused the
+success. The 674-test targeted gate passes. Next: reload the hub program and
+restart the host with these defaults before a bounded physical box test, when
+the operator has positioned BLAST. Physical validation remains outstanding.
+
+**Additional validation supersedes physical readiness:** four more real-Qwen
+runs (recorded physical startup scan, the same with short range dropout,
+simulated box/chair and bent corridor) produced **0/4 completed episodes**.
+They exposed a missing no-progress handoff during ordinary waypoint turns:
+the host repeats a blocked turn without asking Qwen again. Both the recorded
+dropout and synthetic corridor cases reproduce it. Too-close detour/return
+legs and two model timeouts are also unresolved. No production changes were
+made during this validation. Before a physical run, make existing motion
+progress handling consistent for turns and advances, revalidate that exact
+failure. The operator clarified that unknown-space exploration is intentional;
+do not turn incomplete scans into new no-go or mandatory-rescan rules. Do
+not add a fixed detour, another planner, or claim the previous single pass
+establishes robust navigation. Details are in the additional physical-data
+section of the September 5 validation report.
+
+**Zero-motion correction completed in a bounded slice:** ordinary waypoint
+turns and advances now hand control back on no measured pose change, with route
+and goal retained. Zero-encoder-motion attempts do not invalidate prior
+verified retreat evidence. No scan requirement or unknown-space gate was
+added. The 675-test gate passes. A real-Qwen rerun with recorded BLAST startup
+evidence and four range dropouts self-recovered through a model-selected reverse
+and completed 40 mm from goal, with one scan. The corridor no longer loops on a
+blocked turn but is not approved: low reasoning timed out after the handoff;
+reasoning off ended 315 mm from goal at twelve decisions. The existing reverse
+predicate still rejects an earlier partly achieved turn in the low-reasoning
+corridor case. Stop this implementation slice without broadening it to new
+route policy. Partial-motion retreat and request timeouts remain explicit next
+issues; physical testing has not been performed.
+
+1. **Motion and simulation:** check swept-body collisions during rotation for
+   every simulated robot; preserve truthful partial motion in the hardware
+   adapters. Make BLAST follow a model-selected waypoint with feedback between
+   forward pulses, including coarse heading corrections. Verify mirrored box
+   routes and an injected heading error before any physical test.
+2. **Route continuity and recovery:** retain an accepted multi-waypoint route
+   across ordinary progress and recover missing/invalid model replies in the
+   same episode. Give the model control when observation, blockage, user input
+   or an explicit planned checkpoint requires a decision.
+3. **World memory:** retain useful older observations with explicit uncertainty
+   and visited/dead-end experience. Keep the operator view and model view
+   consistent without accumulating every old echo as a precise obstacle.
+4. **Robot parity:** migrate EV3 to the validated goal/route/event contract,
+   retaining its hardware-specific sensing and execution. Validate both robots
+   in the shared simulator before claiming shared autonomous navigation.
+
+Each checkpoint uses focused execution regressions plus bounded real-model
+validation where relevant, with exact outcomes recorded in
+[the simulation worklog](MULTI_ROBOT_NAVIGATION_SIMULATION.md).
+
+## Historical plan
+
 Status: stage 1 cleanup is complete; stage 2 behavioral alignment is in
 progress.
 

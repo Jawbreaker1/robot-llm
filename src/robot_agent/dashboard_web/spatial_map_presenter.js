@@ -164,23 +164,20 @@
           addPoint(point.nominalEchoX, point.nominalEchoY);
         });
       });
-      coarseObstacleCells(trace.coarseGrid).forEach((cell) => {
+      coarseGridCells(trace.coarseGrid).forEach((cell) => {
         const halfCell = cell.sizeMm / 2;
         addPoint(cell.xMm - halfCell, cell.yMm - halfCell);
         addPoint(cell.xMm + halfCell, cell.yMm + halfCell);
       });
     }
 
-    function coarseObstacleCells(grid) {
+    function coarseGridCells(grid) {
       if (!grid) {
         return [];
       }
       const cells = [];
       grid.rows.forEach((row, rowIndex) => {
         [...row].forEach((symbol, columnIndex) => {
-          if (!COARSE_OBSTACLE_SYMBOLS.has(symbol)) {
-            return;
-          }
           cells.push({
             symbol,
             sizeMm: grid.cellSizeMm,
@@ -193,13 +190,16 @@
     }
 
     function renderCoarseObstacleArea(layer, trace, projection) {
-      const cells = coarseObstacleCells(trace?.coarseGrid);
+      const cells = coarseGridCells(trace?.coarseGrid);
       if (cells.length === 0) {
         return;
       }
       const group = createSvgElement("g", {
-        class: "map-coarse-obstacle-area",
+        class: "map-coarse-navigation-grid",
         "data-cell-count": cells.length,
+        "data-obstacle-count": cells.filter((cell) => (
+          COARSE_OBSTACLE_SYMBOLS.has(cell.symbol)
+        )).length,
         "data-cell-size-mm": trace.coarseGrid.cellSizeMm,
         "data-frame": trace.coarseGrid.frame,
       });
@@ -215,13 +215,19 @@
           cell.xMm + cell.sizeMm / 2,
           cell.yMm - cell.sizeMm / 2,
         );
+        const obstacle = COARSE_OBSTACLE_SYMBOLS.has(cell.symbol);
         group.appendChild(createSvgElement("rect", {
           x: Math.min(topLeft.x, bottomRight.x),
           y: Math.min(topLeft.y, bottomRight.y),
           width: Math.abs(bottomRight.x - topLeft.x),
           height: Math.abs(bottomRight.y - topLeft.y),
-          class: `map-coarse-obstacle-cell ${
-            cell.symbol === "?" ? "is-echo" : "is-keep-out"
+          class: `map-coarse-grid-cell${
+            obstacle ? " map-coarse-obstacle-cell" : ""
+          } ${
+            cell.symbol === "?" ? "is-echo"
+              : cell.symbol === "#" ? "is-keep-out"
+                : cell.symbol === "o" ? "is-observed-clear"
+                  : "is-reference"
           }`,
           "data-symbol": cell.symbol,
         }));
@@ -601,6 +607,7 @@
         trace.localDetourRoute,
         projection,
         blastRenderUi(),
+        map.robotPose,
       );
 
       trace.planarScanViews.forEach((view, viewIndex) => {

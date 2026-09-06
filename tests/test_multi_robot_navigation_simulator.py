@@ -49,6 +49,25 @@ def two_robot_world(*, obstacles=()):
 
 
 class MultiRobotNavigationSimulatorTests(unittest.TestCase):
+    def test_rotation_checks_swept_body_even_when_final_heading_is_clear(self):
+        for direction in (-1, 1):
+            with self.subTest(direction=direction):
+                world = MultiRobotNavigationSimulator(
+                    bounds=(-1000, -1000, 1000, 1000),
+                    obstacles=(RectangleObstacle("corner", 130, -15, 155, 25),),
+                    robots=(SimulatedRobot("blast", PoseEstimate(0, 0, 0),
+                                           footprint(), 1500),),
+                    goals=(SimulationGoal("blast", 800, 0),),
+                )
+                self.assertFalse(world._pose_collides("blast", PoseEstimate(0, 0, 0)))
+                self.assertFalse(world._pose_collides(
+                    "blast", PoseEstimate(0, 0, direction * 90_000),
+                ))
+                result = world.rotate("blast", direction * 90_000)
+                self.assertLess(abs(result.heading_mdeg), 45_000)
+                self.assertFalse(world._pose_collides("blast", result))
+                self.assertEqual(world.events[-1].kind, "blocked")
+
     def test_world_contains_no_route_or_waypoint_policy(self):
         world = two_robot_world()
 
@@ -65,6 +84,26 @@ class MultiRobotNavigationSimulatorTests(unittest.TestCase):
         self.assertLess(moved, 300)
         self.assertEqual(world.events[-1].kind, "blocked")
         self.assertEqual(world.pose("blast").x_mm, moved)
+
+    def test_rectangular_body_passes_box_without_corner_circle_veto(self):
+        world = MultiRobotNavigationSimulator(
+            bounds=(-500, -900, 1_250, 900),
+            obstacles=(RectangleObstacle(
+                "front-box", 320, -180, 520, 180,
+            ),),
+            robots=(SimulatedRobot(
+                "blast",
+                PoseEstimate(0, 315, 0),
+                footprint(front=110, rear=60, left=105, right=100),
+                2_000,
+            ),),
+            goals=(SimulationGoal("blast", 800, 0),),
+        )
+
+        moved = world.move("blast", 600)
+
+        self.assertEqual(moved, 600)
+        self.assertEqual(world.events[-1].kind, "move")
 
     def test_robot_is_visible_and_blocks_a_peer(self):
         world = MultiRobotNavigationSimulator(

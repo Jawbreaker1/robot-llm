@@ -30,11 +30,13 @@ def _interrupted() -> BlastControllerError:
 
 def _read_observation(
     adapter, episode_start_heading, motion_executor, cancel_requested,
+    observation=None,
 ):
     if cancel_requested():
         raise _interrupted()
     observation = adapter._with_navigation_reference(
-        adapter._observation(), episode_start_heading,
+        adapter._observation() if observation is None else observation,
+        episode_start_heading,
     )
     observation["odometry"] = motion_executor.pose.to_dict()
     return observation
@@ -45,10 +47,12 @@ def fresh_blast_action_observation(
     motion_executor, cancel_requested, episode_error_type,
     encoder_anchor_correlated, navigation_body_matched,
     allow_no_valid_with_bounded_evidence=False,
+    observation=None,
 ):
     observation = _read_observation(
         adapter, episode_start_heading, motion_executor,
         cancel_requested,
+        observation=observation,
     )
     if not encoder_anchor_correlated(observation, motion_executor):
         raise episode_error_type(
