@@ -10,6 +10,7 @@
   const SVG_WIDTH = 1000;
   const SVG_HEIGHT = 620;
   const MAX_RENDERED_QUALITATIVE_OBSERVATIONS = 100;
+  const COARSE_OBSTACLE_SYMBOLS = new Set(["#", "?", "g", "x"]);
   const blastMapSemantics = global.RobotBlastMapSemantics;
 
   function create(options = {}) {
@@ -163,6 +164,75 @@
           addPoint(point.nominalEchoX, point.nominalEchoY);
         });
       });
+      coarseGridCells(trace.coarseGrid).forEach((cell) => {
+        const halfCell = cell.sizeMm / 2;
+        addPoint(cell.xMm - halfCell, cell.yMm - halfCell);
+        addPoint(cell.xMm + halfCell, cell.yMm + halfCell);
+      });
+    }
+
+    function coarseGridCells(grid) {
+      if (!grid) {
+        return [];
+      }
+      const cells = [];
+      grid.rows.forEach((row, rowIndex) => {
+        [...row].forEach((symbol, columnIndex) => {
+          cells.push({
+            symbol,
+            sizeMm: grid.cellSizeMm,
+            xMm: grid.window.xMaxMm - rowIndex * grid.cellSizeMm,
+            yMm: grid.window.yMaxMm - columnIndex * grid.cellSizeMm,
+          });
+        });
+      });
+      return cells;
+    }
+
+    function renderCoarseObstacleArea(layer, trace, projection) {
+      const cells = coarseGridCells(trace?.coarseGrid);
+      if (cells.length === 0) {
+        return;
+      }
+      const group = createSvgElement("g", {
+        class: "map-coarse-navigation-grid",
+        "data-cell-count": cells.length,
+        "data-obstacle-count": cells.filter((cell) => (
+          COARSE_OBSTACLE_SYMBOLS.has(cell.symbol)
+        )).length,
+        "data-cell-size-mm": trace.coarseGrid.cellSizeMm,
+        "data-frame": trace.coarseGrid.frame,
+      });
+      appendSvgTitle(group, [
+        t("map.navigation_trace.coarse_obstacle_area"),
+      ]);
+      cells.forEach((cell) => {
+        const topLeft = projection.point(
+          cell.xMm - cell.sizeMm / 2,
+          cell.yMm + cell.sizeMm / 2,
+        );
+        const bottomRight = projection.point(
+          cell.xMm + cell.sizeMm / 2,
+          cell.yMm - cell.sizeMm / 2,
+        );
+        const obstacle = COARSE_OBSTACLE_SYMBOLS.has(cell.symbol);
+        group.appendChild(createSvgElement("rect", {
+          x: Math.min(topLeft.x, bottomRight.x),
+          y: Math.min(topLeft.y, bottomRight.y),
+          width: Math.abs(bottomRight.x - topLeft.x),
+          height: Math.abs(bottomRight.y - topLeft.y),
+          class: `map-coarse-grid-cell${
+            obstacle ? " map-coarse-obstacle-cell" : ""
+          } ${
+            cell.symbol === "?" ? "is-echo"
+              : cell.symbol === "#" ? "is-keep-out"
+                : cell.symbol === "o" ? "is-observed-clear"
+                  : "is-reference"
+          }`,
+          "data-symbol": cell.symbol,
+        }));
+      });
+      layer.appendChild(group);
     }
 
     function localOdometryScene(map) {
@@ -525,16 +595,19 @@
         layer.appendChild(group);
       }
 
-      blastMapSemantics.renderAdvisoryWaypoint(
-        layer, trace.advisoryWaypoint, map.robotPose,
-        projection, blastRenderUi(),
-      );
+      if (!trace.localDetourRoute) {
+        blastMapSemantics.renderAdvisoryWaypoint(
+          layer, trace.advisoryWaypoint, map.robotPose,
+          projection, blastRenderUi(),
+        );
+      }
 
       blastMapSemantics.renderRoute(
         layer,
         trace.localDetourRoute,
         projection,
         blastRenderUi(),
+        map.robotPose,
       );
 
       trace.planarScanViews.forEach((view, viewIndex) => {
@@ -649,9 +722,11 @@
         class: "map-local-layer-note",
       });
       layerNote.textContent = t(
-        map.navigationTrace
-          ? "map.navigation_trace.layer_note"
-          : "map.local_odometry.layer_note",
+        map.reasonCode === "localization_lost"
+          ? "map.local_odometry.localization_lost_note"
+          : map.navigationTrace
+            ? "map.navigation_trace.layer_note"
+            : "map.local_odometry.layer_note",
       );
       layer.appendChild(layerNote);
 
@@ -663,7 +738,27 @@
           ? "map.navigation_trace.odometry_title"
           : "map.path.title",
       );
-      renderNavigationTrace(layer, map, projection);
+      let navigationOverlayLayer = null;
+      if (map.navigationTrace) {
+        const navigationScanLayer = createSvgElement("g", {
+          class: "map-navigation-scan-layer",
+        });
+        navigationOverlayLayer = createSvgElement("g", {
+          class: "map-navigation-overlay-layer",
+        });
+        renderCoarseObstacleArea(
+          layer,
+          map.navigationTrace,
+          projection,
+        );
+        renderNavigationTrace(
+          navigationOverlayLayer,
+          map,
+          projection,
+          navigationScanLayer,
+        );
+        layer.appendChild(navigationScanLayer);
+      }
       blastMapSemantics.renderObstacles(
         layer,
         map.objectHypotheses,
@@ -999,6 +1094,9 @@
         }
         layer.appendChild(group);
       }
+      if (navigationOverlayLayer) {
+        layer.appendChild(navigationOverlayLayer);
+      }
     }
 
     function mapCellClass(cellState) {
@@ -1164,10 +1262,25 @@
             : formatNumber(map.poseHistory.length),
         ],
       ];
-      details.replaceChildren(...values.map(([label, value]) => {
+      const coarseGrid = map.navigationTrace?.coarseGrid;
+      if (coarseGrid) {
+        values.push([
+          t("map.details.coarse_grid"),
+          [
+            ...coarseGrid.rows,
+            "",
+            ...coarseGrid.robots.map((robot) => (
+              `${robot.symbol} ${robot.robotId} ${robot.heading}`
+            )),
+            coarseGrid.legend,
+          ].join("\n"),
+          "map-coarse-grid",
+        ]);
+      }
+      details.replaceChildren(...values.map(([label, value, className]) => {
         const row = createElement("div");
         row.appendChild(createElement("dt", "", label));
-        row.appendChild(createElement("dd", "", value));
+        row.appendChild(createElement("dd", className || "", value));
         return row;
       }));
     }
@@ -1750,6 +1863,10 @@
       const localOdometrySceneValue = sharedMap
         ? { points: [], cues: [], latestScans: [] }
         : localOdometryScene(map);
+      const retainedLostLocalization = (
+        map.status === "unavailable"
+        && map.reasonCode === "localization_lost"
+      );
       const localOdometryDrawable = (
         map.contractValid
         && map.frameKind === LOCAL_ODOMETRY
@@ -1757,6 +1874,7 @@
           map.status === "pose_only"
           || map.status === "qualitative_only"
           || map.status === "degraded"
+          || retainedLostLocalization
         )
         && map.bounds === null
         && localOdometrySceneValue.points.length > 0
@@ -1784,6 +1902,9 @@
       } else if (mapDrawable || sharedDrawable) {
         status.className = "state-chip state-ready";
         status.textContent = t("map.status.live");
+      } else if (retainedLostLocalization) {
+        status.className = "state-chip state-locked";
+        status.textContent = t("map.status.localization_lost");
       } else if (map.status === "qualitative_only") {
         status.className = "state-chip state-ready";
         status.textContent = t("map.status.qualitative_only");

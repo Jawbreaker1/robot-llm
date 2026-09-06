@@ -1,10 +1,16 @@
 from copy import deepcopy
 import math
-import time
 from unittest import TestCase
 
 from robot_agent.blast_episode_map_trace import _BlastEpisodeMapTrace
+from robot_agent.blast_mission_completion import BLAST_GOAL_RADIUS_MM
 from robot_agent.blast_spatial_map import BlastSpatialMapBridge
+from robot_agent.coarse_navigation_grid import (
+    build_coarse_navigation_grid,
+    known_clear_axis_reach_mm,
+    model_route_blockage,
+    route_blockage_from_echoes,
+)
 from robot_agent.physical_odometry import PhysicalPose
 
 
@@ -68,6 +74,314 @@ class BlastSpatialMapBridgeTests(TestCase):
             monotonic_clock_ms=Clock(100),
             unix_clock_ms=Clock(1_000),
         )
+
+    def test_coarse_grid_distinguishes_blast_and_ev3(self):
+        grid = build_coarse_navigation_grid(
+            robots=(
+                {
+                    "symbol": "B", "robot_id": "blast-01",
+                    "forward_mm": 0, "left_mm": 0,
+                    "heading_mdeg": 0,
+                },
+                {
+                    "symbol": "E", "robot_id": "ev3rstorm-01",
+                    "forward_mm": 150, "left_mm": 150,
+                    "heading_mdeg": 90_000,
+                },
+            ),
+            goal=(420, 0),
+        )
+
+        self.assertEqual(grid["rows"][6], "....E......")
+        self.assertEqual(grid["rows"][7], ".....B.....")
+        self.assertEqual(
+            [(robot["symbol"], robot["heading"])
+             for robot in grid["robots"]],
+            [("B", "UP"), ("E", "LEFT")],
+        )
+        self.assertEqual(grid["window"], {
+            "x_min_mm": -450, "x_max_mm": 1050,
+            "y_min_mm": -750, "y_max_mm": 750,
+        })
+
+    def test_coarse_grid_rolls_with_robot_in_stable_episode_coordinates(self):
+        grid = build_coarse_navigation_grid(
+            robots=({
+                "symbol": "B", "robot_id": "blast-01",
+                "forward_mm": 1_500, "left_mm": 450,
+                "heading_mdeg": 0,
+            },),
+            goal=(1_800, 0),
+            possible_obstacles=((1_800, 450),),
+            window_center=(1_500, 450),
+        )
+
+        self.assertEqual(grid["window"], {
+            "x_min_mm": 1_050, "x_max_mm": 2_550,
+            "y_min_mm": -300, "y_max_mm": 1_200,
+        })
+        self.assertEqual(grid["robots"][0]["row"], 7)
+        self.assertEqual(grid["robots"][0]["column"], 5)
+        self.assertEqual(grid["rows"][7][5], "B")
+        self.assertEqual(grid["rows"][5][5], "?")
+        self.assertEqual(grid["rows"][5][8], "G")
+        self.assertEqual(len(grid["robot_center_keep_out_cells"]), 5)
+
+    def test_physical_sparse_echoes_do_not_fill_the_right_detour(self):
+        """2026-09-02 scan geometry keeps the short box detour visible."""
+
+        grid = build_coarse_navigation_grid(
+            robots=({
+                "symbol": "B", "robot_id": "blast-01",
+                "forward_mm": 0, "left_mm": 0,
+                "heading_mdeg": 0,
+            },),
+            goal=(800, 0),
+            waypoint=(0, -300),
+            possible_obstacles=(
+                (389, 80), (371, 251), (-126, 792), (-424, 30),
+                (386, 50), (391, -121), (247, -674), (-40, -716),
+                (-441, -150),
+            ),
+        )
+
+        self.assertNotIn(
+            {"x_mm": 0, "y_mm": -300},
+            grid["robot_center_keep_out_cells"],
+        )
+        self.assertEqual(grid["rows"][7][7], "W")
+
+    def test_coarse_grid_shows_clear_ray_keep_out_and_target_overlap(self):
+        robot = ({
+            "symbol": "B", "robot_id": "blast-01",
+            "forward_mm": 0, "left_mm": 0, "heading_mdeg": 0,
+        },)
+        values = {
+            "robots": robot,
+            "goal": (800, 0),
+            "possible_obstacles": ((450, 0),),
+            "clear_segments": (((0, 0), (450, 0)),),
+        }
+
+        goal_waypoint = build_coarse_navigation_grid(
+            **values, waypoint=(800, 0),
+        )
+        blocked_waypoint = build_coarse_navigation_grid(
+            **values, waypoint=(450, 0),
+        )
+
+        self.assertEqual(goal_waypoint["rows"][2], ".....X.....")
+        self.assertEqual(goal_waypoint["rows"][4], "....#?#....")
+        self.assertEqual(goal_waypoint["rows"][6], ".....o.....")
+        self.assertEqual(blocked_waypoint["rows"][2], ".....G.....")
+        self.assertEqual(blocked_waypoint["rows"][4], "....#x#....")
+
+    def test_coarse_grid_summarizes_known_clear_episode_axes(self):
+        grid = build_coarse_navigation_grid(
+            robots=({
+                "symbol": "B", "robot_id": "blast-01",
+                "forward_mm": 0, "left_mm": 0, "heading_mdeg": 0,
+            },),
+            goal=(900, 0),
+            clear_segments=(
+                ((0, 0), (600, 0)),
+                ((0, 0), (0, 600)),
+                ((0, 0), (0, -300)),
+                ((0, 0), (-300, 0)),
+            ),
+        )
+
+        self.assertEqual(known_clear_axis_reach_mm(grid), {
+            "episode_forward_mm": 600,
+            "episode_left_mm": 600,
+            "episode_right_mm": 150,
+            "episode_back_mm": 150,
+        })
+
+    def test_goal_and_waypoint_overlay_preserve_known_clear_reach(self):
+        grid = build_coarse_navigation_grid(
+            robots=({
+                "symbol": "B", "robot_id": "blast-01",
+                "forward_mm": 0, "left_mm": 0, "heading_mdeg": 0,
+            },),
+            goal=(150, 0),
+            waypoint=(150, 0),
+            clear_segments=(((0, 0), (600, 0)),),
+        )
+
+        self.assertIn("X", grid["rows"][6])
+        self.assertEqual(
+            known_clear_axis_reach_mm(grid)["episode_forward_mm"],
+            600,
+        )
+
+    def test_blocked_goal_marker_preserves_keep_out_meaning(self):
+        goal_only = build_coarse_navigation_grid(
+            robots=({
+                "symbol": "B", "robot_id": "blast-01",
+                "forward_mm": 0, "left_mm": 0, "heading_mdeg": 0,
+            },),
+            goal=(600, 0),
+            possible_obstacles=((450, 0),),
+        )
+        goal_waypoint = build_coarse_navigation_grid(
+            robots=({
+                "symbol": "B", "robot_id": "blast-01",
+                "forward_mm": 0, "left_mm": 0, "heading_mdeg": 0,
+            },),
+            goal=(600, 0),
+            waypoint=(600, 0),
+            possible_obstacles=((450, 0),),
+        )
+
+        self.assertIn("g", goal_only["rows"][3])
+        self.assertIn("x", goal_waypoint["rows"][3])
+
+    def test_coarse_grid_rejects_known_blocked_route_but_not_clear_detour(self):
+        grid = build_coarse_navigation_grid(
+            robots=({
+                "symbol": "B", "robot_id": "blast-01",
+                "forward_mm": 0, "left_mm": 0, "heading_mdeg": 0,
+            },),
+            goal=(800, 0),
+            waypoint=(450, 300),
+            possible_obstacles=((450, 0),),
+            clear_segments=(((0, 0), (450, 0)),),
+        )
+
+        blocked = route_blockage_from_echoes(
+            start=(0, 0),
+            waypoints=((450, 300), (800, 300), (800, 0)),
+            possible_obstacles=((330, 80),),
+        )
+        clear = route_blockage_from_echoes(
+            start=(0, 0),
+            waypoints=((0, 450), (750, 450), (800, 0)),
+            possible_obstacles=((330, 80),),
+        )
+
+        self.assertEqual(
+            blocked["reason"], "KNOWN_ECHO_CLEARANCE_INTERSECTION",
+        )
+        self.assertEqual(blocked["leg_index"], 1)
+        self.assertEqual(
+            blocked["blocking_echo_point"],
+            {"x_mm": 330, "y_mm": 80},
+        )
+        self.assertIsNone(clear)
+
+    def test_route_veto_accepts_pure_side_clearance_beside_front_echo(self):
+        self.assertIsNone(route_blockage_from_echoes(
+            start=(0, 0),
+            waypoints=((0, 450),),
+            possible_obstacles=((300, 0),),
+        ))
+
+    def test_model_route_rejects_diagonal_before_motion(self):
+        blocked = model_route_blockage(
+            start=(0, 0),
+            waypoints=((300, -250),),
+            possible_obstacles=(),
+        )
+
+        self.assertEqual(blocked, {
+            "reason": "NON_ORTHOGONAL_ROUTE_LEG",
+            "leg_index": 1,
+            "basis": "COARSE_EPISODE_AXES",
+            "axis_tolerance_mm": 75,
+            "delta_x_mm": 300,
+            "delta_y_mm": -250,
+        })
+
+    def test_model_route_allows_half_coarse_cell_of_odometry_drift(self):
+        self.assertIsNone(model_route_blockage(
+            start=(0, 0),
+            waypoints=((70, -450),),
+            possible_obstacles=(),
+        ))
+
+    def test_model_route_rejects_one_cell_diagonal_as_not_orthogonal(self):
+        blocked = model_route_blockage(
+            start=(0, 0),
+            waypoints=((150, 150),),
+            possible_obstacles=(),
+        )
+
+        self.assertEqual(blocked["reason"], "NON_ORTHOGONAL_ROUTE_LEG")
+
+    def test_model_route_uses_the_shared_echo_clearance(self):
+        route = ((800, 250),)
+        obstacle = ((320, 140),)
+
+        direct = route_blockage_from_echoes(
+            start=(0, 250),
+            waypoints=route,
+            possible_obstacles=obstacle,
+        )
+        model = model_route_blockage(
+            start=(0, 250),
+            waypoints=route,
+            possible_obstacles=obstacle,
+        )
+
+        self.assertEqual(model, direct)
+        self.assertEqual(model["clearance_mm"], 150)
+
+    def test_route_veto_allows_passage_outside_straight_body_envelope(self):
+        route = ((800, 0),)
+
+        blocked = route_blockage_from_echoes(
+            start=(0, 0),
+            waypoints=route,
+            possible_obstacles=((400, 100),),
+        )
+        clear = route_blockage_from_echoes(
+            start=(0, 0),
+            waypoints=route,
+            possible_obstacles=((400, 180),),
+        )
+
+        self.assertIsNotNone(blocked)
+        self.assertIsNone(clear)
+
+    def test_route_veto_rejects_sparse_ray_gap_that_hits_robot_body(self):
+        blocked = route_blockage_from_echoes(
+            start=(0, 0),
+            waypoints=((350, -250),),
+            possible_obstacles=((300, -100),),
+        )
+
+        self.assertEqual(
+            blocked["reason"], "KNOWN_ECHO_CLEARANCE_INTERSECTION",
+        )
+
+    def test_route_blockage_selects_nearest_crossing_not_scan_order(self):
+        route = ((900, 0),)
+        obstacles = ((750, 0), (300, 0))
+
+        forward_order = route_blockage_from_echoes(
+            start=(0, 0),
+            waypoints=route,
+            possible_obstacles=obstacles,
+        )
+        reverse_order = route_blockage_from_echoes(
+            start=(0, 0),
+            waypoints=route,
+            possible_obstacles=tuple(reversed(obstacles)),
+        )
+
+        self.assertEqual(forward_order, reverse_order)
+        self.assertEqual(
+            forward_order["blocking_echo_point"],
+            {"x_mm": 300, "y_mm": 0},
+        )
+
+    def test_route_can_move_away_from_adjacent_echo(self):
+        self.assertIsNone(route_blockage_from_echoes(
+            start=(150, 0),
+            waypoints=((0, 0),),
+            possible_obstacles=((300, 0),),
+        ))
 
     def test_episode_publishes_pose_only_existing_map_contract(self):
         bridge = self.bridge()
@@ -383,45 +697,45 @@ class BlastSpatialMapBridgeTests(TestCase):
                 self.assertTrue(trace["final_goal"]["navigation_enforced"])
                 self.assertEqual(trace["planned_leg"], leg)
 
-    def test_terminal_trace_invalidates_active_route_without_erasing_it(self):
+    def test_model_waypoint_purpose_survives_reaching_previous_point(self):
+        bridge = self.bridge()
+        trace = _BlastEpisodeMapTrace(
+            bridge=bridge, episode_id="episode-a", pose=PhysicalPose(),
+            observation=observation(), observed_at_unix_ms=1_000,
+            episode_start_heading=0.0, minimum_forward_progress_mm=800,
+        )
+        plan = (
+            {"x_mm": 150, "y_mm": -300, "purpose": "right flank past box"},
+            {"x_mm": 600, "y_mm": -300, "purpose": "forward along right side"},
+            {"x_mm": 600, "y_mm": 0, "purpose": "return to center line"},
+        )
+        for remaining in (plan, plan[1:], plan[2:]):
+            self.assertTrue(trace.set_advisory_waypoint_plan(
+                remaining, pose=PhysicalPose(x_mm=80, y_mm=-279),
+                observation=observation(), observed_at_unix_ms=1_000,
+            ))
+            shown = bridge.snapshot()["navigation_trace"]["local_detour_route"]["waypoints"]
+            self.assertEqual([item["purpose"] for item in shown],
+                             [item["purpose"] for item in remaining])
+            self.assertEqual([item["kind"] for item in shown],
+                             ["MODEL_WAYPOINT"] * len(remaining))
+            self.assertEqual(shown[0]["status"], "ACTIVE")
+
+    def test_trace_retains_latest_sixteen_scans_without_host_route(self):
         bridge = BlastSpatialMapBridge()
-        observed_at_unix_ms = time.time_ns() // 1_000_000
         trace = _BlastEpisodeMapTrace(
             bridge=bridge,
             episode_id="episode-a",
             pose=PhysicalPose(),
             observation=observation(),
-            observed_at_unix_ms=observed_at_unix_ms,
+            observed_at_unix_ms=1_000,
             episode_start_heading=0.0,
             minimum_forward_progress_mm=420,
         )
-        trace.navigation_enforced = True
-        trace.planned_leg = planned_leg(
-            kind="REACQUIRE_GOAL_HEADING",
-            scope="LOCAL_DETOUR_ROUTE",
-            route_eligible=True,
+        self.assertEqual(
+            bridge.snapshot()["navigation_trace"]["coarse_grid"]["rows"][7],
+            ".....B.....",
         )
-        trace.local_detour_route = {
-            "schema": "robot-local-detour-route/v1",
-            "read_only": True,
-            "provisional": True,
-            "route_id": "route-a",
-            "version": 2,
-            "status": "ACTIVE",
-            "detour_side": "RIGHT_OF_GOAL",
-            "active_index": 1,
-            "waypoints": [
-                {"ordinal": 0, "kind": "LATERAL_CLEARANCE",
-                 "x_mm": 0, "y_mm": -225, "heading_mdeg": -90_000,
-                 "fact_key": None, "status": "COMPLETED"},
-                {"ordinal": 1, "kind": "REACQUIRE_GOAL_HEADING",
-                 "x_mm": 0, "y_mm": -225, "heading_mdeg": 0,
-                 "fact_key": "GOAL_HEADING_ALIGNED", "status": "ACTIVE"},
-                {"ordinal": 2, "kind": "PASS_BEYOND_TARGET",
-                 "x_mm": 500, "y_mm": -225, "heading_mdeg": 0,
-                 "fact_key": "TARGET_BEHIND", "status": "UPCOMING"},
-            ],
-        }
         scan_view = {
             "scan_pose": {"x_mm": 0, "y_mm": 0, "heading_mdeg": 0},
             "planar_projection": {
@@ -439,45 +753,33 @@ class BlastSpatialMapBridgeTests(TestCase):
                 pose=PhysicalPose(),
                 observation=observation(),
                 pose_observed=False,
-                selected_side=None,
-                waypoint=None,
-                bind_pose=PhysicalPose(),
                 scan_view=scan_view,
             )
 
-        active = bridge.snapshot()["navigation_trace"]
-        self.assertEqual(len(active["planar_scan_views"]), 16)
+        value = bridge.snapshot()["navigation_trace"]
+        self.assertEqual(len(value["planar_scan_views"]), 16)
         self.assertEqual(
-            [view["scan_id"] for view in active["planar_scan_views"]],
+            [view["scan_id"] for view in value["planar_scan_views"]],
             [f"episode-a-scan-{index}" for index in range(2, 18)],
         )
         self.assertEqual(
-            len({view["scan_id"] for view in active["planar_scan_views"]}),
+            len({view["scan_id"] for view in value["planar_scan_views"]}),
             16,
         )
-        self.assertEqual(active["local_detour_route"]["status"], "ACTIVE")
-
-        self.assertTrue(trace.finalize())
-
-        value = bridge.snapshot()["navigation_trace"]
-        self.assertEqual(value["local_detour_route"]["status"], "INVALID")
-        self.assertEqual(
-            [item["status"] for item in value["local_detour_route"]["waypoints"]],
-            ["COMPLETED", "UPCOMING", "UPCOMING"],
-        )
+        self.assertIsNone(value["local_detour_route"])
         self.assertIsNone(value["planned_leg"])
         self.assertFalse(value["final_goal"]["navigation_enforced"])
 
-        self.assertTrue(trace.clear_route(
-            pose=PhysicalPose(), observation=observation(),
-        ))
-        self.assertIsNone(
-            bridge.snapshot()["navigation_trace"]["local_detour_route"]
-        )
+        self.assertTrue(trace.finalize())
+        final = bridge.snapshot()["navigation_trace"]
+        self.assertIsNone(final["local_detour_route"])
+        self.assertIsNone(final["planned_leg"])
+        self.assertFalse(final["final_goal"]["navigation_enforced"])
 
-    def test_planner_map_evidence_is_compact_echo_only_and_detached(self):
+    def test_planner_map_evidence_is_compact_coarse_map_and_detached(self):
+        bridge = self.bridge()
         trace = _BlastEpisodeMapTrace(
-            bridge=self.bridge(),
+            bridge=bridge,
             episode_id="episode-a",
             pose=PhysicalPose(),
             observation=observation(),
@@ -488,6 +790,7 @@ class BlastSpatialMapBridgeTests(TestCase):
         for index in range(5):
             trace.planar_scan_views.append({
                 "scan_id": "scan-{}".format(index),
+                "observed_at_unix_ms": 1_001 + index,
                 "scan_pose": {
                     "x_mm": index * 10,
                     "y_mm": -index * 5,
@@ -495,53 +798,237 @@ class BlastSpatialMapBridgeTests(TestCase):
                 },
                 "projection": {
                     "points": [{
+                        "side": "center",
+                        "measured_range_mm": 225.0,
+                        "relative_bearing_mdeg": 0,
+                        "sensor_origin_x_mm": 0,
+                        "sensor_origin_y_mm": 0,
+                        "beam_heading_mdeg": 0,
                         "nominal_echo_x_mm": 200 + index,
                         "nominal_echo_y_mm": -100 - index,
                     }],
                 },
             })
 
-        evidence = trace.planner_local_map_evidence(
-            PhysicalPose(x_mm=45, y_mm=-10, heading_mdeg=-90_000),
+        for view in trace.planar_scan_views:
+            trace._remember_obstacles(view["projection"]["points"])
+        planner_pose = PhysicalPose(
+            x_mm=45, y_mm=-10, heading_mdeg=-90_000,
         )
-
+        evidence = trace.planner_local_map_evidence(planner_pose)
         self.assertEqual(evidence["schema"], "blast-local-map-evidence/v1")
-        self.assertEqual(evidence["occupancy_model"], "NONE")
         self.assertEqual(evidence["unobserved_space"], "UNKNOWN_NOT_FREE")
+        self.assertEqual(evidence["route_clearance_mm"], 150)
+        self.assertEqual(evidence["known_clear_axis_reach_mm"], {
+            "episode_forward_mm": 0,
+            "episode_left_mm": 0,
+            "episode_right_mm": 0,
+            "episode_back_mm": 0,
+        })
+        self.assertEqual(
+            evidence["direct_goal_blockage"]["reason"],
+            "KNOWN_ECHO_CLEARANCE_INTERSECTION",
+        )
+        self.assertNotIn("keep_out_regions", evidence)
+        self.assertNotIn(
+            "blocking_region", evidence["direct_goal_blockage"],
+        )
         self.assertEqual(evidence["robot_pose"], {
             "x_mm": 45, "y_mm": -10, "heading_mdeg": -90_000,
         })
+        self.assertNotIn("obstacle_regions", evidence)
         self.assertEqual(evidence["directional_goal"], {
             "target_x_mm": 420,
             "target_y_mm": 0,
             "desired_heading_mdeg": 0,
-            "goal_radius_mm": 120,
+            "heading_error_mdeg": 90_000,
+            "goal_radius_mm": BLAST_GOAL_RADIUS_MM,
             "distance_to_goal_mm": 375,
-            "current_lateral_offset_mm": -10,
             "remaining_forward_progress_mm": 375,
+            "signed_forward_error_mm": 375,
+            "longitudinal_relation": "BEFORE_GOAL_LINE",
+            "goal_vector": {
+                "delta_x_mm": 375,
+                "delta_y_mm": 10,
+                "distance_mm": 375,
+            },
+            "corridor_entered": False,
+            "heading_aligned": False,
+        })
+        self.assertEqual(evidence["coarse_grid"], {
+            "cell_size_mm": 150,
+            "window": {
+                "x_min_mm": -450,
+                "x_max_mm": 1050,
+                "y_min_mm": -750,
+                "y_max_mm": 750,
+            },
+            "rows": [
+                {"x_mm": 1050, "cells": "..........."},
+                {"x_mm": 900, "cells": "..........."},
+                {"x_mm": 750, "cells": "..........."},
+                {"x_mm": 600, "cells": "..........."},
+                {"x_mm": 450, "cells": ".....G....."},
+                {"x_mm": 300, "cells": ".....##...."},
+                {"x_mm": 150, "cells": ".....#?...."},
+                {"x_mm": 0, "cells": ".....B....."},
+                {"x_mm": -150, "cells": "..........."},
+                {"x_mm": -300, "cells": "..........."},
+                {"x_mm": -450, "cells": "..........."},
+            ],
+            "column_y_mm": [
+                750, 600, 450, 300, 150, 0,
+                -150, -300, -450, -600, -750,
+            ],
+        })
+        self.assertNotIn("scan_views", evidence)
+        self.assertNotIn("robot_center_keep_out_cells", evidence["coarse_grid"])
+        self.assertNotIn("robot_footprint_mm", evidence)
+        self.assertEqual(evidence["visited_cells"], [
+            {"x_mm": 0, "y_mm": 0},
+        ])
+        self.assertNotIn(
+            "robot_relation", evidence["direct_goal_blockage"],
+        )
+
+        trace.record(
+            pose=PhysicalPose(x_mm=330, y_mm=310),
+            observation=observation(), pose_observed=True, scan_view=None,
+        )
+        moved = trace.planner_local_map_evidence(
+            PhysicalPose(x_mm=330, y_mm=310),
+        )
+        self.assertEqual(moved["visited_cells"], [
+            {"x_mm": 0, "y_mm": 0},
+            {"x_mm": 300, "y_mm": 300},
+        ])
+        self.assertEqual(moved["coarse_grid"]["window"], {
+            "x_min_mm": -150, "x_max_mm": 1_350,
+            "y_min_mm": -450, "y_max_mm": 1_050,
         })
         self.assertEqual(
-            [view["scan_id"] for view in evidence["scan_views"]],
-            ["scan-1", "scan-2", "scan-3", "scan-4"],
+            [row["x_mm"] for row in moved["coarse_grid"]["rows"]],
+            [1350, 1200, 1050, 900, 750, 600, 450, 300, 150, 0, -150],
         )
-        self.assertTrue(evidence["truncated"])
         self.assertEqual(
-            evidence["scan_views"][-1]["echo_points"],
-            [{"x_mm": 204, "y_mm": -104}],
+            moved["coarse_grid"]["column_y_mm"],
+            [1050, 900, 750, 600, 450, 300, 150, 0, -150, -300, -450],
         )
-        self.assertEqual(evidence["robot_footprint_mm"], {
-            "front": 110,
-            "rear": 60,
-            "left": 105,
-            "right": 100,
-            "clearance_margin": 10,
+
+        evidence["coarse_grid"]["rows"][0]["cells"] = "changed"
+        fresh = trace.planner_local_map_evidence(PhysicalPose())
+        self.assertNotEqual(
+            fresh["coarse_grid"]["rows"][0]["cells"], "changed",
+        )
+
+    def test_new_view_retains_an_obstacle_outside_its_measured_rays(self):
+        trace = _BlastEpisodeMapTrace(
+            bridge=self.bridge(),
+            episode_id="episode-a",
+            pose=PhysicalPose(),
+            observation=observation(),
+            observed_at_unix_ms=1_000,
+            episode_start_heading=0.0,
+            minimum_forward_progress_mm=800,
+        )
+        trace.planar_scan_views = [
+            {
+                "scan_id": "old-drifted-box",
+                "observed_at_unix_ms": 1_001,
+                "scan_pose": {"x_mm": 0, "y_mm": 0, "heading_mdeg": 0},
+                "projection": {"points": [{
+                    "side": "center",
+                    "measured_range_mm": 400,
+                    "relative_bearing_mdeg": 0,
+                    "nominal_echo_x_mm": 400,
+                    "nominal_echo_y_mm": 0,
+                    "sensor_origin_x_mm": 0,
+                    "sensor_origin_y_mm": 0,
+                    "beam_heading_mdeg": 0,
+                }]},
+            },
+            {
+                "scan_id": "current-open-route",
+                "observed_at_unix_ms": 1_002,
+                "scan_pose": {"x_mm": 0, "y_mm": 0, "heading_mdeg": 0},
+                "projection": {"points": [{
+                    "side": "left_1",
+                    "measured_range_mm": 602,
+                    "relative_bearing_mdeg": 48_000,
+                    "nominal_echo_x_mm": 400,
+                    "nominal_echo_y_mm": 450,
+                    "sensor_origin_x_mm": 0,
+                    "sensor_origin_y_mm": 0,
+                    "beam_heading_mdeg": 48_000,
+                }]},
+            },
+        ]
+
+        for view in trace.planar_scan_views:
+            trace._remember_obstacles(view["projection"]["points"])
+        evidence = trace.planner_local_map_evidence(PhysicalPose())
+
+        self.assertIn("direct_goal_blockage", evidence)
+        self.assertIsNone(trace.advisory_route_blockage(PhysicalPose()))
+        self.assertEqual(len(trace.planar_scan_views), 2)
+        rows = [item["cells"] for item in evidence["coarse_grid"]["rows"]]
+        self.assertEqual(rows[4][5], "?")
+        self.assertEqual(rows[4][2], "?")
+        self.assertEqual(len(evidence["current_echo_clusters"]), 2)
+        self.assertEqual(evidence["current_echo_clusters"][:1], [{
+            "cluster": 1,
+            "provisional": True,
+            "evidence_count": 1,
+            "echo_bounds_mm": {
+                "x_min_mm": 400, "x_max_mm": 400,
+                "y_min_mm": 450, "y_max_mm": 450,
+            },
+            "robot_center_keep_out_bounds_mm": {
+                "x_min_mm": 250, "x_max_mm": 550,
+                "y_min_mm": 300, "y_max_mm": 600,
+            },
+        }])
+        self.assertIn("direct_detour_axis_candidates", evidence)
+
+    def test_direct_detour_candidates_expose_both_nearest_grid_lines(self):
+        candidates = _BlastEpisodeMapTrace._direct_detour_axis_candidates(
+            (0, 0),
+            (800, 0),
+            ({
+                "robot_center_keep_out_bounds_mm": {
+                    "x_min_mm": 240, "x_max_mm": 770,
+                    "y_min_mm": -281, "y_max_mm": 397,
+                },
+            },),
+        )
+
+        self.assertEqual(candidates, {
+            "basis": "CURRENT_SCAN_ECHO_BOUNDS",
+            "side_selected": False,
+            "left_y_mm": 450,
+            "right_y_mm": -300,
         })
 
-        evidence["scan_views"][0]["echo_points"][0]["x_mm"] = 999
-        fresh = trace.planner_local_map_evidence(PhysicalPose())
-        self.assertEqual(
-            fresh["scan_views"][0]["echo_points"][0]["x_mm"], 201,
+    def test_visited_trail_retains_a_room_scale_ordered_history(self):
+        trace = _BlastEpisodeMapTrace(
+            bridge=self.bridge(),
+            episode_id="episode-a",
+            pose=PhysicalPose(),
+            observation=observation(),
+            observed_at_unix_ms=1_000,
+            episode_start_heading=0.0,
+            minimum_forward_progress_mm=420,
         )
+
+        for index in range(140):
+            trace._record_visited_cell(PhysicalPose(x_mm=index * 150))
+
+        trail = trace.planner_local_map_evidence(
+            PhysicalPose(x_mm=139 * 150),
+        )["visited_cells"]
+        self.assertEqual(len(trail), 128)
+        self.assertEqual(trail[0], {"x_mm": 1_800, "y_mm": 0})
+        self.assertEqual(trail[-1], {"x_mm": 20_850, "y_mm": 0})
 
     def test_planned_leg_claims_and_fields_remain_exact_and_conservative(self):
         bridge = self.bridge()

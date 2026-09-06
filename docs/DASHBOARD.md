@@ -152,14 +152,14 @@ mikrofoninmatning:
 scripts/start_lab_console.sh
 ```
 
-Den kanoniska runtime-standarden är det exakta LM Studio-ID:t
-`google/gemma-4-26b-a4b`. Startprofilen laddar eller byter inte modell;
-det ID:t måste redan exponeras av avsedd LM Studio-server. Ett explicit
+Den kanoniska runtime-standarden är den vanliga, icke-QAT modellen med det
+exakta LM Studio-ID:t `qwen/qwen3.8-27b`. Startprofilen laddar eller byter inte
+modell; det ID:t måste redan exponeras av avsedd LM Studio-server. Ett explicit
 alternativ gäller konsekvent för både Workbench- och Robot-inställningen i den
 processen:
 
 ```sh
-scripts/start_lab_console.sh --model 'EXACT-MODEL-ID-FROM-LM-STUDIO'
+scripts/start_lab_console.sh --model 'qwen/qwen3.8-27b'
 ```
 
 Profilen ansluter som standard till `http://127.0.0.1:8178/v1`, använder den

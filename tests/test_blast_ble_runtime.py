@@ -161,12 +161,17 @@ class FakeHub:
                 "accepted": True,
                 "direction": request["args"]["direction"],
             }
-        elif operation == "turn_pulse":
+        elif operation in ("turn_pulse", "turn_trim_pulse"):
             result = {
                 "accepted": True,
                 "direction": request["args"]["direction"],
             }
         elif operation == "scan_turn_pulse":
+            result = {
+                "accepted": True,
+                "direction": request["args"]["direction"],
+            }
+        elif operation == "scan_trim_pulse":
             result = {
                 "accepted": True,
                 "direction": request["args"]["direction"],
@@ -310,6 +315,21 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(hub.disconnect_count, 1)
 
+    async def test_trim_turn_uses_the_bounded_hub_primitive(self):
+        hub = FakeHub()
+        async def finder(_name):
+            return "device"
+        runtime = BlastBLERuntime(program_path=self.program_path,
+                                  device_finder=finder, hub_factory=lambda device: hub)
+        await runtime.connect()
+        try:
+            result = await runtime.turn_trim_pulse("right")
+            self.assertEqual(result, {"accepted": True, "direction": "right"})
+            with self.assertRaisesRegex(ValueError, "direction"):
+                await runtime.turn_trim_pulse("forward")
+        finally:
+            await runtime.disconnect()
+
     async def test_disconnect_releases_ble_without_hub_command(self):
         hub = FakeHub()
 
@@ -361,6 +381,12 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "direction"):
             await runtime.scan_turn_pulse("forward")
         self.assertEqual(
+            await runtime.scan_trim_pulse("left"),
+            {"accepted": True, "direction": "left"},
+        )
+        with self.assertRaisesRegex(ValueError, "direction"):
+            await runtime.scan_trim_pulse("forward")
+        self.assertEqual(
             await runtime.claw_pulse("open"),
             {"accepted": True, "direction": "open"},
         )
@@ -402,14 +428,22 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
             hub.writes[4],
             {
                 "id": 5,
-                "op": "claw_pulse",
-                "args": {"direction": "open"},
+                "op": "scan_trim_pulse",
+                "args": {"direction": "left"},
             },
         )
         self.assertEqual(
             hub.writes[5],
             {
                 "id": 6,
+                "op": "claw_pulse",
+                "args": {"direction": "open"},
+            },
+        )
+        self.assertEqual(
+            hub.writes[6],
+            {
+                "id": 7,
                 "op": "body_pulse",
                 "args": {"direction": "left"},
             },

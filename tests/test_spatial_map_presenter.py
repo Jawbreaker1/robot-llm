@@ -127,6 +127,20 @@ const map = {
       passage_proven: false, route_eligible: true, selected_side: "RIGHT",
       bind_pose: { x_mm: 0, y_mm: -225, heading_mdeg: -90000 },
       waypoint: { x_mm: 0, y_mm: -225, heading_mdeg: 0 } },
+    coarse_grid: {
+      schema: "robot-coarse-navigation-grid/v1",
+      frame: "EPISODE_START", cell_size_mm: 150,
+      top_is: "START_FORWARD", left_is: "START_LEFT",
+      rows: [
+        "...........", "...........", "...........", "...........",
+        ".....G.....", "...........", "......?....", ".....B.....",
+        "...........", "...........", "...........",
+      ],
+      robots: [{ symbol: "B", robot_id: "blast-01", row: 7,
+        column: 5, heading: "UP" }],
+      legend: ".=UNKNOWN o=OBSERVED_CLEAR_RAY #=ROBOT_KEEP_OUT ?=POSSIBLE_OBSTACLE G=GOAL W=WAYPOINT X=GOAL_AND_WAYPOINT x=WAYPOINT_ON_BLOCKED B=BLAST E=EV3 2=BOTH_ROBOTS",
+      cropped: false,
+    },
     imu_heading: null, local_detour_route: route,
     planar_scan_views: [{ scan_id: "dense-scan", observed_at_unix_ms: 1900,
       scan_pose: { x_mm: 0, y_mm: 0, heading_mdeg: 0 },
@@ -157,7 +171,36 @@ const exactClass = (name) => rendered.filter((node) => (
   String(node.attributes.class || "") === name
 ));
 const obstacleItem = nodes["map-object-list"].children[0];
+const modelPoints = [
+  { x_mm: 600, y_mm: -300, purpose: "forward along right side" },
+  { x_mm: 600, y_mm: 0, purpose: "return to center line" },
+];
+function modelRoute(remaining, robotPose) {
+  const value = { ...route, active_index: 0, waypoints: remaining.map((p, i) => ({
+    ...p, ordinal: i, kind: "MODEL_WAYPOINT", heading_mdeg: 0,
+    fact_key: null, status: i === 0 ? "ACTIVE" : "UPCOMING",
+  })) };
+  const normalized = context.RobotDashboardLogic.normalizeSpatialMap({
+    ...map, navigation_trace: { ...map.navigation_trace, local_detour_route: value },
+  }, 2000).navigationTrace.localDetourRoute;
+  const layer = new FakeNode("g");
+  const ui = {
+    svg(tag, attrs) { const n = new FakeNode(tag); Object.entries(attrs).forEach(([k,v]) => n.setAttribute(k,v)); return n; },
+    title() {}, t: translate, format: String, heading: () => "",
+  };
+  context.RobotBlastMapSemantics.renderRoute(
+    layer, normalized, { point: (x,y) => ({x,y}) }, ui, robotPose,
+  );
+  const all = descendants(layer);
+  return {
+    line: all.find(n => n.tag === "polyline")?.attributes.points || null,
+    labels: all.filter(n => n.tag === "text").map(n => n.textContent),
+  };
+}
 process.stdout.write(JSON.stringify({
+  modelRoute: modelRoute(modelPoints, {xMm:80,yMm:-279}),
+  remainingPoint: modelRoute(modelPoints.slice(1), {xMm:600,yMm:-300}),
+  unknownPose: modelRoute(modelPoints.slice(1), null),
   route: withClass("map-local-detour-route")[0].attributes,
   waypointStatuses: withClass("map-local-detour-waypoint ").map((node) => (
     node.attributes["data-status"]
@@ -167,9 +210,12 @@ process.stdout.write(JSON.stringify({
   )),
   obstacle: withClass("map-provisional-ultrasonic-obstacle")[0].attributes,
   obstacleCount: exactClass("map-provisional-ultrasonic-obstacle").length,
+  coarseGridCellCount: withClass("map-coarse-grid-cell").length,
+  coarseObstacleCount: withClass("map-coarse-obstacle-cell").length,
   scanViewCount: exactClass("map-blast-scan-view").length,
   rawRayCount: exactClass("map-blast-scan-ray").length,
   obstacleItemText: obstacleItem.textContent,
+  metadataText: nodes["map-metadata"].textContent,
 }));
 """
         completed = subprocess.run(
@@ -194,6 +240,14 @@ process.stdout.write(JSON.stringify({
         )
         self.assertEqual(len(result["waypointLabels"]), 3)
         self.assertIn("PASS BEYOND TARGET", result["waypointLabels"][2])
+        self.assertEqual(result["modelRoute"], {
+            "line": "80,-279 600,-300 600,0",
+            "labels": ["1. forward along right side", "2. return to center line"],
+        })
+        self.assertEqual(result["remainingPoint"], {
+            "line": "600,-300 600,0", "labels": ["1. return to center line"],
+        })
+        self.assertIsNone(result["unknownPose"]["line"])
         self.assertEqual(
             result["obstacle"]["data-classification"],
             "PROVISIONAL_ULTRASONIC_OBSTACLE_CLUSTER",
@@ -205,8 +259,13 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(result["rawRayCount"], 1)
         self.assertEqual(result["scanViewCount"], 2)
         self.assertEqual(result["obstacleCount"], 1)
+        self.assertEqual(result["coarseGridCellCount"], 121)
+        self.assertEqual(result["coarseObstacleCount"], 1)
         self.assertIn("PROVISIONAL INFERENCE", result["obstacleItemText"])
         self.assertNotIn("nvd-only-scan", result["obstacleItemText"])
+        self.assertIn(".....G.....", result["metadataText"])
+        self.assertIn(".....B.....", result["metadataText"])
+        self.assertIn("B blast-01 UP", result["metadataText"])
 
     def test_asymmetric_footprint_and_pose_based_scan_cues_are_honest(self):
         script = r"""
@@ -648,6 +707,9 @@ const translations = {
   ),
   "map.local_odometry.layer_label": "PROVISIONAL LOCAL ODOMETRY",
   "map.local_odometry.layer_note": "Angular IR cue · no measured distance",
+  "map.local_odometry.localization_lost_note": (
+    "Last verified path and scan · current pose unknown"
+  ),
   "map.local_odometry.nonmetric": "No metric IR distance",
   "map.local_odometry.robot_title": "Provisional robot pose",
   "map.path.title": "Estimated path from odometry",
@@ -673,6 +735,7 @@ const translations = {
   "map.status.empty": "No map",
   "map.status.invalid": "Invalid",
   "map.status.live": "Live",
+  "map.status.localization_lost": "Localization lost · history retained",
   "map.status.offline": "Offline",
   "map.status.pose_only": "Pose only",
   "map.status.qualitative_only": "Qualitative IR available",
@@ -860,6 +923,41 @@ const poseResult = {
 presenter.render({
   schema: "robot-spatial-map/v1",
   read_only: true,
+  status: "unavailable",
+  reason_code: "localization_lost",
+  robot_id: "robot-1",
+  frame_id: "LOCAL_ODOMETRY",
+  frame_kind: "LOCAL_ODOMETRY",
+  map_version: 3,
+  bounds: null,
+  robot_pose: null,
+  pose_history: [{
+    x_mm: 0,
+    y_mm: 0,
+    heading_mdeg: 0,
+    frame_id: "LOCAL_ODOMETRY",
+  }, {
+    x_mm: 90,
+    y_mm: 0,
+    heading_mdeg: 0,
+    frame_id: "LOCAL_ODOMETRY",
+  }],
+  cells: [],
+  sensor_rays: [],
+  object_hypotheses: [],
+  qualitative_observations: [],
+}, "connected", 2000);
+const localizationLostResult = {
+  connection: nodes["map-connection-status"].textContent,
+  emptyHidden: nodes["map-empty-state"].hidden,
+  localTags: nodes["map-local-odometry-layer"].children
+    .map((node) => node.tag),
+  localText: nodes["map-local-odometry-layer"].textContent,
+};
+
+presenter.render({
+  schema: "robot-spatial-map/v1",
+  read_only: true,
   status: "available",
   robot_id: "robot-1",
   frame_id: "SIM_WORLD",
@@ -934,6 +1032,7 @@ try {
 process.stdout.write(JSON.stringify({
   qualitativeResult,
   poseResult,
+  localizationLostResult,
   metricResult,
   invalidDependenciesRejected,
 }));
@@ -1067,6 +1166,21 @@ process.stdout.write(JSON.stringify({
         self.assertIn(
             "Path points2 shown · 2 older removed",
             pose["metadataText"],
+        )
+
+        localization_lost = result["localizationLostResult"]
+        self.assertEqual(
+            localization_lost["connection"],
+            "Localization lost · history retained",
+        )
+        self.assertTrue(localization_lost["emptyHidden"])
+        self.assertEqual(
+            localization_lost["localTags"],
+            ["text", "text", "path", "circle"],
+        )
+        self.assertIn(
+            "current pose unknown",
+            localization_lost["localText"],
         )
 
         metric = result["metricResult"]
@@ -1296,11 +1410,13 @@ process.stdout.write(JSON.stringify({
   goalAttributes: byClass("map-final-goal").attributes,
   goalZoneAttributes: byClass("map-final-goal-zone").attributes,
   advisoryAttributes: byClass("map-advisory-waypoint").attributes,
+  advisoryLine: byClass("map-advisory-waypoint-line").attributes,
   hasAdvisoryMarker: Boolean(byClass("map-advisory-waypoint-marker")),
   legAttributes: byClass("map-planned-leg").attributes,
   imuAttributes: byClass("map-local-imu-heading").attributes,
   rayAttributes: byClass("map-blast-scan-ray").attributes,
   hasEcho: Boolean(byClass("map-blast-scan-echo")),
+  topLayer: nodes["map-local-odometry-layer"].children.at(-1).attributes.class,
   distanceRatio: lineLength(rayLine) / lineLength(goalLine),
   localText: nodes["map-local-odometry-layer"].textContent,
   invalidFrame: invalidFrame.navigationTrace,
@@ -1367,6 +1483,10 @@ process.stdout.write(JSON.stringify({
         )
         self.assertEqual(result["advisoryAttributes"]["data-read-only"], "true")
         self.assertTrue(result["hasAdvisoryMarker"])
+        # Episode +x points right on this view; -y (starting right) points down.
+        line = result["advisoryLine"]
+        self.assertGreater(float(line["x2"]), float(line["x1"]))
+        self.assertGreater(float(line["y2"]), float(line["y1"]))
         self.assertEqual(
             result["rayAttributes"]["data-quality"],
             "PROVISIONAL_YAW_ONLY",
@@ -1376,12 +1496,16 @@ process.stdout.write(JSON.stringify({
             "400",
         )
         self.assertTrue(result["hasEcho"])
+        self.assertEqual(
+            result["topLayer"],
+            "map-navigation-overlay-layer",
+        )
         self.assertAlmostEqual(result["distanceRatio"], 2 / 3)
         self.assertIn("PROVISIONAL_ENCODER_ODOMETRY", result["localText"])
         self.assertIn("SEARCH POSITION ONLY", result["localText"])
         self.assertIn("GEMMA WAYPOINT", result["localText"])
         self.assertIsNone(result["invalidFrame"])
-        self.assertIsNone(result["invalidEcho"])
+        self.assertEqual(result["invalidEcho"]["planarScanViews"], [])
         self.assertIsNone(result["overCapacity"])
 
     def test_shared_world_renders_separate_robots_without_local_evidence(self):

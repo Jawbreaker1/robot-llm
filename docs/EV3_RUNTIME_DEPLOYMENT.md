@@ -92,6 +92,10 @@ The EV3RSTORM profile synthesizes Swedish speech on the host through
 160 characters. Both host and EV3 accept at most 4 MiB and 20 seconds of mono
 16-bit PCM WAV at 8–48 kHz.
 
+Install the two local voice models once with
+`scripts/setup_piper_service.sh`, then start the project-owned loopback service
+with `scripts/start_piper_service.sh` before launching a physical console.
+
 On the first utterance, the speech thread lazily starts one separate SSH
 process running the fixed Python 3.5-compatible
 `ev3/audio_playback_worker_cli.py`. The worker emits a ready frame, then loops

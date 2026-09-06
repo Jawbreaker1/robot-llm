@@ -2543,9 +2543,11 @@ class DegradedFirstPulseTransport(FakeRuntimeTransport):
 class FakeRuntimePlanner:
     def __init__(self):
         self.calls = 0
+        self.contexts = []
 
     def decide(self, **context):
         self.calls += 1
+        self.contexts.append(copy.deepcopy(context))
         if self.calls == 1:
             value = decision_mapping(
                 episode_id=context["episode_id"],
@@ -4085,7 +4087,7 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
                     with self.assertRaises(PhysicalNavigationRuntimeError):
                         execution_contract.parse_description(changed)
 
-    def test_runtime_executes_exact_tail_and_replans_to_finish(self):
+    def test_clear_path_keeps_goal_across_bounded_forward_primitive(self):
         with tempfile.TemporaryDirectory() as directory:
             memory = NavigationMemoryStore.load(
                 path=Path(directory) / "memory.json",
@@ -4127,6 +4129,10 @@ class PhysicalNavigationRuntimeTests(unittest.TestCase):
         self.assertEqual(result.model_calls, 2)
         self.assertTrue(result.shutdown_clean)
         self.assertEqual(planner.calls, 2)
+        self.assertEqual(
+            [item["mission"]["user_goal"] for item in planner.contexts],
+            ["Move forward at least 100 mm"] * 2,
+        )
         self.assertTrue(planner.assert_completed)
         pulse_actions = [
             arguments["action"]

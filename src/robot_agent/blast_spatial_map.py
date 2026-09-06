@@ -22,6 +22,7 @@ from .blast_scan_observation import (
     SCAN_MAX_ABSOLUTE_BEARING_DEG,
     SCAN_RAY_SIDES,
 )
+from .coarse_navigation_grid import coarse_navigation_grid_valid
 from .local_detour_route import (
     ROUTE_ACTIVE,
     ROUTE_COMPLETE,
@@ -248,14 +249,24 @@ def _planned_leg(value) -> bool:
     return False
 
 
+MODEL_WAYPOINT = "MODEL_WAYPOINT"
+
+
 def _route_waypoint(value) -> bool:
+    model_waypoint = isinstance(value, Mapping) and value.get("kind") == MODEL_WAYPOINT
     return (
         _exact(value, (
             "ordinal", "kind", "x_mm", "y_mm", "heading_mdeg",
             "fact_key", "status",
-        ))
+        ) + (("purpose",) if model_waypoint else ()))
         and _integer(value["ordinal"], 0, 8)
-        and value["kind"] in WAYPOINT_KINDS
+        and (model_waypoint or value["kind"] in WAYPOINT_KINDS)
+        and (not model_waypoint or (
+            isinstance(value["purpose"], str)
+            and value["purpose"] == value["purpose"].strip()
+            and 1 <= len(value["purpose"]) <= 120
+            and not any(ord(character) < 32 for character in value["purpose"])
+        ))
         and _integer(value["x_mm"], -1_000_000, 1_000_000)
         and _integer(value["y_mm"], -1_000_000, 1_000_000)
         and _integer(value["heading_mdeg"], -180_000, 179_999)
@@ -395,7 +406,8 @@ def _scan_view(value, now_unix_ms) -> bool:
 
 def _trace_inputs(final_goal, planned_leg, imu_heading,
                   planar_scan_views, now_unix_ms,
-                  local_detour_route=None, advisory_waypoint=None) -> bool:
+                  local_detour_route=None, advisory_waypoint=None,
+                  coarse_grid=None) -> bool:
     try:
         encoded = json.dumps(
             {
@@ -405,6 +417,7 @@ def _trace_inputs(final_goal, planned_leg, imu_heading,
                 "planar_scan_views": planar_scan_views,
                 "local_detour_route": local_detour_route,
                 "advisory_waypoint": advisory_waypoint,
+                "coarse_grid": coarse_grid,
             },
             allow_nan=False,
             ensure_ascii=False,
@@ -419,6 +432,10 @@ def _trace_inputs(final_goal, planned_leg, imu_heading,
         and _advisory_waypoint(advisory_waypoint)
         and _imu_heading(imu_heading, now_unix_ms)
         and _local_detour_route(local_detour_route)
+        and (
+            coarse_grid is None
+            or coarse_navigation_grid_valid(coarse_grid)
+        )
         and isinstance(planar_scan_views, (tuple, list))
         and len(planar_scan_views) <= MAX_PLANAR_SCAN_VIEWS
         and all(_scan_view(view, now_unix_ms) for view in planar_scan_views)
@@ -468,7 +485,7 @@ def _cluster_scan_points(points):
     return clusters
 
 
-def _provisional_obstacle_hypotheses(planar_scan_views):
+def provisional_obstacle_hypotheses(planar_scan_views):
     """Infer bounded echo clusters only from validated projection points."""
 
     values = []
@@ -908,6 +925,7 @@ class BlastSpatialMapBridge:
         imu_heading: Optional[Mapping[str, object]] = None,
         planar_scan_views=(),
         local_detour_route: Optional[Mapping[str, object]] = None,
+        coarse_grid: Optional[Mapping[str, object]] = None,
     ) -> bool:
         now_monotonic = _clock_value(
             "BLAST spatial monotonic clock", self._monotonic_clock_ms
@@ -917,7 +935,7 @@ class BlastSpatialMapBridge:
         )
         if not _trace_inputs(
             final_goal, planned_leg, imu_heading, planar_scan_views, now_unix,
-            local_detour_route, advisory_waypoint,
+            local_detour_route, advisory_waypoint, coarse_grid,
         ):
             raise ValueError("BLAST navigation trace is invalid")
         with self._lock:
@@ -952,7 +970,9 @@ class BlastSpatialMapBridge:
                 ),
                 "planar_scan_views": deepcopy(list(planar_scan_views)),
             }
-            self._object_hypotheses = _provisional_obstacle_hypotheses(
+            if coarse_grid is not None:
+                self._trace["coarse_grid"] = deepcopy(dict(coarse_grid))
+            self._object_hypotheses = provisional_obstacle_hypotheses(
                 planar_scan_views
             )
             self._map_version += 1
@@ -1001,4 +1021,5 @@ __all__ = (
     "NAVIGATION_TRACE_SCHEMA",
     "MAX_PROVISIONAL_OBSTACLE_HYPOTHESES",
     "BlastSpatialMapBridge",
+    "provisional_obstacle_hypotheses",
 )

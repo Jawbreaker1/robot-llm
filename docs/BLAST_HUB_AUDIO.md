@@ -93,9 +93,14 @@ already started.
 
 ## Voice, loudness, and personality
 
-BLAST has an explicit Swedish Piper profile: `lisa-bright` at speed `0.98`.
-This binding exists only in the BLAST dashboard composition; the EV3 and the
-generic Piper defaults remain `nst-deep` at speed `1.0`.
+BLAST has explicit voices of its own: Swedish Piper `lisa-bright` at speed
+`0.98` and the macOS English female voice `Samantha`. These bindings exist
+only in the BLAST dashboard composition; the EV3 and generic speech defaults
+remain unchanged.
+
+Install the two local voice models once with
+`scripts/setup_piper_service.sh`, then start the project-owned loopback service
+with `scripts/start_piper_service.sh` before launching a physical console.
 
 The native ADPCM player already drives the DAC at full numeric scale and does
 not use Pybricks' tone/note volume attenuator. To raise perceived speech

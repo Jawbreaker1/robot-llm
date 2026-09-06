@@ -45,6 +45,7 @@ DRIVE_PULSE_ANGLE_DEG = 90
 TURN_PULSE_SPEED_DPS = 180
 TURN_PULSE_ANGLE_DEG = 45
 SCAN_TURN_PULSE_ANGLE_DEG = 45
+SCAN_TRIM_PULSE_ANGLE_DEG = 15
 CLAW_PULSE_SPEED_DPS = 180
 CLAW_PULSE_DURATION_MS = 500
 BODY_PULSE_SPEED_DPS = 120
@@ -368,8 +369,16 @@ def turn_pulse(direction):
     return fixed_turn_pulse(direction, TURN_PULSE_ANGLE_DEG)
 
 
+def turn_trim_pulse(direction):
+    return fixed_turn_pulse(direction, 15)
+
+
 def scan_turn_pulse(direction):
     return fixed_turn_pulse(direction, SCAN_TURN_PULSE_ANGLE_DEG)
+
+
+def scan_trim_pulse(direction):
+    return fixed_turn_pulse(direction, SCAN_TRIM_PULSE_ANGLE_DEG)
 
 
 def claw_pulse(direction):
@@ -472,9 +481,15 @@ while True:
         elif operation == "turn_pulse":
             arguments = request.get("args", {})
             result = turn_pulse(arguments.get("direction"))
+        elif operation == "turn_trim_pulse":
+            arguments = request.get("args", {})
+            result = turn_trim_pulse(arguments.get("direction"))
         elif operation == "scan_turn_pulse":
             arguments = request.get("args", {})
             result = scan_turn_pulse(arguments.get("direction"))
+        elif operation == "scan_trim_pulse":
+            arguments = request.get("args", {})
+            result = scan_trim_pulse(arguments.get("direction"))
         elif operation == "claw_pulse":
             arguments = request.get("args", {})
             result = claw_pulse(arguments.get("direction"))

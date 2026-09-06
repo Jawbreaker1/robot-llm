@@ -880,6 +880,20 @@ const advisory = {
   purpose: "Pass the obstacle on its open right side",
   source: "GEMMA_MODEL", read_only: true,
 };
+const coarseGrid = {
+  schema: "robot-coarse-navigation-grid/v1",
+  frame: "EPISODE_START", cell_size_mm: 150,
+  top_is: "START_FORWARD", left_is: "START_LEFT",
+  rows: [
+    "...........", "...........", "...........", "...........",
+    ".....G.....", "...........", "......?....", ".....B.....",
+    "...........", "...........", "...........",
+  ],
+  robots: [{ symbol: "B", robot_id: "blast-01", row: 7, column: 5,
+    heading: "UP" }],
+  legend: ".=UNKNOWN o=OBSERVED_CLEAR_RAY #=ROBOT_KEEP_OUT ?=POSSIBLE_OBSTACLE G=GOAL W=WAYPOINT X=GOAL_AND_WAYPOINT x=WAYPOINT_ON_BLOCKED B=BLAST E=EV3 2=BOTH_ROBOTS",
+  cropped: false,
+};
 function mapFor(finalGoal, plannedLeg, advisoryWaypoint = advisory) {
   return {
     schema: "robot-spatial-map/v1",
@@ -901,6 +915,7 @@ function mapFor(finalGoal, plannedLeg, advisoryWaypoint = advisory) {
       final_goal: finalGoal,
       planned_leg: plannedLeg,
       advisory_waypoint: advisoryWaypoint,
+      coarse_grid: coarseGrid,
       imu_heading: null,
       planar_scan_views: [],
     },
@@ -935,12 +950,20 @@ const mismatchedEnforced = logic.normalizeSpatialMap(mapFor(
 const invalidAdvisory = logic.normalizeSpatialMap(mapFor(
   goal, sideSearch, { ...advisory, read_only: false },
 ), 2000).navigationTrace;
+const invalidGridMap = mapFor(goal, sideSearch);
+invalidGridMap.navigation_trace.coarse_grid = {
+  ...coarseGrid, rows: ["not-a-grid"],
+};
+const invalidGrid = logic.normalizeSpatialMap(
+  invalidGridMap, 2000,
+).navigationTrace;
 
 process.stdout.write(JSON.stringify({
   reference: {
     navigationEnforced: reference.finalGoal.navigationEnforced,
     plannedLeg: reference.plannedLeg,
     advisoryWaypoint: reference.advisoryWaypoint,
+    coarseGrid: reference.coarseGrid,
   },
   enforced: {
     navigationEnforced: enforced.finalGoal.navigationEnforced,
@@ -953,6 +976,7 @@ process.stdout.write(JSON.stringify({
   mismatchedReference,
   mismatchedEnforced,
   invalidAdvisory,
+  invalidGrid,
 }));
 """
         completed = subprocess.run(
@@ -984,6 +1008,14 @@ process.stdout.write(JSON.stringify({
             result["reference"]["advisoryWaypoint"]["source"],
             "GEMMA_MODEL",
         )
+        self.assertEqual(
+            result["reference"]["coarseGrid"]["rows"][7],
+            ".....B.....",
+        )
+        self.assertEqual(
+            result["reference"]["coarseGrid"]["robots"][0]["heading"],
+            "UP",
+        )
         self.assertTrue(result["enforced"]["navigationEnforced"])
         self.assertEqual(
             result["enforced"]["plannedLeg"]["kind"],
@@ -1003,12 +1035,13 @@ process.stdout.write(JSON.stringify({
             result["enforced"]["plannedLeg"]["passageProven"]
         )
         self.assertTrue(result["enforced"]["frozen"])
-        self.assertIsNone(result["invalidClaim"])
-        self.assertIsNone(result["invalidKind"])
+        self.assertIsNone(result["invalidClaim"]["plannedLeg"])
+        self.assertIsNone(result["invalidKind"]["plannedLeg"])
         self.assertIsNone(result["invalidEnforcement"])
-        self.assertIsNone(result["mismatchedReference"])
-        self.assertIsNone(result["mismatchedEnforced"])
-        self.assertIsNone(result["invalidAdvisory"])
+        self.assertIsNone(result["mismatchedReference"]["plannedLeg"])
+        self.assertIsNone(result["mismatchedEnforced"]["plannedLeg"])
+        self.assertIsNone(result["invalidAdvisory"]["advisoryWaypoint"])
+        self.assertIsNone(result["invalidGrid"]["coarseGrid"])
 
     def test_shared_map_normalization_fences_frames_and_is_bounded(self):
         script = r"""
@@ -1756,8 +1789,10 @@ process.stdout.write(JSON.stringify({
     extraWaypoint.navigationTrace,
     oversizedVersion.navigationTrace,
   ],
-  traceRangeAccepted: boundaryRanges.map((range) => (
-    normalize(route, obstacle, traceAtRange(range)).navigationTrace !== null
+  traceRangePointCounts: boundaryRanges.map((range) => (
+    normalize(route, obstacle, traceAtRange(range))
+      .navigationTrace.planarScanViews
+      .reduce((count, scanView) => count + scanView.points.length, 0)
   )),
   obstacleRangeAccepted: boundaryRanges.map((range) => (
     normalize(route, obstacleAtRange(range)).objectHypotheses.length === 1
@@ -1795,11 +1830,14 @@ process.stdout.write(JSON.stringify({
         )
         self.assertEqual(result["obstacle"]["sourceScanIds"], ["dense-scan"])
         self.assertTrue(result["frozen"])
-        self.assertIsNone(result["badRoute"])
+        self.assertIsNone(result["badRoute"]["localDetourRoute"])
         self.assertEqual(result["badObstacleCount"], 0)
-        self.assertEqual(result["exactRouteFailures"], [None, None, None])
+        self.assertTrue(all(
+            item["localDetourRoute"] is None
+            for item in result["exactRouteFailures"]
+        ))
         self.assertEqual(
-            result["traceRangeAccepted"], [True, True, False, False]
+            result["traceRangePointCounts"], [1, 1, 0, 0]
         )
         self.assertEqual(
             result["obstacleRangeAccepted"], [True, True, False, False]

@@ -9,10 +9,15 @@ from .blast_observation_monitor import (
 )
 from .physical_navigation_contract import (
     ADVANCE,
+    REVERSE,
     SCAN_FRONT_ARC,
     TURN_LEFT_90,
     TURN_RIGHT_90,
 )
+
+
+class BlastActionEvidenceChanged(RuntimeError):
+    """The selected action no longer matches the latest idle observation."""
 
 
 def _interrupted() -> BlastControllerError:
@@ -25,11 +30,13 @@ def _interrupted() -> BlastControllerError:
 
 def _read_observation(
     adapter, episode_start_heading, motion_executor, cancel_requested,
+    observation=None,
 ):
     if cancel_requested():
         raise _interrupted()
     observation = adapter._with_navigation_reference(
-        adapter._observation(), episode_start_heading,
+        adapter._observation() if observation is None else observation,
+        episode_start_heading,
     )
     observation["odometry"] = motion_executor.pose.to_dict()
     return observation
@@ -40,10 +47,12 @@ def fresh_blast_action_observation(
     motion_executor, cancel_requested, episode_error_type,
     encoder_anchor_correlated, navigation_body_matched,
     allow_no_valid_with_bounded_evidence=False,
+    observation=None,
 ):
     observation = _read_observation(
         adapter, episode_start_heading, motion_executor,
         cancel_requested,
+        observation=observation,
     )
     if not encoder_anchor_correlated(observation, motion_executor):
         raise episode_error_type(
@@ -56,23 +65,26 @@ def fresh_blast_action_observation(
         == RANGE_STATE_NO_VALID_DISTANCE
         and navigation_body_matched(observation["sensors"])
     )
-    exact_nvd_bounded_action = (
+    bounded_evidence_action = (
         allow_no_valid_with_bounded_evidence is True
-        and action in (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90)
-        and blast_range_state(observation["sensors"].get("distance_mm"))
-        == RANGE_STATE_NO_VALID_DISTANCE
         and navigation_body_matched(observation["sensors"])
+        and (
+            action == REVERSE
+            or (
+                action in (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90)
+                and blast_range_state(
+                    observation["sensors"].get("distance_mm")
+                ) == RANGE_STATE_NO_VALID_DISTANCE
+            )
+        )
     )
     if (
         action != SCAN_FRONT_ARC
         and not exact_nvd_scan
-        and not exact_nvd_bounded_action
+        and not bounded_evidence_action
         and not adapter._current_observation_allows_action(action, observation)
     ):
-        raise episode_error_type(
-            "blast_action_start_unverified",
-            "BLAST action lost current motion safety evidence",
-        )
+        raise BlastActionEvidenceChanged
     return observation
 
 
@@ -103,25 +115,8 @@ def admit_blast_spoken_action(
     )
 
 
-def blast_action_phase_flags(
-    side_search_progress, detour_guidance, detour_scan_role, action,
-):
-    return (
-        side_search_progress is not None
-        and side_search_progress["phase"] == "REORIENT"
-        and action in (TURN_LEFT_90, TURN_RIGHT_90),
-        side_search_progress is not None
-        and side_search_progress["phase"] == "RESCAN"
-        and action == SCAN_FRONT_ARC,
-        detour_guidance is not None
-        and detour_scan_role == "PASS" and action == SCAN_FRONT_ARC,
-        detour_guidance is not None
-        and detour_scan_role == "FINAL" and action == SCAN_FRONT_ARC,
-    )
-
-
 __all__ = (
+    "BlastActionEvidenceChanged",
     "admit_blast_spoken_action",
-    "blast_action_phase_flags",
     "fresh_blast_action_observation",
 )

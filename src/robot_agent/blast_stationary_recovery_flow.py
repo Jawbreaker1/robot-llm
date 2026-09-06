@@ -26,7 +26,6 @@ from .blast_stationary_evidence import (
 from .physical_navigation_contract import (
     SCAN_FRONT_ARC,
     TURN_LEFT_90,
-    TURN_RIGHT_90,
 )
 
 
@@ -251,11 +250,12 @@ def collect_episode_stationary_evidence(
 def read_episode_observation(
     adapter, *, context, deadline_ms, initial=False,
     minimum_safe_distance_mm=None,
+    motion_executor=None, episode_start_heading=None,
 ):
-    """Read normally, recovering only an initial stale/offline snapshot."""
+    """Read once; retry missing range without moving or relaxing admission."""
 
     try:
-        return adapter._observation(), None
+        observation = adapter._observation()
     except Exception as error:
         if not initial or getattr(error, "code", None) not in (
             _INITIAL_SOFT_OBSERVATION_ERRORS
@@ -269,38 +269,38 @@ def read_episode_observation(
             return None, recovered.control
         if recovered.observation is None:
             raise error
-        return recovered.observation, None
+        observation = recovered.observation
+    if motion_executor is not None and blast_range_state(
+        observation["sensors"].get("distance_mm")
+    ) == RANGE_STATE_NO_VALID_DISTANCE:
+        recovered = collect_episode_stationary_evidence(
+            adapter, context=context, deadline_ms=deadline_ms,
+            motion_executor=motion_executor,
+            episode_start_heading=episode_start_heading,
+            minimum_safe_distance_mm=0,
+        )
+        if recovered.control is not None:
+            return None, recovered.control
+        if recovered.observation is not None:
+            observation = recovered.observation
+    return observation, None
 
 
 def prepare_blast_iteration_actions(
-    adapter, *, observation, history, selected_detour_side,
-    navigation_state, latest_scan_view, recovery, motion_executor,
+    adapter, *, observation, history, latest_scan_view,
 ):
-    """Apply scan-side and agentic-recovery filters in one reusable step."""
+    """Use the same current-observation admission throughout the episode."""
 
     available_actions = adapter._available_actions(
         observation, history, latest_scan_view,
     )
-    scan_is_current = adapter._scan_is_current(history)
-    scan_allows_turn = (
-        adapter._current_scan_allows_quarter_turn(history)
-        and latest_scan_view is not None
-    )
-    if scan_is_current and not scan_allows_turn:
-        available_actions = tuple(
-            action for action in available_actions
-            if action not in (TURN_LEFT_90, TURN_RIGHT_90)
-        )
-    observation, available_actions = recovery.enrich_planner_iteration(
-        adapter, observation, available_actions,
-        navigation_state, latest_scan_view,
-    )
-    return observation, available_actions, scan_allows_turn
+    turns_available = TURN_LEFT_90 in available_actions
+    return observation, available_actions, turns_available
 
 
 def begin_blast_iteration(
     adapter, *, context, deadline_ms, index, history,
-    selected_detour_side, navigation_state, latest_scan_view, recovery,
+    latest_scan_view,
     motion_executor=None, episode_start_heading=None,
     motion_executor_factory=None, minimum_rotation_clearance_mm=None,
 ):
@@ -310,6 +310,8 @@ def begin_blast_iteration(
         adapter, context=context, deadline_ms=deadline_ms,
         initial=index == 0,
         minimum_safe_distance_mm=minimum_rotation_clearance_mm,
+        motion_executor=motion_executor,
+        episode_start_heading=episode_start_heading,
     )
     if outcome is not None:
         return None, None, None, None, outcome
@@ -323,17 +325,14 @@ def begin_blast_iteration(
         observation, episode_start_heading,
     )
     observation["odometry"] = motion_executor.pose.to_dict()
-    observation, available_actions, scan_allows_turn = (
+    observation, available_actions, turns_available = (
         prepare_blast_iteration_actions(
             adapter, observation=observation, history=history,
-            selected_detour_side=selected_detour_side,
-            navigation_state=navigation_state,
-            latest_scan_view=latest_scan_view, recovery=recovery,
-            motion_executor=motion_executor,
+            latest_scan_view=latest_scan_view,
         )
     )
     return (
-        observation, available_actions, scan_allows_turn,
+        observation, available_actions, turns_available,
         (motion_executor, episode_start_heading), None,
     )
 
@@ -367,8 +366,7 @@ def recover_planner_soft_no_action(
 def recover_planner_iteration_actions(
     adapter, *, observation, available_actions, completion_allowed,
     context, deadline_ms, motion_executor, episode_start_heading,
-    history, selected_detour_side, navigation_state, latest_scan_view,
-    recovery,
+    history, latest_scan_view,
 ):
     """Refresh one planner-owned no-action iteration when evidence is soft."""
 
@@ -389,16 +387,13 @@ def recover_planner_iteration_actions(
         return observation, available_actions, None, recovered.control
     if recovered.observation is None:
         return observation, available_actions, None, None
-    observation, available_actions, scan_allows_turn = (
+    observation, available_actions, turns_available = (
         prepare_blast_iteration_actions(
             adapter, observation=recovered.observation, history=history,
-            selected_detour_side=selected_detour_side,
-            navigation_state=navigation_state,
-            latest_scan_view=latest_scan_view, recovery=recovery,
-            motion_executor=motion_executor,
+            latest_scan_view=latest_scan_view,
         )
     )
-    return observation, available_actions, scan_allows_turn, None
+    return observation, available_actions, turns_available, None
 
 
 def recover_scan_start_observation(

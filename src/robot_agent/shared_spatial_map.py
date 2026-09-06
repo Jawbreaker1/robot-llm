@@ -46,6 +46,7 @@ _NAVIGATION_TRACE_FIELDS = (
     "planar_scan_views",
 )
 _NAVIGATION_TRACE_ROUTE_FIELD = "local_detour_route"
+_NAVIGATION_TRACE_GRID_FIELD = "coarse_grid"
 
 
 class SharedSpatialMapError(ValueError):
@@ -278,10 +279,11 @@ def _transform_navigation_trace(
         return None
     if (
         not isinstance(value, Mapping)
-        or set(value) not in (
-            set(_NAVIGATION_TRACE_FIELDS),
-            set((*_NAVIGATION_TRACE_FIELDS, _NAVIGATION_TRACE_ROUTE_FIELD)),
-        )
+        or not set(_NAVIGATION_TRACE_FIELDS).issubset(value)
+        or set(value) - set(_NAVIGATION_TRACE_FIELDS) - {
+            _NAVIGATION_TRACE_ROUTE_FIELD,
+            _NAVIGATION_TRACE_GRID_FIELD,
+        }
         or value.get("schema") != NAVIGATION_TRACE_SCHEMA
         or value.get("read_only") is not True
     ):
@@ -301,6 +303,7 @@ def _transform_navigation_trace(
         captured_at_unix_ms,
         value.get(_NAVIGATION_TRACE_ROUTE_FIELD),
         value.get("advisory_waypoint"),
+        value.get(_NAVIGATION_TRACE_GRID_FIELD),
     ):
         raise _SourceUnavailable("source_navigation_trace_invalid")
 

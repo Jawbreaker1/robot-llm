@@ -8,7 +8,10 @@ from typing import Mapping
 
 from . import blast_observation_monitor as scan_contract
 from .blast_navigation_calibration import BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-from .blast_scan_observation import SCAN_MAX_ABSOLUTE_BEARING_DEG
+from .blast_scan_observation import (
+    SCAN_ANGULAR_RAY_SIDES,
+    SCAN_MAX_ABSOLUTE_BEARING_DEG,
+)
 from .physical_odometry import PhysicalPose, normalize_heading_mdeg
 
 
@@ -43,7 +46,7 @@ def _headings(scan):
         if ray.get("side", "").startswith("right_")
     ]
     if (
-        not 1 <= len(values) <= 9
+        not 1 <= len(values) <= len(SCAN_ANGULAR_RAY_SIDES)
         or center != 0.0
         or not all(
             -SCAN_MAX_ABSOLUTE_BEARING_DEG <= value < 0.0

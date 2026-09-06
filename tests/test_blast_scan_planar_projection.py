@@ -10,11 +10,16 @@ from robot_agent.blast_observation_monitor import (
     SCAN_RESULT_SCHEMA,
     blast_range_state,
 )
-from robot_agent.blast_scan_observation import SCAN_ANGULAR_RAY_SIDES
 from robot_agent.blast_scan_planar_projection import (
     project_blast_scan_planar_surfaces,
 )
 from robot_agent.physical_odometry import PhysicalPose
+
+
+DENSE_NINE_SIDES = (
+    "center", "left_1", "left_2", "left_3", "left_4",
+    "right_1", "right_2", "right_3", "right_4",
+)
 
 
 def scan_result(ranges=(300.0, 2_000.0, 2_000.0, 2_000.0, 2_000.0)):
@@ -107,7 +112,7 @@ def dense_scan_result(ranges, relative):
             "observation_settled": True,
         }
         for side, distance, heading in zip(
-            SCAN_ANGULAR_RAY_SIDES, ranges, relative,
+            DENSE_NINE_SIDES, ranges, relative,
         )
     ]
     value["rays"] = [
@@ -186,7 +191,7 @@ class BlastScanPlanarProjectionTests(TestCase):
 
         self.assertEqual(
             [point["side"] for point in points],
-            list(SCAN_ANGULAR_RAY_SIDES),
+            list(DENSE_NINE_SIDES),
         )
         right_three = points[7]
         self.assertEqual(

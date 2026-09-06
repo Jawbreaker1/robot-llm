@@ -1,4 +1,4 @@
-"""Fail-closed BLAST post-pulse turn continuation policy."""
+"""Bounded BLAST post-pulse turn continuation policy."""
 
 from collections.abc import Mapping
 
@@ -17,7 +17,7 @@ def blast_turn_slice_allows_continuation(
     *,
     allow_no_valid_distance_with_bounded_evidence=False,
 ) -> bool:
-    """Admit another pulse only from monitor-verified rotation telemetry.
+    """Admit another bounded pulse while coarse live evidence remains clear.
 
     The opt-in is bounded scan/route turn eligibility for a no-return echo,
     never a claim that geometric clearance has been proved.
@@ -29,10 +29,7 @@ def blast_turn_slice_allows_continuation(
     ):
         return False
     sensors = command_result.get("observation")
-    if not (
-        isinstance(sensors, Mapping)
-        and sensors.get("rotation_sweep_window_verified") is True
-    ):
+    if not isinstance(sensors, Mapping):
         return False
     motors = sensors.get("motor_angles_deg") if isinstance(
         sensors, Mapping

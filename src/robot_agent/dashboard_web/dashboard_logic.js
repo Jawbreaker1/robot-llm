@@ -24,6 +24,9 @@
   const MAX_SCAN_EVIDENCE = 64;
   const MAX_SCAN_RAYS_PER_EVIDENCE = 16;
   const NAVIGATION_TRACE_SCHEMA = "robot-navigation-trace/v1";
+  const COARSE_NAVIGATION_GRID_SCHEMA = (
+    "robot-coarse-navigation-grid/v1"
+  );
   const BLAST_SCAN_PROJECTION_SCHEMA = (
     "blast-planar-scan-projection/v1"
   );
@@ -146,6 +149,101 @@
       return null;
     }
     return Object.freeze({ xMm, yMm, headingMdeg });
+  }
+
+  function normalizeCoarseNavigationGrid(value) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    const grid = record(value);
+    const rows = grid.rows;
+    const robots = grid.robots;
+    const rawWindow = grid.window === undefined ? {
+      x_min_mm: -450, x_max_mm: 1050,
+      y_min_mm: -750, y_max_mm: 750,
+    } : record(grid.window);
+    const windowValues = [
+      rawWindow.x_min_mm, rawWindow.x_max_mm,
+      rawWindow.y_min_mm, rawWindow.y_max_mm,
+    ];
+    if (
+      grid.schema !== COARSE_NAVIGATION_GRID_SCHEMA
+      || grid.frame !== "EPISODE_START"
+      || grid.cell_size_mm !== 150
+      || grid.top_is !== "START_FORWARD"
+      || grid.left_is !== "START_LEFT"
+      || !windowValues.every((item) => (
+        Number.isSafeInteger(item) && item % 150 === 0
+      ))
+      || rawWindow.x_max_mm - rawWindow.x_min_mm !== 1500
+      || rawWindow.y_max_mm - rawWindow.y_min_mm !== 1500
+      || grid.cropped !== Boolean(grid.cropped)
+      || typeof grid.legend !== "string"
+      || !Array.isArray(rows)
+      || rows.length !== 11
+      || !rows.every((row) => (
+        typeof row === "string"
+        && row.length === 11
+        && /^[.o#?GgWXxEB2]+$/.test(row)
+      ))
+      || !Array.isArray(robots)
+      || robots.length < 1
+      || robots.length > 2
+    ) {
+      return undefined;
+    }
+    const normalizedRobots = robots.map((value) => {
+      const robot = record(value);
+      const row = robot.row;
+      const column = robot.column;
+      const offGrid = row === null && column === null;
+      if (
+        !["B", "E"].includes(robot.symbol)
+        || !["blast-01", "ev3rstorm-01"].includes(robot.robot_id)
+        || !["UP", "LEFT", "DOWN", "RIGHT"].includes(robot.heading)
+        || (
+          !offGrid
+          && !(
+            Number.isSafeInteger(row) && row >= 0 && row < 11
+            && Number.isSafeInteger(column)
+            && column >= 0 && column < 11
+          )
+        )
+      ) {
+        return null;
+      }
+      return Object.freeze({
+        symbol: robot.symbol,
+        robotId: robot.robot_id,
+        row,
+        column,
+        heading: robot.heading,
+      });
+    });
+    if (
+      normalizedRobots.some((robot) => robot === null)
+      || new Set(normalizedRobots.map((robot) => robot.symbol)).size
+        !== normalizedRobots.length
+    ) {
+      return undefined;
+    }
+    return Object.freeze({
+      schema: COARSE_NAVIGATION_GRID_SCHEMA,
+      frame: "EPISODE_START",
+      cellSizeMm: 150,
+      topIs: "START_FORWARD",
+      leftIs: "START_LEFT",
+      window: Object.freeze({
+        xMinMm: rawWindow.x_min_mm,
+        xMaxMm: rawWindow.x_max_mm,
+        yMinMm: rawWindow.y_min_mm,
+        yMaxMm: rawWindow.y_max_mm,
+      }),
+      rows: Object.freeze([...rows]),
+      robots: Object.freeze(normalizedRobots),
+      legend: grid.legend,
+      cropped: grid.cropped,
+    });
   }
 
   function normalizeFinalGoal(value, geometryToleranceMm = 1.5) {
@@ -350,16 +448,17 @@
       trace.final_goal,
       geometryToleranceMm,
     );
-    const imuHeading = normalizeImuHeading(trace.imu_heading, nowUnixMs);
-    const plannedLeg = normalizePlannedLeg(trace.planned_leg);
-    const localDetourRoute = blastMapSemantics.normalizeRoute(
+    let imuHeading = normalizeImuHeading(trace.imu_heading, nowUnixMs);
+    let plannedLeg = normalizePlannedLeg(trace.planned_leg);
+    let localDetourRoute = blastMapSemantics.normalizeRoute(
       trace.local_detour_route,
-      { record, identifier, nonnegativeInteger, normalizeTracePose },
+      { record, identifier, nonnegativeInteger, normalizeTracePose, strictText },
     );
-    const advisoryWaypoint = blastMapSemantics.normalizeAdvisoryWaypoint(
+    let advisoryWaypoint = blastMapSemantics.normalizeAdvisoryWaypoint(
       trace.advisory_waypoint,
       { record, coordinate: localCoordinate, strictText },
     );
+    let coarseGrid = normalizeCoarseNavigationGrid(trace.coarse_grid);
     const transformProvenance = shared
       ? trace.transform_provenance
       : null;
@@ -390,24 +489,27 @@
         !== "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY"
       || !sharedIdentityValid
       || finalGoal === null
-      || imuHeading === undefined
-      || plannedLeg === undefined
-      || localDetourRoute === undefined
-      || advisoryWaypoint === undefined
-      || (
-        plannedLeg?.scope === "SEARCH_POSITION_ONLY"
-        && finalGoal.navigationEnforced !== false
-      )
-      || (
-        plannedLeg?.scope === "LOCAL_DETOUR_ROUTE"
-        && finalGoal.navigationEnforced !== true
-      )
       || !Array.isArray(trace.planar_scan_views)
       || trace.planar_scan_views.length > MAX_NAVIGATION_SCAN_VIEWS
     ) {
       return null;
     }
-    const planarScanViews = trace.planar_scan_views.map((scan) => (
+    const plannedLegMatchesGoal = !plannedLeg || (
+      plannedLeg.scope === "SEARCH_POSITION_ONLY"
+      && finalGoal.navigationEnforced === false
+    ) || (
+      plannedLeg.scope === "LOCAL_DETOUR_ROUTE"
+      && finalGoal.navigationEnforced === true
+    );
+    const optionalFieldsValid = (
+      imuHeading !== undefined
+      && plannedLeg !== undefined
+      && plannedLegMatchesGoal
+      && localDetourRoute !== undefined
+      && advisoryWaypoint !== undefined
+      && coarseGrid !== undefined
+    );
+    const normalizedScanViews = trace.planar_scan_views.map((scan) => (
       normalizePlanarScanView(
         scan,
         nowUnixMs,
@@ -416,13 +518,33 @@
         geometryToleranceMm,
       )
     ));
-    if (
-      planarScanViews.some((scan) => scan === null)
-      || new Set(planarScanViews.map((scan) => scan.scanId)).size
-        !== planarScanViews.length
-    ) {
+    const scansValid = (
+      normalizedScanViews.every((scan) => scan !== null)
+      && new Set(normalizedScanViews.map((scan) => scan.scanId)).size
+        === normalizedScanViews.length
+    );
+    if (shared && (!optionalFieldsValid || !scansValid)) {
       return null;
     }
+    if (!shared) {
+      imuHeading = imuHeading === undefined ? null : imuHeading;
+      plannedLeg = (
+        plannedLeg === undefined || !plannedLegMatchesGoal
+      ) ? null : plannedLeg;
+      localDetourRoute = localDetourRoute === undefined
+        ? null : localDetourRoute;
+      advisoryWaypoint = advisoryWaypoint === undefined
+        ? null : advisoryWaypoint;
+      coarseGrid = coarseGrid === undefined ? null : coarseGrid;
+    }
+    const seenScanIds = new Set();
+    const planarScanViews = normalizedScanViews.filter((scan) => {
+      if (scan === null || seenScanIds.has(scan.scanId)) {
+        return false;
+      }
+      seenScanIds.add(scan.scanId);
+      return true;
+    });
     return Object.freeze({
       schema: NAVIGATION_TRACE_SCHEMA,
       readOnly: true,
@@ -447,6 +569,7 @@
       plannedLeg,
       advisoryWaypoint,
       localDetourRoute,
+      coarseGrid,
       planarScanViews: Object.freeze(planarScanViews),
     });
   }
