@@ -5,7 +5,7 @@ project_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 model_directory="${ROBOT_LLM_PIPER_MODEL_DIR-$project_root/models/piper}"
 port="${ROBOT_LLM_PIPER_PORT-8179}"
 
-for voice in sv_SE-lisa-medium sv_SE-nst-medium; do
+for voice in en_GB-cori-high sv_SE-lisa-medium sv_SE-nst-medium; do
     if [ ! -f "$model_directory/$voice.onnx" ] || \
        [ ! -f "$model_directory/$voice.onnx.json" ]; then
         echo "Piper model is missing: $voice" >&2

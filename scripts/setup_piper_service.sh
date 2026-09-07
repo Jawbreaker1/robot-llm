@@ -8,5 +8,6 @@ mkdir -p "$model_directory"
 exec uvx --from 'piper-tts==1.4.2' \
     python -m piper.download_voices \
     --data-dir "$model_directory" \
+    en_GB-cori-high \
     sv_SE-lisa-medium \
     sv_SE-nst-medium

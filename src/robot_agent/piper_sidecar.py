@@ -1,4 +1,4 @@
-"""Small loopback Piper service for the two physical robot voices."""
+"""Small loopback Piper service for the physical robots' voices."""
 
 from __future__ import annotations
 
@@ -32,6 +32,12 @@ class VoiceVariant:
 
 
 VOICE_VARIANTS = {
+    "cori-high": VoiceVariant(
+        "en_GB-cori-high",
+        1.0,
+        0.667,
+        0.8,
+    ),
     "lisa-bright": VoiceVariant(
         "sv_SE-lisa-medium",
         1.04,

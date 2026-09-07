@@ -30,7 +30,6 @@ from .blast_episode_adapter import (
     BlastEpisodeRuntimeAdapter,
 )
 from .blast_hub_speech import (
-    BLAST_ENGLISH_VOICE,
     BLAST_PIPER_PROFILE,
     BlastHubSpeaker,
 )
@@ -62,8 +61,6 @@ from .navigation_diagnostics import (
     record_navigation_diagnostic,
 )
 from .host_piper_speech import (
-    LocaleSpeechSynthesizer,
-    MacOSSayWAVSynthesizer,
     PiperLoopbackSynthesizer,
 )
 from .robot_control_contract import (
@@ -697,15 +694,8 @@ def _configured_blast_runtime_adapter(args, blast_monitor):
         )
 
     def speech_runtime_factory(*, event_sink):
-        synthesizer = LocaleSpeechSynthesizer(
-            {
-                "sv": PiperLoopbackSynthesizer(
-                    profile=BLAST_PIPER_PROFILE,
-                ),
-                "en": MacOSSayWAVSynthesizer(
-                    voice=BLAST_ENGLISH_VOICE,
-                ),
-            }
+        synthesizer = PiperLoopbackSynthesizer(
+            profile=BLAST_PIPER_PROFILE,
         )
         return RobotSpeechRuntime(
             speaker=BlastHubSpeaker(

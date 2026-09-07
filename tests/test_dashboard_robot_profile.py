@@ -344,17 +344,9 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 return_value=planner,
             ) as planner_type,
             mock.patch(
-                "robot_agent.dashboard_cli.LocaleSpeechSynthesizer",
-                return_value=synthesizer,
-            ) as synthesizer_type,
-            mock.patch(
                 "robot_agent.dashboard_cli.PiperLoopbackSynthesizer",
-                return_value="piper",
+                return_value=synthesizer,
             ) as piper_type,
-            mock.patch(
-                "robot_agent.dashboard_cli.MacOSSayWAVSynthesizer",
-                return_value="say-wav",
-            ) as english_synthesizer_type,
             mock.patch(
                 "robot_agent.dashboard_cli.BlastHubSpeaker",
                 return_value=speaker,
@@ -404,14 +396,8 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 runtime_factory(event_sink=event_sink),
                 speech_runtime,
             )
-            synthesizer_type.assert_called_once_with(
-                {"sv": "piper", "en": "say-wav"}
-            )
             piper_type.assert_called_once_with(
                 profile=BLAST_PIPER_PROFILE,
-            )
-            english_synthesizer_type.assert_called_once_with(
-                voice="Samantha",
             )
             speaker_type.assert_called_once_with(
                 synthesizer,

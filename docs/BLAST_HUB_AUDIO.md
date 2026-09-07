@@ -93,14 +93,26 @@ already started.
 
 ## Voice, loudness, and personality
 
-BLAST has explicit voices of its own: Swedish Piper `lisa-bright` at speed
-`0.98` and the macOS English female voice `Samantha`. These bindings exist
-only in the BLAST dashboard composition; the EV3 and generic speech defaults
-remain unchanged.
+BLAST uses local Piper for both languages: Swedish `lisa-bright` and English
+`cori-high` (`en_GB-cori-high`), at speed `0.98`. Cori is a single-speaker UK
+English female voice trained at high quality on public-domain LibriVox
+recordings; see its [model card](https://huggingface.co/rhasspy/piper-voices/blob/main/en/en_GB/cori/high/MODEL_CARD).
+The September 7 correction removes BLAST's separate macOS/Samantha binding;
+there is no silent macOS fallback. EV3 and generic speech defaults are unchanged.
+Piper's existing API model identifier remains `piper-sv` for compatibility,
+but the explicit voice name selects the language model.
 
-Install the two local voice models once with
+Install the three local voice models once with
 `scripts/setup_piper_service.sh`, then start the project-owned loopback service
 with `scripts/start_piper_service.sh` before launching a physical console.
+
+September 7 validation: 76 focused speech/profile/console tests passed. Three
+actual Cori utterances and one Swedish Lisa utterance were synthesized through
+the production Piper profile and converted by BLAST's existing ADPCM encoder.
+Cori synthesis took 0.28–0.95 seconds for these samples; encoded duration was
+2.32–4.50 seconds, within the unchanged eight-second hub limit. Samples are kept
+locally under `local-artifacts/blast-voice-20260907/`. This verifies synthesis
+and transport format, not a new physical listening test through the hub speaker.
 
 The native ADPCM player already drives the DAC at full numeric scale and does
 not use Pybricks' tone/note volume attenuator. To raise perceived speech

@@ -10,7 +10,21 @@ from robot_agent.piper_sidecar import (
 
 class PiperSidecarTests(unittest.TestCase):
     def test_robot_voice_contract_is_small_and_explicit(self):
-        self.assertEqual(set(VOICE_VARIANTS), {"lisa-bright", "nst-deep"})
+        self.assertEqual(
+            set(VOICE_VARIANTS), {"lisa-bright", "nst-deep", "cori-high"}
+        )
+        self.assertEqual(VOICE_VARIANTS["cori-high"].model_name, "en_GB-cori-high")
+        self.assertEqual(
+            parse_synthesis_request({
+                "model": "piper-sv",
+                "input": "Nice try, box. I found a way around you!",
+                "voice": "cori-high",
+                "speed": 0.98,
+            }),
+            SynthesisRequest(
+                "Nice try, box. I found a way around you!", "cori-high", 0.98,
+            ),
+        )
         self.assertEqual(
             parse_synthesis_request(
                 {

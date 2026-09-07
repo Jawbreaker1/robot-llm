@@ -20,12 +20,11 @@ from .host_piper_speech import (
 BLAST_ADPCM_SAMPLE_RATE_HZ = 16_000
 BLAST_ADPCM_MAX_SAMPLES = 128_000
 BLAST_ADPCM_HEADER_BYTES = 7
-BLAST_ENGLISH_VOICE = "Samantha"
 BLAST_ADPCM_MAX_BYTES = (
     BLAST_ADPCM_HEADER_BYTES + BLAST_ADPCM_MAX_SAMPLES // 2
 )
 BLAST_PIPER_PROFILE = PiperSpeechProfile(
-    voices=(("sv", "lisa-bright"),),
+    voices=(("sv", "lisa-bright"), ("en", "cori-high")),
     speed=0.98,
 )
 
@@ -258,7 +257,6 @@ __all__ = (
     "BLAST_ADPCM_MAX_BYTES",
     "BLAST_ADPCM_MAX_SAMPLES",
     "BLAST_ADPCM_SAMPLE_RATE_HZ",
-    "BLAST_ENGLISH_VOICE",
     "BLAST_PIPER_PROFILE",
     "BlastADPCM",
     "BlastHubSpeaker",

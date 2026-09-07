@@ -27,6 +27,11 @@ window and at most two concurrent requests. Robot dialogue and navigation
 utterances use English because this Qwen build is materially less reliable in
 Swedish; the dashboard itself remains bilingual.
 
+BLAST's speech is generated locally by Piper in both languages: the female
+British-English `en_GB-cori-high` voice and Swedish `lisa-bright`. Her English
+speech no longer uses the macOS system voice. The same BLAST personality and
+hub speaker remain in use; see [voice setup](docs/BLAST_HUB_AUDIO.md#voice-loudness-and-personality).
+
 <p align="center">
   <img src="src/robot_agent/dashboard_web/robot-llm-mascot.png" alt="Robot LLM Lab's mildly grumpy modular mascot waving" width="280">
 </p>
@@ -65,13 +70,29 @@ or language-specific command menus. The model never receives raw motor access.
 | Status | Capabilities |
 |---|---|
 | Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
-| Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, persistent telemetry, bounded actions, interruptible stop, and a model-directed act → observe → replan loop with two-sided distance scans |
+| Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, persistent telemetry, bounded actions, interruptible stop, model-directed navigation with distance scans, and an operator-confirmed box detour to the goal |
 | Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, route-free shared-world simulation, per-run physical navigation memory, multi-controller telemetry and connection controls, and agent-directed BLAST episodes |
 | Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
 | Planned | Repeatable autonomous obstacle navigation, richer Robot Inventor goals, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
 
 EV3 obstacle navigation has succeeded in an operator-confirmed physical trial;
 repeatability and broader acceptance runs remain experimental.
+
+### Physical navigation milestone — September 7, 2026
+
+**BLAST has now driven around a real box and stopped at the intended goal.**
+Qwen3.8 selected the route and waypoints toward a goal initially 800 mm ahead
+of the starting position. The operator independently confirmed arrival beyond
+the box; the final estimated distance to the goal was 27 mm. BLAST also
+recovered from an incomplete scan and continued the same mission to completion.
+
+This is a physically verified single-box baseline, not yet proof of repeatable
+navigation through arbitrary rooms or simultaneous multi-robot navigation.
+The plotted return leg looked more diagonal than the operator observed, so a
+remaining map/heading discrepancy is documented for follow-up. See the
+[physical validation report](docs/NAVIGATION_VALIDATION_20260905.md#physical-acceptance-after-reload--september-7).
+
+### Current mapping and robot scope
 
 The current EV3 map is intentionally qualitative. IR reflection can support
 obstacle hypotheses, but it is not vision, object recognition, or precise
@@ -83,8 +104,9 @@ dashboard's physical agent profile. Qwen3.8 chooses typed plans and actions;
 the host executes it through the existing bounded BLE controller, feeds the
 fresh observation back to the model, and repeats until completion or abort.
 The first slice supports drive, turn, and gyro-measured two-sided scan
-decisions. Multi-step obstacle navigation is experimental; manipulation goals
-remain future work for this profile.
+decisions. A multi-step box detour has now been physically verified; repeatability
+and broader obstacle courses remain experimental. Manipulation goals remain
+future work for this profile.
 
 ## Architecture
 
