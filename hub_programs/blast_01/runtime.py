@@ -6,7 +6,7 @@ import json
 import pybricks
 from pybricks.hubs import InventorHub
 from pybricks.messaging import AppData
-from pybricks.parameters import Stop
+from pybricks.parameters import Color, Side, Stop
 from pybricks.pupdevices import ColorSensor, Motor, UltrasonicSensor
 from pybricks.tools import StopWatch, wait
 from uselect import poll
@@ -50,6 +50,22 @@ CLAW_PULSE_SPEED_DPS = 180
 CLAW_PULSE_DURATION_MS = 500
 BODY_PULSE_SPEED_DPS = 120
 BODY_PULSE_DURATION_MS = 900
+FACE_PATTERNS = {
+    "neutral": ("00000", "11011", "11011", "11011", "00000"),
+    "happy": ("00000", "01010", "10101", "00000", "00000"),
+    "frustrated": ("10001", "11011", "01010", "00000", "00000"),
+    "curious": ("00011", "11011", "11011", "11000", "00000"),
+    "surprised": ("11011", "11011", "11011", "11011", "00000"),
+    # The monochrome matrix reads better as one large frown than a white X.
+    "angry": ("00000", "01110", "10001", "10001", "00000"),
+}
+# A blink and small eye movements, not a scan or a change of emotion.
+IDLE_EYE_PATTERNS = (
+    FACE_PATTERNS["neutral"],
+    ("00000", "00000", "11011", "00000", "00000"),
+    ("00000", "10010", "10010", "10010", "00000"),
+    ("00000", "01001", "01001", "01001", "00000"),
+)
 
 hub = InventorHub(
     top_side=HUB_TOP_SIDE,
@@ -73,6 +89,10 @@ motors = {
     ),
     "body": Motor(BODY_PORT, reset_angle=False),
 }
+# The default 8-degree integral dead zone leaves the geared sensor arm short
+# of its reference. Let the motor's own controller finish the return pose.
+motors["body"].control.pid(integral_deadzone=1)
+motors["body"].control.target_tolerances(position=1)
 color_sensor = ColorSensor(COLOR_SENSOR_PORT)
 ultrasonic_sensor = UltrasonicSensor(ULTRASONIC_SENSOR_PORT)
 incoming = poll()
@@ -381,6 +401,54 @@ def scan_trim_pulse(direction):
     return fixed_turn_pulse(direction, SCAN_TRIM_PULSE_ANGLE_DEG)
 
 
+def set_pose(role, target_angle_deg):
+    """Position one accessory motor without resetting any encoder or IMU."""
+    if role not in ("body", "claw"):
+        raise ValueError("pose motor must be body or claw")
+    if type(target_angle_deg) is not int or not -1000000 <= target_angle_deg <= 1000000:
+        raise ValueError("pose target must be an integer angle")
+    if not all(motor.done() for motor in motors.values()):
+        raise ValueError("motors must be idle before setting a pose")
+    motor = motors[role]
+    before = motor.angle()
+    # BLAST's geared arm needs ~800 motor degrees for its full excursion.
+    # These are motor angles, not arm angles; the claw has a different linkage.
+    max_travel = 900 if role == "body" else 180
+    if abs(target_angle_deg - before) > max_travel:
+        raise ValueError("pose target exceeds accessory travel")
+    motor.run_target(500 if role == "body" else 180, target_angle_deg,
+                     then=Stop.HOLD, wait=False)
+    return {
+        "accepted": True,
+        "motor": role,
+        "before_angle_deg": before,
+        "target_angle_deg": target_angle_deg,
+    }
+
+
+def show_face(expression):
+    if expression not in FACE_PATTERNS and expression != "idle":
+        raise ValueError("unknown face expression")
+    # The display is mounted sideways in BLAST; do not rotate the IMU frame.
+    hub.display.orientation(up=Side.RIGHT)
+    hub.display.off()  # Replace any previous animation immediately.
+    if expression == "idle":
+        frames = [
+            [[100 if pixel == "1" else 0 for pixel in row] for row in pattern]
+            for pattern in IDLE_EYE_PATTERNS
+        ]
+        sequence = (frames[0:1] * 24 + frames[1:2] + frames[0:1] * 15
+                    + frames[2:3] * 8 + frames[0:1] * 10
+                    + frames[3:4] * 8 + frames[0:1] * 10 + frames[1:2])
+        hub.display.animate(sequence, interval=150)
+    else:
+        hub.display.icon([
+            [100 if pixel == "1" else 0 for pixel in row]
+            for row in FACE_PATTERNS[expression]
+        ])
+    return {"accepted": True, "expression": expression}
+
+
 def claw_pulse(direction):
     if direction not in ("open", "close"):
         raise ValueError("direction must be open or close")
@@ -436,6 +504,9 @@ def body_pulse(direction):
 
 
 wait(500)
+# Reserve the matrix for eyes; the button light indicates the active runtime.
+show_face("idle")
+hub.light.on(Color.GREEN)
 emit(
     {
         "type": "ready",
@@ -496,6 +567,12 @@ while True:
         elif operation == "body_pulse":
             arguments = request.get("args", {})
             result = body_pulse(arguments.get("direction"))
+        elif operation == "set_pose":
+            arguments = request.get("args", {})
+            result = set_pose(arguments.get("motor"), arguments.get("target_angle_deg"))
+        elif operation == "show_face":
+            arguments = request.get("args", {})
+            result = show_face(arguments.get("expression"))
         elif operation == "play_pcm":
             arguments = request.get("args", {})
             phase = arguments.get("phase")

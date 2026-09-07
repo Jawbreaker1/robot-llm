@@ -105,7 +105,7 @@ class RobotTurnSpeechSink:
         self._progress_revision = 0
         runtime.start()
 
-    def submit(self, request_id: str, text: str, locale: str) -> bool:
+    def submit(self, request_id: str, text: str, locale: str, *, expression=None) -> bool:
         try:
             _validate_request_id(request_id)
             with self._lock:
@@ -117,6 +117,7 @@ class RobotTurnSpeechSink:
                     text=text,
                     locale=locale,
                     progress_revision=self._progress_revision,
+                    **({"expression": expression} if expression is not None else {}),
                 )
             return True
         except RobotSpeechRuntimeError:

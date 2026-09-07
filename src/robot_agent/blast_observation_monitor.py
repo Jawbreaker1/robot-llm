@@ -93,6 +93,13 @@ SAMPLED_AUDIO_MAX_TOTAL_SECONDS = 15.0 * 60.0
 SCAN_COMMAND = "scan_front_arc"
 SURROUNDINGS_SCAN_COMMAND = "scan_surroundings"
 SETTLED_OBSERVATION_COMMAND = "observe_settled"
+# Offsets from the navigation body reference, or the observed claw position.
+# These are motor angles for BLAST's linkage, not angles of the arms.
+GESTURE_POSES = {
+    "claw_snap": (("claw", 45), ("claw", 0)),
+    "arm_wave": (("body", -600), ("body", 0)),
+    "claw_flourish": (("body", -600), ("claw", 45), ("claw", 0), ("body", 0)),
+}
 COMMANDS = {
     "drive_forward": ("drive_pulse", "forward"),
     "drive_reverse": ("drive_pulse", "reverse"),
@@ -108,6 +115,10 @@ COMMANDS = {
     SURROUNDINGS_SCAN_COMMAND: (None, None),
     SETTLED_OBSERVATION_COMMAND: (None, None),
     "stop": ("stop", None),
+    **{gesture: (None, None) for gesture in GESTURE_POSES},
+    **{"face_" + face: ("show_face", face) for face in (
+        "idle", "neutral", "happy", "frustrated", "curious", "surprised", "angry",
+    )},
 }
 NAVIGATION_MOTION_COMMANDS = {
     "drive_forward",
@@ -1672,6 +1683,17 @@ class BlastObservationMonitor:
             )
         if command == SETTLED_OBSERVATION_COMMAND:
             receipt = {"motion_started": False}
+        elif command in GESTURE_POSES:
+            before = await runtime.observe()
+            if before.get("motion_active") is not False:
+                raise BlastControllerError("controller_busy", "BLAST is moving")
+            reference = {
+                "claw": before["motor_angles_deg"]["claw"],
+                "body": BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics.navigation_body_motor_angle_deg,
+            }
+            for role, offset in GESTURE_POSES[command]:
+                receipt = await runtime.set_pose(role, reference[role] + offset)
+                await self._observe_until_idle(runtime, generation=generation, stop_only=False)
         else:
             operation, direction = COMMANDS[command]
             method = getattr(runtime, operation)

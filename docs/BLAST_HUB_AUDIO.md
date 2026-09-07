@@ -13,7 +13,8 @@ hub.speaker.done()
 hub.speaker.stop()
 ```
 
-Production speech uses the compressed streaming API:
+Production speech uploads one compressed utterance at a time, then uses this
+playback API (the internal decoder streams to the DAC, not over Bluetooth):
 
 ```python
 hub.speaker.play_adpcm(
@@ -177,6 +178,61 @@ make -C bricks/primehub clean all
 The package is written to `bricks/primehub/build/firmware.zip`. Keep a clean
 v4.0.1 rollback package while validating the custom build. Never flash during
 an active navigation episode.
+
+## v7 repeat-utterance buffer release (2026-09-07)
+
+Two physical speech/eye demos played the first utterance but failed when
+allocating the next 64,008-byte AppData copy. The native speaker cleared its
+Python `sample_data` reference on completion, but retained the raw
+`adpcm_state.data` pointer. MicroPython's conservative collector scans native
+heap objects too, so that pointer still kept the previous payload alive.
+
+The correction clears that pointer alongside the existing Python-reference
+cleanup: construction, stop, playback completion, `done()`, and replacement
+by beeps/notes. It adds six C assignments. The audio format, eight-second
+limit, one-utterance transport, DMA buffer, voice and navigation are unchanged.
+
+One regression test compiles the actual patched native completion/stop
+functions with hardware stubs. It fails with the old patch and passes with
+the correction, checking both references over 20 cycles and retaining them
+while playback is active. All 48 focused speech/runtime/expression tests pass.
+This checks native reference cleanup, not the physical hub's complete heap.
+
+Built from the same pinned v4.0.1 commit with Arm GNU Toolchain 13.3 and firmware
+warnings as errors. The host-only mpy-cross build needs
+`CFLAGS_EXTRA=-Wno-gnu-folding-constant` with this Mac's Apple Clang.
+
+```text
+firmware patch SHA-256: fbc2dc889cb3adf79c2a6b2fd871de94c0727835d0e79b1576f1676d71564dbc
+firmware.zip SHA-256: fec370ff57b92fcd80e6e84c5bfbbee23c1e3427488ed5f31492da6ae92ee856
+firmware-base.bin SHA-256: 416df436902eb720de88902bff8d0157dd2b391b0f52097beb3b33654669e06c
+local artifact: local-artifacts/firmware/blast-audio-v7/blast-primehub-v4.0.1-v7-audio-release.zip
+```
+
+The same directory also holds `blast-primehub-v4.0.1-v6-rollback-rebuilt.zip`,
+rebuilt from the committed pre-fix patch against the same upstream source.
+Its ZIP SHA-256 is
+`1363aedf3d33360ee7a3bac15a770faec417861e81a11ff50f508c7fec9dee25`.
+This is a newly built rollback package, not the historical August binary.
+
+Status: installed through USB DFU on BLAST-01 on 2026-09-07; the flasher
+completed successfully and retained the `BLAST-01` name. The same four-utterance
+Cori/eyes probe then completed in one BLE session (exit 0): all four audio
+starts were acknowledged, including the second utterance that previously
+failed twice. Durations were 3312, 2032, 3648 and 3104 ms; no allocation error
+or disconnect occurred. Observation also succeeded during the idle animation
+and after playback. Both drive encoders were unchanged and body angle remained
+158 degrees, matching the existing navigation sensor reference. No motor
+commands were sent.
+
+This physically reproduces and passes the formerly failing repeat-utterance
+sequence; it is not an unlimited-duration memory stress test. The operator
+confirmed all four lines and the correctly oriented eyes/idle animation worked
+very well, and remarked on the fast delivery. The probe synthesizes its scripted
+lines before connecting and sends compressed utterances; it does not measure
+Qwen-to-speech response latency. This correction does not change transfer speed.
+Evidence: `/tmp/blast-audio-v7-flash-20260907.log`,
+`/tmp/blast-face-speech-v7-20260907.jsonl` and its `.stderr` companion.
 
 ## Hardware acceptance
 

@@ -5,8 +5,10 @@ from __future__ import annotations
 from array import array
 from dataclasses import dataclass
 import io
+import logging
 import sys
 import threading
+import time
 import wave
 
 from .blast_ble_runtime import blast_adpcm_duration_ms
@@ -29,6 +31,7 @@ BLAST_PIPER_PROFILE = PiperSpeechProfile(
 )
 
 _PCM16_MAX = 32_767
+logger = logging.getLogger(__name__)
 
 _IMA_INDEX_CHANGES = (-1, -1, -1, -1, 2, 4, 6, 8)
 _IMA_STEP_SIZES = (
@@ -197,15 +200,16 @@ def pcm16_wav_to_blast_adpcm(
 class BlastHubSpeaker:
     """Preload one bounded utterance, then play it through BLAST's hub."""
 
-    def __init__(self, synthesizer, controller):
+    def __init__(self, synthesizer, controller, *, gesture_allowed=None):
         if not callable(getattr(synthesizer, "synthesize", None)) or not callable(
             getattr(controller, "play_pcm", None)
         ):
             raise ValueError("BLAST speech dependencies are invalid")
         self.synthesizer = synthesizer
         self.controller = controller
+        self.gesture_allowed = gesture_allowed
 
-    def __call__(self, text: str, locale: str, cancel_event: threading.Event):
+    def __call__(self, text: str, locale: str, cancel_event: threading.Event, *, expression=None):
         if not isinstance(cancel_event, threading.Event):
             raise HostSpeechError(
                 "invalid_speech_cancel",
@@ -244,12 +248,35 @@ class BlastHubSpeaker:
         )
         if callable(mark_started):
             mark_started()
+        playback_end = time.monotonic() + duration_ms / 1_000
         # The hub has already returned to its BLE command loop. This worker
         # waits only so episode cancellation and speech completion stay exact;
         # navigation continues on the monitor's separate owner thread.
-        if cancel_event.wait(duration_ms / 1_000):
-            return None
+        try:
+            if expression is not None:
+                self._express("face_" + expression["face"], cancel_event)
+                if (expression["gesture"] != "none"
+                        and (self.gesture_allowed is None or self.gesture_allowed())):
+                    self._express(expression["gesture"], cancel_event)
+            remaining = (duration_ms / 1_000 if expression is None
+                         else max(0, playback_end - time.monotonic()))
+            if cancel_event.wait(remaining):
+                return None
+        finally:
+            if expression is not None and not cancel_event.is_set():
+                self._express("face_idle", cancel_event)
         return (receipt,)
+
+    def _express(self, command, cancel_event):
+        if cancel_event.is_set():
+            return
+        try:
+            result = self.controller.command(command, cancel_requested=cancel_event.is_set)
+            logger.info("BLAST dialogue expression command=%s completed=%s",
+                        command, result.get("completed"))
+        except Exception:
+            # A missing expression must not discard an otherwise audible reply.
+            logger.warning("BLAST dialogue expression failed command=%s", command, exc_info=True)
 
 
 __all__ = (

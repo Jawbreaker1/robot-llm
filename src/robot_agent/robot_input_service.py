@@ -197,6 +197,8 @@ class RobotInputService:
                         client_request_id,
                         decision.reply_text,
                         locale,
+                        **({"expression": decision.expression}
+                           if decision.expression is not None else {}),
                     ) is True
                 except Exception:
                     speech_queued = False
@@ -213,6 +215,8 @@ class RobotInputService:
                     "captured_at_unix_ms"
                 ],
             }
+            if decision.expression is not None:
+                result["expression"] = decision.expression
         finally:
             with self._lock:
                 self._inflight.discard(client_request_id)

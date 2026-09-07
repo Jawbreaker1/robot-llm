@@ -75,6 +75,24 @@ class Model:
 
 
 class RobotInputServiceTests(unittest.TestCase):
+    def test_expression_is_queued_once_with_reply_and_never_starts_navigation(self):
+        from unittest.mock import Mock
+        expression = {"face": "happy", "gesture": "claw_snap"}
+        control = FakeControl()
+        sink = Mock(return_value=True)
+        service = RobotInputService(
+            control_service=control, speech_sink=sink,
+            model_factory=lambda _: Model(RobotInputDecision(
+                CONVERSE, 950, "Watch this!", expression=expression,
+            ), []),
+        )
+        first = service.dispatch("Snap your claw", "en", "social-1", 3)
+        second = service.dispatch("Snap your claw", "en", "social-1", 3)
+        self.assertEqual(first, second)
+        self.assertEqual(first["expression"], expression)
+        sink.assert_called_once_with("social-1", "Watch this!", "en", expression=expression)
+        self.assertEqual(control.started, [])
+
     def service(self, control, decision, *, spoken=None, seen=None):
         spoken = [] if spoken is None else spoken
         seen = [] if seen is None else seen

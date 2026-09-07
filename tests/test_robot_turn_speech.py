@@ -33,6 +33,16 @@ class FakeRuntime:
 
 
 class RobotTurnSpeechSinkTests(unittest.TestCase):
+    def test_reply_expression_reaches_the_existing_worker_with_its_utterance(self):
+        from unittest.mock import Mock
+        speaker = Mock()
+        sink = RobotTurnSpeechSink(lambda **options: RobotSpeechRuntime(speaker=speaker, **options))
+        expression = {"face": "curious", "gesture": "none"}
+        self.assertTrue(sink.submit("social-1", "Really?", "en", expression=expression))
+        self.assertTrue(sink.close(drain=True))
+        self.assertEqual(speaker.call_args.args[:2], ("Really?", "en"))
+        self.assertEqual(speaker.call_args.kwargs, {"expression": expression})
+
     def test_maps_untrusted_request_ids_and_forwards_without_blocking(self):
         runtime = FakeRuntime()
         events = []

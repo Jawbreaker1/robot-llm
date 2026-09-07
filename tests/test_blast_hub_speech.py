@@ -3,6 +3,9 @@ import ast
 import gc
 import io
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -80,6 +83,119 @@ def load_hub_audio_namespace():
 
 
 class BlastHubSpeechTests(unittest.TestCase):
+    def test_chosen_expression_runs_during_audio_and_restores_idle_eyes(self):
+        synthesizer = mock.Mock()
+        synthesizer.synthesize.return_value = wav_bytes((0,) * 256, 16000)
+        duration = pcm16_wav_to_blast_adpcm(synthesizer.synthesize.return_value).duration_ms
+        controller = mock.Mock()
+        controller.play_pcm.return_value = {"accepted": True, "started": True, "duration_ms": duration}
+        controller.command.return_value = {"completed": True}
+        cancel = threading.Event()
+        with mock.patch.object(cancel, "wait", return_value=False):
+            BlastHubSpeaker(synthesizer, controller)("Hi!", "en", cancel,
+                expression={"face": "happy", "gesture": "claw_snap"})
+        self.assertEqual(controller.mock_calls[0][0], "play_pcm")
+        self.assertEqual([item.args[0] for item in controller.command.call_args_list],
+                         ["face_happy", "claw_snap", "face_idle"])
+        controller.reset_mock()
+        with mock.patch.object(cancel, "wait", return_value=False):
+            BlastHubSpeaker(synthesizer, controller, gesture_allowed=lambda: False)(
+                "Navigation continues", "en", cancel,
+                expression={"face": "happy", "gesture": "arm_wave"})
+        self.assertEqual([item.args[0] for item in controller.command.call_args_list],
+                         ["face_happy", "face_idle"])
+        controller.command.side_effect = RuntimeError("busy")
+        with self.assertLogs("robot_agent.blast_hub_speech", level="WARNING"), \
+                mock.patch.object(cancel, "wait", return_value=False):
+            self.assertIsNotNone(BlastHubSpeaker(synthesizer, controller)(
+                "Still speaking", "en", cancel, expression={"face": "happy", "gesture": "none"}))
+
+    def test_native_completion_and_stop_release_all_payload_references(self):
+        """Compile the actual patched cleanup functions, without a physical hub."""
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("a C compiler is required for the native cleanup test")
+        patch_path = Path(__file__).resolve().parents[1] / "firmware/pybricks/blast_sampled_audio.patch"
+        added_source = "\n".join(
+            line[1:] for line in patch_path.read_text().splitlines()
+            if line.startswith(("+", " ")) and not line.startswith("+++")
+        )
+
+        def function(name):
+            start = added_source.index("static ", added_source.rfind("\n", 0, added_source.index(name + "(")))
+            body = added_source.index("{", start)
+            depth = 1
+            end = body + 1
+            while depth:
+                depth += (added_source[end] == "{") - (added_source[end] == "}")
+                end += 1
+            return added_source[start:end]
+
+        declarations = r'''
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#define PYBRICKS_HUB_PRIMEHUB 1
+#define PBDRV_CONFIG_SOUND_SAMPLED 1
+typedef uintptr_t mp_obj_t;
+typedef int pbio_error_t;
+typedef int pbio_os_state_t;
+#define PBIO_ERROR_AGAIN 1
+#define PBIO_SUCCESS 0
+#define mp_const_none ((mp_obj_t)0)
+#define MP_OBJ_TO_PTR(value) ((void *)(value))
+typedef struct {
+    mp_obj_t sample_data;
+    struct { const uint8_t *data; } adpcm_state;
+    void *iter;
+} pb_type_Speaker_obj_t;
+static bool active;
+static bool pbdrv_sound_is_active(void) { return active; }
+static void pbdrv_sound_stop(void) { active = false; }
+static void pb_type_async_schedule_stop_iteration(void *iter) { (void)iter; }
+static mp_obj_t mp_obj_new_bool(bool value) { return value; }
+'''
+        main = r'''
+int main(void) {
+    static uint8_t payload[64008];
+    pb_type_Speaker_obj_t speaker = {0};
+    mp_obj_t obj = (mp_obj_t)&speaker;
+    for (int cycle = 0; cycle < 20; cycle++) {
+        speaker.sample_data = (mp_obj_t)payload;
+        speaker.adpcm_state.data = payload;
+        active = true;
+        if (pb_type_Speaker_done(obj) || !speaker.sample_data || !speaker.adpcm_state.data) return 1;
+        if (pb_type_Speaker_play_samples_iterate_once(NULL, obj) != PBIO_ERROR_AGAIN) return 2;
+        active = false;
+        if (!pb_type_Speaker_done(obj) || speaker.sample_data || speaker.adpcm_state.data) return 3;
+        speaker.sample_data = (mp_obj_t)payload;
+        speaker.adpcm_state.data = payload;
+        active = true;
+        pb_type_Speaker_close(obj);
+        if (active || speaker.sample_data || speaker.adpcm_state.data) return 4;
+        speaker.sample_data = (mp_obj_t)payload;
+        speaker.adpcm_state.data = payload;
+        if (pb_type_Speaker_play_samples_iterate_once(NULL, obj) != PBIO_SUCCESS
+            || speaker.sample_data || speaker.adpcm_state.data) return 5;
+    }
+    return 0;
+}
+'''
+        source = declarations + "\n".join(function(name) for name in (
+            "pb_type_Speaker_close", "pb_type_Speaker_play_samples_iterate_once", "pb_type_Speaker_done",
+        )) + main
+        with tempfile.TemporaryDirectory(prefix="blast-audio-cleanup-") as directory:
+            c_path = Path(directory) / "cleanup.c"
+            executable = Path(directory) / "cleanup"
+            c_path.write_text(source)
+            built = subprocess.run(
+                [compiler, "-std=c99", "-Wall", "-Werror", str(c_path), "-o", str(executable)],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            checked = subprocess.run([str(executable)], capture_output=True, timeout=5)
+            self.assertEqual(checked.returncode, 0, "native cleanup retained an old audio pointer")
+
     def test_blast_has_its_own_voices(self):
         self.assertIsInstance(BLAST_PIPER_PROFILE, PiperSpeechProfile)
         self.assertEqual(BLAST_PIPER_PROFILE.model, "piper-sv")

@@ -181,6 +181,8 @@ class FakeHub:
                 "accepted": True,
                 "direction": request["args"]["direction"],
             }
+        elif operation in ("set_pose", "show_face"):
+            result = {"accepted": True, **request["args"]}
         elif operation == "body_pulse":
             result = {
                 "accepted": True,
@@ -201,6 +203,8 @@ class FakeHub:
 
     async def write(self, payload):
         payload = bytes(payload)
+        if len(payload) > 60:
+            raise AssertionError("stdin write exceeds the hub ring-buffer budget")
         self._sampled_control_chunks.append(payload)
         self._sampled_control_buffer.extend(payload)
         if b"\n" not in self._sampled_control_buffer:
@@ -448,6 +452,39 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "args": {"direction": "left"},
             },
         )
+
+    async def test_accessory_pose_and_face_use_the_same_session(self):
+        hub = FakeHub()
+        runtime = BlastBLERuntime(
+            program_path=self.program_path,
+            device_finder=AsyncMock(return_value="device"),
+            hub_factory=lambda device: hub,
+        )
+        await runtime.connect()
+        self.assertEqual(
+            await runtime.set_pose("body", 158),
+            {"accepted": True, "motor": "body", "target_angle_deg": 158},
+        )
+        chunks = hub.sampled_control_write_groups[0]
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(json.loads(b"".join(chunks)), hub.writes[-1])
+        self.assertEqual(self.write_pacer.await_count, len(chunks) - 1)
+        self.assertEqual(
+            await runtime.show_face("happy"),
+            {"accepted": True, "expression": "happy"},
+        )
+        for expression in ("surprised", "angry", "idle"):
+            self.assertEqual(
+                await runtime.show_face(expression),
+                {"accepted": True, "expression": expression},
+            )
+        for motor, angle in (("left_drive", 0), ("body", True), ("claw", 1.5)):
+            with self.assertRaises(ValueError):
+                await runtime.set_pose(motor, angle)
+        with self.assertRaises(ValueError):
+            await runtime.show_face("random")
+        await runtime.stop()
+        await runtime.close()
 
     async def test_response_timeout_is_bounded(self):
         hub = FakeHub()

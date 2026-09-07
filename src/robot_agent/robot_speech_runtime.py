@@ -42,6 +42,7 @@ class SpeechItem:
     text: str
     locale: str
     admission: Optional["SpeechAdmission"] = None
+    expression: Optional[Mapping[str, str]] = None
 
 
 class SpeechAdmission:
@@ -227,6 +228,7 @@ class RobotSpeechRuntime:
         progress_revision: int = 0,
         cancel_requested: Optional[Callable[[], bool]] = None,
         admission: Optional[SpeechAdmission] = None,
+        expression: Optional[Mapping[str, str]] = None,
     ) -> int:
         checked_episode = _identifier(episode_id)
         checked_text = _bounded_text(text)
@@ -299,6 +301,7 @@ class RobotSpeechRuntime:
                 text=checked_text,
                 locale=locale,
                 admission=admission,
+                expression=dict(expression) if expression is not None else None,
             )
             if fingerprint in fingerprints:
                 duplicate = item
@@ -425,6 +428,8 @@ class RobotSpeechRuntime:
                     item.text,
                     item.locale,
                     cancel_event,
+                    **({"expression": item.expression}
+                       if item.expression is not None else {}),
                 )
             except Exception as error:
                 if cancel_event.is_set():

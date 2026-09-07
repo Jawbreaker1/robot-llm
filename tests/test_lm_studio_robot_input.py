@@ -118,6 +118,39 @@ class RobotInputContractTests(unittest.TestCase):
 
 
 class LMStudioRobotInputTests(unittest.TestCase):
+    def test_advertised_gestures_match_the_shared_blast_executor(self):
+        from robot_agent.lm_studio_robot_input import REPLY_GESTURES
+        from robot_agent.blast_observation_monitor import GESTURE_POSES
+        self.assertEqual(set(REPLY_GESTURES) - {"none"}, set(GESTURE_POSES))
+
+    def test_blast_expression_is_chosen_in_the_same_call_and_profile_scoped(self):
+        expression = {"face": "happy", "gesture": "claw_snap"}
+        transport = Transport(completion(CONVERSE, "Watch this!", output_changes={
+            "expression": expression,
+        }))
+        model = LMStudioRobotInputModel(model=MODEL, transport=transport, social_expressions=True)
+        result = model.interpret(robot_input("en", "Show me your claw!"), {})
+        self.assertFalse(result.fallback)
+        self.assertEqual(result.expression, expression)
+        self.assertEqual(len(transport.calls), 1)
+        payload = json.loads(transport.calls[0][1])
+        self.assertEqual(payload["reasoning_effort"], "none")
+        self.assertIn("expression", payload["response_format"]["json_schema"]["schema"]["required"])
+        ev3 = LMStudioRobotInputModel(model=MODEL, transport=transport)
+        self.assertTrue(ev3.interpret(robot_input(), {}).fallback)
+
+    def test_invalid_expression_or_expression_on_navigation_cannot_move_accessories(self):
+        for intent, reply, expression in (
+            (CONVERSE, "Hi!", {"face": "happy", "gesture": "drive_forward"}),
+            (PHYSICAL_TASK, None, {"face": "happy", "gesture": "claw_snap"}),
+        ):
+            transport = Transport(completion(intent, reply, output_changes={"expression": expression}))
+            result = LMStudioRobotInputModel(
+                model=MODEL, transport=transport, social_expressions=True,
+            ).interpret(robot_input(), {})
+            self.assertTrue(result.fallback)
+            self.assertIsNone(result.expression)
+
     def model(self, response=None, error=None, **options):
         transport = Transport(response, error)
         return LMStudioRobotInputModel(

@@ -258,6 +258,22 @@ class BlastBLERuntime:
             {"direction": direction},
         )
 
+    async def set_pose(self, motor: str, target_angle_deg: int) -> Dict[str, object]:
+        if motor not in ("body", "claw"):
+            raise ValueError("pose motor must be body or claw")
+        if type(target_angle_deg) is not int or not -1_000_000 <= target_angle_deg <= 1_000_000:
+            raise ValueError("pose target must be an integer angle")
+        return await self._request(
+            "set_pose", {"motor": motor, "target_angle_deg": target_angle_deg},
+        )
+
+    async def show_face(self, expression: str) -> Dict[str, object]:
+        if expression not in (
+            "neutral", "happy", "frustrated", "curious", "surprised", "angry", "idle",
+        ):
+            raise ValueError("unknown face expression")
+        return await self._request("show_face", {"expression": expression})
+
     def _sampled_audio_capability(self):
         capability = (
             self._ready.get("capabilities", {}).get(
@@ -542,9 +558,9 @@ class BlastBLERuntime:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8") + b"\n"
-        await self._write_sampled_audio_control_bytes(encoded)
+        await self._write_control_bytes(encoded)
 
-    async def _write_sampled_audio_control_bytes(
+    async def _write_control_bytes(
         self, payload: bytes,
     ) -> None:
         """Write stdin without overflowing the Prime Hub's 64-byte ring."""
@@ -625,6 +641,8 @@ class BlastBLERuntime:
             "scan_trim_pulse",
             "claw_pulse",
             "body_pulse",
+            "set_pose",
+            "show_face",
             "shutdown",
         ):
             raise ValueError("unsupported BLAST operation")
@@ -641,7 +659,7 @@ class BlastBLERuntime:
             separators=(",", ":"),
             sort_keys=True,
         )
-        await hub.write_line(encoded)
+        await self._write_control_bytes(encoded.encode("utf-8") + b"\n")
         response = await self._read_message()
         if (
             response.get("id") != request_id

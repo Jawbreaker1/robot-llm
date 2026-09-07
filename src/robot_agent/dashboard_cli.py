@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -693,7 +694,7 @@ def _configured_blast_runtime_adapter(args, blast_monitor):
             ),
         )
 
-    def speech_runtime_factory(*, event_sink):
+    def speech_runtime_factory(*, event_sink, gesture_allowed=None):
         synthesizer = PiperLoopbackSynthesizer(
             profile=BLAST_PIPER_PROFILE,
         )
@@ -701,6 +702,7 @@ def _configured_blast_runtime_adapter(args, blast_monitor):
             speaker=BlastHubSpeaker(
                 synthesizer,
                 blast_monitor,
+                gesture_allowed=gesture_allowed,
             ),
             event_sink=event_sink,
             thread_name="blast-01-speech",
@@ -1061,6 +1063,7 @@ def _run(
                     "timeout_seconds": args.robot_input_timeout_seconds,
                 }
                 if profile_id == BLAST_PROFILE_ID:
+                    options["social_expressions"] = True
                     options["reply_persona_by_locale"] = (
                         BLAST_PERSONA_BY_LOCALE
                     )
@@ -1091,6 +1094,11 @@ def _run(
             speech_factory = state.get("speech_runtime_factory")
             speech_locales = state.get("speech_locales", ())
             if callable(speech_factory) and speech_locales:
+                if profile_id == BLAST_PROFILE_ID:
+                    speech_factory = partial(
+                        speech_factory,
+                        gesture_allowed=lambda control=control: control.status()["state"] == "IDLE",
+                    )
                 speech = RobotTurnSpeechSink(
                     speech_factory,
                     supported_locales=speech_locales,
