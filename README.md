@@ -1,451 +1,295 @@
 # Robot LLM Lab 🤖
 
 [![Quality](https://github.com/Jawbreaker1/robot-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/Jawbreaker1/robot-llm/actions/workflows/ci.yml)
-![LLM: Qwen3.8 27B](https://img.shields.io/badge/LLM-Qwen3.8%2027B%20via%20LM%20Studio-6f42c1)
-![EV3 hardware: live](https://img.shields.io/badge/EV3%20hardware-live%20over%20Wi--Fi%2FSSH-2ea44f)
-![Robot Inventor hardware: live](https://img.shields.io/badge/Robot%20Inventor%20hardware-live%20over%20BLE-2ea44f)
-![Physical navigation: experimental](https://img.shields.io/badge/physical%20navigation-experimental-d29922)
+![Local AI: Qwen3.8 27B](https://img.shields.io/badge/local%20AI-Qwen3.8%2027B-6f42c1)
+![Robots: BLAST + EV3RSTORM](https://img.shields.io/badge/robots-BLAST%20%2B%20EV3RSTORM-2ea44f)
+![Voice: Piper + Whisper](https://img.shields.io/badge/voice-Piper%20%2B%20Whisper-008b8b)
 
-**A real LEGO robot controlled by a local agentic AI that can plan, observe,
-speak, and adapt as it goes.**
+**Local intelligence. Real LEGO robots. Personality included.**
 
-Robot LLM Lab connects a local AI agent to physical LEGO robots. EV3RSTORM
-currently carries the complete navigation loop: give it a goal and the agent
-plans, acts, reads sensors and motor feedback, and adapts when reality
-disagrees. Robot Inventor 51515 now runs the same model-directed
-act → observe → replan loop over Pybricks and persistent BLE telemetry, with
-robot-specific bounded actions and gyro-backed distance scans.
+Robot LLM Lab turns LEGO robots into embodied AI agents: machines you can talk
+to, give goals to, and watch as they plan a route, explore their surroundings,
+and respond to what happens. Navigation, conversation, maps, and expressive
+movement come together in one local application.
 
-The language model chooses semantic intent and expression. The host application
-validates and dispatches typed actions, while the active controller worker
-remains the sole owner of its motor ports.
-
-The current physical-navigation baseline is the regular, non-QAT
-`qwen/qwen3.8-27b` served locally by LM Studio. Gemma is no longer the active
-navigation baseline. The current lab configuration gives Qwen a 50k context
-window and at most two concurrent requests. Robot dialogue and navigation
-utterances use English because this Qwen build is materially less reliable in
-Swedish; the dashboard itself remains bilingual.
-
-BLAST's speech is generated locally by Piper in both languages: the female
-British-English `en_GB-cori-high` voice and Swedish `lisa-bright`. Her English
-speech no longer uses the macOS system voice. The same BLAST personality and
-hub speaker remain in use; see [voice setup](docs/BLAST_HUB_AUDIO.md#voice-loudness-and-personality).
+The ambition is a room full of robots that understand their surroundings,
+share what they learn, and interact with people and each other. The foundation
+is already physical: BLAST and EV3RSTORM connect to the same application, carry
+out model-directed actions, and report what their sensors and motors actually
+did. BLAST brings that interaction to life with a natural voice, animated eyes,
+arm gestures, and a snapping claw.
 
 <p align="center">
   <img src="src/robot_agent/dashboard_web/robot-llm-mascot.png" alt="Robot LLM Lab's mildly grumpy modular mascot waving" width="280">
 </p>
 
-<p align="center"><em>Mildly grumpy by design. Personality shapes the language, not motor authority.</em></p>
+<p align="center"><em>A little attitude. A lot to explore.</em></p>
 
-## What makes it agentic
+## Give a goal, not a motor command
 
-Many LLM–robot demos are effectively one-shot remote controls:
-
-```text
-prompt → command → execution
-```
-
-Robot LLM Lab keeps the goal alive and closes the loop:
+The model owns the meaningful decisions: where to go, which waypoints to use,
+when to gather more information, and when to change its plan. The robot runtime
+handles carrying out those decisions with sensor and motor feedback.
 
 ```text
-goal → plan → action → observe → verify → adapt
+goal → plan → act → observe → verify → adapt
+         ↑_______________________________|
 ```
 
-This means:
+A route is a working hypothesis, not a script. The goal stays in context as
+the robot moves; waypoints describe how to reach it, and observations reveal
+when that route needs revising. Following an agreed leg does not require the
+model to approve every small motor pulse. A missing measurement is uncertainty
+to handle, not automatically a new wall or a reason to abandon the goal.
 
-- a goal can survive across several actions and observations;
-- verified sensor and encoder results inform the next decision;
-- the agent can investigate, revise its plan, or stop when reality contradicts
-  its assumptions; and
-- speech, mapping, and UI updates can progress alongside navigation while
-  physical actions remain serialized.
+This loop has taken physical robots around obstacles to their goals. BLAST's
+navigation combines model-authored waypoints, distance scans, motor encoders,
+and heading feedback, including recovery from incomplete observations. The
+next challenge is making that behavior consistent across both robots and a
+wider range of environments.
 
-Natural-language intent is handled by the model through strict schemas. The
-host does not translate instructions with regular expressions, keyword lists,
-or language-specific command menus. The model never receives raw motor access.
+## More than navigation
 
-## What works today
+**Talk to the robot.** Use text or push-to-talk in the web interface. The model
+distinguishes conversation, questions about the robot, and requests to act.
+Local Whisper handles speech recognition; Piper gives the reply a voice that
+plays through the robot's own speaker.
 
-| Status | Capabilities |
-|---|---|
-| Working on physical EV3 | ev3dev, Wi-Fi/SSH control, bounded movement and turning, stop, IR, touch, motor encoders, host-generated robot speech, and the goal → plan → act → observe → replan loop |
-| Working on physical Robot Inventor | Pybricks firmware on BLAST-01, local BLE deployment, persistent telemetry, bounded actions, interruptible stop, model-directed navigation with distance scans, and an operator-confirmed box detour to the goal |
-| Working in the application | English/Swedish web dashboard, direct robot conversation and status questions, local push-to-talk STT, technical events, current plan, active route and waypoint, route-free shared-world simulation, per-run physical navigation memory, multi-controller telemetry and connection controls, and agent-directed BLAST episodes |
-| Experimental | Operator-confirmed physical obstacle passage, active IR scanning, qualitative hazard mapping, model-authorized typed detour routes, body-aware path checks, and recovery from imperfect motor movement |
-| Planned | Repeatable autonomous obstacle navigation, richer Robot Inventor goals, continuous hands-free voice interaction, cameras, vision, sound localization, BOOST, and multi-robot coordination |
+**See the personality.** Qwen can choose BLAST's expression and gesture along
+with her reply. Her 5×5 display becomes a pair of expressive eyes, with blinking,
+glances, and different moods. Arm waves and claw flourishes make the response
+physical. Gestures return the sensor-carrying arm to its navigation pose;
+conversation gestures currently run while the robot is idle.
 
-EV3 obstacle navigation has succeeded in an operator-confirmed physical trial;
-repeatability and broader acceptance runs remain experimental.
+**Follow the decisions.** The dashboard brings together the goal, plan,
+waypoints, estimated position, sensor observations, speech, and execution
+events. You can see what the robot is trying to do as well as what it measured.
 
-### Physical navigation milestone — September 7, 2026
+**Experiment before driving.** A shared-world simulator puts robot bodies,
+sensors, obstacles, and goals in the same room. With Qwen in the loop, the model
+must create its own route; the scenario does not supply the answer.
 
-**BLAST has now driven around a real box and stopped at the intended goal.**
-Qwen3.8 selected the route and waypoints toward a goal initially 800 mm ahead
-of the starting position. The operator independently confirmed arrival beyond
-the box; the final estimated distance to the goal was 27 mm. BLAST also
-recovered from an incomplete scan and continued the same mission to completion.
-
-This is a physically verified single-box baseline, not yet proof of repeatable
-navigation through arbitrary rooms or simultaneous multi-robot navigation.
-The plotted return leg looked more diagonal than the operator observed, so a
-remaining map/heading discrepancy is documented for follow-up. See the
-[physical validation report](docs/NAVIGATION_VALIDATION_20260905.md#physical-acceptance-after-reload--september-7).
-
-### Current mapping and robot scope
-
-The current EV3 map is intentionally qualitative. IR reflection can support
-obstacle hypotheses, but it is not vision, object recognition, or precise
-metric SLAM. The forward-facing color/light sensor is installed but is not yet
-used by the production navigation loop.
-
-BLAST-01 has its own registered robot identity and can be selected as the
-dashboard's physical agent profile. Qwen3.8 chooses typed plans and actions;
-the host executes it through the existing bounded BLE controller, feeds the
-fresh observation back to the model, and repeats until completion or abort.
-The first slice supports drive, turn, and gyro-measured two-sided scan
-decisions. A multi-step box detour has now been physically verified; repeatability
-and broader obstacle courses remain experimental. Manipulation goals remain
-future work for this profile.
-
-## Architecture
+## How it fits together
 
 ```mermaid
 flowchart TD
-    U["Goal, question, or voice transcript"] --> H["Host agent"]
-    S["Sensors, encoders, and map memory"] --> H
-    H --> L["Local LLM<br/>plan and expression"]
-    L --> V["Typed proposal"]
-    V --> P["Host validation and policy"]
-    P --> A["One semantic action"]
-    A --> W["Controller worker<br/>sole motor owner"]
-    W --> R["Physical LEGO robot"]
-    R --> S
-    L -. speech .-> T["Host speech worker"]
-    T -. audio .-> R
-    S --> D["Dashboard and map"]
+    U["You<br/>text or voice"] --> H["Conversation and mission context<br/>goal · route · observations"]
+    H --> Q["Local Qwen<br/>plan · replan · reply · express"]
+    Q --> P["Navigation plan and waypoints"]
+    P --> X["Robot-specific execution<br/>turn · drive · scan · report progress"]
+    X --> B["BLAST<br/>Pybricks · Bluetooth"]
+    X --> E["EV3RSTORM<br/>ev3dev · Wi-Fi / SSH"]
+    Q --> T["Piper speech"]
+    T --> B
+    T --> E
+    Q --> G["BLAST expressions<br/>eyes · arms · claw"]
+    G --> B
+    B --> O["Sensor and motor feedback<br/>map · estimated pose · execution result"]
+    E --> O
+    O --> H
+    O --> D["Live dashboard and map"]
+    H --> D
 ```
 
-The host owns goals, state, navigation memory, model calls, and validation.
-Each controller worker exposes a small set of fixed robot operations and
-processes one request at a time. It contains no planner, personality, or
-independent goal. EV3 and Robot Inventor are both application-integrated for
-autonomous execution. Their profiles translate shared semantic intent into
-robot-specific bounded operations; EV3 currently has the richer map and route
-executive, while BLAST replans after each movement or scan. Once the model has
-authorized a target and detour side, a deterministic route executive may
-serialize several freshly checked pulses before asking the model again. New
-geometry, ambiguous progress, a veto, or a failed movement returns control to
-the agent immediately.
+The application keeps mission state and brings observations back to the model.
+Each robot's controller owns its motors and translates supported actions into
+hardware operations. Qwen chooses the route and expression; it does not need
+to manage motor ports, Bluetooth packets, or audio encoding.
 
-Speech, map publication, and UI delivery already run alongside the physical
-loop. Future vision, audio, validation, and planning workers will publish
-time-stamped observations or proposals, but they will not control motors
-directly. Physical execution remains serialized through the worker that owns
-the relevant controller.
+This is a shared application, not yet a single shared navigation implementation.
+BLAST and EV3 have distinct execution paths and sensor representations. Bringing
+their goal, route, and recovery handling together is the next integration step,
+while keeping hardware-specific behavior in their adapters.
 
-More detail is available in [the architecture document](docs/ARCHITECTURE.md).
+The core stack runs locally: **Qwen3.8 27B through LM Studio**, **whisper.cpp**
+for voice input, and **Piper** for speech. BLAST uses the `en_GB-cori-high` voice.
+The dashboard supports English and Swedish.
 
-## Dashboard
+## Two bodies, different capabilities
 
-![Current English Workbench with the physical EV3 control service ready and Robot selected](docs/images/dashboard-live-workbench-current-en.jpg)
+| | BLAST · Robot Inventor 51515 | EV3RSTORM · MINDSTORMS EV3 |
+|---|---|---|
+| Connection | Persistent Bluetooth session with Pybricks | Wi-Fi / SSH with an ev3dev worker |
+| Navigation feedback | Ultrasonic distance, motor encoders, IMU | IR, touch, motor encoders |
+| Physical behavior | Drive, turn, scan, arm and claw gestures, animated eyes | Drive, turn, active IR scan, stop |
+| Interaction | Model-directed conversation, onboard speech, expressions | Model-directed conversation and onboard speech |
 
-The local web application has two conversation targets:
+Both platforms have completed physical obstacle detours. Their sensors do not
+provide interchangeable maps: BLAST measures distance, while EV3's IR supports
+qualitative obstacle evidence rather than a precise distance image. Neither is
+currently a vision-based object-recognition or precision-SLAM system.
 
-- **Robot** can answer, report what its current sensors and plan say, or turn a
-  text or speech instruction into a physical goal.
-- **Workbench** provides ordinary dialogue, configuration, evidence, and
-  development tools.
+Multi-robot support has several distinct parts. Both robots can be configured
+in one dashboard, and calibrated start positions allow their paths to be shown
+in a common map. The shared simulator supports concurrent bodies. **Coordinated
+physical navigation and shared obstacle knowledge are still in development**;
+the combined dashboard currently permits one physical navigation task at a time.
 
-The dashboard shows the current live state rather than offering old physical
-runs to resume. It exposes the current goal, plan, action, speech state,
-active detour route and waypoint progress, technical events, and a read-only
-map. Navigation memory is retained during an EV3 episode and reset before the
-next physical run. The **Bodies** view keeps each controller separate: BLAST
-has Connect, Disconnect, and Retry controls, while EV3 has a motion-free
-readiness check because its SSH worker is opened and closed per task.
+## The live dashboard
 
-The same Map view can display a completed simulator run or qualitative physical
-odometry and obstacle hypotheses:
+![Robot LLM Lab web dashboard with Robot and Workbench conversation targets](docs/images/dashboard-live-workbench-current-en.jpg)
 
-![Map UI populated by the deterministic simulator demo](docs/images/dashboard-simulator-map-current-en.jpg)
+- **Robot** is the place to talk, ask about observations, and submit goals.
+- **Workbench** provides general dialogue and development tools.
+- **Map** shows available position estimates, obstacle evidence, routes, and
+  waypoint progress.
+- **Bodies** exposes each controller's connection, battery, and telemetry.
+- **Settings** holds model, language, and voice-input configuration, including
+  microphone selection.
 
-See [the dashboard guide](docs/DASHBOARD.md) for STT, settings, persistence,
-and UI contracts.
+![Map view preview using deterministic demo data, not a recorded Qwen route](docs/images/dashboard-simulator-map-current-en.jpg)
 
-## Quick start without a robot
+*Map interface preview using built-in demo data. Live runs populate the view
+from the connected robot's observations and navigation state.*
+
+See the [dashboard guide](docs/DASHBOARD.md) for voice input, settings, and
+[shared fixed-start maps](docs/DASHBOARD.md#gemensam-fixed-start-karta-för-ev3-och-blast).
+
+## Test decisions in a simulated world
+
+The navigation simulator defines the environment, not the solution: room
+bounds, obstacles, robot footprints, starting poses, sensor behavior, and goals.
+Robot bodies occupy real space in the simulation and can obstruct each other.
+Scenarios include boxes, side obstacles, narrow passages, corridors, bends,
+staggered obstacles, and dead ends.
+
+There are two different kinds of test:
+
+- **Hardware-free checks** exercise the simulated world, robot adapters,
+  movement, collision checks, and execution contracts.
+- **Model-in-the-loop runs** exercise navigation decisions. Qwen receives the
+  robot's observed context and must choose waypoints, scans, and replans itself.
+
+The Qwen runner uses BLAST's production episode adapter, planner context, and
+action schema. Model-driven EV3 parity is a next step. The simulator can also
+replay recorded startup scans and inject missing range readings, helping
+reproduce problems encountered on the physical robot.
+
+With Qwen loaded in LM Studio, run a scenario:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m robot_agent.blast_navigation_simulation \
+  --model 'qwen/qwen3.8-27b' --scenario blast-box-front --compact
+```
+
+Omit `--scenario` to run the default scenario set. Traces retain model requests,
+responses, reasoning when available, and execution results for inspection.
+
+Simulation and physical testing serve different purposes. The simulated
+hardware simplifies gyro and scan feedback; a successful simulated route does
+not certify physical calibration or sensor timing. We validate on real robots
+alongside simulation, and keep detailed evidence in the
+[simulation notes](docs/MULTI_ROBOT_NAVIGATION_SIMULATION.md) and
+[physical validation report](docs/NAVIGATION_VALIDATION_20260905.md).
+
+## Get started
+
+### Explore without hardware
 
 ```sh
 git clone https://github.com/Jawbreaker1/robot-llm.git
 cd robot-llm
-PYTHONPATH=src python3 -m robot_agent.dashboard_cli \
-  --simulation-map-demo
+PYTHONPATH=src python3 -m robot_agent.dashboard_cli --simulation-map-demo
 ```
 
-Open the private live URL printed by the server and choose **Map**. This uses a
-deterministic simulator and requires no EV3 or loaded LLM. It demonstrates the
-application and mapping pipeline, not physical calibration.
+Open the private live URL printed by the server and choose **Map**. No robot or
+loaded model is needed. This is a deterministic interface demo, separate from
+the Qwen navigation simulator.
 
-To run the Workbench with a model exposed by LM Studio:
+To add local AI conversation, load `qwen/qwen3.8-27b` in LM Studio and start:
 
 ```sh
 ROBOT_LLM_STT_URL='' scripts/start_lab_console.sh \
   --model 'qwen/qwen3.8-27b'
 ```
 
-The empty STT URL starts without speech recognition. Follow the
-[dashboard guide](docs/DASHBOARD.md) to add the local whisper.cpp service.
+The empty STT setting starts without voice input. Omit it once the local speech
+recognition service is configured using the [dashboard guide](docs/DASHBOARD.md).
 
-## Navigation simulator
+### Connect your robots
 
-The current simulator is a shared 2D physical world for BLAST, EV3RSTORM, and
-future robot profiles. A scenario supplies only room bounds, rectangular
-obstacles, measured robot footprints, starting poses, sensor behavior, and
-final goals. It does not supply a preferred side, waypoint list, route, or
-backtracking answer. Robot bodies are dynamic obstacles, so BLAST and EV3 can
-move in the same simulated room rather than being evaluated in isolated
-worlds.
+Prepare the hardware before using its launcher:
 
-The fast hardware-free gate checks the common world, collision behavior,
-robot-specific adapters, and route-free scenarios ranging from a clear room
-and one shared box to staggered obstacles and a dead end requiring another
-route:
+| Robot | Setup |
+|---|---|
+| BLAST | Python 3.10+, dependencies in `requirements-pybricks.txt`, Pybricks on the hub, and Bluetooth. See [hub audio and firmware](docs/BLAST_HUB_AUDIO.md) for onboard Piper speech. |
+| EV3RSTORM | ev3dev, a network connection, and the deployed worker. Follow [Wi-Fi setup](docs/EV3_WIFI.md) and [runtime deployment](docs/EV3_RUNTIME_DEPLOYMENT.md). |
+
+For BLAST, install the host Bluetooth tooling:
 
 ```sh
-PYTHONPATH=src .venv/bin/python -m unittest \
-  tests.test_multi_robot_navigation_simulator \
-  tests.test_simulation_robot_adapters \
-  tests.test_navigation_simulation_scenarios
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-pybricks.txt
 ```
 
-Those deterministic tests validate the simulator and execution contracts, not
-the language model's planning quality. The separate Qwen-in-the-loop runner
-sends the same bounded context and action schema used by physical BLAST to the
-real LM Studio model, including BLAST's production persona and output budget.
-With `qwen/qwen3.8-27b` loaded on port 1234, run the six current BLAST cases—box
-ahead, the physical box/chair approximation, box at the side, boxes on both
-sides, straight corridor, and bent corridor—with:
-
-```sh
-PYTHONPATH=src .venv/bin/python \
-  -m robot_agent.blast_navigation_simulation \
-  --model 'qwen/qwen3.8-27b' --compact
-```
-
-BLAST live navigation and this simulator default to `reasoning_effort=low`
-and an 8192-token total output ceiling, with a 60-second request timeout. The
-ceiling leaves room for both reasoning and the final decision; it does not
-require the model to use all those tokens. BLAST retries an incomplete or
-invalidly structured reply once, with the same goal, route, pose and observation,
-without scanning or moving between attempts. Two unusable replies still fail
-the episode; this is not an unbounded model loop. The shared navigation planner uses Qwen's thinking-mode
-sampling: temperature 1.0, top-p 0.95, top-k 20, min-p 0, presence penalty 0
-and repeat penalty 1.0. Future
-waypoints are tentative route memory; only the current leg is executable.
-Complete planner requests and raw replies (including
-reasoning), controller results, and original controller errors are saved locally
-under `local-artifacts/navigation-dashboard.jsonl` or
-`local-artifacts/navigation-simulation.jsonl`. These ignored diagnostic files
-contain goals and sensor context; they are not inputs to robot decisions.
-
-For one short diagnostic run, add for example
-`--scenario blast-box-front`. The Qwen gate currently exercises BLAST; the
-shared simulator already supports concurrent BLAST and EV3 execution, but
-model-driven EV3 parity is still pending. Simulator success does not replace
-physical calibration or live navigation trials.
-
-The simulated scan adapter still assumes settled observations and a gyro tied
-exactly to simulated pose. It does not execute the physical scan monitor's
-per-pulse checks. A passing route therefore does not validate that physical
-scan/feedback chain; its observed failures must also be reproduced and tested.
-
-The [simulator notes](docs/MULTI_ROBOT_NAVIGATION_SIMULATION.md) also describe
-replaying a recorded BLAST startup scan with transient missing range readings.
-Reaching the goal is not sufficient if the trace contains collisions or
-unexplained scan loops.
-
-## Start the robot console
-
-The normal two-controller lab starts with one command:
-
-```sh
-scripts/start_robot_console.sh --model 'qwen/qwen3.8-27b'
-```
-
-This assumes the default local speech-recognition service is running. To start
-without voice input, use:
+Start the console with both robot profiles:
 
 ```sh
 ROBOT_LLM_STT_URL='' scripts/start_robot_console.sh \
   --model 'qwen/qwen3.8-27b'
 ```
 
-This configures EV3RSTORM and BLAST without contacting either robot. Power them
-on afterwards, then use **Bodies → Check connection** for EV3 and
-**Bodies → Connect** for BLAST. The defaults are `robot@ev3dev.local` and
-`BLAST-01`; different names can be supplied without editing the scripts:
+Use **Bodies → Check connection** for EV3 and **Bodies → Connect** for BLAST.
+Defaults are `robot@ev3dev.local` and `BLAST-01`; override them with
+`ROBOT_LLM_EV3_TARGET` and `ROBOT_LLM_BLAST_HUB_NAME`. Starting the console does
+not start a navigation task.
 
-```sh
-ROBOT_LLM_EV3_TARGET='robot@192.168.1.50' \
-ROBOT_LLM_BLAST_HUB_NAME='MY-BLAST' \
-  scripts/start_robot_console.sh --model 'qwen/qwen3.8-27b'
-```
+For one robot, use `scripts/start_blast_console.sh` or
+`scripts/start_ev3rstorm_console.sh` with the same options. The launchers use
+the repository's `.venv` when available. Disconnect other Bluetooth clients,
+such as Pybricks Code, before connecting BLAST.
 
-The combined profile currently uses EV3 as the active goal executor while
-BLAST, once connected, remains available for telemetry and bounded controller
-actions. Use
-`scripts/start_ev3rstorm_console.sh` or `scripts/start_blast_console.sh` when
-only one robot should be configured. All launchers reuse the same application
-entry point and prefer the repository's `.venv` when it exists.
+## Where we are heading
 
-### Show both live paths in one fixed-start map
+The next milestone is **two autonomous robots using a common agentic flow**:
+the same approach to goals, route memory, and replanning, with different
+hardware underneath. Small, physically validated steps keep that integration
+grounded in behavior rather than framework-building.
 
-Run one dashboard process per active robot; each process keeps sole ownership
-of its robot. The dashboard you watch can read the other process's local v1
-map over authenticated loopback and project both pose trails into the existing
-shared v2 map. For example, start the EV3 peer first:
+From there, the project grows in three directions:
 
-```sh
-ROBOT_LLM_STT_URL='' scripts/start_ev3rstorm_console.sh --port 8766
-```
+- **Explore together.** Navigate larger spaces, recover from dead ends, share
+  obstacle knowledge, and coordinate movement in the same room.
+- **Interact with character.** Extend expressive behavior across both robots,
+  improve conversational responsiveness, and explore useful manipulation as
+  well as playful gestures.
+- **Perceive more.** Add vision, continuous voice interaction, sound-source
+  reasoning, and new LEGO bodies such as BOOST.
 
-Then start BLAST on the normal port. Replace the illustrative `600, 0, 0`
-with the measured EV3 start origin `(x mm, y mm, yaw millidegrees)` in BLAST's
-start frame (`+X` forward, `+Y` left, positive yaw left/counter-clockwise):
+The long-term picture: a robot hears a dog bark, finds the source, turns toward
+it, and answers, “woof right back at you.” Perception, planning, movement, and
+personality working together.
 
-```sh
-ROBOT_LLM_STT_URL='' scripts/start_blast_console.sh \
-  --port 8765 \
-  --shared-peer-port 8766 \
-  --shared-peer-access-key-file ~/.robot-llm/dashboard-access-key \
-  --shared-peer-x-mm 600 \
-  --shared-peer-y-mm 0 \
-  --shared-peer-yaw-mdeg 0
-```
+## Development and documentation
 
-The first complete local-map generation from each process is bound once.
-Starting a new episode changes that robot's local frame and deliberately makes
-the shared map unavailable instead of silently teleporting it; place both
-robots back on the fixed marks and restart the viewing process to bind again.
-This checkpoint shares pose/path visualization only. It does not yet fuse
-obstacle hypotheses or authorize simultaneous navigation.
-
-## Running with a physical EV3
-
-The physical path requires an EV3 running ev3dev, a network connection to the
-brick, Python 3.9+ on the host, the deployed EV3 worker, and a model served by
-LM Studio.
-
-Before allowing movement, verify the robot configuration and complete the
-motion-free deployment checks in:
-
-- [EV3 Wi-Fi setup](docs/EV3_WIFI.md)
-- [EV3 runtime deployment](docs/EV3_RUNTIME_DEPLOYMENT.md)
-
-Then start the explicit EV3 profile. Its default target is
-`robot@ev3dev.local`:
-
-```sh
-ROBOT_LLM_STT_URL='' scripts/start_ev3rstorm_console.sh \
-  --model 'qwen/qwen3.8-27b'
-```
-
-Set `ROBOT_LLM_EV3_TARGET` when the brick uses another hostname or address.
-
-Omit the STT override when the local speech-recognition service is configured.
-The dashboard may be started before the EV3 is powered on. After the brick has
-booted, choose **Bodies → Check connection** to verify SSH, the deployed worker,
-stationary sensing, stop, and clean shutdown without issuing a motor command.
-The check records when readiness was last verified; it does not claim or keep a
-persistent connection. Robot movement begins only after a goal is submitted
-and explicitly started in the dashboard.
-
-## Robot Inventor 51515 bring-up
-
-BLAST-01 runs Pybricks and accepts programs directly from the local repository
-over Bluetooth. Live diagnostics identify four angular motors, a color sensor,
-an ultrasonic sensor, the built-in six-axis IMU and battery telemetry. Display,
-speaker and bounded motor actuation are physically verified. A persistent BLE
-session exposes observations, stop, drive, turn, claw and body pulses. The
-dashboard can keep that session open, show battery, distance, color, IMU and
-motor telemetry, run those fixed actions manually, or bind the same connection
-to a model-directed robot episode. Stop can interrupt an in-flight pulse and is
-verified against a fresh inactive observation. The **Bodies** view exposes the
-same BLE lifecycle as Connect, Disconnect, and Retry controls.
-
-```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements-pybricks.txt
-./scripts/run_blast_smoke.sh
-.venv/bin/python -m pybricksdev run ble --name BLAST-01 \
-  hub_programs/blast_01/inventory.py
-```
-
-To run BLAST as the dashboard's active physical agent:
-
-```sh
-ROBOT_LLM_PYTHON=.venv/bin/python ROBOT_LLM_STT_URL='' \
-  scripts/start_blast_console.sh \
-  --model 'qwen/qwen3.8-27b'
-```
-
-This optional toolchain requires Python 3.10 or newer. Disconnect Pybricks Code
-from the hub before running the local command because only one BLE client can
-own the connection.
-
-## Tests
+Run the hardware-free quality suite:
 
 ```sh
 sh ./scripts/quality_check.sh
 ```
 
-The hardware-free suite covers contracts, agent loops, process transports,
-mapping, dashboard behavior, simulated EV3 sysfs, and failure cleanup. It does
-not replace physical calibration or live stop tests.
-
-## Roadmap
-
-- Make physical obstacle navigation repeatable and complete its live
-  calibration and acceptance runs.
-- Add color sensing, continuous voice interaction, wireless cameras,
-  microphones, vision, and sound-source reasoning.
-- Extend Robot Inventor navigation with shared route and map support, then add
-  BOOST and coordinate several LEGO controllers.
-- Expand the asynchronous architecture with parallel perception, validation,
-  and forward planning while preserving serialized motor ownership.
-
-Long-term vision: hear a dog bark, locate the sound, look for the source,
-recognize the dog, turn toward it, and answer, “woof right back at you.”
-
-## Documentation
-
-| Document | Contents |
+| Guide | Contents |
 |---|---|
-| [Architecture](docs/ARCHITECTURE.md) | Agent runtime, authority, parallelism, memory, and multi-controller design |
-| [Navigation simplification plan](docs/NAVIGATION_SIMPLIFICATION_PLAN.md) | Fixed three-stage plan for aligning BLAST and EV3 without a new framework |
-| [Dashboard](docs/DASHBOARD.md) | Live UI, STT, map, settings, and persistence |
-| [EV3 Wi-Fi](docs/EV3_WIFI.md) | Network onboarding and recovery |
-| [EV3 runtime deployment](docs/EV3_RUNTIME_DEPLOYMENT.md) | Worker deployment, preflight, transport, speech, and physical checks |
-| [Experiment plan](docs/EXPERIMENT_PLAN.md) | Test protocols, observations, limitations, and evidence |
-| [Navigation benchmark](docs/LM_STUDIO_NAVIGATION_BENCHMARK.md) | Structured-planner benchmark method and results |
-| [`docs/data`](docs/data) | Machine-readable experiment artifacts |
-
-## Repository layout
+| [Dashboard](docs/DASHBOARD.md) | UI, microphone input, settings, maps, and persistence |
+| [BLAST speech](docs/BLAST_HUB_AUDIO.md) | Piper voice, onboard playback, and firmware setup |
+| [BLAST expressions](docs/BLAST_SOCIAL_EXPRESSIONS.md) | Qwen-directed faces, arm and claw gestures, and physical checks |
+| [Navigation simulation](docs/MULTI_ROBOT_NAVIGATION_SIMULATION.md) | Shared world, scenarios, model runs, and recorded-data regressions |
+| [EV3 deployment](docs/EV3_RUNTIME_DEPLOYMENT.md) | Worker setup, transport, speech, and hardware checks |
+| [Architecture notes](docs/ARCHITECTURE.md) | Design background, runtime boundaries, and multi-controller concepts |
+| [Navigation integration plan](docs/NAVIGATION_SIMPLIFICATION_PLAN.md) | Bounded steps toward shared BLAST and EV3 navigation |
+| [Experiments and evidence](docs/EXPERIMENT_PLAN.md) | Validation methods, observations, and linked results |
 
 ```text
-config/                 robot topology and fixed action profiles
-docs/                   architecture, setup, experiments, evidence, and images
-ev3/                    EV3 HAL, bounded workers, and diagnostic tools
-hub_programs/           controller-side programs for non-EV3 LEGO hubs
-src/robot_agent/        host agent, navigation, mapping, speech, and dashboard
-tests/                  hardware-free scenarios, contracts, and failure tests
+config/                 robot topology and action profiles
+docs/                   guides, design notes, validation reports, and images
+ev3/                    EV3 hardware layer, workers, and diagnostics
+hub_programs/           programs running on LEGO hubs
+src/robot_agent/        agent, navigation, simulation, mapping, speech, and UI
+tests/                  hardware-free scenarios and regression tests
 ```
-
-Robot LLM Lab deliberately avoids a large robotics framework. New abstractions
-are introduced when experiments show that they are needed.
 
 No open-source license has been selected yet.
 
 LEGO, MINDSTORMS, EV3, Robot Inventor, and BOOST are trademarks of the LEGO
-Group. This independent experimental project is not affiliated with or
-endorsed by the LEGO Group.
+Group. This independent project is not affiliated with or endorsed by the
+LEGO Group.
