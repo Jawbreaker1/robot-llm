@@ -9,7 +9,10 @@ import socket
 from typing import Callable, Mapping
 
 from . import lm_studio as _lm
-from .blast_personality import normalize_persona_by_locale
+from .blast_personality import (
+    REPLY_FACES, REPLY_GESTURES, normalize_persona_by_locale,
+    social_expression_schema, valid_social_expression,
+)
 
 
 CONVERSE = "CONVERSE"
@@ -37,8 +40,6 @@ MAX_RESPONSE_BYTES = 32 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024
 MAX_REPLY_CHARS = 160
 MAX_OUTPUT_TOKENS = 192
-REPLY_FACES = ("idle", "neutral", "happy", "frustrated", "curious", "surprised", "angry")
-REPLY_GESTURES = ("none", "claw_snap", "arm_wave", "claw_flourish")
 MIN_PHYSICAL_CONFIDENCE_MILLI = 700
 REQUEST_TIMEOUT_SECONDS = 10.0
 Transport = Callable[[str, bytes, Mapping[str, str], float, int], bytes]
@@ -85,10 +86,10 @@ _SOCIAL_EXPRESSION_PROMPT = (
     " This robot is BLAST, with a 5x5 face display and a real grip claw. With each spoken "
     "reply choose expression.face (idle, neutral, happy, frustrated, curious, surprised, angry) "
     "and expression.gesture (none, claw_snap, arm_wave or claw_flourish). Choose them yourself to suit the conversation; "
-    "not every reply needs a gesture. claw_snap is a short open-and-return of the claw, not "
+    "not every reply needs a gesture. claw_snap fully opens and closes the claw twice, not "
     "grasping an object. These supported social requests are CONVERSE, not navigation tasks. "
     "arm_wave is a large outward-and-back sweep of the coupled arms. claw_flourish adds a "
-    "claw snap at the arm's extended pose, then returns the sensor arm to its navigation pose. "
+    "double claw snap at the arm's extended pose, then returns the sensor arm to its navigation pose. "
     "Both arms share a motor; independent arm positioning and lifting objects are unavailable. "
     "When control.state is not IDLE, choose gesture none so arm gestures don't interrupt navigation. "
     "For PHYSICAL_TASK and STOP_TASK expression must be null. Do not mix a social gesture "
@@ -167,10 +168,7 @@ class RobotInputDecision:
     def __post_init__(self) -> None:
         if self.expression is not None and (
             self.intent in _ACTION_INTENTS or self.fallback
-            or not isinstance(self.expression, dict)
-            or set(self.expression) != {"face", "gesture"}
-            or self.expression["face"] not in REPLY_FACES
-            or self.expression["gesture"] not in REPLY_GESTURES
+            or not valid_social_expression(self.expression)
             or (self.intent not in (CONVERSE, READ_ONLY_TASK)
                 and self.expression["gesture"] != "none")
         ):
@@ -317,13 +315,7 @@ class LMStudioRobotInputModel:
         }
         system_prompt = _SYSTEM_PROMPT
         if self._social_expressions:
-            properties["expression"] = {"oneOf": [
-                {"type": "null"},
-                {"type": "object", "properties": {
-                    "face": {"type": "string", "enum": list(REPLY_FACES)},
-                    "gesture": {"type": "string", "enum": list(REPLY_GESTURES)},
-                }, "required": ["face", "gesture"], "additionalProperties": False},
-            ]}
+            properties["expression"] = social_expression_schema()
             system_prompt += _SOCIAL_EXPRESSION_PROMPT
         if self._reply_persona_by_locale is not None:
             system_prompt += _REPLY_PERSONA_PROMPT.format(

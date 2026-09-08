@@ -243,16 +243,21 @@ class SimulationRobotAdapterTests(unittest.TestCase):
             def _observation(self):
                 observation = super()._observation()
                 pose = self.simulation.pose(self.world_robot_id)
-                if missing_echo and pose.x_mm > 700 and abs(pose.heading_mdeg) < 20_000:
+                if (missing_echo and len(dropouts) < 3
+                        and pose.x_mm > 600 and abs(pose.y_mm) < 50
+                        and abs(pose.heading_mdeg) < 20_000):
                     observation["distance_mm"] = 2_000
+                    dropouts.append(pose)
                 return observation
 
         for missing_echo in (False, True):
             with self.subTest(missing_echo=missing_echo):
+                dropouts = []
                 side = 450
                 route = [
                     {"x_mm": 0, "y_mm": side, "purpose": "Clear box"},
-                    {"x_mm": 800, "y_mm": side, "purpose": "Pass box"},
+                    {"x_mm": 650, "y_mm": side, "purpose": "Pass box"},
+                    {"x_mm": 650, "y_mm": 0, "purpose": "Return behind box"},
                     {"x_mm": 800, "y_mm": 0, "purpose": "Reach goal"},
                 ]
                 contexts = []
@@ -279,15 +284,19 @@ class SimulationRobotAdapterTests(unittest.TestCase):
                            FinalApproachDropout):
                     result = run_blast_gemma_scenario(
                         blast_box_front(), planner_factory=lambda _: Planner(),
-                        max_decisions=5,
+                        max_decisions=7,
                     )
                 self.assertIsNone(result["error_code"])
                 self.assertTrue(result["completed"], result["terminal_reason"])
                 self.assertEqual(result["scans"], 1)
                 self.assertEqual(result["blocked_moves"], 0)
                 self.assertEqual(contexts[2].active_waypoint_plan[-1]["purpose"], "Reach goal")
-                self.assertEqual(contexts[2].observation["sensors"]["range_state"],
-                                 "NO_VALID_DISTANCE" if missing_echo else "MEASURED")
+                self.assertEqual(len(dropouts), 3 if missing_echo else 0)
+                self.assertEqual(contexts[-1].observation["sensors"]["range_state"], "MEASURED")
+                self.assertLessEqual(result["distance_to_goal_mm"], 50)
+                # Reproduces the missing final leg: a turn behind the box is
+                # not arrival. The wheels must then drive toward the goal.
+                self.assertGreater(result["final_pose"]["x_mm"], 700)
 
     def test_persistent_missing_range_keeps_waypoint_and_bounds_progress(self):
         contexts = []

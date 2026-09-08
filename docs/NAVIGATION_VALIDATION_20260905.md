@@ -681,3 +681,104 @@ production refactoring was added during this checkpoint. The successful
 physical run therefore does not constitute a green full quality gate. Commit
 and push preserve the tested baseline; merging with this known structural debt
 requires an explicit decision after disclosure of these results.
+
+## Post-gesture physical regression — September 7
+
+Tested the committed `main` checkout at `d12334d` without changing production
+code or navigation settings. BLAST started in front of the box with a goal
+800 mm ahead. The running console used Qwen3.8-27B, low reasoning, and the
+existing 8192-token output ceiling.
+
+### Gesture preparation required recovery
+
+The normal robot-turn endpoint returned the Qwen-selected greeting
+“Ready to roll! Watch this claw snap!”, with `happy` and `claw_flourish`.
+The operator reported that the arm looked correctly restored. However, the
+controller's four-second completion wait expired during the gesture. Its last
+observation showed body angle 156° against the requested 158°, and
+`motion_active=true`. The hub's body-motor completion tolerance is 1°.
+The controller stopped the motion and reconnected; restoring the idle face
+also failed across that connection change.
+
+A separate existing `--gesture restore` probe reproduced the completion
+timeout at 156°, without commanding the wheels. A subsequent reconnected
+observation reported the arm at 158° and all motors inactive, after which
+navigation was started. This preparation therefore did **not** pass as a
+hands-off gesture-to-navigation transition. The observed completion sensitivity
+and its connection recovery remain unresolved; no tolerance or timeout was
+changed to obtain this result.
+
+### Obstacle passage completed; goal acceptance was too early
+
+Episode `episode-f97344bd54a7c1970f18c0b6` ran for approximately 5½ minutes.
+Qwen authored the route `(150,0) → (150,-300) → (600,-300) → (600,0) → (800,0)`.
+It retained the route through missing range readings and a short reverse;
+valid range returned and forward travel resumed. No manual drive command or
+replacement goal was injected during the navigation episode.
+
+- One startup surroundings scan, about 361° coverage and 1° restoration error;
+  the operator confirmed that the real heading remained approximately correct.
+- No subsequent scan. Thirty forward actions, one reverse, and five turn
+  actions, including an intermediate heading correction.
+- Nine Qwen requests, all returning structured decisions in 6.3–21.1 seconds.
+  No navigation controller failure or speech error was logged.
+- The operator confirmed passage around the right side and arrival behind the
+  box, but noted imperfect turns and a small remaining heading discrepancy.
+- Final estimated pose `(657,12,-3.184°)`, target `(800,0)`: 144 mm residual.
+  After the last right turn, Qwen chose `COMPLETE` because this was inside the
+  existing 150 mm goal radius. There was **no final forward leg**.
+
+The operator independently confirmed that BLAST stood just behind the box,
+with her back almost touching it, and had only turned toward the goal without
+advancing afterward. Runtime status was `IDLE/completed`, but this does not
+validate arrival at the intended goal point. The final-goal acceptance radius
+allowed an early finish; it is not evidence that Qwen lost the goal. The cause
+of the remaining physical-versus-estimated turn discrepancy is not established.
+
+Result: physical obstacle passage and continuation after range dropout are
+confirmed. Automatic recovery from accessory completion errors and the intended
+final approach still need correction before accepting the combined test.
+Evidence is in `local-artifacts/navigation-dashboard.jsonl` for the episode
+above and `/tmp/blast-gui-arm-gestures-20260907.log` for the gesture failure.
+
+## Final-approach correction and heading audit — September 7
+
+Goal arrival is now 50 mm, independent of the 150 mm grid resolution. The final
+waypoint uses that same positional check, so the intermediate-waypoint lateral
+allowance cannot consume the final target while completion is still forbidden.
+Other waypoint tolerances, turn calibration, recovery policy and model-owned
+route decisions are unchanged.
+
+The recorded `(657,12,-3.184°)` endpoint is no longer eligible for completion:
+its final waypoint remains and requests forward motion. A second regression
+covers the final target with 60 mm lateral error, which must request a turn
+instead of being discarded as an already-reached intermediate waypoint.
+The existing physical-adapter simulation test now explicitly includes a last
+forward leg after the return behind the box, both with valid range and three
+missing readings. Both reach within 50 mm with one scan and no collision.
+
+Two actual Qwen3.8-27B runs (low reasoning, 8192-token ceiling, at most ten
+decisions each, three transient invalid readings) validated the smaller goal
+radius: `blast-box-front` completed 50 mm from its goal and
+`blast-measured-box-and-chair` completed 5 mm away. Each used one startup scan,
+zero blocked moves, and matching simulated/estimated final poses. The second
+world is based on the measured box/chair arrangement; these runs used simulated
+sensor geometry, not replayed raw scans. The final-waypoint consistency change
+was subsequently validated in the focused hardware-free suite (314 tests).
+
+An exploratory variant with permanently missing range on the last approach did
+not complete within the scripted planner's seven-decision budget. This is not
+a passing permanent-outage test; the correction above targets arrival and
+transient dropouts, not unlimited blind travel.
+
+Heading audit: the map and planner use the motion executor's pose, not a second
+raw-gyro orientation; raw gyro/reference fields are removed from model context.
+Recorded turns ended approximately 3–6° from their intended cardinal headings,
+within the current 12° waypoint alignment allowance. That alone does not prove
+whether the remaining real-world discrepancy is wheel drift or gyro error.
+Recomputing the 30 recorded forward displacements using each pulse's gyro turn
+instead of its encoder turn changes the total displacement by only about
+`(-1.8,-3.3)` mm (maximum 1.7 mm for one pulse), insufficient to explain the
+reported larger skew. No speculative gyro bias, axis flip or calibration
+change was added. Physical heading-versus-floor verification is still needed;
+this is not a claim of corrected physical angular accuracy.

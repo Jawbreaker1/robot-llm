@@ -11,7 +11,9 @@ from uuid import uuid4
 from typing import Callable, Mapping, Sequence
 
 from . import lm_studio as _lm
-from .blast_personality import normalize_persona_by_locale
+from .blast_personality import (
+    normalize_persona_by_locale, social_expression_schema, valid_social_expression,
+)
 from .navigation_diagnostics import record_navigation_diagnostic
 
 
@@ -472,6 +474,7 @@ class ControllerActionDecision:
     utterance: str | None
     waypoint: Mapping[str, object] | None = None
     following_waypoints: tuple[Mapping[str, object], ...] = ()
+    expression: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -495,9 +498,11 @@ class LMStudioControllerActionPlanner:
         max_output_tokens: int = MAX_OUTPUT_TOKENS,
         utterance_persona_by_locale: Mapping[str, str] | None = None,
         max_utterance_chars: int = MAX_UTTERANCE_CHARS,
+        social_expressions: bool = False,
     ) -> None:
         if (
-            not callable(transport)
+            not isinstance(social_expressions, bool)
+            or not callable(transport)
             or not callable(clock)
             or isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
@@ -529,6 +534,7 @@ class LMStudioControllerActionPlanner:
         self._reasoning_effort = reasoning_effort
         self._max_output_tokens = max_output_tokens
         self._max_utterance_chars = max_utterance_chars
+        self._social_expressions = social_expressions
 
     @property
     def model(self) -> str:
@@ -612,6 +618,18 @@ class LMStudioControllerActionPlanner:
             },
         }
         system_prompt = _SYSTEM_PROMPT
+        if self._social_expressions and context.completion_allowed:
+            properties["expression"] = social_expression_schema()
+            system_prompt += (
+                "\nWhen you choose COMPLETE because the mission's final goal is reached, "
+                "celebrate with a short spoken utterance and an expression of your choice. "
+                "arm_wave raises and lowers the arms; claw_snap opens/closes the claw twice; "
+                "claw_flourish does that with the arms raised, then restores them. "
+                "The robot remains stationary during the celebration. You choose the face "
+                "and gesture; null or gesture none is also allowed. For any action other "
+                "than COMPLETE, or without an utterance, expression must be null. "
+                "Do not celebrate intermediate waypoints or change navigation to celebrate.\n"
+            )
         if context.local_map_evidence is not None:
             system_prompt += _LOCAL_MAP_PROMPT
         if self._utterance_persona_by_locale is not None:
@@ -774,6 +792,8 @@ class LMStudioControllerActionPlanner:
             "waypoint",
             "following_waypoints",
         }
+        if self._social_expressions and context.completion_allowed:
+            expected.add("expression")
         if not isinstance(value, dict) or set(value) != expected:
             raise _lm.LMStudioProtocolError(
                 "LM Studio controller-action fields are invalid"
@@ -783,6 +803,7 @@ class LMStudioControllerActionPlanner:
         assessment = value["assessment"]
         plan = value["plan"]
         utterance = value["utterance"]
+        expression = value.get("expression")
         raw_following_waypoints = value["following_waypoints"]
         if not isinstance(raw_following_waypoints, list):
             raise _lm.LMStudioProtocolError(
@@ -888,6 +909,11 @@ class LMStudioControllerActionPlanner:
             or len(utterance) > self._max_utterance_chars
         ):
             issues.append("utterance_invalid")
+        if expression is not None and (
+            action != COMPLETE or utterance is None
+            or not valid_social_expression(expression)
+        ):
+            issues.append("expression_invalid")
         if issues:
             raise _lm.LMStudioProtocolError(
                 "LM Studio controller-action decision is invalid: "
@@ -901,6 +927,7 @@ class LMStudioControllerActionPlanner:
             utterance=utterance,
             waypoint=waypoint,
             following_waypoints=following_waypoints,
+            expression=expression,
         )
 
 

@@ -5,6 +5,31 @@ existing speech. The model chooses whether and how to express itself; motor
 execution does not infer frustration, celebration or curiosity from obstacles.
 No separate mood engine or automatic obstacle-to-gesture rules are planned.
 
+## Mission finale
+
+When the existing navigation goal check permits `COMPLETE`, Qwen can choose a
+short final utterance and a face/gesture from the same vocabulary used in
+conversation. A happy arm wave or raised double claw snap can be a victory
+gesture; the model chooses, not a host-side celebration rule. Nothing changes
+in navigation requests before completion is permitted.
+
+The navigation adapter offers the finale at rest and drains the existing speech
+worker so episode cleanup does not cut off the audio or gesture. Stop still
+cancels it. Optional speech/gesture failure does not undo mission completion.
+Intermediate waypoints, replanning and aborts do not trigger this finale.
+Live and simulated BLAST use the same planner configuration. No new motion
+primitive, animation engine or navigation rule is added; muted episodes remain
+muted. Goal arrival now uses a separate 50 mm radius, also applied to the final
+waypoint; see the final-approach regression in `NAVIGATION_VALIDATION_20260905.md`.
+
+Validation: 254 focused tests pass, including terminal playback completion,
+idle wheels, cancellation and optional playback failure. One real Qwen3.8 call
+(low reasoning, 8,192-token cap) selected `COMPLETE`, `happy` and `arm_wave` in
+5.421 seconds through the actual adapter/speech runtime with a fake controller
+and recording speaker. The approach was scripted: this checks the finale, not
+route planning or physical arm motion. Physical mission-finale acceptance is
+still pending.
+
 ## Three bounded steps
 
 1. **Accessory hardware and neutral pose:** implement and physically verify
@@ -424,3 +449,50 @@ good). This combined physical run is therefore accepted for audible speech
 and visible expressions/arm/claw movement, as well as the measured return to
 the navigation pose. This acceptance does not extend to gestures during
 navigation or to a subsequent navigation run, which remain untested here.
+
+### Wider double claw gesture
+
+The 45-motor-degree relative snap was visibly too small. A stationary probe
+with the arms presented at body target -442° started with the claw closed at
+198°. Requesting an opening to 378° stopped progressing at 331° and hit the
+existing four-second completion timeout. The motor was stopped; this larger
+target is not used by the production gesture.
+
+The subsequent probe completed with fixed claw targets 200° (closed) and
+325° (open): close, open, close, open, close. Measured readings were
+201 → 321 → 201 → 322 → 201°. The arm returned to 158°, both drive encoders
+were unchanged (1107/2866°), and navigation sensor-pose matching passed.
+This establishes a repeatable larger excursion below the observed travel
+limit; operator confirmation of the visual opening remains pending.
+
+`claw_snap` now uses this double cycle. `claw_flourish` uses the same cycle
+with the arms extended, then restores the existing navigation reference.
+The initial close handles a claw left open by a previous manual action.
+Fixed endpoints replace the previous relative-to-last-position reference so
+small return errors do not accumulate across gestures. Qwen still chooses
+whether to gesture using the same reply schema; its capability description
+now describes the double snap. No new model call, navigation rule, drive
+setting, motor timeout, or arm tolerance is introduced here.
+
+Reproduce the stationary measurement, with the GUI disconnected from BLE:
+
+```sh
+PYTHONPATH=src .venv/bin/python scripts/probe_blast_expressions.py \
+  --gesture claw --claw-offset 125 --claw-closed-angle 200 --present-claw
+```
+
+The earlier accessory-return timeout documented in the physical navigation
+regression remains a separate unresolved issue. One successful return here
+does not establish that it is fixed.
+
+All 134 focused expression, controller-monitor, robot-input and hub-speech
+tests pass. They verify the actual commanded claw targets (200/325°, not the
+relative offsets), the double cycle from an initially open claw, the arm
+return sequence, and cancellation before remaining poses execute.
+
+The console was reloaded with the same Qwen and Whisper settings. Through the
+normal GUI turn endpoint, Qwen returned `happy/claw_flourish` in 1.82 seconds
+with a short reply about two snaps. BLAST was not reconnecting to Bluetooth
+at that point, so this did not validate combined physical speech and gesture
+through the production conversation path. The completed physical probe above
+and this model-selection result are separate evidence, not an end-to-end pass.

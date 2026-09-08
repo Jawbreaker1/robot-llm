@@ -114,7 +114,7 @@ class BlastEpisodeSpeech:
             self.close()
             self._publish_failed(error, stage="start")
 
-    def offer(self, text, *, progress_revision: int):
+    def offer(self, text, *, progress_revision: int, expression=None):
         if self._runtime is None or text is None:
             return None
         try:
@@ -132,6 +132,7 @@ class BlastEpisodeSpeech:
                 locale=self._context.request.locale,
                 progress_revision=progress_revision,
                 cancel_requested=self._cancelled,
+                **({"expression": expression} if expression is not None else {}),
             )
             return admission if callable(offer_with_admission) else None
         except Exception as error:
@@ -163,15 +164,23 @@ class BlastEpisodeSpeech:
             )
             return
 
-    def close(self) -> bool:
+    def close(self, *, drain: bool = False) -> bool:
         if self._runtime is None:
             return True
-        self.cancel()
+        if not drain or self._cancelled():
+            drain = False
+            self.cancel()
         try:
             closed = self._runtime.close(
-                drain=False,
-                timeout_seconds=1.0,
+                drain=drain,
+                timeout_seconds=30.0 if drain else 1.0,
             ) is True
+            if drain and not closed:
+                # A failed optional finale must not hold the mission open.
+                self.cancel()
+                closed = self._runtime.close(
+                    drain=False, timeout_seconds=1.0,
+                ) is True
             if closed:
                 self._runtime = None
             return closed

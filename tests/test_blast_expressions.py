@@ -145,7 +145,8 @@ class BlastExpressionSpeechProbeTests(unittest.IsolatedAsyncioTestCase):
         from robot_agent.blast_observation_monitor import BlastObservationMonitor
         for gesture, poses in (
             ("arm_wave", [("body", -442), ("body", 158)]),
-            ("claw_flourish", [("body", -442), ("claw", 234), ("claw", 189), ("body", 158)]),
+            ("claw_flourish", [("body", -442), ("claw", 200), ("claw", 325),
+                               ("claw", 200), ("claw", 325), ("claw", 200), ("body", 158)]),
         ):
             monitor = BlastObservationMonitor()
             observed = {"motion_active": False, "motor_angles_deg": {"claw": 189, "body": 155}}
@@ -156,25 +157,26 @@ class BlastExpressionSpeechProbeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result["completed"])
             self.assertEqual(runtime.mock_calls, [call.observe(), *[call.set_pose(*pose) for pose in poses]])
 
-    async def test_monitor_claw_gesture_returns_to_start_without_body_or_drive_commands(self):
+    async def test_monitor_claw_gesture_uses_fixed_endpoints_twice_and_respects_stop(self):
         from robot_agent.blast_observation_monitor import BlastObservationMonitor, BlastControllerError
         monitor = BlastObservationMonitor()
         runtime = Mock()
         observation = {"motion_active": False, "motor_angles_deg": {
-            "claw": 189, "body": 158, "left_drive": -16, "right_drive": 0,
+            "claw": 325, "body": 158, "left_drive": -16, "right_drive": 0,
         }}
         runtime.observe = AsyncMock(return_value=observation)
         runtime.set_pose = AsyncMock(return_value={"accepted": True})
         monitor._observe_until_idle = AsyncMock(return_value=observation)
         result = await monitor._perform_command(runtime, 1, "claw_snap")
         self.assertTrue(result["completed"])
-        self.assertEqual(runtime.mock_calls, [call.observe(), call.set_pose("claw", 234),
-                                              call.set_pose("claw", 189)])
+        self.assertEqual(runtime.mock_calls, [call.observe(), call.set_pose("claw", 200),
+                         call.set_pose("claw", 325), call.set_pose("claw", 200),
+                         call.set_pose("claw", 325), call.set_pose("claw", 200)])
         runtime.reset_mock()
         monitor._observe_until_idle.side_effect = BlastControllerError("controller_command_interrupted", "Stop")
         with self.assertRaises(BlastControllerError):
             await monitor._perform_command(runtime, 1, "claw_snap")
-        runtime.set_pose.assert_called_once_with("claw", 234)
+        runtime.set_pose.assert_called_once_with("claw", 200)
 
     async def test_audio_is_preloaded_before_face_and_playback_start(self):
         script = Path(__file__).resolve().parents[1] / "scripts/probe_blast_expressions.py"

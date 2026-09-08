@@ -99,6 +99,47 @@ class ControllerActionPlannerTests(unittest.TestCase):
         )
         return planner, transport
 
+    def test_completion_expression_uses_existing_social_vocabulary(self):
+        expression = {"face": "happy", "gesture": "claw_flourish"}
+        planner, transport = self.planner(completion({
+            "action": COMPLETE, "confidence_milli": 950,
+            "assessment": "Final goal reached.", "plan": [],
+            "utterance": "Mission crushed!", "expression": expression,
+        }), social_expressions=True)
+        result = planner.decide(context(completion_allowed=True))
+        self.assertEqual(result.decision.expression, expression)
+        prompt = json.loads(transport.calls[0][1])["messages"][0]["content"]
+        self.assertIn("Do not celebrate intermediate waypoints", prompt)
+
+    def test_completion_expressions_do_not_change_navigation_requests(self):
+        output = completion({
+            "action": "DRIVE_FORWARD", "confidence_milli": 950,
+            "assessment": "Continue.", "plan": ["DRIVE_FORWARD"],
+            "utterance": None,
+        })
+        requests = []
+        for enabled in (False, True):
+            planner, transport = self.planner(output, social_expressions=enabled)
+            self.assertIsNone(planner.decide(context(completion_allowed=False)).decision.expression)
+            requests.append(transport.calls[0][1])
+        self.assertEqual(*requests)
+
+    def test_completion_expression_rejects_wrong_action_or_invalid_payload(self):
+        for action, utterance, expression in (
+            ("DRIVE_FORWARD", "Go!", {"face": "happy", "gesture": "arm_wave"}),
+            (COMPLETE, None, {"face": "happy", "gesture": "arm_wave"}),
+            (COMPLETE, "Done!", {"face": "happy", "gesture": "drive_forward"}),
+            (COMPLETE, "Done!", {"face": "happy"}),
+        ):
+            with self.subTest(action=action, expression=expression):
+                planner, _ = self.planner(completion({
+                    "action": action, "confidence_milli": 950,
+                    "assessment": "Done.", "plan": [],
+                    "utterance": utterance, "expression": expression,
+                }), social_expressions=True)
+                with self.assertRaises(LMStudioProtocolError):
+                    planner.decide(context(completion_allowed=True))
+
     def test_returns_one_observation_bound_action(self):
         planner, transport = self.planner(completion({
             "action": "DRIVE_FORWARD",

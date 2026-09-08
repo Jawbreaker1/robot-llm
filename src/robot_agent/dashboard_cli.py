@@ -688,6 +688,7 @@ def _configured_blast_runtime_adapter(args, blast_monitor):
             timeout_seconds=args.robot_planner_timeout_seconds,
             reasoning_effort=args.blast_reasoning_effort,
             max_output_tokens=BLAST_NAVIGATION_OUTPUT_TOKENS,
+            social_expressions=True,
             utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
             max_utterance_chars=(
                 BLAST_MAX_NAVIGATION_UTTERANCE_CHARS

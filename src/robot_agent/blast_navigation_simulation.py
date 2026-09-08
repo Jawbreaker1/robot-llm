@@ -145,6 +145,7 @@ def run_blast_gemma_scenario(
                 timeout_seconds=timeout_seconds,
                 reasoning_effort=reasoning_effort,
                 max_output_tokens=max_output_tokens,
+                social_expressions=True,
                 utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
                 max_utterance_chars=BLAST_MAX_NAVIGATION_UTTERANCE_CHARS,
                 transport=recording_transport,

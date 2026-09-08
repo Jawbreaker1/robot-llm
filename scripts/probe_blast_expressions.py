@@ -95,10 +95,19 @@ async def run(args):
                 if expression == "idle":
                     report("observe_during_idle_animation", await runtime.observe())
         elif args.gesture == "claw":
-            start = before["motor_angles_deg"]["claw"]
+            start = (before["motor_angles_deg"]["claw"]
+                     if args.claw_closed_angle is None else args.claw_closed_angle)
+            neutral = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics.navigation_body_motor_angle_deg
             await runtime.show_face("happy")
-            for target in (start + 45, start, start + 45, start):
+            if args.present_claw:
+                await pose(runtime, "body", neutral - 600)
+            if args.claw_closed_angle is not None:
+                await pose(runtime, "claw", start)
+            for target in (start + args.claw_offset, start, start + args.claw_offset, start):
                 await pose(runtime, "claw", target)
+                await asyncio.sleep(0.4)
+            if args.present_claw:
+                await pose(runtime, "body", neutral)
         elif args.gesture in ("body", "restore"):
             sensor = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics
             neutral = sensor.navigation_body_motor_angle_deg
@@ -129,10 +138,17 @@ if __name__ == "__main__":
     parser.add_argument("--hub-name", default="BLAST-01")
     parser.add_argument("--gesture", choices=("none", "faces", "claw", "body", "restore"), default="none")
     parser.add_argument("--body-offset", type=int, help="Measured body-motor excursion from navigation pose")
+    parser.add_argument("--claw-offset", type=int, default=45, help="Claw opening excursion in motor degrees")
+    parser.add_argument("--claw-closed-angle", type=int, help="Explicit measured closed reference for a claw already left open")
+    parser.add_argument("--present-claw", action="store_true", help="Lift the arms during the claw probe, then restore the sensor pose")
     parser.add_argument("--speech", action="store_true", help="Pair the face demo with BLAST's English Piper voice")
     args = parser.parse_args()
     if args.speech and args.gesture != "faces":
         parser.error("--speech currently accompanies the faces demo only")
     if args.gesture == "body" and (args.body_offset is None or not 0 < abs(args.body_offset) <= 900):
         parser.error("body probe requires an explicit --body-offset between -900 and 900 (nonzero)")
+    if not 0 < args.claw_offset <= 180:
+        parser.error("claw offset must be between 1 and 180 motor degrees")
+    if args.present_claw and args.gesture != "claw":
+        parser.error("--present-claw requires --gesture claw")
     asyncio.run(run(args))

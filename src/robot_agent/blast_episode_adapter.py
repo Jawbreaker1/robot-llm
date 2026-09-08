@@ -1053,6 +1053,7 @@ class BlastEpisodeRuntimeAdapter:
         self,
         *,
         planner,
+        speech,
         context,
         observation,
         history,
@@ -1195,6 +1196,15 @@ class BlastEpisodeRuntimeAdapter:
         if outcome is not None:
             return None, outcome
         if action == COMPLETE:
+            # Every iteration reaches the planner at rest. The existing gesture
+            # executor checks idle again; no wheel action follows this finale.
+            speech.offer(
+                decision.utterance, progress_revision=len(history) + 1,
+                expression=decision.expression,
+            )
+            speech.close(drain=True)
+            if blast_episode_cancelled(context):
+                return None, self._control_outcome(context, deadline_ms)
             return None, self._outcome("completed", True, assessment)
         if action == ABORT:
             return None, self._outcome(
@@ -1454,9 +1464,13 @@ class BlastEpisodeRuntimeAdapter:
         ) > 0
 
     @staticmethod
-    def _waypoint_reached(pose, waypoint) -> bool:
+    def _waypoint_reached(pose, waypoint, *, mission=None) -> bool:
         if waypoint is None:
             return False
+        if mission is not None and (
+            waypoint["x_mm"], waypoint["y_mm"]
+        ) == mission.target_point():
+            return BlastEpisodeRuntimeAdapter._goal_corridor_entered(mission, pose)
         delta_x = abs(waypoint["x_mm"] - pose.x_mm)
         delta_y = abs(waypoint["y_mm"] - pose.y_mm)
         heading = math.radians(pose.heading_mdeg / 1_000.0)
@@ -1528,12 +1542,12 @@ class BlastEpisodeRuntimeAdapter:
 
     @classmethod
     def _waypoint_follow_motion_action(
-        cls, pose, waypoint, available_actions,
+        cls, pose, waypoint, available_actions, *, mission=None,
     ):
         """Resolve one explicit waypoint-follow request to a bounded primitive."""
 
         geometry = cls._active_waypoint_geometry(pose, waypoint)
-        if geometry is None or cls._waypoint_reached(pose, waypoint):
+        if geometry is None or cls._waypoint_reached(pose, waypoint, mission=mission):
             return None
         heading_error = normalize_heading_mdeg(
             cls._waypoint_axis_heading_mdeg(pose, waypoint)
@@ -1569,13 +1583,13 @@ class BlastEpisodeRuntimeAdapter:
     @classmethod
     def _waypoint_turn_alignment(
         cls, pose, waypoint,
-        *, allow_reached=False,
+        *, allow_reached=False, mission=None,
     ):
         """Return the turn direction and bearing to a model-owned waypoint."""
 
         if waypoint is None:
             return None
-        if not allow_reached and cls._waypoint_reached(pose, waypoint):
+        if not allow_reached and cls._waypoint_reached(pose, waypoint, mission=mission):
             return None
         desired_heading = (
             cls._waypoint_axis_heading_mdeg(pose, waypoint) / 1_000
@@ -1661,7 +1675,7 @@ class BlastEpisodeRuntimeAdapter:
                     and mission.heading_aligned(motion_executor.pose)
                 )
             return (
-                not self._waypoint_reached(motion_executor.pose, waypoint)
+                not self._waypoint_reached(motion_executor.pose, waypoint, mission=mission)
                 and self._advance_target_is_ahead(
                     mission, motion_executor.pose, waypoint,
                 )
@@ -2081,6 +2095,7 @@ class BlastEpisodeRuntimeAdapter:
                         return outcome
                 if self._waypoint_reached(
                     motion_executor.pose, active_waypoint,
+                    mission=map_trace.mission,
                 ):
                     waypoint_plan = waypoint_plan[1:]
                     active_waypoint = (
@@ -2151,6 +2166,7 @@ class BlastEpisodeRuntimeAdapter:
                     motion_executor.pose,
                     active_waypoint,
                     available_actions,
+                    mission=map_trace.mission,
                 )
                 route_blockage = map_trace.advisory_route_blockage(
                     motion_executor.pose,
@@ -2262,6 +2278,7 @@ class BlastEpisodeRuntimeAdapter:
                     decision_count += 1
                     try:
                         step, outcome = self._planner_step(
+                            speech=speech,
                             planner=planner, context=context,
                             observation=observation, history=history,
                             available_actions=planner_available_actions,
@@ -2317,6 +2334,7 @@ class BlastEpisodeRuntimeAdapter:
                     waypoint_plan
                     and self._waypoint_reached(
                         motion_executor.pose, waypoint_plan[0],
+                        mission=map_trace.mission,
                     )
                 ):
                     reached_waypoints.append(waypoint_plan[0])
@@ -2405,6 +2423,7 @@ class BlastEpisodeRuntimeAdapter:
                         motion_executor.pose,
                         active_waypoint,
                         available_actions,
+                        mission=map_trace.mission,
                     )
                     if action is None:
                         route_following = False
@@ -2486,6 +2505,7 @@ class BlastEpisodeRuntimeAdapter:
                         selected_turn_alignment = self._waypoint_turn_alignment(
                             motion_executor.pose,
                             active_waypoint,
+                            mission=map_trace.mission,
                         )
                     if (
                         selected_turn_alignment is None

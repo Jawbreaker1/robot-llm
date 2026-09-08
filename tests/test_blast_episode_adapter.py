@@ -57,12 +57,12 @@ from robot_agent.physical_navigation_contract import (
 from robot_agent.physical_navigation_mission import DirectionalMission
 from robot_agent.physical_odometry import PhysicalPose
 from robot_agent.robot_control_contract import RobotRuntimeUpdate
-from robot_agent.robot_speech_runtime import SpeechAdmission
+from robot_agent.robot_speech_runtime import RobotSpeechRuntime, SpeechAdmission
 
 
 def decision(
     action, *, plan=(), assessment="ok", utterance=None, waypoint=None,
-    following_waypoints=(),
+    following_waypoints=(), expression=None,
 ):
     return ControllerActionPlannerResult(
         decision=ControllerActionDecision(
@@ -73,6 +73,7 @@ def decision(
             utterance=utterance,
             waypoint=waypoint,
             following_waypoints=tuple(following_waypoints),
+            expression=expression,
         ),
         latency_ms=12,
     )
@@ -1749,11 +1750,46 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(
             BlastEpisodeRuntimeAdapter._intermediate_waypoint_plan(
                 mission,
-                PhysicalPose(x_mm=820, y_mm=80),
+                PhysicalPose(x_mm=820, y_mm=30),
                 (final_goal,),
             ),
             (),
         )
+
+    def test_recorded_post_box_pose_keeps_final_approach_before_completion(self):
+        mission = DirectionalMission.begin(
+            episode_id="recorded-post-box-20260907",
+            minimum_forward_progress_mm=800,
+            pose=PhysicalPose(), heading_tolerance_mdeg=20_000,
+        )
+        waypoint = {"x_mm": 800, "y_mm": 0, "purpose": "Final goal"}
+        # Actual last-turn endpoint from episode-f97344bd54a7c1970f18c0b6.
+        before = PhysicalPose(x_mm=657, y_mm=12, heading_mdeg=-3_184)
+        self.assertFalse(blast_directional_completion_allowed(
+            mission=mission, pose=before, localization_valid=True,
+        ))
+        self.assertEqual(BlastEpisodeRuntimeAdapter._intermediate_waypoint_plan(
+            mission, before, (waypoint,),
+        ), (waypoint,))
+        self.assertEqual(BlastEpisodeRuntimeAdapter._waypoint_follow_motion_action(
+            before, waypoint, (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90),
+            mission=mission,
+        ), ADVANCE)
+        # The final target cannot be consumed using an intermediate waypoint's
+        # wider cross-axis allowance while the goal itself is still out of reach.
+        lateral = PhysicalPose(x_mm=795, y_mm=60)
+        self.assertFalse(BlastEpisodeRuntimeAdapter._waypoint_reached(
+            lateral, waypoint, mission=mission,
+        ))
+        self.assertEqual(BlastEpisodeRuntimeAdapter._waypoint_follow_motion_action(
+            lateral, waypoint, (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90),
+            mission=mission,
+        ), TURN_RIGHT_90)
+        # Ordinary drive pulses can reach the goal without millimetre precision.
+        self.assertTrue(blast_directional_completion_allowed(
+            mission=mission, pose=PhysicalPose(x_mm=792, y_mm=5, heading_mdeg=-3_184),
+            localization_valid=True,
+        ))
 
     def test_reached_waypoint_promotes_next_model_planned_leg(self):
         first = {
@@ -2049,14 +2085,14 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         ))
         self.assertTrue(blast_directional_completion_allowed(
             mission=mission,
-            pose=PhysicalPose(x_mm=500, y_mm=100),
+            pose=PhysicalPose(x_mm=450, y_mm=30),
             localization_valid=True,
         ))
 
     def test_directional_episode_completes_after_verified_minimum_progress(self):
         controller = FakeController(1_000)
         planner = Planner(
-            [decision("ADVANCE") for _index in range(6)]
+            [decision("ADVANCE") for _index in range(9)]
             + [decision(COMPLETE, assessment="Verified goal reached.")]
         )
 
@@ -2069,14 +2105,69 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertTrue(result.completed)
         self.assertEqual(result.terminal_reason, "completed")
-        self.assertEqual(controller.commands, ["drive_forward"] * 6)
+        self.assertEqual(controller.commands, ["drive_forward"] * 9)
         self.assertFalse(planner.contexts[-2].completion_allowed)
         self.assertTrue(planner.contexts[-1].completion_allowed)
         self.assertEqual(planner.contexts[-1].available_actions, ())
         self.assertEqual(
             planner.contexts[-1].observation["odometry"]["x_mm"],
-            270,
+            405,
         )
+
+    def test_goal_finale_drains_at_rest_and_remains_optional_and_cancellable(self):
+        for ending in ("completed", "failed", "stopped"):
+            with self.subTest(ending=ending):
+                controller = FakeController(1_000)
+                expression = {"face": "happy", "gesture": "arm_wave"}
+                planner = Planner([decision("ADVANCE") for _ in range(9)] + [
+                    decision(COMPLETE, utterance="Mission crushed!", expression=expression),
+                ])
+                context, updates = episode_context()
+                context.settings.speech_enabled = True
+                entered, release = threading.Event(), threading.Event()
+                offers, results, errors = [], [], []
+
+                def speaker(text, locale, cancel_event, *, expression):
+                    offers.append((text, locale, expression, list(controller.commands),
+                                   controller.snapshot()["observation"]["motion_active"]))
+                    cancel_event.mark_playback_started()
+                    entered.set()
+                    release.wait(2)
+                    if ending == "failed":
+                        raise RuntimeError("optional finale unavailable")
+                    offers.append(cancel_event.is_set())
+
+                adapter = self.adapter(
+                    controller, planner, minimum_forward_progress_mm=420,
+                    speech_runtime_factory=lambda **kw: RobotSpeechRuntime(speaker=speaker, **kw),
+                    speech_locales=("en",),
+                )
+                worker = threading.Thread(target=self._capture_run,
+                                          args=(adapter, context, results, errors))
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(2))
+                    self.assertTrue(worker.is_alive(), "Must wait beyond audio-start for the gesture")
+                    self.assertEqual(offers[0], ("Mission crushed!", "en", expression,
+                                               ["drive_forward"] * 9, False))
+                    self.assertTrue(planner.contexts[-1].completion_allowed)
+                    if ending == "stopped":
+                        context.stop_requested.set()
+                        adapter.request_stop()
+                finally:
+                    release.set()
+                    worker.join(2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(results[0].completed, ending != "stopped")
+                self.assertEqual(results[0].terminal_reason,
+                                 "stopped" if ending == "stopped" else "completed")
+                self.assertEqual(controller.commands,
+                                 ["drive_forward"] * 9 + (["stop"] if ending == "stopped" else []))
+                if ending != "failed":
+                    self.assertEqual(offers[-1], ending == "stopped")
+                else:
+                    self.assertIn("failed", [u.get("speech_status") for u in updates])
 
     def test_directional_episode_can_complete_with_no_safe_motion_at_goal(self):
         class BlockedAtGoalController(FakeController):
@@ -2087,7 +2178,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 )
                 if (
                     command == "drive_forward"
-                    and self.commands.count("drive_forward") == 10
+                    and self.commands.count("drive_forward") == 13
                 ):
                     result["observation"]["distance_mm"] = 40
                     self.snapshot_value["observation"] = result["observation"]
@@ -2095,7 +2186,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         controller = BlockedAtGoalController(1_000)
         planner = Planner(
-            [decision("ADVANCE") for _index in range(10)]
+            [decision("ADVANCE") for _index in range(13)]
             + [decision(COMPLETE, assessment="Verified blocked goal reached.")]
         )
 
@@ -2108,11 +2199,11 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
 
         self.assertTrue(result.completed)
         self.assertEqual(result.terminal_reason, "completed")
-        self.assertEqual(controller.commands, ["drive_forward"] * 10)
+        self.assertEqual(controller.commands, ["drive_forward"] * 13)
         terminal_context = planner.contexts[-1]
         self.assertEqual(
             terminal_context.observation["odometry"]["x_mm"],
-            450,
+            585,
         )
         self.assertEqual(
             terminal_context.observation["sensors"]["distance_mm"],

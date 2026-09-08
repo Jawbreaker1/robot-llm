@@ -93,12 +93,19 @@ SAMPLED_AUDIO_MAX_TOTAL_SECONDS = 15.0 * 60.0
 SCAN_COMMAND = "scan_front_arc"
 SURROUNDINGS_SCAN_COMMAND = "scan_surroundings"
 SETTLED_OBSERVATION_COMMAND = "observe_settled"
-# Offsets from the navigation body reference, or the observed claw position.
-# These are motor angles for BLAST's linkage, not angles of the arms.
+# Measured closed reference for this BLAST linkage, not the last arbitrary pose.
+CLAW_CLOSED_MOTOR_ANGLE_DEG = 200
+# These are OFFSETS: _perform_command adds the 200-degree claw reference.
+# The actual commanded claw targets are 200, 325, 200, 325, 200 degrees,
+# all within the physically verified closed/open range (not absolute 0/125).
+DOUBLE_CLAW_POSES = (
+    ("claw", 0), ("claw", 125), ("claw", 0), ("claw", 125), ("claw", 0),
+)
+# Body offsets remain relative to the existing navigation sensor reference.
 GESTURE_POSES = {
-    "claw_snap": (("claw", 45), ("claw", 0)),
+    "claw_snap": DOUBLE_CLAW_POSES,
     "arm_wave": (("body", -600), ("body", 0)),
-    "claw_flourish": (("body", -600), ("claw", 45), ("claw", 0), ("body", 0)),
+    "claw_flourish": (("body", -600),) + DOUBLE_CLAW_POSES + (("body", 0),),
 }
 COMMANDS = {
     "drive_forward": ("drive_pulse", "forward"),
@@ -1688,7 +1695,7 @@ class BlastObservationMonitor:
             if before.get("motion_active") is not False:
                 raise BlastControllerError("controller_busy", "BLAST is moving")
             reference = {
-                "claw": before["motor_angles_deg"]["claw"],
+                "claw": CLAW_CLOSED_MOTOR_ANGLE_DEG,
                 "body": BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics.navigation_body_motor_angle_deg,
             }
             for role, offset in GESTURE_POSES[command]:

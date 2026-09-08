@@ -5,19 +5,26 @@
 ![Robots: BLAST + EV3RSTORM](https://img.shields.io/badge/robots-BLAST%20%2B%20EV3RSTORM-2ea44f)
 ![Voice: Piper + Whisper](https://img.shields.io/badge/voice-Piper%20%2B%20Whisper-008b8b)
 
-**Local intelligence. Real LEGO robots. Personality included.**
+**One shared AI brain. Many simple bodies. Personality included.**
 
-Robot LLM Lab turns LEGO robots into embodied AI agents: machines you can talk
-to, give goals to, and watch as they plan a route, explore their surroundings,
-and respond to what happens. Navigation, conversation, maps, and expressive
-movement come together in one local application.
+Robot LLM Lab is a local, LLM-driven application that acts through physical
+devices. The robots are its tools for sensing, moving, speaking, and interacting
+with the world — not separate computers that each need their own AI brain.
+Planning, conversation, mission memory, and interpretation of observations live
+in the shared application; the devices supply the physical capabilities.
 
-The ambition is a room full of robots that understand their surroundings,
-share what they learn, and interact with people and each other. The foundation
-is already physical: BLAST and EV3RSTORM connect to the same application, carry
-out model-directed actions, and report what their sensors and motors actually
-did. BLAST brings that interaction to life with a natural voice, animated eyes,
-arm gestures, and a snapping claw.
+This separates intelligence from the cost and computing power of each body.
+Even a simple, inexpensive robot can draw on a capable model without running
+it onboard. The ambition is shared intelligence across devices: what one body
+discovers can inform another's actions, while each retains its own capabilities
+and personality.
+
+LEGO is our first proving ground, not the boundary of the idea. BLAST and
+EV3RSTORM already connect to the same application and carry out model-directed
+actions with real sensor and motor feedback. BLAST makes that intelligence
+expressive with a natural voice, animated eyes, arm gestures, and a snapping
+claw. Coordinated navigation and shared obstacle knowledge across physical
+robots are the next integration milestone.
 
 <p align="center">
   <img src="src/robot_agent/dashboard_web/robot-llm-mascot.png" alt="Robot LLM Lab's mildly grumpy modular mascot waving" width="280">
@@ -25,11 +32,36 @@ arm gestures, and a snapping claw.
 
 <p align="center"><em>A little attitude. A lot to explore.</em></p>
 
+## Intelligence in the application, capabilities in the body
+
+The application offloads the robots' high-level thinking to a shared local LLM.
+Each device only needs to expose what it can sense and do through a
+hardware-specific adapter. Its onboard controller still handles motor control
+and immediate feedback; it does not need to run a language model or maintain
+its own independent planning system.
+
+That architecture makes three things possible:
+
+- **Capable behavior on modest hardware.** Put the expensive computation in
+  the host, rather than adding an AI computer to every device.
+- **Knowledge that is not trapped in one robot.** Bring observations, maps,
+  and mission history into the application, where they can inform work across
+  bodies instead of being rediscovered by each one.
+- **New bodies without a new brain.** Describe a device's capabilities and
+  connect its adapter, building toward reuse of the same agentic flow for
+  different sensors, actuators, and form factors.
+
+Centralized intelligence does not mean a fixed script. The model still chooses
+how to pursue a goal using the available information and capabilities. Nor does
+it create sensors a device does not have: useful autonomy depends on honest
+observations and reliable execution, not the model alone.
+
 ## Give a goal, not a motor command
 
-The model owns the meaningful decisions: where to go, which waypoints to use,
-when to gather more information, and when to change its plan. The robot runtime
-handles carrying out those decisions with sensor and motor feedback.
+The model in the central application owns the meaningful decisions: where to
+go, which waypoints to use, when to gather more information, and when to change
+its plan. The robot-specific runtime carries out those decisions with sensor
+and motor feedback.
 
 ```text
 goal → plan → act → observe → verify → adapt
@@ -73,28 +105,30 @@ must create its own route; the scenario does not supply the answer.
 
 ```mermaid
 flowchart TD
-    U["You<br/>text or voice"] --> H["Conversation and mission context<br/>goal · route · observations"]
-    H --> Q["Local Qwen<br/>plan · replan · reply · express"]
-    Q --> P["Navigation plan and waypoints"]
-    P --> X["Robot-specific execution<br/>turn · drive · scan · report progress"]
-    X --> B["BLAST<br/>Pybricks · Bluetooth"]
-    X --> E["EV3RSTORM<br/>ev3dev · Wi-Fi / SSH"]
-    Q --> T["Piper speech"]
-    T --> B
-    T --> E
-    Q --> G["BLAST expressions<br/>eyes · arms · claw"]
-    G --> B
-    B --> O["Sensor and motor feedback<br/>map · estimated pose · execution result"]
+    U["You<br/>text or voice"] --> H
+    subgraph APP["Shared local application · the brain"]
+        H["Conversation and mission memory<br/>goals · plans · observations"]
+        H --> Q["Local Qwen<br/>reason · plan · replan · reply · express"]
+        Q --> X["Robot-specific adapters<br/>navigation · speech · supported gestures"]
+        O["Sensor and motor feedback<br/>maps · estimated poses · execution results"] --> H
+        O --> D["Live dashboard and map"]
+        H --> D
+    end
+    subgraph BODIES["Physical devices · sensing and action"]
+        B["BLAST<br/>Pybricks · Bluetooth"]
+        E["EV3RSTORM<br/>ev3dev · Wi-Fi / SSH"]
+    end
+    X --> B
+    X --> E
+    B --> O
     E --> O
-    O --> H
-    O --> D["Live dashboard and map"]
-    H --> D
 ```
 
-The application keeps mission state and brings observations back to the model.
-Each robot's controller owns its motors and translates supported actions into
-hardware operations. Qwen chooses the route and expression; it does not need
-to manage motor ports, Bluetooth packets, or audio encoding.
+The application owns the high-level agent loop and keeps mission state outside
+the bodies. Adapters translate its decisions into supported operations, while
+each robot's onboard controller handles its motors and reports results. Qwen
+chooses the route and expression; it does not need to manage motor ports,
+Bluetooth packets, or audio encoding.
 
 This is a shared application, not yet a single shared navigation implementation.
 BLAST and EV3 have distinct execution paths and sensor representations. Bringing
@@ -105,7 +139,7 @@ The core stack runs locally: **Qwen3.8 27B through LM Studio**, **whisper.cpp**
 for voice input, and **Piper** for speech. BLAST uses the `en_GB-cori-high` voice.
 The dashboard supports English and Swedish.
 
-## Two bodies, different capabilities
+## Our first two bodies
 
 | | BLAST · Robot Inventor 51515 | EV3RSTORM · MINDSTORMS EV3 |
 |---|---|---|
@@ -241,10 +275,10 @@ such as Pybricks Code, before connecting BLAST.
 
 ## Where we are heading
 
-The next milestone is **two autonomous robots using a common agentic flow**:
-the same approach to goals, route memory, and replanning, with different
-hardware underneath. Small, physically validated steps keep that integration
-grounded in behavior rather than framework-building.
+The next milestone is **one common agentic flow working through both robots**:
+shared handling of goals, route memory, and replanning, with different hardware
+underneath. Small, physically validated steps keep that integration grounded
+in behavior rather than framework-building.
 
 From there, the project grows in three directions:
 
@@ -256,9 +290,10 @@ From there, the project grows in three directions:
 - **Perceive more.** Add vision, continuous voice interaction, sound-source
   reasoning, and new LEGO bodies such as BOOST.
 
-The long-term picture: a robot hears a dog bark, finds the source, turns toward
-it, and answers, “woof right back at you.” Perception, planning, movement, and
-personality working together.
+The long-term picture: one device hears a dog bark; the application uses that
+observation to have a suitable body investigate, turn toward the source, and
+answer, “woof right back at you.” Shared perception, planning, movement, and
+personality — without every body needing its own powerful computer.
 
 ## Development and documentation
 

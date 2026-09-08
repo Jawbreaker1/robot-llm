@@ -1,4 +1,4 @@
-"""Host-authored speech personality shared by BLAST dialogue and navigation."""
+"""BLAST personality and expression vocabulary shared by dialogue and navigation."""
 
 from __future__ import annotations
 
@@ -13,6 +13,27 @@ BLAST_MAX_NAVIGATION_UTTERANCE_CHARS = 72
 BLAST_NAVIGATION_OUTPUT_TOKENS = 8_192
 BLAST_NAVIGATION_REASONING_EFFORT = "low"
 BLAST_NAVIGATION_TIMEOUT_SECONDS = 60.0
+REPLY_FACES = ("idle", "neutral", "happy", "frustrated", "curious", "surprised", "angry")
+REPLY_GESTURES = ("none", "claw_snap", "arm_wave", "claw_flourish")
+
+
+def valid_social_expression(value) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"face", "gesture"}
+        and value["face"] in REPLY_FACES
+        and value["gesture"] in REPLY_GESTURES
+    )
+
+
+def social_expression_schema() -> dict:
+    return {"oneOf": [
+        {"type": "null"},
+        {"type": "object", "properties": {
+            "face": {"type": "string", "enum": list(REPLY_FACES)},
+            "gesture": {"type": "string", "enum": list(REPLY_GESTURES)},
+        }, "required": ["face", "gesture"], "additionalProperties": False},
+    ]}
 
 BLAST_PERSONA_BY_LOCALE = MappingProxyType({
     "sv": (
