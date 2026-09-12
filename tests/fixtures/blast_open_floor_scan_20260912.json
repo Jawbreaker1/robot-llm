@@ -1,0 +1,382 @@
+{
+  "source_episode": "episode-e1475d7b4ca7fc422f4d5790",
+  "description": "Recorded September 12 startup scan with unsettled echoes. No route or model decisions; later sensing uses simulated geometry.",
+  "scans": [
+    {
+      "schema": "blast-scan-front-arc/v3",
+      "state": "complete",
+      "result": "restored",
+      "bearing_source": "IMU_YAW_WITH_ENCODER_FALLBACK",
+      "bearing_frame": "ROBOT_RELATIVE_AT_SCAN_START",
+      "start_heading_deg": 0,
+      "final_heading_deg": 0.97772,
+      "restoration_error_deg": 0.97772,
+      "restoration_verified": true,
+      "sweep_coverage_deg": 359.0222796,
+      "sweep_direction": "left",
+      "sweep_turn_count": 16,
+      "encoder_start_angles_deg": {
+        "left_drive": -78,
+        "right_drive": 269
+      },
+      "encoder_final_angles_deg": {
+        "left_drive": -825,
+        "right_drive": 1007
+      },
+      "encoder_restoration": {
+        "common_mode_residue_mm": -2.25,
+        "opposed_residue_deg": -3.825,
+        "motion_stopped": true,
+        "observation_settled": false,
+        "body_pose_verified": true
+      },
+      "imu_heading_diagnostics": {
+        "authority": "SCAN_GEOMETRY_WHEN_AVAILABLE",
+        "start_heading_deg": 5.5192796,
+        "final_heading_deg": -353.503,
+        "restoration_error_deg": 0.9777204000000097
+      },
+      "all_observations_settled": false,
+      "rays": [
+        {
+          "side": "center",
+          "distance_mm": 2000,
+          "range_state": "NO_VALID_DISTANCE",
+          "body_motor_angle_deg": 157,
+          "heading_deg": 0,
+          "relative_heading_deg": 0,
+          "imu_heading_deg": 5.5192796,
+          "drive_encoder_delta_deg": {
+            "left_drive": 0,
+            "right_drive": 0
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 378014
+        },
+        {
+          "side": "left_near",
+          "distance_mm": 759,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 157,
+          "heading_deg": -94.42368,
+          "relative_heading_deg": -94.42368,
+          "imu_heading_deg": -88.9044,
+          "drive_encoder_delta_deg": {
+            "left_drive": -195,
+            "right_drive": 193
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 395625
+        },
+        {
+          "side": "left_far",
+          "distance_mm": 386,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 158,
+          "heading_deg": -164.54496,
+          "relative_heading_deg": -164.54496,
+          "imu_heading_deg": -159.02568,
+          "drive_encoder_delta_deg": {
+            "left_drive": -343,
+            "right_drive": 336
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 406425
+        },
+        {
+          "side": "right_near",
+          "distance_mm": 774,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 157,
+          "heading_deg": 101.35076,
+          "relative_heading_deg": 101.35076,
+          "imu_heading_deg": -253.12996,
+          "drive_encoder_delta_deg": {
+            "left_drive": -539,
+            "right_drive": 529
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 422767
+        },
+        {
+          "side": "right_far",
+          "distance_mm": 789,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 157,
+          "heading_deg": 171.82876,
+          "relative_heading_deg": 171.82876,
+          "imu_heading_deg": -182.65196,
+          "drive_encoder_delta_deg": {
+            "left_drive": -392,
+            "right_drive": 384
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 409361
+        }
+      ],
+      "angular_rays": [
+        {
+          "side": "center",
+          "distance_mm": 2000,
+          "range_state": "NO_VALID_DISTANCE",
+          "body_motor_angle_deg": 157,
+          "heading_deg": 0,
+          "relative_heading_deg": 0,
+          "imu_heading_deg": 5.5192796,
+          "drive_encoder_delta_deg": {
+            "left_drive": 0,
+            "right_drive": 0
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 378014
+        },
+        {
+          "side": "left_1",
+          "distance_mm": 2000,
+          "range_state": "NO_VALID_DISTANCE",
+          "body_motor_angle_deg": 157,
+          "heading_deg": -23.838066,
+          "relative_heading_deg": -23.838066,
+          "imu_heading_deg": -18.318786,
+          "drive_encoder_delta_deg": {
+            "left_drive": -49,
+            "right_drive": 48
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 382153
+        },
+        {
+          "side": "left_2",
+          "distance_mm": 687,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 157,
+          "heading_deg": -47.669336,
+          "relative_heading_deg": -47.669336,
+          "imu_heading_deg": -42.150056,
+          "drive_encoder_delta_deg": {
+            "left_drive": -97,
+            "right_drive": 98
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 387075
+        },
+        {
+          "side": "left_3",
+          "distance_mm": 725,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 158,
+          "heading_deg": -71.02279,
+          "relative_heading_deg": -71.02279,
+          "imu_heading_deg": -65.50351,
+          "drive_encoder_delta_deg": {
+            "left_drive": -146,
+            "right_drive": 146
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 391844
+        },
+        {
+          "side": "left_4",
+          "distance_mm": 759,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 157,
+          "heading_deg": -94.42368,
+          "relative_heading_deg": -94.42368,
+          "imu_heading_deg": -88.9044,
+          "drive_encoder_delta_deg": {
+            "left_drive": -195,
+            "right_drive": 193
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 395625
+        },
+        {
+          "side": "left_5",
+          "distance_mm": 831,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 157,
+          "heading_deg": -118.12481,
+          "relative_heading_deg": -118.12481,
+          "imu_heading_deg": -112.60553,
+          "drive_encoder_delta_deg": {
+            "left_drive": -245,
+            "right_drive": 242
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 399490
+        },
+        {
+          "side": "left_6",
+          "distance_mm": 361,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 157,
+          "heading_deg": -141.30508,
+          "relative_heading_deg": -141.30508,
+          "imu_heading_deg": -135.7858,
+          "drive_encoder_delta_deg": {
+            "left_drive": -293,
+            "right_drive": 290
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 402972
+        },
+        {
+          "side": "left_7",
+          "distance_mm": 386,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 158,
+          "heading_deg": -164.54496,
+          "relative_heading_deg": -164.54496,
+          "imu_heading_deg": -159.02568,
+          "drive_encoder_delta_deg": {
+            "left_drive": -343,
+            "right_drive": 336
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 406425
+        },
+        {
+          "side": "right_1",
+          "distance_mm": 2000,
+          "range_state": "NO_VALID_DISTANCE",
+          "body_motor_angle_deg": 157,
+          "heading_deg": 0.97772,
+          "relative_heading_deg": 0.97772,
+          "imu_heading_deg": -353.503,
+          "drive_encoder_delta_deg": {
+            "left_drive": -747,
+            "right_drive": 738
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 442333
+        },
+        {
+          "side": "right_2",
+          "distance_mm": 2000,
+          "range_state": "NO_VALID_DISTANCE",
+          "body_motor_angle_deg": 157,
+          "heading_deg": 8.688,
+          "relative_heading_deg": 8.688,
+          "imu_heading_deg": -345.79272,
+          "drive_encoder_delta_deg": {
+            "left_drive": -731,
+            "right_drive": 722
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 438577
+        },
+        {
+          "side": "right_3",
+          "distance_mm": 2000,
+          "range_state": "NO_VALID_DISTANCE",
+          "body_motor_angle_deg": 157,
+          "heading_deg": 31.57148,
+          "relative_heading_deg": 31.57148,
+          "imu_heading_deg": -322.90924,
+          "drive_encoder_delta_deg": {
+            "left_drive": -683,
+            "right_drive": 675
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 435103
+        },
+        {
+          "side": "right_4",
+          "distance_mm": 2000,
+          "range_state": "NO_VALID_DISTANCE",
+          "body_motor_angle_deg": 158,
+          "heading_deg": 55.12752,
+          "relative_heading_deg": 55.12752,
+          "imu_heading_deg": -299.3532,
+          "drive_encoder_delta_deg": {
+            "left_drive": -635,
+            "right_drive": 626
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 431022
+        },
+        {
+          "side": "right_5",
+          "distance_mm": 774,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 157,
+          "heading_deg": 101.35076,
+          "relative_heading_deg": 101.35076,
+          "imu_heading_deg": -253.12996,
+          "drive_encoder_delta_deg": {
+            "left_drive": -539,
+            "right_drive": 529
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 422767
+        },
+        {
+          "side": "right_6",
+          "distance_mm": 492,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 158,
+          "heading_deg": 124.547688,
+          "relative_heading_deg": 124.547688,
+          "imu_heading_deg": -229.933032,
+          "drive_encoder_delta_deg": {
+            "left_drive": -490,
+            "right_drive": 481
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 418664
+        },
+        {
+          "side": "right_7",
+          "distance_mm": 430,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 157,
+          "heading_deg": 147.98912,
+          "relative_heading_deg": 147.98912,
+          "imu_heading_deg": -206.4916,
+          "drive_encoder_delta_deg": {
+            "left_drive": -440,
+            "right_drive": 433
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 413953
+        },
+        {
+          "side": "right_8",
+          "distance_mm": 789,
+          "range_state": "MEASURED",
+          "body_motor_angle_deg": 157,
+          "heading_deg": 171.82876,
+          "relative_heading_deg": 171.82876,
+          "imu_heading_deg": -182.65196,
+          "drive_encoder_delta_deg": {
+            "left_drive": -392,
+            "right_drive": 384
+          },
+          "observation_settled": false,
+          "evidence_use": "SWEEP_CONTINUATION_ONLY",
+          "observed_at_ms": 409361
+        }
+      ]
+    }
+  ]
+}

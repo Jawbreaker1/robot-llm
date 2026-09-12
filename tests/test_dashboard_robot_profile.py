@@ -376,6 +376,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 timeout_seconds=6.5,
                 reasoning_effort="low",
                 max_output_tokens=BLAST_NAVIGATION_OUTPUT_TOKENS,
+                social_expressions=True,
                 utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
                 max_utterance_chars=(
                     BLAST_MAX_NAVIGATION_UTTERANCE_CHARS
@@ -402,6 +403,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
             speaker_type.assert_called_once_with(
                 synthesizer,
                 monitor,
+                gesture_allowed=None,
             )
             speech_runtime_type.assert_called_once_with(
                 speaker=speaker,
@@ -473,6 +475,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
             base_url="http://127.0.0.1:1234",
             model="model-a",
             timeout_seconds=10.0,
+            social_expressions=True,
             reply_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
         )
         ready = json.loads(stdout.getvalue())
@@ -650,6 +653,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
                     base_url="http://127.0.0.1:1234",
                     model="model-b",
                     timeout_seconds=10.0,
+                    social_expressions=True,
                     reply_persona_by_locale=BLAST_PERSONA_BY_LOCALE,
                 ),
             ],

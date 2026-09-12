@@ -2,8 +2,30 @@
 
 from __future__ import annotations
 
+from .blast_episode_execution import (
+    ACTION_COMMANDS,
+    _ROUTE_VALIDATION_ACTION_SOURCE,
+    _STARTUP_SURROUNDINGS_ACTION,
+    _encoder_anchor_correlated,
+    _navigation_drive_encoders_available,
+    _navigation_body_matched,
+    _minimum_rotation_clearance_mm,
+    BlastEpisodeError,
+    _dispatch_episode_action,
+    _run_startup_perception,
+)
+from .blast_episode_planning import (
+    _PLAN_CONTINUATION_ACTION_SOURCE,
+    _WAYPOINT_REACHED_RADIUS_MM,
+    _WAYPOINT_ALIGNMENT_TRIGGER_DEG,
+    _planner_history,
+    _planner_map_with_route_feedback,
+    _route_interruption,
+    _planner_step,
+    _admit_waypoint_step,
+)
+
 import copy
-from functools import partial
 import math
 import threading
 import time
@@ -14,12 +36,12 @@ from .blast_action_admission import (
     admit_blast_spoken_action,
     fresh_blast_action_observation,
 )
-from .blast_navigation_calibration import (
-    BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
-)
+from .blast_navigation_calibration import BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
 from .blast_episode_deadline import (
-    SETTLED_OBSERVATION_HEADROOM_MS, BlastEpisodeDeadline,
-    blast_action_deadline_headroom_ms)
+    SETTLED_OBSERVATION_HEADROOM_MS,
+    BlastEpisodeDeadline,
+    blast_action_deadline_headroom_ms,
+)
 from .blast_episode_map_trace import _BlastEpisodeMapTrace
 from .blast_episode_speech import BlastEpisodeSpeech, blast_episode_cancelled
 from .blast_observation_monitor import (
@@ -31,45 +53,23 @@ from .blast_observation_monitor import (
     blast_range_state,
     validate_blast_scan_ray_contract,
 )
-from .blast_scan_observation import current_side_scan
 from .blast_scan_planar_projection import project_blast_scan_planar_surfaces
-from .blast_scan_safety import (
-    BlastScanPermitUnavailable,
-    blast_scan_sweep_is_clear,
-    issue_blast_scan_permit,
-)
+from .blast_scan_safety import blast_scan_sweep_is_clear
 from .blast_stationary_recovery_flow import (
     begin_blast_iteration,
     recover_planner_iteration_actions,
-    recover_scan_start_observation,
     read_episode_observation,
 )
 from .blast_spatial_map import BlastSpatialMapBridge
-from .coarse_navigation_grid import (
-    GRID_CELL_SIZE_MM,
-    MODEL_ROUTE_AXIS_TOLERANCE_MM,
-)
-from .blast_navigation_action_profile import (
-    BLAST_NAVIGATION_COMMANDS,
-)
-from .blast_navigation_motion_execution import (
-    BlastNavigationMotionExecutor,
-)
+from .coarse_navigation_grid import GRID_CELL_SIZE_MM, MODEL_ROUTE_AXIS_TOLERANCE_MM
+from .blast_navigation_motion_execution import BlastNavigationMotionExecutor
 from .blast_mission_completion import (
     BLAST_GOAL_HEADING_TOLERANCE_MDEG,
     BLAST_GOAL_RADIUS_MM,
     blast_directional_completion_allowed,
 )
 from .blast_turn_safety import blast_turn_slice_allows_continuation
-from .lm_studio import LMStudioProtocolError
-from .lm_studio_controller_action import (
-    ABORT,
-    COMPLETE,
-    FOLLOW_WAYPOINT,
-    ControllerActionContext,
-    ControllerActionPlannerResult,
-)
-from .navigation_diagnostics import record_navigation_diagnostic
+from .lm_studio_controller_action import COMPLETE, FOLLOW_WAYPOINT
 from .physical_navigation_contract import (
     ADVANCE,
     REVERSE,
@@ -80,81 +80,16 @@ from .physical_navigation_contract import (
 from .physical_odometry import normalize_heading_mdeg
 from .robot_control_service import RobotEpisodeOutcome
 BLAST_PROFILE_ID = ROBOT_ID
-ACTION_COMMANDS = {
-    action: BLAST_NAVIGATION_COMMANDS[action]
-    for action in (ADVANCE, REVERSE, TURN_LEFT_90, TURN_RIGHT_90)
-}
-BLAST_PLAN_ACTIONS = (
-    FOLLOW_WAYPOINT,
-    ADVANCE,
-    REVERSE,
-    TURN_LEFT_90,
-    TURN_RIGHT_90,
-    SCAN_FRONT_ARC,
-)
 DEFAULT_MAX_DECISIONS = 16
 DEFAULT_MAX_OBSERVATION_AGE_MS = 3_000
 DEFAULT_MIN_FORWARD_CLEARANCE_MM = 120
 DEFAULT_MINIMUM_FORWARD_PROGRESS_MM = 800
-_PLANNER_ACTION_SOURCE = "PLANNER_ACTION"
-_PLAN_CONTINUATION_ACTION_SOURCE = "PLAN_CONTINUATION"
-_STARTUP_PERCEPTION_ACTION_SOURCE = "STARTUP_PERCEPTION"
-_ROUTE_VALIDATION_ACTION_SOURCE = "ROUTE_VALIDATION"
-_STARTUP_SURROUNDINGS_ACTION = "SCAN_SURROUNDINGS"
 _STRAIGHT_SCAN_REUSE_MM = GRID_CELL_SIZE_MM * 2
 # Finish the commanded axis close to its target, while tolerating ordinary
 # cross-axis LEGO odometry drift. A large circular radius cut clearance legs
 # short and let BLAST turn toward an obstacle before passing its corner.
-_WAYPOINT_REACHED_RADIUS_MM = 25
 _WAYPOINT_CROSS_AXIS_TOLERANCE_MM = MODEL_ROUTE_AXIS_TOLERANCE_MM
-_WAYPOINT_ALIGNMENT_TRIGGER_DEG = 12.0
-_STARTUP_HEADING_RESTORATION_TOLERANCE_DEG = 20.0
 _ADVANCE_PROGRESS_STALLED = object()
-_SCAN_REFUSAL_CODES = frozenset(("scan_start_clearance_unverified",
-                                 "scan_sweep_clearance_lost",
-                                 "scan_sweep_observation_unverified"))
-
-
-def _encoder_anchor_correlated(observation, motion_executor) -> bool:
-    sensors = (
-        observation.get("sensors")
-        if isinstance(observation, Mapping) else None
-    )
-    if not isinstance(sensors, Mapping):
-        sensors = observation
-    matches = getattr(motion_executor, "observation_matches_anchor", None)
-    return callable(matches) and matches(sensors)
-
-
-def _navigation_drive_encoders_available(sensors) -> bool:
-    motors = (
-        sensors.get("motor_angles_deg")
-        if isinstance(sensors, Mapping) else None
-    )
-    return (
-        isinstance(motors, Mapping)
-        and all(type(motors.get(role)) is int for role in (
-            "left_drive", "right_drive",
-        ))
-    )
-
-
-def _navigation_body_matched(sensors) -> bool:
-    motors = sensors.get("motor_angles_deg")
-    angle = motors.get("body") if isinstance(motors, Mapping) else None
-    return (
-        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics
-        .matches_navigation_body_angle(angle)
-    )
-
-
-def _minimum_rotation_clearance_mm() -> int:
-    return (
-        BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-        .minimum_rotation_clearance_mm()
-    )
-
-
 def _planner_scan_geometry_checked(
     action, observation, latest_scan_view, pose,
 ):
@@ -166,170 +101,6 @@ def _planner_scan_geometry_checked(
         and latest_scan_view is not None
         and blast_scan_sweep_is_clear(latest_scan_view, pose)
     )
-
-
-def _range_evidence(distance):
-    state = blast_range_state(distance)
-    return {
-        "range_state": state,
-        "distance_mm": distance if state == RANGE_STATE_MEASURED else None,
-    }
-
-
-def _route_interruption(reason, distance, waypoint):
-    evidence = _range_evidence(distance)
-    if (
-        reason == "FORWARD_CLEARANCE_UNAVAILABLE"
-        and evidence["range_state"] != RANGE_STATE_MEASURED
-    ):
-        reason = "RANGE_MEASUREMENT_UNAVAILABLE"
-    return {
-        "reason": reason,
-        **evidence,
-        "waypoint": waypoint,
-    }
-
-
-def _planner_navigation_value(value):
-    """Expose coarse episode facts without hardware-scale angle precision."""
-
-    if isinstance(value, Mapping):
-        result = {}
-        for key, nested in value.items():
-            if (
-                key == "imu"
-                or key == "navigation_reference"
-                or key.startswith("imu_")
-            ):
-                continue
-            planner_key = key
-            planner_value = _planner_navigation_value(nested)
-            if (
-                key.endswith("_mdeg")
-                and isinstance(nested, (int, float))
-                and not isinstance(nested, bool)
-            ):
-                planner_key = key[:-5] + "_deg"
-                planner_value = round(nested / 1_000)
-            result[planner_key] = planner_value
-        if "motor_angles_deg" in value and "distance_mm" in value:
-            result.update(_range_evidence(value["distance_mm"]))
-        return result
-    if isinstance(value, tuple):
-        return tuple(_planner_navigation_value(item) for item in value)
-    if isinstance(value, list):
-        return [_planner_navigation_value(item) for item in value]
-    return value
-
-
-def _planner_history(history):
-    """Project pulse receipts into compact semantic navigation events."""
-
-    retained_keys = (
-        "action",
-        "requested_action",
-        "action_source",
-        "observation_settled",
-        "pose",
-        "motion",
-        "odometry_reanchored_after_scan",
-        "scan_view_count",
-        "scan_state",
-        "sweep_coverage_deg",
-        "heading_restoration",
-        "route_rejection",
-        "route_interruption",
-        "active_waypoint_geometry_after",
-        "scan_refusal",
-        "waypoint_plan",
-    )
-    events = []
-    for item in history:
-        event = {
-            key: item[key] for key in retained_keys if key in item
-        }
-        scan = item.get("scan")
-        if isinstance(scan, Mapping):
-            event["scan"] = {
-                key: scan[key] for key in (
-                    "state",
-                    "result",
-                    "restoration_verified",
-                    "sweep_coverage_deg",
-                    "all_observations_settled",
-                ) if key in scan
-            }
-        result_observation = item.get("result_observation")
-        if isinstance(result_observation, Mapping):
-            event.update(_range_evidence(result_observation.get("distance_mm")))
-        if (
-            item.get("action_source") == _PLAN_CONTINUATION_ACTION_SOURCE
-            and events
-            and events[-1].get("action") == item.get("action")
-            and events[-1].get("action_source") in (
-                _PLANNER_ACTION_SOURCE,
-                _PLAN_CONTINUATION_ACTION_SOURCE,
-            )
-        ):
-            original_source = events[-1]["action_source"]
-            event["action_source"] = original_source
-            event["continued"] = True
-            events[-1] = event
-        elif (
-            event.get("route_rejection") is not None
-            and events
-            and events[-1].get("route_rejection")
-            == event["route_rejection"]
-            and events[-1].get("waypoint_plan")
-            == event.get("waypoint_plan")
-            and events[-1].get("pose") == event.get("pose")
-        ):
-            event["repeat_count"] = events[-1].get(
-                "repeat_count", 1,
-            ) + 1
-            events[-1] = event
-        else:
-            events.append(event)
-    return tuple(events)
-
-
-def _planner_map_with_route_feedback(local_map_evidence, history):
-    """Keep the latest unchanged route refusal beside the current map."""
-
-    if not isinstance(local_map_evidence, Mapping):
-        return local_map_evidence
-    for event in reversed(_planner_history(history)):
-        rejection = event.get("route_rejection")
-        if isinstance(rejection, Mapping):
-            enriched = copy.deepcopy(local_map_evidence)
-            enriched["latest_route_rejection"] = {
-                "rejection": copy.deepcopy(rejection),
-                "rejected_waypoint_plan": copy.deepcopy(
-                    event.get("waypoint_plan", ())
-                ),
-                "pose_at_rejection": copy.deepcopy(event.get("pose")),
-                "repeat_count": event.get("repeat_count", 1),
-                "pose_or_evidence_changed": False,
-            }
-            return enriched
-        if event.get("action") in (
-            ADVANCE,
-            REVERSE,
-            TURN_LEFT_90,
-            TURN_RIGHT_90,
-            SCAN_FRONT_ARC,
-            _STARTUP_SURROUNDINGS_ACTION,
-        ):
-            break
-    return local_map_evidence
-
-
-class BlastEpisodeError(RuntimeError):
-    """One safely reportable BLAST episode failure."""
-
-    def __init__(self, code: str, message: str) -> None:
-        self.code = code
-        super().__init__(message)
 
 
 class BlastEpisodeRuntimeAdapter:
@@ -506,69 +277,6 @@ class BlastEpisodeRuntimeAdapter:
             for item in history
         )
 
-    def _recent_evidence_allows_bounded_advance(
-        self, history, latest_scan_view,
-    ) -> bool:
-        """Reuse evidence in the actual travel direction, not named scan sides."""
-
-        current_pose = next((
-            item["pose"] for item in reversed(history)
-            if isinstance(item.get("pose"), Mapping)
-        ), None)
-        candidates = []
-        for item in reversed(history):
-            sensors = item.get("result_observation")
-            pose = item.get("pose")
-            if (
-                isinstance(sensors, Mapping)
-                and item.get("observation_settled") is True
-                and blast_range_state(sensors.get("distance_mm"))
-                == RANGE_STATE_MEASURED
-                and isinstance(pose, Mapping)
-                and current_pose is not None
-            ):
-                candidates.append((pose, pose.get("heading_mdeg", 0), sensors["distance_mm"]))
-            action = item.get("action")
-            if action in (SCAN_FRONT_ARC, _STARTUP_SURROUNDINGS_ACTION):
-                break
-        scan = latest_scan_view.get("scan") if isinstance(latest_scan_view, Mapping) else None
-        rays = scan.get("angular_rays") if isinstance(scan, Mapping) else None
-        scan_pose = latest_scan_view.get("scan_pose") if isinstance(latest_scan_view, Mapping) else None
-        if isinstance(scan_pose, Mapping) and isinstance(rays, list):
-            for ray in rays:
-                if ray.get("observation_settled") is not True:
-                    continue
-                bearing = ray.get("relative_heading_deg")
-                if not isinstance(bearing, (int, float)) or isinstance(bearing, bool):
-                    continue
-                state = ray.get("range_state")
-                if state not in (RANGE_STATE_MEASURED, RANGE_STATE_NO_VALID_DISTANCE):
-                    continue
-                candidates.append((
-                    scan_pose, scan_pose["heading_mdeg"] - round(bearing * 1000),
-                    ray.get("distance_mm") if state == RANGE_STATE_MEASURED else None,
-                ))
-        if current_pose is None:
-            return False
-        heading = current_pose.get("heading_mdeg", 0)
-        radians = math.radians(heading / 1000)
-        for pose, bearing, distance in candidates:
-            dx = current_pose["x_mm"] - pose["x_mm"]
-            dy = current_pose["y_mm"] - pose["y_mm"]
-            if (
-                abs(normalize_heading_mdeg(bearing - heading)) > 12_000
-                or math.hypot(dx, dy) >= _STRAIGHT_SCAN_REUSE_MM
-                or abs(-dx * math.sin(radians) + dy * math.cos(radians))
-                > _WAYPOINT_CROSS_AXIS_TOLERANCE_MM
-            ):
-                continue
-            travelled = max(0, dx * math.cos(radians) + dy * math.sin(radians))
-            # A settled no-return permits bounded exploration; it never becomes
-            # a free map cell. The route guard still retains measured obstacles.
-            if distance is None or distance - travelled > self.minimum_forward_clearance_mm:
-                return True
-        return False
-
     def _current_scan_supports_bounded_reverse(
         self, history, latest_scan_view,
     ) -> bool:
@@ -667,8 +375,13 @@ class BlastEpisodeRuntimeAdapter:
             return False
         distance = sensors.get("distance_mm")
         if action == ADVANCE:
+            # Pybricks' no-echo response is normal on open floor, not a fault
+            # or a measured 2 m clearance. Check fresh data before every pulse;
+            # the route guard still rejects known obstacles on the chosen leg.
+            state = blast_range_state(distance)
             return (
-                blast_range_state(distance) == RANGE_STATE_MEASURED
+                state == RANGE_STATE_NO_VALID_DISTANCE
+                or state == RANGE_STATE_MEASURED
                 and float(distance) > self.minimum_forward_clearance_mm
             )
         if action in (SCAN_FRONT_ARC, TURN_LEFT_90, TURN_RIGHT_90):
@@ -698,15 +411,6 @@ class BlastEpisodeRuntimeAdapter:
             )
         ):
             available.append(REVERSE)
-        if (
-            blast_range_state(
-                observation["sensors"].get("distance_mm")
-            ) == RANGE_STATE_NO_VALID_DISTANCE
-        ):
-            if self._recent_evidence_allows_bounded_advance(
-                history, latest_scan_view,
-            ):
-                available.append(ADVANCE)
         if (
             self._current_observation_allows_action(
                 SCAN_FRONT_ARC, observation
@@ -769,219 +473,6 @@ class BlastEpisodeRuntimeAdapter:
         if value is None:
             return None
         return self._outcome(value[0], False, value[1])
-
-    def _dispatch_action(
-        self,
-        action,
-        motion_executor,
-        control_requested,
-        *,
-        allow_turn_no_valid_with_bounded_evidence=False,
-        action_permit=None,
-        surroundings_scan=False,
-        turn_continue_requested=None,
-        trim_turn=False,
-    ):
-        if action == SCAN_FRONT_ARC:
-            kwargs = {"cancel_requested": control_requested}
-            if action_permit is not None:
-                kwargs["action_permit"] = action_permit
-            surroundings = getattr(
-                self.controller, "scan_surroundings", None,
-            )
-            result = (
-                surroundings(**kwargs)
-                if surroundings_scan and callable(surroundings)
-                else self.controller.command("scan_front_arc", **kwargs)
-            )
-            return result, None
-        continuation_gate = None
-        if action in (TURN_LEFT_90, TURN_RIGHT_90):
-            continuation_gate = (
-                turn_continue_requested
-                if turn_continue_requested is not None
-                else partial(
-                    blast_turn_slice_allows_continuation,
-                    allow_no_valid_distance_with_bounded_evidence=(
-                        allow_turn_no_valid_with_bounded_evidence
-                    ),
-                )
-            )
-        execution = motion_executor.execute(
-            action,
-            cancel_requested=control_requested,
-            continue_requested=continuation_gate,
-            **({"trim_turn": True} if trim_turn else {}),
-        )
-        return execution.controller_results[-1], execution
-
-    def _scan_failure_outcome(self, code):
-        if code not in _SCAN_REFUSAL_CODES:
-            return None
-        sweep_stopped = code != "scan_start_clearance_unverified"
-        message = (
-            "BLAST scan stopped between pulses; reposition before retry"
-            if sweep_stopped
-            else "BLAST scan could not start from settled safety evidence"
-        )
-        return self._outcome("no_safe_blast_action", False, message)
-
-    def _dispatch_episode_action(
-        self, *, action, observation, geometry_checked, motion_executor,
-        prior_receipt,
-        allow_turn_no_valid_with_bounded_evidence, context, deadline_ms,
-        map_trace=None, perception_only_scan=False,
-        surroundings_scan=False, turn_continue_requested=None,
-        scan_refusal_can_replan=False,
-        trim_turn=False,
-    ):
-        outcome = self._control_outcome(
-            context, deadline_ms, blast_action_deadline_headroom_ms(action),
-        )
-        if outcome is not None:
-            return None, None, observation, outcome
-        control_requested = lambda: self._control_outcome(
-            context, deadline_ms) is not None
-        for attempt in range(2):
-            if not _encoder_anchor_correlated(
-                observation, motion_executor,
-            ):
-                raise BlastEpisodeError(
-                    "blast_action_start_unverified",
-                    "BLAST drive encoders no longer match its trusted pose",
-                )
-            action_permit = self._scan_action_permit(
-                action=action,
-                observation=observation,
-                geometry_checked=geometry_checked,
-                pose=motion_executor.pose,
-                prior_receipt=prior_receipt,
-                expected_drive_angles=(
-                    motion_executor.expected_start_angles
-                ),
-                perception_only=perception_only_scan,
-            )
-            try:
-                record_navigation_diagnostic(
-                    "controller_action_started", episode_id=context.episode_id,
-                    robot_id=ROBOT_ID, action=action,
-                    pose=motion_executor.pose.to_dict(),
-                    observation_before=observation,
-                )
-                command_result, execution = self._dispatch_action(
-                    action,
-                    motion_executor,
-                    control_requested,
-                    allow_turn_no_valid_with_bounded_evidence=(
-                        allow_turn_no_valid_with_bounded_evidence
-                    ),
-                    action_permit=action_permit,
-                    surroundings_scan=surroundings_scan,
-                    turn_continue_requested=turn_continue_requested,
-                    trim_turn=trim_turn,
-                )
-                record_navigation_diagnostic(
-                    "controller_action_completed", episode_id=context.episode_id,
-                    robot_id=ROBOT_ID, action=action, result=command_result,
-                )
-                return command_result, execution, observation, None
-            except BlastControllerError as error:
-                record_navigation_diagnostic(
-                    "controller_action_failed", episode_id=context.episode_id,
-                    robot_id=ROBOT_ID, action=action, code=error.code,
-                    message=str(error), motion_started=error.motion_started,
-                    evidence_uncertain=error.evidence_uncertain,
-                    cause=str(error.__cause__) if error.__cause__ else None,
-                )
-                if (
-                    action == SCAN_FRONT_ARC
-                    and error.motion_started is not False
-                ):
-                    motion_executor.invalidate_after_failed_scan()
-                    if map_trace is not None:
-                        map_trace.invalidate_localization()
-                outcome = self._control_outcome(context, deadline_ms)
-                if (
-                    error.code in (
-                        {"controller_command_interrupted"}
-                        | _SCAN_REFUSAL_CODES
-                    )
-                    and outcome is not None
-                ):
-                    return None, None, observation, outcome
-                retryable = (
-                    attempt == 0
-                    and error.code == "scan_start_clearance_unverified"
-                    and error.motion_started is False
-                )
-                if retryable:
-                    outcome = self._control_outcome(
-                        context,
-                        deadline_ms,
-                        blast_action_deadline_headroom_ms(action),
-                    )
-                    if outcome is not None:
-                        return None, None, observation, outcome
-                    try:
-                        retry_observation = (
-                            recover_scan_start_observation(
-                                self,
-                                context=context,
-                                deadline_ms=deadline_ms,
-                                motion_executor=motion_executor,
-                                episode_start_heading=(
-                                    observation.get(
-                                        "navigation_reference", {}
-                                    ).get("episode_start_heading_deg")
-                                ),
-                                allow_no_return=(
-                                    perception_only_scan
-                                    or action_permit is not None
-                                    and blast_range_state(
-                                        observation["sensors"].get(
-                                            "distance_mm"
-                                        )
-                                    ) == RANGE_STATE_NO_VALID_DISTANCE
-                                ),
-                                minimum_safe_distance_mm=(
-                                    _minimum_rotation_clearance_mm()
-                                ),
-                            )
-                        )
-                        retry_observation, retry_outcome = retry_observation
-                    except BlastControllerError:
-                        raise
-                else:
-                    retry_observation, retry_outcome = None, None
-                if retry_outcome is not None:
-                    return None, None, observation, retry_outcome
-                if retry_observation is not None:
-                    outcome = self._control_outcome(
-                        context,
-                        deadline_ms,
-                        blast_action_deadline_headroom_ms(action),
-                    )
-                    if outcome is not None:
-                        return None, None, observation, outcome
-                    observation = retry_observation
-                    continue
-                scan_outcome = self._scan_failure_outcome(error.code)
-                if scan_outcome is not None:
-                    if (
-                        scan_refusal_can_replan
-                        and error.code
-                        == "scan_start_clearance_unverified"
-                        and error.motion_started is False
-                    ):
-                        return {
-                            "recoverable_scan_refusal": {
-                                "code": error.code,
-                                "motion_started": False,
-                            },
-                        }, None, observation, None
-                    return None, None, observation, scan_outcome
-                raise
-        raise AssertionError("BLAST action retry loop exhausted")
 
     def _fresh_planner_action_observation(
         self,
@@ -1048,201 +539,6 @@ class BlastEpisodeRuntimeAdapter:
         return observation, self._control_outcome(
             context, deadline_ms, blast_action_deadline_headroom_ms(action),
         )
-
-    def _planner_step(
-        self,
-        *,
-        planner,
-        speech,
-        context,
-        observation,
-        history,
-        available_actions,
-        completion_allowed,
-        turns_available,
-        latest_scan_view,
-        motion_executor,
-        episode_start_heading,
-        deadline_ms,
-        abort_allowed,
-        local_map_evidence,
-        active_waypoint,
-        active_waypoint_plan,
-        waypoint_required,
-        active_plan,
-    ):
-        outcome = self._control_outcome(context, deadline_ms)
-        if outcome is not None: return None, outcome
-        try:
-            planner_context = ControllerActionContext(
-                goal=context.request.goal,
-                locale=context.request.locale,
-                robot_id=ROBOT_ID,
-                controller_id=CONTROLLER_ID,
-                available_actions=available_actions,
-                observation=_planner_navigation_value(observation),
-                history=_planner_navigation_value(
-                    _planner_history(history)[-12:]
-                ),
-                completion_allowed=completion_allowed,
-                abort_allowed=abort_allowed,
-                robot_relative_side_scan=_planner_navigation_value(
-                    current_side_scan(history, latest_scan_view)
-                ),
-                local_map_evidence=_planner_navigation_value(
-                    local_map_evidence
-                ),
-                active_waypoint=active_waypoint,
-                active_waypoint_geometry=(
-                    _planner_navigation_value(
-                        self._active_waypoint_geometry(
-                            motion_executor.pose, active_waypoint,
-                        )
-                    )
-                ),
-                active_waypoint_plan=active_waypoint_plan,
-                waypoint_reached_radius_mm=_WAYPOINT_REACHED_RADIUS_MM,
-                waypoint_required=waypoint_required,
-                plan_actions=BLAST_PLAN_ACTIONS,
-                active_plan=active_plan,
-            )
-            # An unusable reply is not a navigation event. Retry once with the
-            # same goal, route, pose and observations; do not scan or move.
-            for attempt in range(2):
-                try:
-                    result = planner.decide(planner_context)
-                    break
-                except LMStudioProtocolError:
-                    outcome = self._control_outcome(context, deadline_ms)
-                    if outcome is not None:
-                        return None, outcome
-                    if attempt:
-                        raise
-                    record_navigation_diagnostic(
-                        "planner_reply_retry", robot_id=ROBOT_ID,
-                        episode_id=context.episode_id,
-                    )
-        except Exception:
-            outcome = self._control_outcome(context, deadline_ms)
-            if outcome is not None:
-                return None, outcome
-            raise
-        outcome = self._control_outcome(context, deadline_ms)
-        if outcome is not None:
-            return None, outcome
-        if not isinstance(result, ControllerActionPlannerResult):
-            raise BlastEpisodeError(
-                "blast_planner_result_invalid",
-                "BLAST planner returned an invalid result",
-            )
-        decision = result.decision
-        action = decision.action
-        bounded_turn = (
-            turns_available
-            and action in (TURN_LEFT_90, TURN_RIGHT_90)
-        )
-        scan_guided_advance = (
-            action == ADVANCE
-            and self._recent_evidence_allows_bounded_advance(
-                history, latest_scan_view,
-            )
-        )
-        bounded_reverse = (
-            action == REVERSE
-            and (
-                self._current_scan_supports_bounded_reverse(
-                    history, latest_scan_view,
-                )
-                or self._completed_advance_allows_bounded_reverse(history)
-            )
-        )
-        bounded_no_valid = (
-            bounded_turn or scan_guided_advance or bounded_reverse
-        )
-        terminal_actions = tuple(
-            action for action in (COMPLETE, ABORT)
-            if (
-                action == COMPLETE and completion_allowed
-                or action == ABORT and abort_allowed
-            )
-        )
-        if action not in available_actions + terminal_actions:
-            raise BlastEpisodeError(
-                "blast_planner_action_invalid",
-                "BLAST planner selected an unavailable action",
-            )
-        if action in ACTION_COMMANDS or action == SCAN_FRONT_ARC:
-            observation, stopped = self._fresh_planner_observation_or_stop(
-                action, episode_start_heading,
-                motion_executor, context, deadline_ms,
-                allow_no_valid_with_bounded_evidence=bounded_no_valid,
-            )
-            if stopped is not None:
-                return None, stopped
-        assessment = decision.assessment
-        context.publish({
-            "current_action": None if action in (COMPLETE, ABORT) else action,
-            "plan": list(decision.plan),
-            "model_latency_ms": result.latency_ms,
-            "message": decision.utterance or assessment,
-            "obstacle": {
-                "distance_mm": observation["sensors"].get("distance_mm"),
-                "observed_at_monotonic_ms": observation[
-                    "observed_at_monotonic_ms"
-                ],
-            },
-        })
-        outcome = self._control_outcome(context, deadline_ms)
-        if outcome is not None:
-            return None, outcome
-        if action == COMPLETE:
-            # Every iteration reaches the planner at rest. The existing gesture
-            # executor checks idle again; no wheel action follows this finale.
-            speech.offer(
-                decision.utterance, progress_revision=len(history) + 1,
-                expression=decision.expression,
-            )
-            speech.close(drain=True)
-            if blast_episode_cancelled(context):
-                return None, self._control_outcome(context, deadline_ms)
-            return None, self._outcome("completed", True, assessment)
-        if action == ABORT:
-            return None, self._outcome(
-                "planner_aborted", False, assessment,
-            )
-        return {
-            "action": action,
-            "assessment": assessment,
-            "utterance": decision.utterance,
-            "plan": list(decision.plan),
-            "action_source": _PLANNER_ACTION_SOURCE,
-            "observation": observation,
-            "bounded_no_valid_eligible": bounded_no_valid,
-            "active_waypoint": decision.waypoint,
-            "waypoint_plan": (
-                () if decision.waypoint is None else (
-                    decision.waypoint,
-                    *decision.following_waypoints,
-                )
-            ),
-        }, None
-    def _scan_action_permit(
-        self, *, action, observation, geometry_checked, pose, prior_receipt,
-        expected_drive_angles=None, perception_only=False,
-    ):
-        try:
-            return issue_blast_scan_permit(
-                controller=self.controller,
-                action=action,
-                distance_mm=observation["sensors"].get("distance_mm"),
-                geometry_checked=geometry_checked,
-                pose=pose,
-                prior_receipt=prior_receipt,
-                expected_drive_angles=expected_drive_angles,
-                perception_only=perception_only,
-            )
-        except BlastScanPermitUnavailable as error:
-            raise BlastEpisodeError(error.code, str(error)) from None
 
     def _begin_map_trace(
         self, context, pose, observation, episode_start_heading,
@@ -1699,9 +995,6 @@ class BlastEpisodeRuntimeAdapter:
             action = (
                 TURN_LEFT_90 if geometry["heading_error_mdeg"] > 0 else TURN_RIGHT_90
             ) if correcting else ADVANCE
-            bounded_evidence = correcting or self._recent_evidence_allows_bounded_advance(
-                history, latest_scan_view,
-            )
             try:
                 observation, outcome = (
                     self._fresh_planner_observation_or_stop(
@@ -1710,7 +1003,7 @@ class BlastEpisodeRuntimeAdapter:
                         motion_executor,
                         context,
                         deadline_ms,
-                        allow_no_valid_with_bounded_evidence=bounded_evidence,
+                        allow_no_valid_with_bounded_evidence=correcting,
                     )
                 )
             except BlastActionEvidenceChanged:
@@ -1727,8 +1020,7 @@ class BlastEpisodeRuntimeAdapter:
                     allow_no_valid_distance=True,
                 )
             command_result, execution, observation, outcome = (
-                self._dispatch_episode_action(
-                    action=action,
+                _dispatch_episode_action(self, action=action,
                     observation=observation,
                     geometry_checked=False,
                     motion_executor=motion_executor,
@@ -1776,245 +1068,39 @@ class BlastEpisodeRuntimeAdapter:
                 distance = next_distance
         return None
 
-    def _restore_startup_heading(
-        self, *, scan_item, motion_executor, episode_start_heading,
-        map_trace, context, deadline_ms,
-    ):
-        """Coarsely return a completed full scan to its IMU start heading."""
+    def _run_startup_perception(self, **kwargs):
+        return _run_startup_perception(self, **kwargs)
 
-        result_observation = scan_item.get("result_observation")
-        scan = scan_item.get("scan")
-        coverage = (
-            scan.get("sweep_coverage_deg")
-            if isinstance(scan, Mapping) else None
-        )
-        if (
-            not isinstance(scan, Mapping)
-            or scan.get("state") != "complete"
-            or isinstance(coverage, bool)
-            or not isinstance(coverage, (int, float))
-            or float(coverage) < 350.0
-        ):
-            return result_observation, None, None
-        heading_mdeg = motion_executor.pose.heading_mdeg
-        tolerance_mdeg = round(
-            _STARTUP_HEADING_RESTORATION_TOLERANCE_DEG * 1_000
-        )
-        correction = {
-            "initial_error_mdeg": heading_mdeg,
-            "tolerance_mdeg": tolerance_mdeg,
-            "action": None,
-            "final_error_mdeg": heading_mdeg,
-        }
-        if abs(heading_mdeg) <= tolerance_mdeg:
-            map_trace.record_action(
-                SCAN_FRONT_ARC, motion_executor.pose,
-                result_observation, None, pose_observed=True,
-            )
-            return result_observation, None, correction
-
-        observation = self._with_navigation_reference(
-            self._observation(), episode_start_heading,
-        )
-        observation["odometry"] = motion_executor.pose.to_dict()
-        alignment = self._desired_heading_turn_alignment(
-            0.0, motion_executor.pose,
-        )
-        if alignment is None:
-            return result_observation, None, correction
-        action, desired_heading, direction, _error = alignment
-        correction["action"] = action
-        command_result, execution, _observation, outcome = (
-            self._dispatch_episode_action(
-                action=action,
-                observation=observation,
-                geometry_checked=False,
-                motion_executor=motion_executor,
-                prior_receipt=scan_item,
-                allow_turn_no_valid_with_bounded_evidence=True,
-                context=context,
-                deadline_ms=deadline_ms,
-                map_trace=map_trace,
-                turn_continue_requested=(
-                    self._waypoint_alignment_continuation(
-                        desired_heading=desired_heading,
-                        direction=direction,
-                        start_observation=observation,
-                        start_heading_mdeg=motion_executor.pose.heading_mdeg,
-                        allow_no_valid_distance=True,
-                        alignment_trigger_deg=(
-                            _STARTUP_HEADING_RESTORATION_TOLERANCE_DEG
-                        ),
-                    )
-                ),
-            )
-        )
-        if outcome is not None:
-            return result_observation, outcome, correction
-        result_observation = command_result.get("observation")
-        correction["final_error_mdeg"] = motion_executor.pose.heading_mdeg
-        map_trace.record_action(
-            action, motion_executor.pose, result_observation, None,
-            pose_observed=True,
-        )
-        context.publish({
-            "current_action": None,
-            "obstacle": {
-                "distance_mm": (
-                    result_observation.get("distance_mm")
-                    if isinstance(result_observation, Mapping) else None
+    def _selected_turn_alignment(self, action, active_waypoint, pose, mission):
+        """Use the existing waypoint or final-heading alignment target."""
+        selected_turn_alignment = None
+        selected_turn_trigger_deg = _WAYPOINT_ALIGNMENT_TRIGGER_DEG
+        if action in (TURN_LEFT_90, TURN_RIGHT_90):
+            if active_waypoint is not None:
+                selected_turn_alignment = self._waypoint_turn_alignment(
+                    pose,
+                    active_waypoint,
+                    mission=mission,
                 )
-            },
-        })
-        return result_observation, None, correction
-
-    def _run_startup_perception(
-        self, *, observation, available_actions, turns_available,
-        latest_scan_view, history, motion_executor, episode_start_heading,
-        map_trace, context, deadline_ms,
-    ):
-        """Acquire one complete encoder-measured view before Gemma decides."""
-
-        initial_scan_view_count = len(map_trace.planar_scan_views)
-        startup_history = []
-        action = SCAN_FRONT_ARC
-        try:
-            observation, outcome = self._fresh_planner_observation_or_stop(
-                action, episode_start_heading, motion_executor,
-                context, deadline_ms,
-            )
-        except BlastEpisodeError:
-            outcome = self._outcome(
-                "blast_startup_perception_incomplete", False,
-                "BLAST could not safely begin its surroundings scan",
-            )
-        if outcome is not None:
-            return (
-                observation, available_actions, turns_available,
-                latest_scan_view, outcome,
-            )
-        command_result, execution, observation, outcome = (
-            self._dispatch_episode_action(
-                action=action,
-                observation=observation,
-                geometry_checked=False,
-                motion_executor=motion_executor,
-                prior_receipt=history[-1] if history else None,
-                allow_turn_no_valid_with_bounded_evidence=False,
-                context=context,
-                deadline_ms=deadline_ms,
-                map_trace=map_trace,
-                perception_only_scan=True,
-                surroundings_scan=True,
-            )
-        )
-        if outcome is not None:
-            startup_outcome = (
-                outcome if outcome.terminal_reason in (
-                    "stopped", "episode_deadline_elapsed",
-                    "episode_deadline_headroom_insufficient",
-                ) else self._outcome(
-                    "blast_startup_perception_incomplete", False,
-                    "BLAST could not safely complete its surroundings scan",
+            if (
+                selected_turn_alignment is None
+                and (
+                    mission.longitudinal_progress_mm(
+                        pose
+                    ) >= mission.minimum_forward_progress_mm
+                    or mission.distance_to_target_mm(
+                        pose
+                    ) <= BLAST_GOAL_RADIUS_MM
                 )
-            )
-            return (
-                observation, available_actions, turns_available,
-                latest_scan_view, startup_outcome,
-            )
-        latest_scan_view = self._record_episode_action_result(
-            action=action,
-            action_source=_STARTUP_PERCEPTION_ACTION_SOURCE,
-            assessment="Mandatory startup surroundings acquisition",
-            plan=(action,),
-            command_result=command_result,
-            execution=execution,
-            scan_pose=motion_executor.pose,
-            motion_executor=motion_executor,
-            history=startup_history,
-            map_trace=map_trace,
-            context=context,
-            published_action=_STARTUP_SURROUNDINGS_ACTION,
-        )
-        startup_scan_item = startup_history[-1]
-        outcome = self._control_outcome(context, deadline_ms)
-        if outcome is not None:
-            return (
-                observation, available_actions, turns_available,
-                latest_scan_view, outcome,
-            )
-        if (
-            latest_scan_view is None
-            or not motion_executor.localization_valid
-            or len(map_trace.planar_scan_views)
-            != initial_scan_view_count + 1
-        ):
-            return (
-                observation, available_actions, turns_available,
-                latest_scan_view,
-                self._outcome(
-                    "blast_startup_perception_incomplete", False,
-                    "BLAST startup scan produced no localized surroundings",
-                ),
-            )
-        (
-            final_observation, outcome, heading_restoration,
-        ) = self._restore_startup_heading(
-            scan_item=startup_scan_item,
-            motion_executor=motion_executor,
-            episode_start_heading=episode_start_heading,
-            map_trace=map_trace,
-            context=context,
-            deadline_ms=deadline_ms,
-        )
-        if outcome is not None:
-            return (
-                observation, available_actions, turns_available,
-                latest_scan_view, outcome,
-            )
-        history.append({
-            "action": _STARTUP_SURROUNDINGS_ACTION,
-            "action_source": _STARTUP_PERCEPTION_ACTION_SOURCE,
-            "assessment": "Mandatory startup surroundings acquisition",
-            "plan": [_STARTUP_SURROUNDINGS_ACTION],
-            "result_observation": final_observation,
-            "observation_settled": startup_scan_item[
-                "observation_settled"
-            ],
-            "pose": motion_executor.pose.to_dict(),
-            "scan_view_count": 1,
-            "scan_state": startup_scan_item["scan"]["state"],
-            "sweep_coverage_deg": startup_scan_item["scan"].get(
-                "sweep_coverage_deg"
-            ),
-            "heading_restoration": heading_restoration,
-        })
-        context.publish({
-            "current_action": None,
-            "scan": None,
-            "obstacle": {
-                "distance_mm": (
-                    final_observation.get("distance_mm")
-                    if isinstance(final_observation, Mapping)
-                    else None
+            ):
+                selected_turn_alignment = self._desired_heading_turn_alignment(
+                    mission.reference_heading_mdeg / 1_000,
+                    pose,
                 )
-            },
-        })
-        (
-            observation, available_actions, turns_available,
-            _runtime, outcome,
-        ) = begin_blast_iteration(
-            self, context=context, deadline_ms=deadline_ms,
-            index=1, history=history, latest_scan_view=latest_scan_view,
-            motion_executor=motion_executor,
-            episode_start_heading=episode_start_heading,
-            motion_executor_factory=BlastNavigationMotionExecutor,
-            minimum_rotation_clearance_mm=_minimum_rotation_clearance_mm(),
-        )
-        return (
-            observation, available_actions, turns_available,
-            latest_scan_view, outcome,
-        )
+                selected_turn_trigger_deg = (
+                    BLAST_GOAL_HEADING_TOLERANCE_MDEG / 1_000
+                )
+        return selected_turn_alignment, selected_turn_trigger_deg
 
     def run(self, context) -> RobotEpisodeOutcome:
         with self._lock:
@@ -2277,8 +1363,7 @@ class BlastEpisodeRuntimeAdapter:
                         planner_available_actions = available_actions
                     decision_count += 1
                     try:
-                        step, outcome = self._planner_step(
-                            speech=speech,
+                        step, outcome = _planner_step(self, speech=speech,
                             planner=planner, context=context,
                             observation=observation, history=history,
                             available_actions=planner_available_actions,
@@ -2319,212 +1404,28 @@ class BlastEpisodeRuntimeAdapter:
                 if outcome is not None:
                     return outcome
                 requested_action = step["action"]
-                action = requested_action
+                waypoint_plan, route_following, replan, outcome = _admit_waypoint_step(
+                    self, step=step, map_trace=map_trace,
+                    motion_executor=motion_executor, history=history,
+                    context=context, available_actions=available_actions,
+                    turns_available=turns_available, latest_scan_view=latest_scan_view,
+                    episode_start_heading=episode_start_heading,
+                    deadline_ms=deadline_ms, route_following=route_following,
+                )
+                active_waypoint = waypoint_plan[0] if waypoint_plan else None
+                if outcome is not None:
+                    return outcome
+                if replan:
+                    continue
+                action = step["action"]
                 assessment = step["assessment"]
                 plan = step["plan"]
                 action_source = step["action_source"]
                 observation = step["observation"]
-                waypoint_plan = self._intermediate_waypoint_plan(
-                    map_trace.mission,
-                    motion_executor.pose,
-                    step["waypoint_plan"],
-                )
-                reached_waypoints = []
-                while (
-                    waypoint_plan
-                    and self._waypoint_reached(
-                        motion_executor.pose, waypoint_plan[0],
-                        mission=map_trace.mission,
-                    )
-                ):
-                    reached_waypoints.append(waypoint_plan[0])
-                    waypoint_plan = waypoint_plan[1:]
-                if (
-                    requested_action == FOLLOW_WAYPOINT
-                    and reached_waypoints
-                    and not waypoint_plan
-                ):
-                    rejected_waypoint = reached_waypoints[-1]
-                    distance_mm = round(math.hypot(
-                        rejected_waypoint["x_mm"] - motion_executor.pose.x_mm,
-                        rejected_waypoint["y_mm"] - motion_executor.pose.y_mm,
-                    ))
-                    history.append({
-                        "action": FOLLOW_WAYPOINT,
-                        "requested_action": FOLLOW_WAYPOINT,
-                        "action_source": _ROUTE_VALIDATION_ACTION_SOURCE,
-                        "route_rejection": {
-                            "reason": "WAYPOINT_ALREADY_REACHED",
-                            "distance_mm": distance_mm,
-                            "reached_radius_mm": _WAYPOINT_REACHED_RADIUS_MM,
-                            "waypoint": rejected_waypoint,
-                        },
-                        "waypoint_plan": tuple(reached_waypoints),
-                        "pose": motion_executor.pose.to_dict(),
-                    })
-                    active_waypoint = None
-                    map_trace.set_advisory_waypoint_plan(
-                        (),
-                        pose=motion_executor.pose,
-                        observation=observation["sensors"],
-                        observed_at_unix_ms=(
-                            observation["observed_at_unix_ms"]
-                        ),
-                    )
-                    context.publish({
-                        "current_action": None,
-                        "plan": list(plan),
-                        "message": (
-                            "Gemma waypoint is already reached; replanning"
-                        ),
-                    })
-                    continue
-                active_waypoint = (
-                    waypoint_plan[0] if waypoint_plan else None
-                )
-                step["active_waypoint"] = active_waypoint
-                step["waypoint_plan"] = waypoint_plan
-                map_trace.set_advisory_waypoint_plan(
-                    waypoint_plan,
-                    pose=motion_executor.pose,
-                    observation=observation["sensors"],
-                    observed_at_unix_ms=observation["observed_at_unix_ms"],
-                )
-                route_blockage = map_trace.advisory_route_blockage(
-                    motion_executor.pose,
-                )
-                if requested_action == FOLLOW_WAYPOINT:
-                    route_following = active_waypoint is not None
-                    if route_blockage is not None:
-                        route_blockage = dict(route_blockage)
-                    if route_blockage is not None:
-                        route_following = False
-                        history.append({
-                            "action": FOLLOW_WAYPOINT,
-                            "requested_action": FOLLOW_WAYPOINT,
-                            "action_source": _ROUTE_VALIDATION_ACTION_SOURCE,
-                            "route_rejection": route_blockage,
-                            "waypoint_plan": waypoint_plan,
-                            "pose": motion_executor.pose.to_dict(),
-                        })
-                        # Stop physical execution, but keep Gemma's complete
-                        # rejected hypothesis in context and on the map until
-                        # the model explicitly revises or replaces it.
-                        context.publish({
-                            "current_action": None,
-                            "plan": list(plan),
-                            "message": (
-                                "Gemma route crosses a known coarse "
-                                "keep-out cell; replanning"
-                            ),
-                        })
-                        continue
-                    action = self._waypoint_follow_motion_action(
-                        motion_executor.pose,
-                        active_waypoint,
-                        available_actions,
-                        mission=map_trace.mission,
-                    )
-                    if action is None:
-                        route_following = False
-                        geometry = self._active_waypoint_geometry(
-                            motion_executor.pose, active_waypoint,
-                        )
-                        if geometry is not None:
-                            history.append({
-                                "action": FOLLOW_WAYPOINT,
-                                "requested_action": FOLLOW_WAYPOINT,
-                                "action_source": (
-                                    _ROUTE_VALIDATION_ACTION_SOURCE
-                                ),
-                                "route_interruption": _route_interruption(
-                                    (
-                                        "REQUIRED_STEERING_UNAVAILABLE"
-                                        if abs(
-                                            geometry[
-                                                "heading_error_mdeg"
-                                            ]
-                                        ) >= round(
-                                            _WAYPOINT_ALIGNMENT_TRIGGER_DEG
-                                            * 1_000
-                                        )
-                                        else (
-                                            "FORWARD_CLEARANCE_UNAVAILABLE"
-                                        )
-                                    ),
-                                    observation[
-                                        "sensors"
-                                    ].get("distance_mm"),
-                                    active_waypoint,
-                                ),
-                                "pose": motion_executor.pose.to_dict(),
-                            })
-                        context.publish({
-                            "current_action": None,
-                            "plan": list(plan),
-                        })
-                        continue
-                    bounded_no_valid = (
-                        action in (TURN_LEFT_90, TURN_RIGHT_90)
-                        and turns_available
-                        or action == ADVANCE
-                        and self._recent_evidence_allows_bounded_advance(
-                            history, latest_scan_view,
-                        )
-                    )
-                    try:
-                        observation, outcome = (
-                            self._fresh_planner_observation_or_stop(
-                                action,
-                                episode_start_heading,
-                                motion_executor,
-                                context,
-                                deadline_ms,
-                                allow_no_valid_with_bounded_evidence=(
-                                    bounded_no_valid
-                                ),
-                            )
-                        )
-                    except BlastActionEvidenceChanged:
-                        route_following = False
-                        context.publish({
-                            "current_action": None,
-                            "plan": list(plan),
-                        })
-                        continue
-                    if outcome is not None:
-                        return outcome
-                    step["action"] = action
-                    step["observation"] = observation
-                    step["bounded_no_valid_eligible"] = bounded_no_valid
                 selected_turn_continuation = None
-                selected_turn_alignment = None
-                selected_turn_trigger_deg = _WAYPOINT_ALIGNMENT_TRIGGER_DEG
-                if action in (TURN_LEFT_90, TURN_RIGHT_90):
-                    if active_waypoint is not None:
-                        selected_turn_alignment = self._waypoint_turn_alignment(
-                            motion_executor.pose,
-                            active_waypoint,
-                            mission=map_trace.mission,
-                        )
-                    if (
-                        selected_turn_alignment is None
-                        and (
-                            map_trace.mission.longitudinal_progress_mm(
-                                motion_executor.pose
-                            ) >= map_trace.mission.minimum_forward_progress_mm
-                            or map_trace.mission.distance_to_target_mm(
-                                motion_executor.pose
-                            ) <= BLAST_GOAL_RADIUS_MM
-                        )
-                    ):
-                        selected_turn_alignment = self._desired_heading_turn_alignment(
-                            map_trace.mission.reference_heading_mdeg / 1_000,
-                            motion_executor.pose,
-                        )
-                        selected_turn_trigger_deg = (
-                            BLAST_GOAL_HEADING_TOLERANCE_MDEG / 1_000
-                        )
+                selected_turn_alignment, selected_turn_trigger_deg = self._selected_turn_alignment(
+                    action, active_waypoint, motion_executor.pose, map_trace.mission,
+                )
                 scan_pose = motion_executor.pose if action == SCAN_FRONT_ARC else None
                 try:
                     observation, outcome = admit_blast_spoken_action(
@@ -2571,8 +1472,7 @@ class BlastEpisodeRuntimeAdapter:
                     execution,
                     observation,
                     outcome,
-                ) = self._dispatch_episode_action(
-                    action=action,
+                ) = _dispatch_episode_action(self, action=action,
                     observation=observation,
                     geometry_checked=no_return_scan_geometry_checked,
                     motion_executor=motion_executor,

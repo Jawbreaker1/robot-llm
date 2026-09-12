@@ -10,7 +10,6 @@
   const SVG_WIDTH = 1000;
   const SVG_HEIGHT = 620;
   const MAX_RENDERED_QUALITATIVE_OBSERVATIONS = 100;
-  const COARSE_OBSTACLE_SYMBOLS = new Set(["#", "?", "g", "x"]);
   const blastMapSemantics = global.RobotBlastMapSemantics;
 
   function create(options = {}) {
@@ -164,75 +163,15 @@
           addPoint(point.nominalEchoX, point.nominalEchoY);
         });
       });
-      coarseGridCells(trace.coarseGrid).forEach((cell) => {
+      blastMapSemantics.coarseGridCells(trace.coarseGrid).forEach((cell) => {
         const halfCell = cell.sizeMm / 2;
         addPoint(cell.xMm - halfCell, cell.yMm - halfCell);
         addPoint(cell.xMm + halfCell, cell.yMm + halfCell);
       });
     }
 
-    function coarseGridCells(grid) {
-      if (!grid) {
-        return [];
-      }
-      const cells = [];
-      grid.rows.forEach((row, rowIndex) => {
-        [...row].forEach((symbol, columnIndex) => {
-          cells.push({
-            symbol,
-            sizeMm: grid.cellSizeMm,
-            xMm: grid.window.xMaxMm - rowIndex * grid.cellSizeMm,
-            yMm: grid.window.yMaxMm - columnIndex * grid.cellSizeMm,
-          });
-        });
-      });
-      return cells;
-    }
-
     function renderCoarseObstacleArea(layer, trace, projection) {
-      const cells = coarseGridCells(trace?.coarseGrid);
-      if (cells.length === 0) {
-        return;
-      }
-      const group = createSvgElement("g", {
-        class: "map-coarse-navigation-grid",
-        "data-cell-count": cells.length,
-        "data-obstacle-count": cells.filter((cell) => (
-          COARSE_OBSTACLE_SYMBOLS.has(cell.symbol)
-        )).length,
-        "data-cell-size-mm": trace.coarseGrid.cellSizeMm,
-        "data-frame": trace.coarseGrid.frame,
-      });
-      appendSvgTitle(group, [
-        t("map.navigation_trace.coarse_obstacle_area"),
-      ]);
-      cells.forEach((cell) => {
-        const topLeft = projection.point(
-          cell.xMm - cell.sizeMm / 2,
-          cell.yMm + cell.sizeMm / 2,
-        );
-        const bottomRight = projection.point(
-          cell.xMm + cell.sizeMm / 2,
-          cell.yMm - cell.sizeMm / 2,
-        );
-        const obstacle = COARSE_OBSTACLE_SYMBOLS.has(cell.symbol);
-        group.appendChild(createSvgElement("rect", {
-          x: Math.min(topLeft.x, bottomRight.x),
-          y: Math.min(topLeft.y, bottomRight.y),
-          width: Math.abs(bottomRight.x - topLeft.x),
-          height: Math.abs(bottomRight.y - topLeft.y),
-          class: `map-coarse-grid-cell${
-            obstacle ? " map-coarse-obstacle-cell" : ""
-          } ${
-            cell.symbol === "?" ? "is-echo"
-              : cell.symbol === "#" ? "is-keep-out"
-                : cell.symbol === "o" ? "is-observed-clear"
-                  : "is-reference"
-          }`,
-          "data-symbol": cell.symbol,
-        }));
-      });
-      layer.appendChild(group);
+      blastMapSemantics.renderCoarseObstacleArea(layer, trace, projection, blastRenderUi());
     }
 
     function localOdometryScene(map) {
@@ -640,7 +579,8 @@
             point.nominalEchoY,
           );
           const rayGroup = createSvgElement("g", {
-            class: "map-blast-scan-ray",
+            class: point.settled === false ? "map-blast-scan-ray is-uncertain" : "map-blast-scan-ray",
+            "data-observation-settled": String(point.settled !== false),
             "data-side": point.side,
             "data-measured-range-mm": point.measuredRangeMm,
             "data-relative-bearing-mdeg": point.relativeBearingMdeg,
@@ -653,6 +593,7 @@
               range: formatNumber(point.measuredRangeMm),
             }),
             t("map.navigation_trace.scan_limitations"),
+            ...(point.settled === false ? [t("map.navigation_trace.scan_uncertain")] : []),
           ]);
           rayGroup.appendChild(createSvgElement("line", {
             x1: origin.x,
@@ -739,8 +680,9 @@
           : "map.path.title",
       );
       let navigationOverlayLayer = null;
+      let navigationScanLayer = null;
       if (map.navigationTrace) {
-        const navigationScanLayer = createSvgElement("g", {
+        navigationScanLayer = createSvgElement("g", {
           class: "map-navigation-scan-layer",
         });
         navigationOverlayLayer = createSvgElement("g", {
@@ -757,7 +699,6 @@
           projection,
           navigationScanLayer,
         );
-        layer.appendChild(navigationScanLayer);
       }
       blastMapSemantics.renderObstacles(
         layer,
@@ -1097,6 +1038,9 @@
       if (navigationOverlayLayer) {
         layer.appendChild(navigationOverlayLayer);
       }
+      // Actual echoes must remain visible even where plans or inferred
+      // obstacle markers overlap the measured ray and hit point.
+      if (navigationScanLayer) layer.appendChild(navigationScanLayer);
     }
 
     function mapCellClass(cellState) {

@@ -1,5 +1,7 @@
 from copy import deepcopy
 from dataclasses import replace
+import json
+from pathlib import Path
 from unittest import TestCase, mock
 
 from robot_agent.blast_navigation_calibration import (
@@ -280,7 +282,7 @@ class BlastScanPlanarProjectionTests(TestCase):
             [],
         )
 
-    def test_unsettled_far_ray_is_excluded_from_partial_projection(self):
+    def test_unsettled_far_ray_is_retained_separately_from_settled_points(self):
         scan = scan_result((300.0, 1_489.0, 500.0, 600.0, 700.0))
         scan["all_observations_settled"] = False
         scan["rays"][1].update({
@@ -297,6 +299,37 @@ class BlastScanPlanarProjectionTests(TestCase):
         self.assertNotIn(1_489.0, (
             point["measured_range_mm"] for point in points
         ))
+        projection = project_blast_scan_planar_surfaces(scan=scan, scan_pose=PhysicalPose())
+        self.assertEqual(projection["uncertain_points"][0]["measured_range_mm"], 1_489.0)
+
+    def test_recorded_unsettled_echoes_reach_model_without_blocking_space(self):
+        from robot_agent.blast_episode_map_trace import _BlastEpisodeMapTrace
+        from robot_agent.blast_spatial_map import _scan_view, provisional_obstacle_hypotheses
+
+        scan = json.loads((Path(__file__).parent / "fixtures" /
+                           "blast_open_floor_scan_20260912.json").read_text())["scans"][0]
+        pose = PhysicalPose()
+        projection = project_blast_scan_planar_surfaces(scan=scan, scan_pose=pose)
+        self.assertEqual(projection["points"], [])
+        self.assertEqual(len(projection["uncertain_points"]), 10)
+        self.assertTrue(all(p["measured_range_mm"] < 2000 for p in projection["uncertain_points"]))
+        trace = _BlastEpisodeMapTrace(
+            bridge=None, episode_id="recorded-uncertain", pose=pose,
+            observation={}, observed_at_unix_ms=1789211773002,
+            episode_start_heading=0, minimum_forward_progress_mm=800,
+        )
+        trace.record(pose=pose, observation={}, pose_observed=False, scan_view={
+            "scan_pose": pose.to_dict(), "planar_projection": projection,
+        })
+        view = trace.planar_scan_views[0]
+        self.assertTrue(_scan_view(view, view["observed_at_unix_ms"]))
+        self.assertEqual(provisional_obstacle_hypotheses([view]), [])
+        self.assertEqual(trace._coarse_navigation_observations(), ((), ()))
+        evidence = trace.planner_local_map_evidence(pose)
+        self.assertEqual(len(evidence["uncertain_echoes"]["points"]), 10)
+        self.assertIn("NOT_CONFIRMED", evidence["uncertain_echoes"]["quality"])
+        self.assertNotIn("direct_goal_blockage", evidence)
+        self.assertEqual(trace._coarse_grid(pose)["robot_center_keep_out_cells"], [])
 
     def test_unready_scan_or_sensor_pose_is_rejected(self):
         mutations = (

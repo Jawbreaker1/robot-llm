@@ -782,3 +782,743 @@ instead of its encoder turn changes the total displacement by only about
 reported larger skew. No speculative gyro bias, axis flip or calibration
 change was added. Physical heading-versus-floor verification is still needed;
 this is not a claim of corrected physical angular accuracy.
+
+## Physical regression: heading drift and reverse after a turn — September 8
+
+Episode `episode-7e439e36f0a3e864cc67d6af` tested the local working tree based
+on `fead6b0`, after the hardware-free suite passed all 2,107 tests on both
+Python 3.9 and 3.13. Qwen3.8-27B used low reasoning and the existing 8,192-token
+output ceiling. Piper, the dashboard and the controller used the normal live
+path; no manual wheel command or substitute route was injected.
+
+This physical test **failed**. The operator reported that BLAST backed into
+EV3 and that the real angular deviation was leftward while the map showed a
+rightward deviation. The final approach was therefore not validated.
+
+- The initial surroundings scan completed with 359.23° coverage and 0.77°
+  reported restoration error. These are sensor-derived figures, not independent
+  physical angle measurements.
+- Qwen planned `(0,450) → (600,450) → (600,0)` and later retained `(800,0)`
+  as the final waypoint. The robot followed the first two legs without another
+  scan. The recorded pose before the return leg was approximately `(579,396)`.
+- Six model responses arrived in 22.0–26.4 seconds. There was no model timeout
+  or reported speech failure. Actions comprised 23 advances, four turns
+  (including one trim), two reverses, the startup scan and one front-arc scan.
+- After the turn toward `(600,0)`, repeated `NO_VALID_DISTANCE` readings removed
+  `ADVANCE` and `FOLLOW_WAYPOINT` from the model's available actions. The route
+  and goal remained in context. Qwen selected two reverse pulses, approximately
+  9 cm total by odometry, followed by the front-arc scan.
+- That scan reported `restoration_unverified` with -62.65° IMU restoration
+  error. The episode faulted with `blast_scan_restoration_unverified`. A stop
+  was then sent; the controller confirmed inactive motors and IDLE state.
+
+### Measured heading discrepancy
+
+After the stop, observations at Unix milliseconds `1788901540900` and
+`1788901610771` had identical drive encoders (`left_drive=1334`,
+`right_drive=2572`) and `motion_active=false`. Reported gyro heading changed
+from -256.12570° to -230.27094°: **25.85° in 69.87 seconds**. The operator
+explicitly confirmed that BLAST had not been moved by hand. Both samples
+reported `imu.ready=true` but `imu.stationary=false`.
+
+Across the 23 advance commands, the recorded wheel deltas imply about 4.17°
+net left yaw under the existing calibration, while the command-local gyro
+changes imply 6.60° net right yaw. Neither encoder odometry nor gyro alone is
+independent ground truth, but the disagreement and confirmed stationary drift
+support the operator's observation. The current executor replaces its heading
+with the command-local gyro delta whenever that value is finite. Excluding
+long model waits does not exclude gyro drift during physical commands. The
+cause of the reported gyro drift itself is not yet established; no sign flip,
+bias constant, calibration adjustment or navigation patch was applied.
+
+### Separate reverse-admission defect
+
+`_completed_advance_allows_bounded_reverse` skips verified turns while looking
+back for unused forward pulses. A forward pulse before a turn therefore still
+authorizes reversing in a different direction; it is not evidence of clearance
+along that new reverse path. This needs a focused regression using the real
+sequence, separately from the heading-quality problem. The physical failure
+must not be treated as a successful goal-arrival or recovery validation merely
+because the hardware-free suite is green.
+
+### Stationary IMU isolation and chronology — September 8–9
+
+The operator approved a stationary diagnostic, without a navigation run or
+firmware change. A standalone program initialized only `InventorHub` with the
+existing BLAST orientation, disabled the display and sampled the IMU every two
+seconds. No motors, accessories or speech were initialized; no calibration
+settings or heading resets were written. The installed firmware reported
+`4.0.1`, `local-build-v4.0.1-dirty on 2026-09-07` throughout.
+
+All 31 samples reported `ready=true` and `stationary=true`. Heading changed
+from -0.00045° to -1.56881° in 60.523 seconds: **1.57° per minute**, compared
+with 25.85° over 69.87 seconds in the earlier normal-runtime observation.
+Immediately before isolation, the normal runtime still reported
+`stationary=false`, unchanged motor positions and, eventually, `ready=false`.
+The probe log is `/private/tmp/blast-gyro-isolation-20260908.log` (temporary
+local diagnostic, not a committed test fixture).
+
+This shows that the severe drift was not persistent under the isolated
+program with the same installed firmware. It does **not** distinguish a
+program-lifecycle/calibration-state effect from accessory activity or an
+indirect firmware interaction: changing programs also changes operating
+conditions. The normal controller was requested to reconnect afterward but
+produced no fresh observation, so that comparison remains incomplete.
+
+The September 6 audit above already recorded 4.99758° of yaw change during
+43.085 seconds with unchanged wheel encoders. Therefore drift predates the
+September 7 v7 audio-firmware update; an earlier custom-firmware contribution
+is not excluded. The hub audio patch does not directly modify the IMU driver,
+and the BLAST axis configuration has not changed since August 5. The onset
+and root cause remain unproven. No navigation, calibration or firmware fix
+was made during this diagnostic.
+
+### Confirmed brake/coast calibration interaction — September 9
+
+Heading reliability is the priority before another navigation acceptance run.
+After the operator powered BLAST on, the ordinary runtime reported
+`ready=true`, `stationary=true` and inactive motors. This narrows the previous
+isolation result: the ordinary program does not itself prevent calibration
+immediately after startup.
+
+Review of the exact pinned upstream Pybricks commit
+`4104553405decb0384bcfb030fbfcb4b5a9854cc` found that
+[`pbio_imu_is_stationary`](https://github.com/pybricks/pybricks-micropython/blob/4104553405decb0384bcfb030fbfcb4b5a9854cc/lib/pbio/src/imu.c#L455)
+requires both stable sensor data and `pbio_dcmotor_all_coasting()`.
+The bias-update callback returns without updating calibration otherwise.
+Thus BRAKE or HOLD blocks calibration even when encoder positions are stable.
+Our drive/turn pulses finish in BRAKE, `stop_all()` brakes all motors, and
+accessory poses finish in HOLD. `motor.done()` does not establish the motor
+state required for calibration.
+
+A 50-second physical A/B/A probe, with no motor-rotation command or firmware
+change, reproduced the gate in one program session:
+
+| Motor state | Duration | Stationary samples | Heading change |
+| --- | --- | --- | --- |
+| Coast before | 10.086 s | 6/6 | +0.2971° |
+| Brake | 20.164 s | 0/11 | +1.1816° |
+| Coast after | 20.204 s | 11/11 | +1.2810° |
+
+All samples remained `ready=true`; the readiness timeout is ten minutes, so
+this short probe does not test expiry. Left-wheel and accessory encoders were
+unchanged. The right-wheel reading varied by one motor degree (50–51) and
+returned to 50. Evidence: `/private/tmp/blast_gyro_brake_probe_20260909.py` and
+`/private/tmp/blast-gyro-brake-probe-20260909.log`.
+
+This proves the calibration-blocking interaction, not that it is the sole
+cause of the earlier 25.85° drift. Braking was present since August 5
+(`d12047c`); accessory HOLD was added September 7 (`f47b212`). Therefore the
+underlying brake condition is not a newly introduced September defect.
+
+The next bounded correction should address the hub motor lifecycle: complete
+and brake motion, then release motors at rest so automatic calibration can
+resume. Check that the geared sensor arm retains its navigation reference
+when released, and validate gyro recovery after movement before attempting
+the box again. Do not compensate with a guessed angular bias, discard the
+gyro globally or add planner rules. No production fix was applied in this
+diagnostic; the normal controller was reconnected afterward.
+
+### Bounded motor-release correction and physical check — September 9
+
+The hub's existing background poll now releases all motors once a commanded
+motion has completed and settled for 150 ms. Existing BRAKE endpoints and
+accessory HOLD targets remain in place during completion. Any moving motor
+defers release for all motors; observation, faces and speech do not postpone
+the timer. No gyro thresholds, bias values, angle offsets, planner rules or
+firmware were changed. Three focused tests execute the actual hub helper and
+dispatch hook, covering all nine motor commands, active motion, one-shot
+release and unaffected audio polling.
+
+The real `BlastBLERuntime` deployed this same modified hub program for a
+stationary physical probe. It observed the startup baseline, sent normal
+`stop`, moved the body motor 80° from its 158° reference and returned it,
+then commanded the claw's existing 202° position. No drive or turn command
+was sent. This is the normal hardware runtime, not a simulated sensor model.
+
+- After `stop`, `stationary` became true at the first subsequent one-second
+  sample (1.14 s); heading changed +0.1206° over 13.745 s.
+- After the accessory return, `stationary` similarly became true at 1.11 s
+  and stayed true for all remaining samples. Heading changed +0.3417° over
+  22.921 s. The body encoder stayed within 157–158°, inside the existing
+  navigation-reference tolerance. The claw stayed at 202°.
+- Both drive encoders ended at their initial values (-106°, 50°); the right
+  reading occasionally varied by one motor degree. The probe finished
+  successfully and the ordinary dashboard controller reconnected online,
+  with `ready=true`, `stationary=true` and inactive motors.
+
+Evidence: `/private/tmp/blast_validate_idle_release_20260909.py` and
+`/private/tmp/blast-validate-idle-release-20260909.log`.
+
+The formerly persistent calibration block is corrected in these physical
+stop/accessory cases. This does not yet validate wheel stopping distance,
+turn accuracy, full-scan closure or long-duration navigation. The next bounded
+physical check is turn/scan accuracy and gyro recovery afterward, before
+another box-navigation acceptance attempt.
+
+Validation: `scripts/quality_check.sh` passed all JavaScript syntax checks
+and **2,110 tests** in 146.565 seconds on Python 3.13. The three new idle-release
+tests also passed on Python 3.9. Focused expression and hub-speech suites
+passed (11 and 22 tests respectively). `git diff --check` passed. The final
+hub-source change is 25 added / 5 removed lines; no new planner code was added.
+
+### Physical turn and surroundings-scan check — September 9
+
+The operator requested continuation of the bounded hardware check. The probe
+used the production `BlastObservationMonitor`, `BlastNavigationMotionExecutor`
+and surroundings-scan implementation with the corrected hub runtime: one
+four-pulse left quarter-turn, ten seconds at rest, one right quarter-turn,
+ten seconds at rest, then one full surroundings scan and twenty seconds at
+rest. No translation command or Qwen request was issued. This tests motion
+execution and IMU recovery, not autonomous route planning or goal arrival.
+The operator-authorized turn test used the existing no-return continuation
+opt-in; measured close obstacles still used the production turn gate. The
+scan used the ordinary perception-only startup permit, with real sensor data.
+
+- Left turn: command-local gyro change corresponded to **92.079° left**;
+  all four pulses completed. Idle yaw changed -0.0262° over 9.271 s.
+- Right turn: command-local gyro change corresponded to **91.298° right**;
+  all four pulses completed. Idle yaw changed +0.1310° over 9.118 s.
+- The sole full scan completed with 17 pulses, reported **361.2198°**
+  coverage and **1.2198°** endpoint error, `restoration_verified=true`.
+  Idle yaw changed +0.1909° over 19.799 s afterward; 19 of the 21 samples
+  reported stationary, with the first two still in post-motion settling.
+- The final gyro direction was approximately **1.70°** clockwise from the
+  initial direction after the entire sequence, modulo the full revolution.
+  The sensor-arm encoder remained at 158°, the claw at 202°, and the final
+  observation reported ready, stationary and no active motion.
+- The scan retained nine measured ranges and seven no-return rays in its
+  sixteen angular samples. No-return values were not converted into obstacle
+  distances. The encoder-only scan closure residue was -10.93°, with 3 mm
+  common-mode residue: wheel-derived angle and gyro are still not identical.
+  This test does not independently calibrate wheel geometry or measure slip.
+
+The probe completed without error, additional scans or replanning, and the
+dashboard controller was reconnected online. No production changes were
+made during this validation. The operator was asked to confirm the actual
+quarter-turns and final physical direction; that independent confirmation
+was still pending when these measurements were recorded. Do not label the
+sensor-derived angles as independently measured floor angles.
+
+Evidence: `/private/tmp/blast_turn_scan_validation_20260909.py` and
+`/private/tmp/blast-turn-scan-validation-20260909.log`.
+
+### Single scan repeated for visual inspection — September 9
+
+The operator had not watched the previous sequence closely, so physical
+direction remained unconfirmed. On the explicit request to repeat while
+BLAST was powered on, one surroundings scan was run through the same
+production controller and scan code, without quarter-turn tests or any
+translation command. The dashboard was unavailable at the start; the probe
+owned the BLE connection directly.
+
+The scan completed normally with 16 pulses, **356.1274°** gyro-derived
+coverage and **3.8726°** endpoint residue, `restoration_verified=true`.
+Encoder closure residue was -2.11° with 1 mm common-mode residue. During
+4.682 s of post-scan observations yaw changed +0.4402°; the final three of
+six samples reported stationary. The sensor-arm encoder remained at 158°
+and the final observation was ready and motion-inactive. This is a second
+successful scan-execution check, not independent confirmation of a physical
+360° rotation; the operator's visual assessment was requested after completion.
+No production code was changed for the repeat.
+
+Evidence: `/private/tmp/blast_single_scan_20260909.py` and
+`/private/tmp/blast-single-scan-20260909.log`.
+
+After the probe, the existing Piper and Whisper services and BLAST web
+console were restarted with their previous settings. The console responded
+again at port 8765 and a controller reconnection was requested; no mission
+was started.
+
+The operator subsequently confirmed that the single scan looked very
+reasonable and estimated the visible deviation to be smaller than the
+reported 4°. This is qualitative confirmation of the single scan's physical
+return direction, not a measured angular reference or long-run validation.
+
+### Heading-history review and next validation boundary — September 9
+
+The operator highlighted the remaining requirement: direction must remain
+consistent with the physical robot over a longer run, without growing error.
+Git history confirms a relevant recent change in `d883fae` (September 7):
+`BlastNavigationMotionExecutor.execute()` began applying command-local gyro
+yaw to its pose heading after each completed movement. In the preceding
+committed version, that executor retained its wheel-derived motion heading;
+the episode adapter used gyro reanchoring for startup restoration. The
+intermediate absolute-heading variant described in the September 6 audit
+was superseded by the command-local implementation in the same checkpoint.
+
+This provides a concrete route by which drifting gyro readings can change
+both the displayed direction and subsequent steering, even if the wheel
+estimate indicates a deviation the other way. The September 8 recording
+already contains that disagreement (approximately 4.17° left from wheels
+versus 6.60° right from gyro across advance commands). It does not establish
+wheel odometry as ground truth or prove every observed discrepancy had that
+single cause. The motor-release correction addresses calibration availability;
+it has not yet validated accumulated position and heading accuracy.
+
+Next proposed check: a bounded 3–5 minute run with straight travel, multiple
+quarter-turns, normal scans and planner waits. At a few visible floor
+references, compare actual direction/position with map pose and the existing
+per-command gyro/encoder logs. Inspect the first divergence, not just the
+final position. Keep the production navigation path and do not introduce
+another filter, angle offset or route rule before evidence warrants it.
+No longer run or additional production change was performed in this review.
+
+### Open-floor production run — September 10
+
+Episode `episode-e8466e0af05131abc476ebc9` ran with the motor-idle release
+correction, the ordinary physical BLAST controller and remote
+`qwen/qwen3.8-27b` (low reasoning). No navigation code or goal configuration
+was changed during the run. The operator reported a relatively open floor
+without boxes.
+
+Test setup discrepancy: the submitted goal text said 1000 mm, but the
+authoritative directional mission remained configured for 800 mm. This was
+disclosed during the run. This result validates the configured 800 mm target,
+not the requested one-metre distance or correct parsing of distances in text.
+
+The episode reached its goal after approximately eight minutes. Final map
+pose was `(777, 22) mm`, heading `2.236°`, with 32 mm estimated target
+distance inside the configured 50 mm goal radius. The operator confirmed
+both the approximately 80 cm physical displacement and the near-original
+heading matched the map. This is useful qualitative physical confirmation;
+it is not a precision floor measurement or a general long-route guarantee.
+
+Navigation efficiency failed: logs contain 21 ADVANCE commands, four
+REVERSE commands, two scan actions (including startup), and a left/right
+quarter-turn pair. The operator heard repeated sensor-related complaints
+and observed the reversals. Request `fc39d4b20e164cf6a3454bd060968cc8`, for
+example, exposes only TURN_LEFT_90, TURN_RIGHT_90, REVERSE and SCAN_FRONT_ARC
+in both available_actions and the strict output action enum. Its response
+chooses REVERSE while its speech says to charge ahead. Earlier request
+`88a56f4c208b4f169b46874f12071388` has the same restricted enum even though
+the model's reasoning explicitly selects FOLLOW_WAYPOINT.
+
+Live observations repeatedly report raw distance 2000, normalized in planner
+context to null / NO_VALID_DISTANCE. Pybricks documents 2000 as the return
+value when no valid distance is obtained. This is not evidence of a broken
+sensor: on the operator-confirmed open floor, absent echoes from distant
+objects are a plausible normal explanation. It also does not prove every
+unobserved cell is free. The demonstrated defect is the handling of this
+condition: forward/follow actions disappear and leave incompatible turns,
+reversals or scans as the only selectable actions. Do not describe these
+reversals as obstacle-driven route choices or successful recovery.
+
+The browser had retained stale mission status. Reloading the existing tab
+restored the completed episode, map, grid and trace; the map panel was made
+visible. No frontend source change was made in this check.
+
+Evidence: `local-artifacts/navigation-dashboard.jsonl` records from Unix ms
+1789049984571 through 1789050471747, plus the read-only partial timeline
+`/private/tmp/blast-open-run-watch-20260910.jsonl` and operator confirmation.
+Next correction should address coherent no-echo/action availability, not
+another planner or steering offset. The one-metre text/configuration mismatch
+also remains unresolved. Neither correction was implemented during this run.
+
+### No-echo admission simplification — September 10
+
+The follow-up removes `_recent_evidence_allows_bounded_advance` and its
+forward-only exception paths. Fresh Pybricks no-echo responses now permit
+an ordinary forward pulse without depending on distance or heading from
+an older scan. Current close measurements and genuinely invalid values
+(including None, negative and non-finite samples) still refuse that pulse.
+The existing body/encoder checks, startup scan, route geometry checks and
+between-pulse observations remain. No-echo samples still reach model/map
+context as unknown rather than a measured 2000 mm clearance; known mapped
+obstacles are not erased. The shared model prompt explains this distinction.
+No gyro, motor-idle, turn or hub code was changed in this follow-up.
+
+Two obsolete scan-expiry tests were consolidated into one fresh-range
+contract. The existing persistent-no-return simulator test now checks
+completion of an 800 mm waypoint using the real September 10 startup scan.
+That test uses a scripted planner and is an execution regression, not model
+validation. A route-free `blast-open-floor` scenario and the recorded scan
+fixture were added for reproducible model validation. Subsequent sensing is
+simulated world geometry, not a claim to replay all physical sensor behavior.
+
+Real Qwen validation (`qwen/qwen3.8-27b`, low reasoning, 8192 output tokens):
+the open-floor case with that recorded startscan reached the goal, with 39 mm
+simulated final distance, one startup scan, no blocked moves and no reversals.
+Qwen selected FOLLOW_WAYPOINT directly to (800, 0), then COMPLETE. The
+ordinary executor followed that route without returning for more planning
+on each no-echo pulse. Evidence:
+`/private/tmp/blast-open-floor-qwen-20260910.json` and
+`local-artifacts/navigation-simulation.jsonl`.
+
+Validation: `scripts/quality_check.sh` passed 2109 tests in 149.821 seconds,
+including JavaScript syntax checks. The final prompt and simulation-adapter
+tests were also rerun separately (37 and 13 passing). A new physical run
+with this host change has not been performed; the running console must be
+restarted to load it. Do not confuse the previous physical gyro validation
+with validation of this newly simplified no-echo policy.
+
+The second real-Qwen case used `blast-measured-box-and-chair`, the September
+2 recorded box scan, and four injected no-echo reads. It did NOT pass:
+decision_budget_exhausted after 12 model decisions, 402 mm from goal,
+one startup scan, six blocked simulated moves, no runtime exception.
+Qwen chose a left-side detour, passed along the box and tried to descend
+behind it. It corrected a rejected diagonal leg but repeatedly retried a
+descent after movement stalled. At the repeated stall the front range was
+1710 mm / MEASURED, and FOLLOW_WAYPOINT was available. Thus the repeated
+attempts in this case are not the removed no-echo action-enum restriction.
+The forward ray did not establish clearance for the complete robot body.
+Qwen eventually changed its maneuver, but did not reach the goal within the
+bounded run. This remains a failed navigation case, not a successful box
+validation or a reason to increase the budget until the score turns green.
+Evidence: `/private/tmp/blast-box-chair-qwen-20260910.json` and the same
+simulation diagnostic log. No follow-on planner/geometry changes were made.
+
+Next bounded step: physically validate the open-floor no-echo correction
+after restarting the console, then address the return-leg/stall behavior
+separately. The one-metre text/config mismatch and retreat-after-turn
+eligibility noted earlier are also still outside this correction.
+
+### Physical open-floor validation — September 12
+
+Episode `episode-e1475d7b4ca7fc422f4d5790` used the restarted production
+BLAST console with the September 10 no-echo simplification. The operator
+confirmed BLAST was on an open floor without a box. Both the submitted goal
+and the configured directional target were 800 mm straight ahead; this
+avoids, but does not fix, the earlier arbitrary-distance text/config mismatch.
+No production code was changed during the run.
+
+The episode completed in approximately 244 seconds. It executed one startup
+surroundings scan and 17 forward pulses, with no reverse, extra scan, logged
+controller-action failure or replanning loop. Scan closure was 359.02 degrees
+with a 0.98-degree gyro-derived endpoint residue. Actual Qwen
+`qwen/qwen3.8-27b` requests used low reasoning and an 8192-token output ceiling.
+The two model decisions were ADVANCE with a waypoint at (800, 0), then
+COMPLETE. Latencies were 6206 and 4285 ms; completion-token counts were 547
+and 281. Ordinary forward execution continued with fresh raw-2000 no-echo
+readings, without removing forward actions or asking the model each pulse.
+
+Final map position was (780, -3) mm, with heading +1.903 degrees (left) and
+20 mm estimated target distance, inside the existing 50 mm goal radius.
+The operator confirmed the approximately 80 cm physical travel and map
+agreement, then reported a very small leftward deviation, only a few degrees.
+This is qualitative physical confirmation of the open-floor correction,
+not a precision position measurement or general obstacle-course acceptance.
+The small observed leftward deviation is consistent with the sign of the
+final displayed heading; no steering-offset correction was added.
+
+Two limitations remain visible in this run. The first model response preceded
+the first forward command by approximately 83 seconds; sampled status showed
+speech playing during that interval, and speech ultimately completed without
+an error. The exact breakdown of that delay has not been diagnosed. Also,
+the condensed startup-scan summary retained five readings (four measured and
+one no-echo). The full angular record contained 16 readings, including ten
+measured echoes. All were marked SWEEP_CONTINUATION_ONLY, so its planar map
+projection contained no hit points. This run therefore validates no-echo forward
+continuation on operator-confirmed open floor, not obstacle representation.
+Do not infer a fully observed free room from the empty projection.
+
+Evidence: `local-artifacts/navigation-dashboard.jsonl`, records beginning
+at Unix ms 1789211704356; production status completed at 1789211947875;
+final robot-specific spatial-map response and operator observations.
+Next: a separately positioned physical single-box test, checking usable
+obstacle evidence before interpreting its route. Keep the speech delay and
+the previously failed box/chair simulation as explicit separate follow-ups.
+
+### Preserve uncertain echoes without blocking navigation — September 12
+
+Investigation of that recorded run identified two independent data/display
+losses. The projection discarded every measured echo whose settling check
+failed. The browser also still accepted only nine scan points and indexed
+sides 1–4, although the backend full-sweep contract supports seventeen points
+and sides 1–8. The browser limits now match the existing backend contract.
+
+The same projection calculation now retains unsettled measured returns in
+an optional `uncertain_points` field. The map renders them as dashed rays
+with hollow echo markers, and Qwen receives their positions, timestamp and
+explicit quality through `local_map_evidence.uncertain_echoes`. Settled
+points remain separate. Uncertain echoes do not populate obstacle memory,
+robot-center keep-out cells or verified-free-space calculations. No movement
+permission, settling threshold, route policy or mandatory-rescan rule changed.
+Shared-map transforms preserve this distinction using the same geometry path.
+
+The historical scan does not contain its settling sample windows, so it
+cannot establish whether sample count, distance variation or tilt caused
+the failures. Added timeout diagnostics record those quantities for the
+next physical test; no hardware failure is inferred from this evidence.
+
+Validation: the full quality check passed 2,110 tests. After correcting the
+browser's old point/side limits, the focused projection, renderer, dashboard
+normalization and shared-coordinate tests also passed. A read-only browser
+replay using the actual scan and production renderer visibly retained all
+ten uncertain echoes without obstacle blobs.
+
+Actual Qwen `qwen/qwen3.8-27b`, low reasoning, 8,192 output tokens, completed
+one bounded `blast-open-floor` simulation using
+`tests/fixtures/blast_open_floor_scan_20260912.json` as its startup scan and
+four injected range-dropout reads. Result: goal reached, 39 mm remaining,
+three model decisions, one startup scan, no additional scans, blocked moves,
+route rejections or reversals. Later sensing used simulated geometry: this
+is a recorded-startup/model integration check, not a full physical replay or
+box-navigation acceptance. Evidence: `local-artifacts/navigation-simulation.jsonl`.
+
+The physical robot was not moved for this correction, and the running
+console was not restarted. These changes take effect after its next restart;
+the separate replay does not modify the completed live episode.
+
+### Remove precision settling gates — September 12
+
+The follow-up correction removes the five-sample, 5 mm distance-spread and
+1-degree tilt-spread acceptance gate. Post-motion observation now requires
+two consecutive motor-idle observations, including a fresh read. Range and
+tilt can vary without restarting that confirmation or making its result
+unusable. Missing tilt or a no-echo range no longer prevents idle confirmation.
+The obsolete distance/tilt comparison code and constants were removed.
+
+The existing `observation_settled` receipt field is retained for compatibility:
+it now confirms idle sampling, not constant range/tilt, exact geometry or free
+space. Measured echoes remain provisional map evidence. Invalid distances,
+nearby obstacles, sensor-arm pose and encoder geometry retain their separate
+checks. A turn's sweep-clearance flag is no longer inferred from idle status
+alone. Explicit stop/preemption and the existing bounded timeout remain.
+No waypoint, planner, gyro, footprint or obstacle-margin policy was changed.
+
+Validation targets the real `BlastObservationMonitor` and scan implementation,
+with a fake hardware transport. A full surroundings sweep with alternating
+500/540 mm returns and 2–3-degree tilt variation completes with measured,
+idle-confirmed rays, correct closure and no recovery stop. Forward movement
+also accepts idle samples differing by 40 mm and 2.5 degrees without waiting
+for five near-identical readings. Missing idle confirmation stays explicit;
+close-obstacle, sensor-pose and stop/preemption regressions still pass. Tests
+that demanded five identical readings were updated to the new contract.
+The higher-level route simulator bypasses this settling implementation, so
+a successful route simulation alone would not validate this correction.
+
+Full quality check: 2,111 tests passed in 83.826 seconds, including the real
+monitor regressions above and existing navigation/map tests. JavaScript
+syntax checks and `git diff --check` also passed. Test output:
+`/private/tmp/robot-quality-idle-settling-20260912.log`.
+
+No physical movement or console restart was performed. Physical confirmation
+of the changed sampling behavior remains the next validation step; old scan
+records keep their original quality flags and are not retroactively upgraded.
+
+### Physical validation of idle sampling — September 12
+
+Restarted the production console with low-reasoning Qwen and ran the same
+800 mm open-floor goal, episode `episode-13f1c1166ff70d89314a3933`, starting
+at Unix ms 1789214844484. The physical surroundings scan completed in 15.334
+seconds, versus 68.642 seconds in the preceding run. All sixteen angular
+readings were idle-confirmed: nine measured echoes and seven no-echo readings.
+The live map visibly retained the rays/hits, and the operator confirmed it
+looked substantially better and accurate. No additional scan or reverse ran.
+
+This was NOT an end-to-end navigation pass. After twelve forward pulses the
+episode faulted at (547, -39) mm, approximately 256 mm from the goal. Every
+completed movement had an idle-confirmed receipt. The final event reports:
+`blast_motion_slice_discontinuous`, expected encoders `(1094, 4405)`, observed
+`(1094, 4403)`, delta `(0, -2)`. The pre-command continuity limit is one motor
+degree. At the configured 0.5 mm/encoder-degree scale, this was approximately
+1 mm of relaxation at one wheel, not a detected obstacle. The faster sampling
+exposes this remaining precision assumption; no tolerance or execution-code
+change was made during the physical test.
+
+The operator subsequently questioned the displayed rightward angle because
+it was not apparent physically. The scan-end IMU estimate introduced roughly
+3.33 degrees of rightward heading; command-local yaw updates during driving
+added approximately 1.56 degrees, giving the displayed -4.888-degree heading.
+The encoder scan-closure residue was about 0.885 degrees, so these two sources
+do not establish the same endpoint angle. After stopping, raw gyro heading
+changed from -354.5918 to -354.6892 over 72.989 seconds, with unchanged wheel
+encoders. This does not show large ongoing stationary drift, but neither does
+it validate the displayed angle against reality. Earlier post-motion sampling
+is a hypothesis to examine, not a proven gyro fault or a reason to reintroduce
+the range/tilt precision gate.
+
+Evidence: `local-artifacts/navigation-dashboard.jsonl`, episode events (final
+sequence 30 at Unix ms 1789214944216), live-map screenshot and operator report.
+BLAST remains stopped and online. Next bounded correction: handle small
+inter-command wheel settling without discarding localization or terminating
+the mission, while investigating scan-end heading separately. No automatic
+restart with a new start-relative target was attempted.
+
+### Consistent wheel-settling allowance — September 12
+
+The recorded `(0, -2)` encoder change is now handled by the existing settling
+segments, not a new recovery mode. BLAST uses one shared allowance equivalent
+to 10 mm of travel per wheel (20 encoder degrees at the provisional scale)
+for pre-command continuity, receipt gaps and scan-entry anchors. These small
+movements remain explicit odometry segments; they are not discarded, snapped
+away or counted as commanded motion. Larger unexplained gaps and malformed
+or wrong-direction receipts retain their checks. EV3's default odometry
+allowance is unchanged. No gyro, route-planning or obstacle policy changed.
+
+The regression replays the actual expected `(1094, 4405)` and observed
+`(1094, 4403)` encoders, checks that the 1 mm wheel relaxation is included in
+position accounting, and executes a subsequent forward action successfully.
+Scan-entry and receipt tests cover the same allowance and reject its outer
+boundary. The full quality check passed: 2,112 tests in 84.522 seconds,
+JavaScript syntax checks and `git diff --check`.
+Log: `/private/tmp/robot-quality-wheel-settling-complete-20260912.log`.
+
+The operator returned BLAST to the original open-floor starting position.
+After reconnecting the powered-on hub, physical episode
+`episode-a1858855aff35eecca98edfc` started with the same 800 mm goal and
+low-reasoning Qwen.
+
+Physical result: completed without runtime errors. One full surroundings scan
+took 15.332 seconds, with sixteen idle-confirmed angular readings: ten measured
+echoes and six no-echo readings. Seventeen forward pulses followed, with no
+reverse or additional scan. The final map position was (781, 30) mm, 36 mm from
+the target inside the existing 50 mm goal radius. Motion finished after about
+67 seconds; the episode finished after about 93 seconds including final speech.
+
+This run exercised the actual settling correction: three inter-command wheel
+gaps exceeded the former one-degree limit, with deltas `(-1, -3)`, `(-2, -1)`
+and `(-2, -1)`. The largest individual wheel relaxation was 1.5 mm. They did
+not discard localization or interrupt the route. Other one-degree settling
+gaps were present too. Evidence is the production controller receipts and
+encoder observations in `local-artifacts/navigation-dashboard.jsonl`.
+
+The operator confirmed that BLAST was approximately 80 cm ahead of the start,
+that she had deviated slightly left, and that this was accurately represented
+on the live map. This is a physical open-floor pass with operator-confirmed
+map alignment, not proof that every gyro condition or obstacle route is solved.
+The next bounded physical validation is the box route; no additional movement
+was started and no new planner or recovery subsystem was introduced.
+
+### Physical front-and-right box route — September 12
+
+The operator placed boxes ahead and to BLAST's right, leaving the left side
+open, and returned her to the start. The goal remained 800 mm straight ahead;
+the model was not told which side to choose.
+
+First attempt `episode-aa1d9d4a83dfe3d602f8f930` ended before any wheel motion
+or planner request. A front echo at 217 mm was present, but the sensor-arm
+encoder was 156 degrees against the 158 +/- 1-degree navigation reference.
+The scan reported `scan_start_clearance_unverified` and the episode returned
+`blast_startup_perception_incomplete`. This is an unresolved startup
+preparation/strictness issue, not a model route-planning failure.
+
+Used the existing stationary `probe_blast_expressions.py --gesture restore`
+to restore the sensor position. It reported 157 degrees, 218 mm front range,
+and zero changes in both wheel encoders. Reconnected the console for the same
+physical route; no planning, calibration or tolerance code was changed.
+
+Retry `episode-bd32c663cf868fd7e2e5b7a0` completed with no controller-action
+failures or reverse movement. The initial full sweep took 15.867 seconds and
+contained sixteen idle-confirmed angular readings, nine measured echoes.
+The live map visibly showed rays, hits, obstacle regions and model waypoints.
+
+The actual first Qwen request included the front cluster (four echoes around
+x=296–327 mm, y=5–215 mm), a separate close right-side echo at (21, -241) mm,
+the robot footprint clearance representation, goal (800, 0), coarse grid and
+known-clear axis reaches (left 450 mm, right 0 mm). Low reasoning and an 8192
+output-token cap were retained. The recorded response reasoning explicitly
+rejected the right detour because of its nearby echo/keep-out intersection and
+chose the left route: (0, 450), (500, 450), (500, 0), (800, 0). No operator
+left-turn instruction was added to the model's goal or context.
+
+BLAST followed the first two legs. At approximately (503, 489) mm Qwen revised
+the return leg, which still intersected mapped obstacles, to continue to
+(800, 489) and then return to (800, 0). One host route interruption reported
+`FORWARD_CLEARANCE_UNAVAILABLE` despite a measured 564 mm range. The model
+retained the new waypoints and selected a front-arc rescan; five of its nine
+angular readings were measured and all were idle-confirmed. It then continued
+to the goal instead of aborting. The exact action-availability cause of that
+interruption has not yet been resolved; it must not be labelled a sensor fault
+solely from the robot's spoken commentary.
+
+Total: two scans (startup 360-degree sweep plus one front-arc refresh), forty
+forward pulses, two left-turn and three right-turn actions, eight model
+decisions, no reverse and no controller-action failure. The episode completed
+in approximately 309 seconds including planning and speech. Final estimated
+position was (841, 27) mm, 49 mm from target, heading approximately -18 degrees,
+within the existing 50 mm / 20-degree completion tolerances—not an exact
+position or heading claim.
+
+The operator confirmed both that BLAST passed the box on her own left with a
+matching map, and that she reached the intended goal behind the box. Her slight
+leftward drift was visible on the map and handled during the route. This is a
+successful physical two-box route after the explicit sensor-arm preparation,
+not an unattended-startup pass. Follow-ups remain the startup arm preparation
+and unnecessary clearance interruption; no further physical run or code
+refactor was started in this validation step.
+
+### Conversation after navigation — September 12
+
+The operator's clear status question received the generic clarification twice.
+A motorless replay established the cause before any model call: the status
+projector copied full scan diagnostics and obstacle support points, producing
+17,209 bytes against the conversation client's 16,384-byte facts limit. The
+input service hid that exception behind a misleading clarification reply.
+
+The shared BLAST/EV3 conversation projector now retains a concise latest scan,
+obstacle meaning/location/uncertainty, scan boundaries, pose and mission status.
+It omits raw support-point lists and encoder diagnostics. No-echo sentinels
+become null distances, headings are expressed in degrees with their sign
+convention, and stored observations are explicitly distinguished from live
+sensor readings. EV3 IR remains qualitative, not centimetres. The actual
+post-route context is approximately 8.9 KB. Navigation's map, planner and
+execution are unchanged; no new classifier or routing rules were introduced.
+
+Technical fallback replies now describe a technical failure, log its cause,
+and expose `fallback: true` in the turn response. Genuine model-selected
+clarifications retain the model's question. Status/conversation/failure paths
+still cannot start navigation; only the existing physical-task branch can.
+
+Real-Qwen, motorless checks covered status, recent mission outcome, sensor
+questions, social conversation, stop, navigation, unsupported physical tasks
+and ambiguity. All eight intent checks matched and returned no fallback;
+ordinary replies took about 2–2.5 seconds. Additional checks caught and corrected
+context ambiguity around no-echo values, IR units and heading sign. The final
+BLAST sensor answer described the last scan as stale; EV3 described a nearby
+IR reflection without inventing centimetres. EV3 validation here used supplied
+status/IR facts, not a physical EV3 run.
+
+The conversation classifier remains the existing single intent-and-reply call
+per turn, using robot status, not a new multi-agent dialogue engine. Its existing
+reasoning-off/192-token settings were not the cause of this incident and were
+left unchanged; navigation still uses low reasoning with 8192 output tokens.
+The live console was reloaded to activate the fix. This clears its in-memory
+mission view; the physical validation logs above remain retained.
+
+The exact original question was then submitted through the live GUI after
+reload. It displayed a normal status reply (idle, awaiting instructions), and
+the control service remained IDLE with no navigation episode. The accompanying
+model-selected arm_wave reported a separate hub error: `motors must be idle
+before setting a pose`. The monitor reconnected afterward. Text conversation
+is verified; this does not establish successful gesture or complete audible
+delivery. That accessory-execution issue was not folded into this context fix.
+
+Final quality gate: 2,114 tests passed in 100.684 seconds, JavaScript syntax
+checks and `git diff --check` passed. The 52 focused conversation/HTTP tests
+include dense recorded BLAST scan evidence, EV3's nonmetric observations and
+technical-failure reporting. Log:
+`/private/tmp/robot-quality-conversation-release-20260912.log`.
+
+### Interrupted dialogue audio — September 12
+
+The user confirmed that the reply above was audibly cut off. Both `arm_wave`
+and `claw_flourish` had received a valid hub rejection between accessory poses
+(`motors must be idle before setting a pose`). The host misclassified that
+rejection as a broken protocol session and restarted the hub, stopping audio.
+The arm was left at -443 motor degrees, next to its -442-degree raised target.
+
+Accessory target moves now finish with BRAKE instead of HOLD, retaining the
+existing delayed coast release. This avoids continued tiny hold corrections
+reopening the busy state after a pose has completed. Speed, target positions,
+travel bounds and navigation execution are unchanged. Hub validation failures
+are explicitly marked as command rejections; the host reports them without
+tearing down the session. Unknown/internal errors and malformed protocol
+responses retain the existing failure handling. No automatic gesture retries
+or new navigation rules were added.
+
+Regression checks cover a rejected second arm pose during audio, continued
+face commands on the same session, and malformed error responses remaining
+failures. All 2,116 tests passed in 97.930 seconds, with the full quality gate
+passing (`/private/tmp/robot-quality-speech-gesture-20260912.log`).
+
+The live GUI greeting-and-wave test then returned a normal Qwen reply and
+finished with no expression failure or reconnect. Body position returned to
+157 degrees; wheel encoders stayed exactly at 3811 and 6773 degrees. The user
+confirmed complete audible delivery and the returning wave, but also heard
+the model's literal `*waves arm*` stage direction. The dialogue prompt now
+explicitly separates words read aloud from nonverbal expression fields.
+Three real-Qwen, motorless checks then returned clean spoken text and separate
+arm-wave, claw-flourish and face-only choices, without fallback. All 13 dialogue
+model tests passed after this prompt-only follow-up.

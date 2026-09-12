@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .blast_navigation_calibration import (
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
@@ -201,6 +201,14 @@ def _blast_gemma_scenario(
     )
 
 
+def blast_open_floor() -> NavigationSimulationScenario:
+    """Open room whose forward wall stays beyond ultrasonic range."""
+    return replace(
+        _blast_gemma_scenario("blast-open-floor", ()),
+        bounds=(-1_200, -1_200, 5_000, 1_200),
+    )
+
+
 def blast_box_front() -> NavigationSimulationScenario:
     return _blast_gemma_scenario(
         "blast-box-front",
@@ -281,6 +289,7 @@ def blast_gemma_validation_scenarios():
     """Small strategic cases; none contains a route or waypoint answer."""
 
     return (
+        blast_open_floor(),
         blast_box_front(),
         blast_measured_box_and_chair(),
         blast_box_at_side(),
@@ -297,6 +306,7 @@ __all__ = (
     "blast_box_at_side",
     "blast_box_front",
     "blast_measured_box_and_chair",
+    "blast_open_floor",
     "blast_boxes_both_sides",
     "blast_gemma_validation_scenarios",
     "blast_straight_corridor",

@@ -1,5 +1,8 @@
 # Navigation simplification plan
 
+For the next EV3 work, follow the [active EV3 integration plan](EV3_INTEGRATION_PLAN.md).
+The dated checkpoints below retain historical context; they are not all current.
+
 ## Latest physical checkpoint — September 7: box baseline accepted
 
 After reloading the tested host, physical BLAST episode

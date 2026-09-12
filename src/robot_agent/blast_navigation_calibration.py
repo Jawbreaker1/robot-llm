@@ -201,7 +201,15 @@ BLAST_PROVISIONAL_NAVIGATION_CALIBRATION = BlastNavigationCalibration(
 )
 
 
+# Allow up to 1 cm of wheel travel as post-command mechanical settling.
+# This motion is still included in odometry, not snapped away or ignored.
+BLAST_ENCODER_SETTLING_DEGREES = round(
+    10 / BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry.linear_mm_per_encoder_degree
+)
+
+
 __all__ = (
+    "BLAST_ENCODER_SETTLING_DEGREES",
     "BLAST_NAVIGATION_EVIDENCE_ID",
     "BLAST_PROVISIONAL_NAVIGATION_CALIBRATION",
     "BlastNavigationCalibration",

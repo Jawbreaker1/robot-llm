@@ -50,6 +50,7 @@ CLAW_PULSE_SPEED_DPS = 180
 CLAW_PULSE_DURATION_MS = 500
 BODY_PULSE_SPEED_DPS = 120
 BODY_PULSE_DURATION_MS = 900
+MOTOR_SETTLE_MS = 150
 FACE_PATTERNS = {
     "neutral": ("00000", "11011", "11011", "11011", "00000"),
     "happy": ("00000", "01010", "10101", "00000", "00000"),
@@ -74,7 +75,8 @@ hub = InventorHub(
 clock = StopWatch()
 
 # reset_angle=False preserves positions across runtime deployments. Motion
-# operations below are fixed, bounded, and finish with braking.
+# operations below are fixed and bounded; settled stops are then released
+# so the IMU can recalibrate while BLAST is at rest.
 motors = {
     "right_drive": Motor(
         RIGHT_DRIVE_PORT,
@@ -103,17 +105,29 @@ sampled_audio_supported = all(
 )
 sampled_audio_app_data = AppData([(0, SAMPLED_AUDIO_MAX_BYTES)])
 sampled_audio_transfer = None
+motor_release_at_ms = None
 
 
 def emit(value):
     print(json.dumps(value))
 
 
-def poll_sampled_audio():
-    """Release the DMA buffer as soon as one-shot playback is done."""
+def poll_background_tasks():
+    """Release completed audio and settled motors, allowing IMU calibration."""
+    global motor_release_at_ms
 
     if sampled_audio_supported:
         hub.speaker.done()
+    if motor_release_at_ms is None:
+        return
+    if not all(motor.done() for motor in motors.values()):
+        motor_release_at_ms = clock.time() + MOTOR_SETTLE_MS
+    elif clock.time() >= motor_release_at_ms:
+        # Pybricks calibrates only with ALL motors coasting, not BRAKE/HOLD.
+        # Keep the commanded stop until motion has finished and settled.
+        for motor in motors.values():
+            motor.stop()
+        motor_release_at_ms = None
 
 
 def read_line():
@@ -121,7 +135,7 @@ def read_line():
     too_large = False
     while True:
         while not incoming.poll(0):
-            poll_sampled_audio()
+            poll_background_tasks()
             wait(10)
         character = stdin.buffer.read(1)
         if character == b"\n":
@@ -416,8 +430,10 @@ def set_pose(role, target_angle_deg):
     max_travel = 900 if role == "body" else 180
     if abs(target_angle_deg - before) > max_travel:
         raise ValueError("pose target exceeds accessory travel")
+    # Finish the pose, then brake until the normal idle release. HOLD keeps
+    # correcting tiny deflections and can become "busy" again between poses.
     motor.run_target(500 if role == "body" else 180, target_angle_deg,
-                     then=Stop.HOLD, wait=False)
+                     then=Stop.BRAKE, wait=False)
     return {
         "accepted": True,
         "motor": role,
@@ -534,11 +550,17 @@ emit(
 while True:
     request = None
     try:
-        poll_sampled_audio()
+        poll_background_tasks()
         line = read_line()
         request = json.loads(line)
         request_id = request["id"]
         operation = request["op"]
+        if operation in (
+            "stop", "drive_pulse", "turn_pulse", "turn_trim_pulse",
+            "scan_turn_pulse", "scan_trim_pulse", "claw_pulse",
+            "body_pulse", "set_pose",
+        ):
+            motor_release_at_ms = clock.time() + MOTOR_SETTLE_MS
         if operation == "ping":
             result = {"uptime_ms": clock.time()}
         elif operation == "observe":
@@ -609,6 +631,7 @@ while True:
                 if isinstance(request, dict)
                 else None,
                 "error": str(error),
+                "error_type": "rejected" if isinstance(error, ValueError) else "runtime",
             }
         )
 

@@ -2406,20 +2406,29 @@ textarea:focus-visible,
 }
 
 .map-blast-scan-ray-line {
-  stroke: rgb(116 167 255 / 24%);
+  stroke: rgb(116 167 255 / 85%);
   stroke-linecap: round;
-  stroke-width: 2;
+  stroke-width: 2.5;
 }
 
 .map-blast-scan-origin {
   fill: var(--evidence);
-  opacity: 0.36;
+  opacity: 0.85;
 }
 
 .map-blast-scan-echo {
-  fill: rgb(255 107 98 / 24%);
-  stroke: rgb(255 107 98 / 50%);
-  stroke-width: 2;
+  fill: #ff6b62;
+  stroke: #ffd4d0;
+  stroke-width: 2.5;
+}
+
+.map-blast-scan-ray.is-uncertain .map-blast-scan-ray-line {
+  stroke-dasharray: 6 4;
+}
+
+.map-blast-scan-ray.is-uncertain .map-blast-scan-echo {
+  fill: var(--surface, #101719);
+  stroke: #ff9c94;
 }
 
 .map-provisional-ultrasonic-obstacle-envelope {

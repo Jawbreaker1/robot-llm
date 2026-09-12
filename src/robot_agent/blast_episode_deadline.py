@@ -1,5 +1,7 @@
 """Absolute, checkpoint-bounded deadlines for one BLAST episode."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 from .blast_navigation_action_profile import (

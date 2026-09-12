@@ -3369,7 +3369,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             allow_no_valid_distance_with_bounded_evidence=True,
         ))
 
-    def test_full_surroundings_scan_offers_turns_at_no_return(self):
+    def test_full_surroundings_scan_offers_forward_and_turns_at_no_return(self):
         controller = FakeController(2_000)
         adapter = self.adapter(controller, Planner([]))
         observation = adapter._observation()
@@ -3381,7 +3381,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 "action": SCAN_FRONT_ARC,
                 "scan": scan,
             },)),
-            (TURN_LEFT_90, TURN_RIGHT_90),
+            (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90),
         )
 
         scan.pop("sweep_coverage_deg")
@@ -3390,7 +3390,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
                 "action": SCAN_FRONT_ARC,
                 "scan": scan,
             },)),
-            (TURN_LEFT_90, TURN_RIGHT_90),
+            (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90),
         )
 
     def test_old_scan_does_not_override_current_close_range(self):
@@ -3411,70 +3411,27 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertNotIn(TURN_LEFT_90, available)
         self.assertNotIn(TURN_RIGHT_90, available)
 
-    def test_recent_forward_measurement_survives_dropout_but_not_new_blockage(self):
+    def test_fresh_no_echo_does_not_expire_with_scan_distance_or_heading(self):
         controller = FakeController(2_000)
         adapter = self.adapter(controller, Planner([]))
         observation = adapter._observation()
-        history = (
-            {"action": TURN_RIGHT_90, "pose": {"x_mm": 0, "y_mm": 0},
-             "observation_settled": True,
-             "result_observation": {"distance_mm": 881}},
-            {"action": ADVANCE, "pose": {"x_mm": 5, "y_mm": -48},
-             "motion": {"command_completed": True},
-             "observation_settled": True,
-             "result_observation": {"distance_mm": 2_000}},
-        )
-        self.assertIn(ADVANCE, adapter._available_actions(observation, history))
-        close = copy.deepcopy(observation)
-        close["sensors"]["distance_mm"] = 40
-        self.assertNotIn(ADVANCE, adapter._available_actions(close, history))
-        for next_motion in (
-            {**history[-1], "pose": {"x_mm": 0, "y_mm": -350}},
-            {**history[-1], "action": TURN_LEFT_90,
-             "pose": {"x_mm": 5, "y_mm": -48, "heading_mdeg": 90_000}},
-        ):
-            with self.subTest(next_motion=next_motion):
-                self.assertNotIn(ADVANCE, adapter._available_actions(
-                    observation, (*history, next_motion),
-                ))
-
-    def test_scan_evidence_follows_actual_direction_not_named_flanks(self):
-        controller = FakeController(2_000)
-        adapter = self.adapter(controller, Planner([]))
-        observation = adapter._observation()
-        pose = {"x_mm": 0, "y_mm": 0, "heading_mdeg": 0}
-        scan = dense_scan_result(
-            (2_000, 100, 2_000, 2_000, 2_000, 900, 2_000, 2_000, 2_000),
-            (0, -22, -44, -66, -88, 22, 44, 66, 88),
-        )
-        view = {"scan": scan, "scan_pose": pose}
-        history = ({"action": SCAN_FRONT_ARC, "pose": pose},)
-        # A nearby flank does not erase the observed forward direction.
-        self.assertIn(ADVANCE, adapter._available_actions(observation, history, view))
-        moved = {"action": ADVANCE, "pose": {**pose, "x_mm": 50},
-                 "motion": {"command_completed": True}}
-        self.assertIn(ADVANCE, adapter._available_actions(
-            observation, (*history, moved), view,
-        ))
-        for change in (
-            {"x_mm": 350}, {"y_mm": 150}, {"heading_mdeg": 135_000},
-        ):
-            with self.subTest(change=change):
-                self.assertNotIn(ADVANCE, adapter._available_actions(
-                    observation, (*history, {**moved, "pose": {**pose, **change}}), view,
-                ))
-        partial = copy.deepcopy(scan)
-        partial.update({"state": "partial", "result": "coverage_incomplete"})
-        self.assertIn(ADVANCE, adapter._available_actions(
-            observation, history, {**view, "scan": partial},
-        ))
-        partial["angular_rays"][0]["observation_settled"] = False
-        self.assertNotIn(ADVANCE, adapter._available_actions(
-            observation, history, {**view, "scan": partial},
-        ))
-        close = copy.deepcopy(observation)
-        close["sensors"]["distance_mm"] = 40
-        self.assertNotIn(ADVANCE, adapter._available_actions(close, history, view))
+        # Includes the September 10 stall pose and positions beyond the former
+        # 300 mm reuse limit. A fresh no-echo sample is not stale scan evidence.
+        for x_mm, y_mm, heading in ((321, 9, 1_000), (800, 0, 0), (0, 450, 90_000)):
+            history = ({
+                "action": ADVANCE,
+                "pose": {"x_mm": x_mm, "y_mm": y_mm, "heading_mdeg": heading},
+                "observation_settled": True,
+                "result_observation": {"distance_mm": 2_000},
+            },)
+            for distance, expected in ((2_000, True), (900, True), (40, False),
+                                       (None, False), (-1, False), (float("nan"), False)):
+                with self.subTest(pose=history[0]["pose"], distance=distance):
+                    observation["sensors"]["distance_mm"] = distance
+                    self.assertEqual(
+                        ADVANCE in adapter._available_actions(observation, history),
+                        expected,
+                    )
 
     def test_full_scan_lets_gemma_consider_reverse_from_all_rays(self):
         controller = FakeController(2_000)
@@ -4101,7 +4058,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(controller.commands, ["scan_front_arc"])
         self.assertEqual(
             planner.contexts[0].available_actions,
-            (FOLLOW_WAYPOINT, TURN_LEFT_90, TURN_RIGHT_90, SCAN_FRONT_ARC),
+            (FOLLOW_WAYPOINT, ADVANCE, TURN_LEFT_90, TURN_RIGHT_90, SCAN_FRONT_ARC),
         )
         self.assertTrue(
             controller.permit_requests[0]["perception_only"],
@@ -4152,7 +4109,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             planner.contexts[1].available_actions,
-            (FOLLOW_WAYPOINT, TURN_LEFT_90, TURN_RIGHT_90, REVERSE, SCAN_FRONT_ARC),
+            (FOLLOW_WAYPOINT, ADVANCE, TURN_LEFT_90, TURN_RIGHT_90, REVERSE, SCAN_FRONT_ARC),
         )
         self.assertTrue(controller.permit_requests[-1]["allow_no_return"])
         self.assertTrue(controller.permit_requests[-1]["perception_only"])

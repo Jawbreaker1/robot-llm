@@ -114,11 +114,9 @@ def project_blast_scan_planar_surfaces(
     assert forward is not None and left is not None and yaw is not None
 
     points = []
+    uncertain_points = []
     for ray, raw_heading in zip(projection_rays, raw_headings):
-        if (
-            ray.get("observation_settled") is not True
-            or ray["range_state"] != scan_contract.RANGE_STATE_MEASURED
-        ):
+        if ray["range_state"] != scan_contract.RANGE_STATE_MEASURED:
             continue
         magnitude = round(abs(raw_heading) * 1_000)
         if ray["side"] == "center":
@@ -134,7 +132,8 @@ def project_blast_scan_planar_surfaces(
         beam_heading = normalize_heading_mdeg(body_heading + yaw)
         beam_angle = math.radians(beam_heading / 1_000)
         distance = _finite(ray["distance_mm"])
-        points.append({
+        destination = points if ray.get("observation_settled") is True else uncertain_points
+        destination.append({
             "side": ray["side"],
             "measured_range_mm": distance,
             "relative_bearing_mdeg": relative,
@@ -144,7 +143,7 @@ def project_blast_scan_planar_surfaces(
             "nominal_echo_x_mm": round(origin_x + distance * math.cos(beam_angle)),
             "nominal_echo_y_mm": round(origin_y + distance * math.sin(beam_angle)),
         })
-    return {
+    projection = {
         "schema": "blast-planar-scan-projection/v1",
         "frame": "EPISODE_LOCAL_ODOMETRY",
         "quality": "PROVISIONAL_YAW_ONLY",
@@ -153,3 +152,8 @@ def project_blast_scan_planar_surfaces(
         "scan_turn_translation_compensated": False,
         "points": points,
     }
+    # Retain actual returns for inspection without promoting them to the
+    # settled points consumed by obstacle memory and clearance checks.
+    if uncertain_points:
+        projection["uncertain_points"] = uncertain_points
+    return projection

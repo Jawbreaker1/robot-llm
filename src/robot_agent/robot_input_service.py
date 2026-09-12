@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 from copy import deepcopy
+import logging
 import threading
 import time
 from typing import Callable, Mapping, Optional
@@ -12,6 +13,7 @@ from .lm_studio_robot_input import (
     STOP_TASK,
     RobotInput,
     RobotInputDecision,
+    robot_input_failure_reply,
 )
 from .robot_control_service import RobotControlServiceError
 from .robot_status_facts import project_robot_status_facts
@@ -19,12 +21,7 @@ from .robot_status_facts import project_robot_status_facts
 
 ROBOT_INPUT_TURN_SCHEMA = "robot-input-turn/v1"
 MAX_INPUT_HISTORY = 128
-
-
-def _clarification(locale: str) -> str:
-    if locale == "sv":
-        return "Jag är inte säker på vad du menar. Kan du förtydliga?"
-    return "I am not sure what you mean. Could you clarify?"
+LOGGER = logging.getLogger(__name__)
 
 
 def _active_episode_reply(locale: str) -> str:
@@ -90,7 +87,7 @@ class RobotInputService:
         return RobotInputDecision(
             intent=CLARIFY,
             confidence_milli=0,
-            reply_text=_clarification(input_value.locale),
+            reply_text=robot_input_failure_reply(input_value.locale),
             fallback=True,
         )
 
@@ -102,6 +99,7 @@ class RobotInputService:
                 raise TypeError
             return decision
         except Exception:
+            LOGGER.exception("Robot input failed request_id=%s", input_value.request_id)
             return self._fallback(input_value)
 
     def dispatch(
@@ -207,6 +205,7 @@ class RobotInputService:
                 "request_id": client_request_id,
                 "intent": decision.intent,
                 "confidence_milli": decision.confidence_milli,
+                "fallback": decision.fallback,
                 "answer_text": decision.reply_text,
                 "episode": episode,
                 "control": control,

@@ -6,7 +6,9 @@ from itertools import product
 from unittest.mock import patch
 
 from robot_agent.blast_navigation_simulation import run_blast_gemma_scenario
-from robot_agent.navigation_simulation_scenarios import blast_box_front, blast_measured_box_and_chair
+from robot_agent.navigation_simulation_scenarios import (
+    blast_box_front, blast_measured_box_and_chair, blast_open_floor,
+)
 from robot_agent.lm_studio_controller_action import (
     COMPLETE, FOLLOW_WAYPOINT, ControllerActionDecision, ControllerActionPlannerResult,
 )
@@ -298,32 +300,36 @@ class SimulationRobotAdapterTests(unittest.TestCase):
                 # not arrival. The wheels must then drive toward the goal.
                 self.assertGreater(result["final_pose"]["x_mm"], 700)
 
-    def test_persistent_missing_range_keeps_waypoint_and_bounds_progress(self):
+    def test_recorded_open_floor_no_echo_follows_waypoint_to_goal(self):
         contexts = []
-        waypoint = {"x_mm": 0, "y_mm": -450, "purpose": "Side contract"}
+        waypoint = {"x_mm": 800, "y_mm": 0, "purpose": "Goal"}
+        scan = json.loads((Path(__file__).parent / "fixtures" /
+                           "blast_open_floor_scan_20260910.json").read_text())["scans"][0]
+        # Execution regression using physical startup data, not an LLM score.
         class Planner:
             def decide(self, context):
                 contexts.append(context)
-                action = FOLLOW_WAYPOINT if len(contexts) == 1 else SCAN_FRONT_ARC
+                action = COMPLETE if context.completion_allowed else FOLLOW_WAYPOINT
+                if action == FOLLOW_WAYPOINT and action not in context.available_actions:
+                    raise AssertionError("Following vanished on open floor")
                 return ControllerActionPlannerResult(ControllerActionDecision(
-                    action=action, confidence_milli=1000, assessment="Inspect missing range",
-                    plan=(action,), utterance=None, waypoint=waypoint,
+                    action=action, confidence_milli=1000, assessment="Follow the route",
+                    plan=(action,), utterance=None,
+                    waypoint=waypoint if action == FOLLOW_WAYPOINT else None,
                 ), latency_ms=0)
-        run_blast_gemma_scenario(
-            replace(blast_box_front(), obstacles=()),
+        result = run_blast_gemma_scenario(
+            blast_open_floor(), startup_scan=scan,
             planner_factory=lambda _: Planner(), max_decisions=2,
-            range_dropout_reads=100,
         )
+        self.assertTrue(result["completed"], result.get("error_message"))
+        self.assertTrue(result["goal_reached"])
+        self.assertEqual(result["scans"], 1)
+        self.assertEqual(result["blocked_moves"], 0)
+        self.assertNotIn("drive_reverse", result["commands_tail"])
         self.assertEqual(len(contexts), 2)
-        self.assertIsNone(contexts[1].observation["sensors"]["distance_mm"])
-        self.assertEqual(contexts[1].observation["sensors"]["range_state"], "NO_VALID_DISTANCE")
-        # Reuse the measured space through a short dropout, then return to the
-        # planner without calling the missing echo a wall or losing the route.
-        progress = contexts[1].observation["odometry"]["total_forward_mm"]
-        self.assertGreater(progress, 200)
-        self.assertLessEqual(progress, 350)
-        self.assertIsNone(contexts[1].history[-1]["distance_mm"])
-        self.assertEqual(contexts[1].active_waypoint, waypoint)
+        for context in contexts:
+            self.assertIsNone(context.observation["sensors"]["distance_mm"])
+            self.assertEqual(context.observation["sensors"]["range_state"], "NO_VALID_DISTANCE")
 
     def test_retained_waypoint_keeps_its_side_through_transient_range_loss(self):
         # Execution contract only. Real Qwen decisions are validated separately.

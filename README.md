@@ -303,6 +303,9 @@ Run the hardware-free quality suite:
 sh ./scripts/quality_check.sh
 ```
 
+CI runs this complete suite on Python 3.9 and 3.13. Focused tests are useful
+during development, but do not replace the full check before merging.
+
 | Guide | Contents |
 |---|---|
 | [Dashboard](docs/DASHBOARD.md) | UI, microphone input, settings, maps, and persistence |

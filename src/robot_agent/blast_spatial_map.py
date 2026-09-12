@@ -384,11 +384,14 @@ def _scan_view(value, now_unix_ms) -> bool:
     ):
         return False
     projection = value["projection"]
-    if not _exact(projection, (
+    if not isinstance(projection, Mapping):
+        return False
+    fields = (
         "schema", "frame", "quality", "vertical_pitch_compensated",
         "ultrasonic_beam_width_modeled", "scan_turn_translation_compensated",
         "points",
-    )) or not (
+    ) + (("uncertain_points",) if "uncertain_points" in projection else ())
+    if not _exact(projection, fields) or not (
         projection["schema"] == "blast-planar-scan-projection/v1"
         and projection["frame"] == "EPISODE_LOCAL_ODOMETRY"
         and projection["quality"] == "PROVISIONAL_YAW_ONLY"
@@ -398,10 +401,15 @@ def _scan_view(value, now_unix_ms) -> bool:
         and isinstance(projection["points"], list)
         and len(projection["points"]) <= len(SCAN_ANGULAR_RAY_SIDES)
         and all(_scan_point(point) for point in projection["points"])
+        and isinstance(projection.get("uncertain_points", []), list)
+        and len(projection.get("uncertain_points", [])) <= len(SCAN_ANGULAR_RAY_SIDES)
+        and all(_scan_point(point) for point in projection.get("uncertain_points", []))
     ):
         return False
-    sides = [point["side"] for point in projection["points"]]
-    return len(sides) == len(set(sides))
+    sides = [point["side"] for point in (
+        projection["points"] + projection.get("uncertain_points", [])
+    )]
+    return len(sides) <= len(SCAN_ANGULAR_RAY_SIDES) and len(sides) == len(set(sides))
 
 
 def _trace_inputs(final_goal, planned_leg, imu_heading,

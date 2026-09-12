@@ -40,7 +40,7 @@ class BlastExpressionTests(unittest.TestCase):
         self.namespace = {
             "motors": self.motors,
             "hub": SimpleNamespace(display=self.display, light=self.light),
-            "Stop": SimpleNamespace(HOLD="hold"),
+            "Stop": SimpleNamespace(BRAKE="brake"),
             "Side": SimpleNamespace(RIGHT="right"),
             "Color": SimpleNamespace(GREEN="green"),
         }
@@ -52,7 +52,7 @@ class BlastExpressionTests(unittest.TestCase):
         self.assertEqual(result["before_angle_deg"], 188)
         self.assertEqual(result["target_angle_deg"], 158)
         self.motors["body"].run_target.assert_called_once_with(
-            500, 158, then="hold", wait=False,
+            500, 158, then="brake", wait=False,
         )
         for motor in self.motors.values():
             motor.reset_angle.assert_not_called()
@@ -97,7 +97,7 @@ class BlastExpressionTests(unittest.TestCase):
     def test_geared_arm_accepts_full_excursion_but_claw_does_not(self):
         self.namespace["set_pose"]("body", 958)
         self.motors["body"].run_target.assert_called_once_with(
-            500, 958, then="hold", wait=False,
+            500, 958, then="brake", wait=False,
         )
         with self.assertRaises(ValueError):
             self.namespace["set_pose"]("claw", 958)

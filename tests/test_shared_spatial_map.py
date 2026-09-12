@@ -352,6 +352,22 @@ class SharedSpatialMapCompositorTests(TestCase):
                 self.assertEqual(ray["measured_range_mm"], 300.0)
                 self.assertEqual(ray["relative_bearing_mdeg"], 0)
 
+                source_projection = value["navigation_trace"][
+                    "planar_scan_views"
+                ][0]["projection"]
+                source_projection["uncertain_points"] = source_projection["points"]
+                source_projection["points"] = []
+                uncertain_robot = compositor(
+                    (Provider(value), calibration)
+                ).snapshot()["robots"][0]
+                uncertain_projection = uncertain_robot["navigation_trace"][
+                    "planar_scan_views"
+                ][0]["projection"]
+                self.assertEqual(uncertain_projection["points"], [])
+                self.assertEqual(
+                    uncertain_projection["uncertain_points"], projection["points"]
+                )
+
     def test_malformed_navigation_trace_isolated_from_healthy_source(self):
         broken_value = local_map(
             "blast-01", "blast-hub", "blast-local", "episode-a"

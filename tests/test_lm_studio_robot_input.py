@@ -136,6 +136,9 @@ class LMStudioRobotInputTests(unittest.TestCase):
         payload = json.loads(transport.calls[0][1])
         self.assertEqual(payload["reasoning_effort"], "none")
         self.assertIn("expression", payload["response_format"]["json_schema"]["schema"]["required"])
+        self.assertIn("reply_text is read aloud verbatim", payload["messages"][0]["content"])
+        self.assertIn("nonverbal behavior only in expression.face and expression.gesture",
+                      payload["messages"][0]["content"])
         ev3 = LMStudioRobotInputModel(model=MODEL, transport=transport)
         self.assertTrue(ev3.interpret(robot_input(), {}).fallback)
 
@@ -313,7 +316,7 @@ class LMStudioRobotInputTests(unittest.TestCase):
                 result = model.interpret(robot_input(), {})
                 self.assertEqual((result.intent, result.confidence_milli), (CLARIFY, 0))
                 self.assertTrue(result.fallback)
-                self.assertIn("förtydliga", result.reply_text)
+                self.assertIn("tekniskt fel", result.reply_text)
 
     def test_transport_failures_fail_closed(self):
         for error in (socket.timeout(), TimeoutError(), OSError()):

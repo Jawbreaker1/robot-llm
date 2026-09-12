@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 from robot_agent.blast_ble_runtime import (
+    BlastCommandRejected,
     _adpcm_sample_count,
     _fletcher16,
     blast_adpcm_duration_ms,
@@ -14,7 +15,7 @@ from robot_agent.blast_observation_monitor import (
     RANGE_STATE_INVALID,
     RANGE_STATE_MEASURED,
     RANGE_STATE_NO_VALID_DISTANCE,
-    POST_MOTION_SETTLE_SAMPLE_COUNT,
+    POST_MOTION_IDLE_SAMPLE_COUNT,
     SCAN_COMMAND,
     SCAN_COMMAND_TIMEOUT_SECONDS,
     SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
@@ -33,6 +34,7 @@ from robot_agent.blast_navigation_action_profile import (
     SCAN_TURN_ENCODER_DEGREES_PER_PULSE,
     TURN_SPEED_DPS,
 )
+from robot_agent.blast_navigation_calibration import BLAST_ENCODER_SETTLING_DEGREES
 from robot_agent.blast_scan_safety import issue_blast_scan_permit
 from robot_agent.blast_scan_observation import SCAN_RAY_EVIDENCE_SWEEP_ONLY
 from robot_agent.blast_navigation_motion_execution import BlastNavigationMotionExecutor
@@ -750,7 +752,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
         class ImmediatelySettledMonitor(BlastObservationMonitor):
             @staticmethod
-            def _settling_window_is_stable(samples):
+            def _post_motion_window_is_idle(samples):
                 return bool(samples)
 
         monitor = ImmediatelySettledMonitor(
@@ -897,7 +899,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
             completed_commands = 0
 
             @staticmethod
-            def _settling_window_is_stable(samples):
+            def _post_motion_window_is_idle(samples):
                 return bool(samples)
 
             @staticmethod
@@ -1870,7 +1872,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
         class ImmediatelySettledMonitor(BlastObservationMonitor):
             @staticmethod
-            def _settling_window_is_stable(samples):
+            def _post_motion_window_is_idle(samples):
                 return bool(samples)
 
         monitor = ImmediatelySettledMonitor(
@@ -1984,7 +1986,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
         class ImmediatelySettledMonitor(BlastObservationMonitor):
             @staticmethod
-            def _settling_window_is_stable(samples):
+            def _post_motion_window_is_idle(samples):
                 return bool(samples)
 
         monitor = ImmediatelySettledMonitor(
@@ -2084,7 +2086,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
         class ImmediatelySettledMonitor(BlastObservationMonitor):
             @staticmethod
-            def _settling_window_is_stable(samples):
+            def _post_motion_window_is_idle(samples):
                 return bool(samples)
 
         factory = Factory()
@@ -2609,7 +2611,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertEqual(monitor.settle_timeouts, [None])
         self.assertGreaterEqual(
             len([call for call in runtime.calls if call == ("observe",)]),
-            5,
+            POST_MOTION_IDLE_SAMPLE_COUNT,
         )
         self.assertFalse(any(
             call[0] in {
@@ -3066,13 +3068,6 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 if self.settle_calls == 1:
                     observation = dict(initial_observation)
                     observation["distance_mm"] = 300
-                    self._settling_samples = (
-                        (300.0, 0.0, 0.0),
-                        (310.0, 2.0, 0.0),
-                        (300.0, 0.0, 0.0),
-                        (310.0, 2.0, 0.0),
-                        (300.0, 0.0, 0.0),
-                    )
                     return observation, False
                 return await super()._observe_until_settled(
                     runtime,
@@ -3155,24 +3150,25 @@ class BlastObservationMonitorTests(unittest.TestCase):
         )
         monitor.close()
 
-    def test_sweep_only_window_rejects_each_pose_and_range_fault(self):
+    def test_idle_scan_window_keeps_range_and_sensor_pose_checks(self):
         monitor = BlastObservationMonitor(runtime_factory=FakeRuntime)
         observation = {
             "motion_active": False,
+            "distance_mm": 1400,
             "imu": {"heading_deg": 0.0},
             "motor_angles_deg": {"body": 158},
         }
-        safe = ((1_400.0, 0.0, 0.0),) * 5
+        safe = (observation, {**observation, "distance_mm": 1420,
+                              "imu": {"raw_tilt_deg": [3.0, -2.0]}})
         monitor._settling_samples = safe
         self.assertTrue(
             monitor._scan_sweep_window_allows_continuation(observation)
         )
 
         cases = (
-            ("short", safe[:4], observation),
-            ("close", ((53.0, 0.0, 0.0),) * 5, observation),
-            ("invalid", ((-1.0, 0.0, 0.0),) * 5, observation),
-            ("tilt", safe[:4] + ((1_400.0, 1.1, 0.0),), observation),
+            ("short", safe[:1], observation),
+            ("close", ({**observation, "distance_mm": 53}, observation), observation),
+            ("invalid", ({**observation, "distance_mm": -1}, observation), observation),
             ("moving", safe, {**observation, "motion_active": True}),
             ("body", safe, {
                 **observation,
@@ -3253,21 +3249,11 @@ class BlastObservationMonitorTests(unittest.TestCase):
             ):
                 self.settle_calls += 1
                 if self.settle_calls == 1:
-                    self._settling_samples = (
-                        (321.0, 0.0, 0.0),
-                        (2_000.0, 0.0, 0.0),
-                        (740.0, 0.0, 0.0),
-                        (2_000.0, 0.0, 0.0),
-                        (321.0, 0.0, 0.0),
-                    )
                     return initial_observation, False
                 if self.settle_calls == 2:
                     self._settling_samples = ()
                     return initial_observation, False
                 if self.settle_calls == 3:
-                    self._settling_samples = (
-                        (2_000.0, 0.0, 0.0),
-                    ) * POST_MOTION_SETTLE_SAMPLE_COUNT
                     initial_observation = {
                         **initial_observation,
                         "distance_mm": 2_000,
@@ -3325,9 +3311,6 @@ class BlastObservationMonitorTests(unittest.TestCase):
                         "distance_mm": 840,
                         "motion_active": False,
                     }
-                    self._settling_samples = (
-                        (840.0, 0.0, 0.0),
-                    ) * POST_MOTION_SETTLE_SAMPLE_COUNT
                     return observation, False
                 return initial_observation, True
 
@@ -3471,7 +3454,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 scan_failures.append(error.code)
 
         with mock.patch(
-            "robot_agent.blast_observation_monitor."
+            "robot_agent.blast_monitor_scan."
             "SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS",
             0.3,
         ):
@@ -3642,7 +3625,8 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertTrue(result["completed"])
         monitor.close()
 
-        for delta in (-2, 2):
+        limit = BLAST_ENCODER_SETTLING_DEGREES
+        for delta in (-limit - 1, limit + 1):
             with self.subTest(delta=delta):
                 monitor = BlastObservationMonitor(
                     poll_interval_seconds=0.05,
@@ -3671,8 +3655,9 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 )
                 monitor.close()
 
-    def test_measured_scan_permit_allows_only_one_degree_anchor_settling(self):
-        for delta, accepted in ((-2, False), (-1, True), (1, True), (2, False)):
+    def test_measured_scan_permit_uses_shared_wheel_settling_allowance(self):
+        limit = BLAST_ENCODER_SETTLING_DEGREES
+        for delta, accepted in ((-limit - 1, False), (-2, True), (2, True), (limit + 1, False)):
             with self.subTest(delta=delta):
                 monitor = BlastObservationMonitor(
                     poll_interval_seconds=0.05,
@@ -3727,8 +3712,9 @@ class BlastObservationMonitorTests(unittest.TestCase):
                 )
                 monitor.close()
 
-    def test_measured_scan_permit_tolerates_one_degree_consumption_drift(self):
-        for delta, accepted in ((-2, False), (-1, True), (1, True), (2, False)):
+    def test_measured_scan_permit_tolerates_small_consumption_drift(self):
+        limit = BLAST_ENCODER_SETTLING_DEGREES
+        for delta, accepted in ((-limit - 1, False), (-2, True), (2, True), (limit + 1, False)):
             with self.subTest(delta=delta):
                 monitor = BlastObservationMonitor(
                     poll_interval_seconds=0.05,
@@ -3984,23 +3970,19 @@ class BlastObservationMonitorTests(unittest.TestCase):
             if call[0] == "distance"
         ]
         self.assertIn(2_000, pre_turn_distances)
-        self.assertEqual(pre_turn_distances[-5:], [500] * 5)
+        # A no-echo sample is not a fault; one fresh idle read is enough.
+        self.assertEqual(pre_turn_distances, [2_000, 500])
         self.assertEqual(result["scan"]["rays"][0]["distance_mm"], 500)
         monitor.close()
 
-    def test_navigation_command_returns_latest_settled_observation(self):
+    def test_navigation_accepts_idle_readings_despite_lego_wobble(self):
         class RockingRuntime(FakeRuntime):
             async def drive_pulse(self, direction):
                 receipt = await super().drive_pulse(direction)
                 self.samples = [
                     (True, 250, 2.0),
                     (False, 244, 1.4),
-                    (False, 248, 0.9),
-                    (False, 251, 0.3),
-                    (False, 250, 0.2),
-                    (False, 252, 0.1),
-                    (False, 251, 0.1),
-                    (False, 251, 0.1),
+                    (False, 284, 3.9),
                 ]
                 return receipt
 
@@ -4022,29 +4004,30 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
         result = monitor.command("drive_forward")
 
-        self.assertEqual(result["observation"]["distance_mm"], 251)
+        self.assertEqual(result["observation"]["distance_mm"], 284)
         self.assertEqual(
             result["observation"]["imu"]["raw_tilt_deg"],
-            [0.1, 0.0],
+            [3.9, 0.0],
         )
         self.assertFalse(result["observation"]["motion_active"])
         self.assertTrue(result["observation_settled"])
-        self.assertGreaterEqual(FakeRuntime.instances[0].observe_calls, 8)
+        self.assertEqual(FakeRuntime.instances[0].samples, [])
         monitor.close()
 
-    def test_unsettled_navigation_returns_explicit_quality_flag(self):
+    def test_missing_idle_confirmation_returns_explicit_quality_flag(self):
         class RockingRuntime(FakeRuntime):
             async def drive_pulse(self, direction):
                 receipt = await super().drive_pulse(direction)
                 self.motion_observations = 0
                 self.after_drive = True
+                self.post_drive_reads = 0
                 return receipt
 
             async def observe(self):
                 observation = await super().observe()
                 if getattr(self, "after_drive", False):
-                    observation["motion_active"] = False
-                    observation["distance_mm"] = 200 + self.observe_calls * 20
+                    self.post_drive_reads += 1
+                    observation["motion_active"] = self.post_drive_reads > 1
                 return observation
 
         monitor = BlastObservationMonitor(
@@ -4063,8 +4046,38 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
         self.assertTrue(result["completed"])
         self.assertFalse(result["observation_settled"])
-        self.assertFalse(result["observation"]["motion_active"])
+        self.assertTrue(result["observation"]["motion_active"])
         monitor.close()
+
+    def test_full_scan_retains_echoes_despite_lego_wobble(self):
+        class WobblingRuntime(FakeRuntime):
+            async def observe(self):
+                observation = await super().observe()
+                wobble = self.observe_calls % 2
+                observation["distance_mm"] = 500 + wobble * 40
+                observation["imu"]["raw_tilt_deg"] = [wobble * 3.0, -wobble * 2.0]
+                return observation
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05,
+            runtime_factory=WobblingRuntime,
+        )
+        monitor.start()
+        self.wait_for(monitor, "online")
+        try:
+            result = monitor.scan_surroundings(
+                action_permit=self.measured_scan_permit(monitor),
+            )
+            self.assertTrue(result["completed"])
+            scan = result["scan"]
+            self.assertTrue(scan["restoration_verified"])
+            self.assertTrue(scan["all_observations_settled"])
+            self.assertGreaterEqual(len(scan["angular_rays"]), 16)
+            self.assertTrue(all(ray["range_state"] == RANGE_STATE_MEASURED
+                                for ray in scan["angular_rays"]))
+            self.assertNotIn(("stop",), FakeRuntime.instances[0].calls)
+        finally:
+            monitor.close()
 
     def test_turn_marks_only_safe_unsettled_clearance(self):
         for distance, clearance_verified in (
@@ -4083,9 +4096,7 @@ class BlastObservationMonitorTests(unittest.TestCase):
                         observation = dict(initial_observation)
                         observation["distance_mm"] = distance
                         observation["motion_active"] = False
-                        self._settling_samples = (
-                            (float(distance), 0.0, 0.0),
-                        ) * 5
+                        self._settling_samples = (observation,) * POST_MOTION_IDLE_SAMPLE_COUNT
                         return observation, False
 
                 monitor = RemeasureMonitor(
@@ -4113,8 +4124,8 @@ class BlastObservationMonitorTests(unittest.TestCase):
 
         class FinalCheckMonitor(BlastObservationMonitor):
             @staticmethod
-            def _settling_window_is_stable(samples):
-                stable = BlastObservationMonitor._settling_window_is_stable(
+            def _post_motion_window_is_idle(samples):
+                stable = BlastObservationMonitor._post_motion_window_is_idle(
                     samples
                 )
                 if stable:
@@ -4634,29 +4645,80 @@ class BlastObservationMonitorTests(unittest.TestCase):
         self.assertFalse(command_thread.is_alive())
         monitor.close()
 
+    def test_rejected_mid_gesture_preserves_playing_audio_and_connection(self):
+        class RejectedPoseRuntime(FakeRuntime):
+            async def set_pose(self, role, target):
+                self.calls.append(("set_pose", role, target))
+                if target == 158:
+                    raise BlastCommandRejected("motors must be idle before setting a pose")
+                return {"accepted": True}
+
+            async def show_face(self, face):
+                self.calls.append(("show_face", face))
+                return {"accepted": True}
+
+        monitor = BlastObservationMonitor(
+            poll_interval_seconds=0.05, runtime_factory=RejectedPoseRuntime,
+        )
+        self.addCleanup(monitor.close)
+        monitor.start()
+        self.wait_for(monitor, "online")
+        generation = monitor.runtime_generation()
+        runtime = FakeRuntime.instances[-1]
+        self.assertTrue(monitor.play_pcm(adpcm_block(16000))["started"])
+        with self.assertRaises(BlastControllerError) as failed:
+            monitor.command("arm_wave")
+        self.assertEqual(failed.exception.code, "controller_command_rejected")
+        self.assertTrue(monitor.command("face_idle")["completed"])
+        self.assertEqual(monitor.runtime_generation(), generation)
+        self.assertEqual(monitor.snapshot()["state"], "online")
+        self.assertFalse(runtime.closed)
+        self.assertNotIn(("stop",), runtime.calls)
+        self.assertEqual([c for c in runtime.calls if c[0] == "set_pose"],
+                         [("set_pose", "body", -442), ("set_pose", "body", 158)])
+
     def test_command_failure_reconnects_before_accepting_more_work(self):
+        closing = threading.Event()
+        release_close = threading.Event()
+
         class BrokenRuntime(FakeRuntime):
             async def claw_pulse(self, direction):
-                raise RuntimeError("protocol failed")
+                if direction == "open":
+                    raise RuntimeError("protocol failed")
+                return await super().claw_pulse(direction)
+
+            async def close(self):
+                closing.set()
+                while not release_close.is_set():
+                    await __import__("asyncio").sleep(0.005)
+                await super().close()
 
         monitor = BlastObservationMonitor(
             poll_interval_seconds=0.05,
             reconnect_interval_seconds=0.05,
             runtime_factory=BrokenRuntime,
         )
+        self.addCleanup(monitor.close)
+        self.addCleanup(release_close.set)
         monitor.start()
         self.wait_for(monitor, "online")
+        generation = monitor.runtime_generation()
 
         with self.assertRaises(BlastControllerError) as failed:
             monitor.command("claw_open")
 
         self.assertEqual(failed.exception.code, "controller_command_failed")
-        deadline = time.monotonic() + 1.0
-        while len(FakeRuntime.instances) < 2 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        self.assertGreaterEqual(len(FakeRuntime.instances), 2)
+        self.assertTrue(closing.wait(2.0))
+        self.assertEqual(monitor.snapshot()["state"], "offline")
+        with self.assertRaises(BlastControllerError) as unavailable:
+            monitor.command("claw_close")
+        self.assertEqual(unavailable.exception.code, "controller_unavailable")
+
+        release_close.set()
+        self.wait_for(monitor, "online")
+        self.assertGreater(monitor.runtime_generation(), generation)
         self.assertTrue(FakeRuntime.instances[0].closed)
-        monitor.close()
+        self.assertTrue(monitor.command("claw_close")["completed"])
 
     def test_close_terminates_an_inflight_command_and_closes_runtime(self):
         started = threading.Event()

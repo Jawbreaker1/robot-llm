@@ -1,5 +1,7 @@
 import unittest
 
+from robot_agent.blast_navigation_calibration import BLAST_ENCODER_SETTLING_DEGREES
+
 from robot_agent.blast_navigation_motion_execution import (
     MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES,
     MAX_RESTORED_SCAN_OPPOSED_RESIDUE_DEGREES,
@@ -171,7 +173,10 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         })
         self.assertTrue(executor.observation_matches_anchor(within_tolerance))
         for invalid in (
-            {"motor_angles_deg": {"left_drive": 98, "right_drive": 200}},
+            {"motor_angles_deg": {
+                "left_drive": 100 - BLAST_ENCODER_SETTLING_DEGREES - 1,
+                "right_drive": 200,
+            }},
             {"motor_angles_deg": {"left_drive": 100}},
             {"motor_angles_deg": {
                 "left_drive": 100.0, "right_drive": 200,
@@ -180,7 +185,7 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 self.assertFalse(executor.observation_matches_anchor(invalid))
 
-        controller.angles["left_drive"] += 2
+        controller.angles["left_drive"] += BLAST_ENCODER_SETTLING_DEGREES + 1
         with self.assertRaises(PhysicalNavigationContractError):
             executor.execute(ADVANCE)
         controller.angles = {"left_drive": 100, "right_drive": 200}
@@ -295,7 +300,7 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
     def test_accumulated_pre_command_and_receipt_gap_latches(self):
         controller, executor = self.executor()
         executor.execute(TURN_LEFT_90)
-        controller.angles["right_drive"] += 1
+        controller.angles["right_drive"] += BLAST_ENCODER_SETTLING_DEGREES
         controller.next_gap = (0, 1)
         command_count = len(controller.commands)
         trusted_pose = executor.pose
@@ -313,10 +318,10 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertEqual(executor.expected_start_angles, trusted_anchor)
         self.assertFalse(executor.localization_valid)
 
-    def test_two_degree_receipt_gap_across_actions_latches_localization(self):
+    def test_excessive_receipt_gap_across_actions_latches_localization(self):
         controller, executor = self.executor()
         executor.execute(TURN_LEFT_90)
-        controller.next_gap = (0, 2)
+        controller.next_gap = (0, BLAST_ENCODER_SETTLING_DEGREES + 1)
 
         with self.assertRaises(PhysicalNavigationContractError) as raised:
             executor.execute(ADVANCE)
@@ -327,7 +332,7 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         )
         self.assertFalse(executor.localization_valid)
 
-    def test_two_degree_internal_gap_still_latches_localization(self):
+    def test_small_internal_wheel_relaxation_is_accounted(self):
         controller, executor = self.executor()
         original_command = controller.command
         calls = 0
@@ -344,14 +349,38 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
 
         controller.command = command
 
-        with self.assertRaises(PhysicalNavigationContractError) as raised:
-            executor.execute(TURN_RIGHT_90)
+        result = executor.execute(TURN_RIGHT_90)
 
-        self.assertEqual(
-            raised.exception.code,
-            "blast_motion_slice_discontinuous",
+        self.assertTrue(result.motion.complete)
+        self.assertEqual(result.motion.observed_slice_count, 5)
+        self.assertEqual(result.motion.verified_slice_count, 4)
+        self.assertEqual(result.pose.heading_mdeg, -93_590)
+        self.assertTrue(executor.localization_valid)
+
+    def test_recorded_two_degree_wheel_relaxation_keeps_position_and_continues(self):
+        # September 12: receipt (1094, 4405), then idle snapshot (1094, 4403).
+        controller = FakeController()
+        controller.angles = {"left_drive": 1094, "right_drive": 4405}
+        executor = BlastNavigationMotionExecutor(
+            controller=controller, initial_observation=controller.observation(),
         )
-        self.assertFalse(executor.localization_valid)
+        controller.angles["right_drive"] -= 2
+        self.assertTrue(executor.observation_matches_anchor(controller.observation()))
+
+        result = executor.execute(ADVANCE)
+
+        self.assertTrue(result.motion.complete)
+        self.assertEqual(result.motion.observed_slice_count, 2)
+        self.assertEqual(result.motion.verified_slice_count, 1)
+        settling = result.motion.segments[0]
+        self.assertEqual(settling.kind, "inter_action_settling")
+        self.assertFalse(settling.command_verified)
+        self.assertEqual(settling.right_encoder_delta_degrees, -2)
+        self.assertEqual(result.motion.left_encoder_delta_degrees, 90)
+        self.assertEqual(result.motion.right_encoder_delta_degrees, 88)
+        self.assertEqual(executor.expected_start_angles, controller.angles)
+        self.assertTrue(executor.localization_valid)
+        self.assertTrue(executor.execute(ADVANCE).motion.complete)
 
     def test_cancelled_turn_retains_only_observed_prefix(self):
         controller, executor = self.executor()
@@ -484,8 +513,9 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
     def test_cross_action_encoder_gap_fails_closed_without_advancing_pose(self):
         controller, executor = self.executor()
         first = executor.execute(ADVANCE)
-        controller.angles["left_drive"] += 2
-        controller.angles["right_drive"] += 2
+        gap = BLAST_ENCODER_SETTLING_DEGREES + 1
+        controller.angles["left_drive"] += gap
+        controller.angles["right_drive"] += gap
         command_count = len(controller.commands)
 
         with self.assertRaises(PhysicalNavigationContractError) as raised:
@@ -499,7 +529,8 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
             str(raised.exception),
             (
                 "BLAST encoders changed outside a verified motion action: "
-                "expected=(190, 290) observed=(192, 292) delta=(2, 2)"
+                f"expected=(190, 290) observed=({190 + gap}, {290 + gap}) "
+                f"delta=({gap}, {gap})"
             ),
         )
         self.assertEqual(executor.pose, first.pose)
@@ -558,8 +589,9 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertEqual(pose_after_scan.y_mm, 0)
         self.assertEqual(result.pose.heading_mdeg, 94_570)
 
-    def test_restored_scan_start_allows_only_one_degree_settling(self):
-        for delta, accepted in ((-2, False), (-1, True), (1, True), (2, False)):
+    def test_restored_scan_start_uses_the_same_settling_allowance(self):
+        limit = BLAST_ENCODER_SETTLING_DEGREES
+        for delta, accepted in ((-limit - 1, False), (-2, True), (2, True), (limit + 1, False)):
             with self.subTest(delta=delta):
                 controller, executor = self.executor()
                 scan_start = {

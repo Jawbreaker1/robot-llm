@@ -506,6 +506,21 @@ class _BlastEpisodeMapTrace:
                     ),
                 },
             }
+            if self.planar_scan_views:
+                latest_view = self.planar_scan_views[-1]
+                uncertain = latest_view["projection"].get("uncertain_points", [])
+                if uncertain:
+                    evidence["uncertain_echoes"] = {
+                        "quality": "UNSETTLED_NOT_CONFIRMED_OBSTACLES_OR_CLEARANCE",
+                        "observed_at_unix_ms": latest_view["observed_at_unix_ms"],
+                        "points": [
+                            dict(zip(("x_mm", "y_mm"), self._episode_axes(
+                                point["nominal_echo_x_mm"],
+                                point["nominal_echo_y_mm"],
+                            ))) | {"measured_range_mm": point["measured_range_mm"]}
+                            for point in uncertain
+                        ],
+                    }
             current_echo_clusters = self._current_echo_clusters()
             if current_echo_clusters:
                 evidence["current_echo_clusters"] = current_echo_clusters

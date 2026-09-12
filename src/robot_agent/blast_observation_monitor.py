@@ -2,10 +2,45 @@
 
 from __future__ import annotations
 
+from .blast_controller_contract import (
+    SNAPSHOT_SCHEMA,
+    ROBOT_ID,
+    CONTROLLER_ID,
+    DEFAULT_POLL_INTERVAL_SECONDS,
+    DEFAULT_RECONNECT_INTERVAL_SECONDS,
+    DISCONNECT_TIMEOUT_SECONDS,
+    COMMAND_TIMEOUT_SECONDS,
+    INTERNAL_COMMAND_TIMEOUT_SECONDS,
+    SCAN_COMMAND_TIMEOUT_SECONDS,
+    SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS,
+    MIN_COMMAND_BUDGET_SECONDS,
+    COMMAND_RESPONSE_MARGIN_SECONDS,
+    MOTION_TIMEOUT_SECONDS,
+    MOTION_POLL_INTERVAL_SECONDS,
+    POST_MOTION_SETTLE_TIMEOUT_SECONDS,
+    SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
+    SCAN_PULSE_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
+    POST_MOTION_IDLE_SAMPLE_COUNT,
+    COMMAND_RESULT_SCHEMA,
+    SAMPLED_AUDIO_RESULT_SCHEMA,
+    SAMPLED_AUDIO_TIMEOUT_SECONDS,
+    SAMPLED_AUDIO_MAX_TOTAL_SECONDS,
+    SCAN_COMMAND,
+    SURROUNDINGS_SCAN_COMMAND,
+    SETTLED_OBSERVATION_COMMAND,
+    CLAW_CLOSED_MOTOR_ANGLE_DEG,
+    DOUBLE_CLAW_POSES,
+    GESTURE_POSES,
+    COMMANDS,
+    NAVIGATION_MOTION_COMMANDS,
+    _BlastNoReturnScanPermit,
+    BlastControllerError,
+)
+from .blast_monitor_scan import _perform_scan_front_arc, _perform_scan_surroundings
+
 import asyncio
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from copy import deepcopy
-from dataclasses import dataclass
 import logging
 import math
 from queue import Empty, Full, Queue
@@ -22,42 +57,23 @@ from .blast_ble_runtime import (
     SAMPLED_AUDIO_SAMPLE_RATE_HZ,
     SAMPLED_AUDIO_TRANSPORT,
     BlastBLERuntime,
+    BlastCommandRejected,
     _adpcm_sample_count,
 )
-from .blast_pcm_upload import (
-    BlastPCMDeadline,
-    BlastPCMStartTimeout,
-    BlastPCMUpload,
-)
+from .blast_pcm_upload import BlastPCMDeadline, BlastPCMStartTimeout, BlastPCMUpload
 from .blast_navigation_calibration import (
+    BLAST_ENCODER_SETTLING_DEGREES,
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
 )
-from .blast_navigation_action_profile import (
-    SCAN_TURN_ENCODER_DEGREES_PER_PULSE,
-    SCAN_TRIM_ENCODER_DEGREES_PER_PULSE,
-    TURN_SPEED_DPS,
-)
 from .blast_scan_observation import (
-    MINIMUM_SURROUNDINGS_SCAN_COVERAGE_DEG,
-    PYBRICKS_ULTRASONIC_NO_VALID_DISTANCE_MM,
     RANGE_STATE_INVALID,
     RANGE_STATE_MEASURED,
     RANGE_STATE_NO_VALID_DISTANCE,
-    SCAN_RAY_EVIDENCE_SETTLED,
-    SCAN_RAY_EVIDENCE_SWEEP_ONLY,
     SCAN_RAY_SIDES,
     SCAN_RESTORATION_TOLERANCE_DEG,
     SCAN_RESULT_SCHEMA,
     blast_range_state,
     body_motor_angle as _body_motor_angle,
-    build_blast_encoder_scan,
-    build_blast_front_arc_scan,
-    build_blast_partial_scan,
-    scan_sweep_bearing_deg,
-    scan_heading,
-    surroundings_scan_next_turn,
-    drive_encoder_angles,
-    encoder_relative_bearing_deg,
     validate_blast_scan_ray_contract,
 )
 
@@ -65,101 +81,11 @@ from .blast_scan_observation import (
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-SNAPSHOT_SCHEMA = "controller-runtime-observation/v1"
-ROBOT_ID = "blast-01"
-CONTROLLER_ID = "blast-01.hub"
-DEFAULT_POLL_INTERVAL_SECONDS = 1.0
-DEFAULT_RECONNECT_INTERVAL_SECONDS = 3.0
-DISCONNECT_TIMEOUT_SECONDS = 3.0
-COMMAND_TIMEOUT_SECONDS = 15.0
-INTERNAL_COMMAND_TIMEOUT_SECONDS = 12.0
-SCAN_COMMAND_TIMEOUT_SECONDS = 90.0
-SCAN_INTERNAL_COMMAND_TIMEOUT_SECONDS = 75.0
-MIN_COMMAND_BUDGET_SECONDS = 2.0
-COMMAND_RESPONSE_MARGIN_SECONDS = 0.25
-MOTION_TIMEOUT_SECONDS = 4.0
-MOTION_POLL_INTERVAL_SECONDS = 0.05
-POST_MOTION_SETTLE_TIMEOUT_SECONDS = 1.5
-SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS = 3.0
-SCAN_PULSE_POST_MOTION_SETTLE_TIMEOUT_SECONDS = 1.5
-_SCAN_PERMIT_EXPECTED_ANCHOR_TOLERANCE_DEG = 1
-POST_MOTION_SETTLE_SAMPLE_COUNT = 5
-POST_MOTION_DISTANCE_RANGE_MM = 5.0
-POST_MOTION_TILT_RANGE_DEG = 1.0
-COMMAND_RESULT_SCHEMA = "controller-command-result/v1"
-SAMPLED_AUDIO_RESULT_SCHEMA = "controller-sampled-audio-result/v1"
-SAMPLED_AUDIO_TIMEOUT_SECONDS = 60.0
-SAMPLED_AUDIO_MAX_TOTAL_SECONDS = 15.0 * 60.0
-SCAN_COMMAND = "scan_front_arc"
-SURROUNDINGS_SCAN_COMMAND = "scan_surroundings"
-SETTLED_OBSERVATION_COMMAND = "observe_settled"
 # Measured closed reference for this BLAST linkage, not the last arbitrary pose.
-CLAW_CLOSED_MOTOR_ANGLE_DEG = 200
 # These are OFFSETS: _perform_command adds the 200-degree claw reference.
 # The actual commanded claw targets are 200, 325, 200, 325, 200 degrees,
 # all within the physically verified closed/open range (not absolute 0/125).
-DOUBLE_CLAW_POSES = (
-    ("claw", 0), ("claw", 125), ("claw", 0), ("claw", 125), ("claw", 0),
-)
 # Body offsets remain relative to the existing navigation sensor reference.
-GESTURE_POSES = {
-    "claw_snap": DOUBLE_CLAW_POSES,
-    "arm_wave": (("body", -600), ("body", 0)),
-    "claw_flourish": (("body", -600),) + DOUBLE_CLAW_POSES + (("body", 0),),
-}
-COMMANDS = {
-    "drive_forward": ("drive_pulse", "forward"),
-    "drive_reverse": ("drive_pulse", "reverse"),
-    "turn_left": ("turn_pulse", "left"),
-    "turn_right": ("turn_pulse", "right"),
-    "turn_left_trim": ("turn_trim_pulse", "left"),
-    "turn_right_trim": ("turn_trim_pulse", "right"),
-    "claw_open": ("claw_pulse", "open"),
-    "claw_close": ("claw_pulse", "close"),
-    "body_left": ("body_pulse", "left"),
-    "body_right": ("body_pulse", "right"),
-    SCAN_COMMAND: (None, None),
-    SURROUNDINGS_SCAN_COMMAND: (None, None),
-    SETTLED_OBSERVATION_COMMAND: (None, None),
-    "stop": ("stop", None),
-    **{gesture: (None, None) for gesture in GESTURE_POSES},
-    **{"face_" + face: ("show_face", face) for face in (
-        "idle", "neutral", "happy", "frustrated", "curious", "surprised", "angry",
-    )},
-}
-NAVIGATION_MOTION_COMMANDS = {
-    "drive_forward",
-    "drive_reverse",
-    "turn_left",
-    "turn_right",
-    "turn_left_trim",
-    "turn_right_trim",
-}
-
-
-@dataclass(frozen=True)
-class _BlastNoReturnScanPermit:
-    """One short-lived scan permit bound to an exact encoder anchor."""
-
-    runtime_generation: int
-    expires_at_monotonic_ns: int
-    drive_angles_deg: tuple[float, float]
-    allow_no_return: bool = True
-
-
-class BlastControllerError(RuntimeError):
-    """A bounded BLAST command could not be accepted or verified."""
-
-    def __init__(
-        self, code: str, message: str, *, motion_started=None,
-        evidence_uncertain=False,
-    ) -> None:
-        self.code = code
-        self.motion_started = motion_started
-        self.evidence_uncertain = evidence_uncertain is True
-        super().__init__(message)
-
-
 class BlastObservationMonitor:
     """Own one BLE session for telemetry and serialized fixed commands."""
 
@@ -310,7 +236,7 @@ class BlastObservationMonitor:
                 and not isinstance(expected.get(role), bool)
                 and math.isfinite(float(expected[role]))
                 and abs(float(motors[role]) - float(expected[role]))
-                <= _SCAN_PERMIT_EXPECTED_ANCHOR_TOLERANCE_DEG
+                <= BLAST_ENCODER_SETTLING_DEGREES
                 for role in roles
             )
         )
@@ -1133,8 +1059,16 @@ class BlastObservationMonitor:
                 "controller_command_timeout",
                 "BLAST command did not finish in time",
             )
+            self._set_state("offline", failure.code)
             self._finish_command(result, error=failure)
             raise failure
+        except BlastCommandRejected as error:
+            # A declined pose is not a lost connection. Restarting here also
+            # kills unrelated audio that is already playing on the hub.
+            self._finish_command(result, error=BlastControllerError(
+                "controller_command_rejected", str(error),
+            ))
+            return False
         except Exception as error:
             failure = (
                 error
@@ -1146,13 +1080,17 @@ class BlastObservationMonitor:
             )
             if failure is not error:
                 failure.__cause__ = error
-            self._finish_command(result, error=failure)
-            if failure.code in (
+            session_usable = failure.code in (
+                "controller_busy",
                 "controller_command_interrupted",
                 "scan_start_clearance_unverified",
                 "scan_sweep_clearance_lost",
                 "scan_sweep_observation_unverified",
-            ):
+            )
+            if not session_usable:
+                self._set_state("offline", failure.code)
+            self._finish_command(result, error=failure)
+            if session_usable:
                 return False
             raise failure
 
@@ -1160,7 +1098,7 @@ class BlastObservationMonitor:
         samples = self._settling_samples
         if (
             observation.get("motion_active") is not False
-            or len(samples) != POST_MOTION_SETTLE_SAMPLE_COUNT
+            or not self._post_motion_window_is_idle(samples)
             or not (
                 BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
                 .range_sensor_extrinsics
@@ -1168,525 +1106,27 @@ class BlastObservationMonitor:
             )
         ):
             return False
-        tilt_ranges = tuple(max(sample[index] for sample in samples)
-                            - min(sample[index] for sample in samples)
-                            for index in (1, 2))
-        if any(value > POST_MOTION_TILT_RANGE_DEG for value in tilt_ranges):
-            return False
         minimum = (
             BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
             .minimum_rotation_clearance_mm()
         )
         return all(
-            blast_range_state(sample[0]) == RANGE_STATE_NO_VALID_DISTANCE
+            blast_range_state(sample.get("distance_mm")) == RANGE_STATE_NO_VALID_DISTANCE
             or (
-                blast_range_state(sample[0]) == RANGE_STATE_MEASURED
-                and sample[0] > minimum
+                blast_range_state(sample.get("distance_mm")) == RANGE_STATE_MEASURED
+                and sample["distance_mm"] > minimum
             )
             for sample in samples
         )
-
-    async def _recover_scan_turn(self, runtime, generation, error, sensor):
-        """Stop and retain one moved scan pulse when its range is uncertain."""
-
-        close_obstacle = error.code == "scan_sweep_clearance_lost"
-        if not error.evidence_uncertain and not close_obstacle:
-            raise error
-        await runtime.stop()
-        final = await self._observe_until_idle(
-            runtime, generation=generation, stop_only=True,
-        )
-        final, final_settled = await self._observe_until_settled(
-            runtime, generation=generation,
-            initial_observation=final,
-            timeout_seconds=SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
-        )
-        if (
-            final.get("motion_active") is not False
-            or drive_encoder_angles(final) is None
-            or not sensor.matches_navigation_body_angle(
-                _body_motor_angle(final)
-            )
-        ):
-            raise error
-        evidence = (
-            SCAN_RAY_EVIDENCE_SETTLED
-            if final_settled is True
-            else SCAN_RAY_EVIDENCE_SWEEP_ONLY
-        )
-        sample = (
-            {"stopped_after_uncertain_evidence": True},
-            final,
-            final_settled,
-            evidence,
-        )
-        can_continue = (
-            error.code != "controller_command_failed"
-            and not close_obstacle
-            and self._scan_sweep_window_allows_continuation(final)
-        )
-        return sample, can_continue
-
-    async def _scan_turn(
-        self,
-        runtime,
-        generation,
-        direction,
-        *,
-        start_drive_angles,
-        trim=False,
-    ):
-        if await self._service_preempt_stop(runtime, generation):
-            raise BlastControllerError(
-                "controller_command_interrupted",
-                "BLAST scan was interrupted by stop",
-                motion_started=False,
-            )
-        expected_wheel_angle = (
-            SCAN_TRIM_ENCODER_DEGREES_PER_PULSE
-            if trim else SCAN_TURN_ENCODER_DEGREES_PER_PULSE
-        )
-        try:
-            receipt = await (
-                runtime.scan_trim_pulse(direction)
-                if trim else runtime.scan_turn_pulse(direction)
-            )
-            observation = await self._observe_until_idle(
-                runtime,
-                generation=generation,
-                stop_only=False,
-            )
-            observation, observation_settled = (
-                await self._observe_until_settled(
-                    runtime, generation=generation,
-                    initial_observation=observation,
-                    timeout_seconds=(
-                        SCAN_PULSE_POST_MOTION_SETTLE_TIMEOUT_SECONDS
-                    ),
-                )
-            )
-        except BlastControllerError as error:
-            if error.motion_started is None:
-                error.motion_started = True
-            raise
-        except Exception as error:
-            # A pulse or its following read can fail after physical movement.
-            # Both use the existing stop/read/partial-scan recovery.
-            logger.warning(
-                "BLAST scan pulse/read failed direction=%s trim=%s error_type=%s",
-                direction, trim, type(error).__name__,
-            )
-            raise BlastControllerError(
-                "controller_command_failed",
-                "BLAST scan pulse or observation transport failed",
-                evidence_uncertain=True,
-            ) from error
-        distance = observation.get("distance_mm")
-        sweep_only = observation_settled is not True
-        sensor = (
-            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-            .range_sensor_extrinsics
-        )
-        current_drive_angles = drive_encoder_angles(observation)
-        before_angles = (
-            receipt.get("before_angles_deg")
-            if isinstance(receipt, Mapping) else None
-        )
-        receipt_fields = {
-            "accepted", "direction", "speed_dps", "wheel_angle_deg",
-            "before_angles_deg",
-        }
-        receipt_profile_valid = (
-            isinstance(receipt, Mapping)
-            and set(receipt) == receipt_fields
-            and receipt.get("accepted") is True
-            and receipt.get("direction") == direction
-            and receipt.get("speed_dps") == TURN_SPEED_DPS
-            and receipt.get("wheel_angle_deg")
-            == expected_wheel_angle
-            and isinstance(before_angles, Mapping)
-            and set(before_angles) == {"left_drive", "right_drive"}
-            and all(type(before_angles.get(role)) is int for role in (
-                "left_drive", "right_drive",
-            ))
-            and current_drive_angles is not None
-        )
-        if receipt_profile_valid:
-            pulse_delta = {
-                role: current_drive_angles[role] - before_angles[role]
-                for role in ("left_drive", "right_drive")
-            }
-            expected_signs = (
-                {"left_drive": -1, "right_drive": 1}
-                if direction == "left"
-                else {"left_drive": 1, "right_drive": -1}
-            )
-            receipt_profile_valid = all(
-                pulse_delta[role] * expected_signs[role] > 0
-                and abs(pulse_delta[role])
-                <= 4 * expected_wheel_angle
-                for role in ("left_drive", "right_drive")
-            )
-        if (
-            not receipt_profile_valid
-            or encoder_relative_bearing_deg(
-                observation, start_drive_angles,
-            ) is None
-            or not sensor.matches_navigation_body_angle(
-                _body_motor_angle(observation)
-            )
-        ):
-            raise BlastControllerError(
-                "scan_sweep_observation_unverified",
-                "BLAST scan lost correlated encoder or sensor-pose evidence",
-                motion_started=True,
-            )
-        range_state = blast_range_state(distance)
-        if range_state == RANGE_STATE_INVALID:
-            raise BlastControllerError(
-                "scan_sweep_observation_unverified",
-                "BLAST scan received invalid settled range evidence",
-                motion_started=True,
-                evidence_uncertain=True,
-            )
-        if observation.get("motion_active") is not False:
-            raise BlastControllerError(
-                "scan_sweep_observation_unverified",
-                "BLAST scan pulse did not reach an idle observation",
-                motion_started=True, evidence_uncertain=True,
-            )
-        if range_state == RANGE_STATE_MEASURED and float(distance) <= (
-            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-            .minimum_rotation_clearance_mm()
-        ):
-            raise BlastControllerError(
-                "scan_sweep_clearance_lost",
-                "BLAST scan stopped after a close settled observation",
-                motion_started=True,
-            )
-        return (
-            receipt,
-            observation,
-            observation_settled,
-            (
-                SCAN_RAY_EVIDENCE_SWEEP_ONLY
-                if sweep_only
-                else SCAN_RAY_EVIDENCE_SETTLED
-            ),
-        )
-
-    async def _perform_scan_front_arc(
-        self, runtime, generation, *, action_permit=None,
-    ):
-        center = await self._observe_until_idle(
-            runtime,
-            generation=generation,
-            stop_only=False,
-        )
-        center, center_settled = await self._observe_until_settled(
-            runtime,
-            generation=generation,
-            initial_observation=center,
-            timeout_seconds=SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
-        )
-        center_settled |= self._scan_sweep_window_allows_continuation(center)
-        sensor = (
-            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-            .range_sensor_extrinsics
-        )
-        center_distance = center.get("distance_mm")
-        center_motors = center.get("motor_angles_deg")
-        center_drive = tuple(center_motors.get(role)
-                             if isinstance(center_motors, Mapping) else None
-                             for role in ("left_drive", "right_drive"))
-        start_drive_angles = drive_encoder_angles(center)
-        permit_anchor_matched = (
-            isinstance(action_permit, _BlastNoReturnScanPermit)
-            and action_permit.runtime_generation == generation
-            and time.monotonic_ns()
-            <= action_permit.expires_at_monotonic_ns
-            and all(
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and abs(float(value) - expected)
-                <= _SCAN_PERMIT_EXPECTED_ANCHOR_TOLERANCE_DEG
-                for value, expected in zip(
-                    center_drive, action_permit.drive_angles_deg
-                )
-            )
-        )
-        permit_allows_no_return = (
-            permit_anchor_matched and action_permit.allow_no_return
-        )
-        center_state = blast_range_state(center_distance)
-        range_allows_start = (
-            permit_anchor_matched
-            and center_state == RANGE_STATE_MEASURED
-            and float(center_distance) > (
-                BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-                .minimum_rotation_clearance_mm()
-            )
-        ) or (
-            permit_allows_no_return
-            and center_state == RANGE_STATE_NO_VALID_DISTANCE
-        )
-        if not (
-            start_drive_angles is not None
-            and sensor.matches_navigation_body_angle(
-                _body_motor_angle(center)
-            )
-            and range_allows_start
-        ):
-            raise BlastControllerError(
-                "scan_start_clearance_unverified",
-                "BLAST scan lacks usable idle range evidence or sensor pose",
-                motion_started=False,
-            )
-
-        sweep_samples = []
-        partial_reason = None
-        directions = (
-            *("left",) * 4,
-            *("right",) * 8,
-            *("left",) * 4,
-        )
-        for direction in directions:
-            try:
-                sample = await self._scan_turn(
-                    runtime, generation, direction,
-                    start_drive_angles=start_drive_angles,
-                )
-            except BlastControllerError as error:
-                sample, can_continue = await self._recover_scan_turn(
-                    runtime, generation, error, sensor,
-                )
-                if not can_continue:
-                    partial_reason = error.code
-            sweep_samples.append(sample)
-            if partial_reason is not None:
-                break
-        _receipt, final, final_settled, _evidence = sweep_samples[-1]
-        if partial_reason is not None:
-            scan = build_blast_partial_scan(
-                center=center,
-                center_settled=center_settled,
-                start_drive_angles=start_drive_angles,
-                sweep_samples=sweep_samples,
-                final=final,
-                final_settled=final_settled,
-                final_body_verified=True,
-            )
-            return {
-                "schema": COMMAND_RESULT_SCHEMA,
-                "robot_id": ROBOT_ID,
-                "controller_id": CONTROLLER_ID,
-                "command": SCAN_COMMAND,
-                "accepted": True,
-                "completed": True,
-                "receipt": {
-                    "turn_count": len(sweep_samples),
-                    "coverage": "partial_front_arc",
-                    "coverage_complete": False,
-                    "reason_code": partial_reason,
-                },
-                "observation": final,
-                "observation_settled": final_settled,
-                "scan": scan,
-            }
-        left_outbound = sweep_samples[:4]
-        right_outbound = sweep_samples[8:12]
-        try:
-            scan = build_blast_front_arc_scan(
-                center=center,
-                center_settled=center_settled,
-                start_drive_angles=start_drive_angles,
-                left_outbound=left_outbound,
-                right_outbound=right_outbound,
-                final=final,
-                final_settled=final_settled,
-                final_body_verified=sensor.matches_navigation_body_angle(
-                    _body_motor_angle(final)
-                ),
-            )
-        except ValueError as error:
-            raise BlastControllerError(
-                "scan_sweep_observation_unverified",
-                "BLAST front scan encoder geometry was invalid",
-                motion_started=True,
-            ) from error
-        return {
-            "schema": COMMAND_RESULT_SCHEMA,
-            "robot_id": ROBOT_ID,
-            "controller_id": CONTROLLER_ID,
-            "command": SCAN_COMMAND,
-            "accepted": True,
-            "completed": True,
-            "receipt": {"turn_count": 16, "coverage": "front_arc"},
-            "observation": final,
-            "observation_settled": final_settled,
-            "scan": scan,
-        }
-
-    async def _perform_scan_surroundings(
-        self, runtime, generation, *, action_permit=None,
-    ):
-        center = await self._observe_until_idle(
-            runtime,
-            generation=generation,
-            stop_only=False,
-        )
-        center, center_settled = await self._observe_until_settled(
-            runtime,
-            generation=generation,
-            initial_observation=center,
-            timeout_seconds=SCAN_POST_MOTION_SETTLE_TIMEOUT_SECONDS,
-        )
-        center_settled |= self._scan_sweep_window_allows_continuation(center)
-        sensor = (
-            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-            .range_sensor_extrinsics
-        )
-        center_distance = center.get("distance_mm")
-        center_motors = center.get("motor_angles_deg")
-        center_drive = tuple(center_motors.get(role)
-                             if isinstance(center_motors, Mapping) else None
-                             for role in ("left_drive", "right_drive"))
-        start_drive_angles = drive_encoder_angles(center)
-        permit_anchor_matched = (
-            isinstance(action_permit, _BlastNoReturnScanPermit)
-            and action_permit.runtime_generation == generation
-            and time.monotonic_ns()
-            <= action_permit.expires_at_monotonic_ns
-            and all(
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and abs(float(value) - expected)
-                <= _SCAN_PERMIT_EXPECTED_ANCHOR_TOLERANCE_DEG
-                for value, expected in zip(
-                    center_drive, action_permit.drive_angles_deg
-                )
-            )
-        )
-        permit_allows_no_return = (
-            permit_anchor_matched and action_permit.allow_no_return
-        )
-        center_state = blast_range_state(center_distance)
-        range_allows_start = (
-            permit_anchor_matched
-            and center_state == RANGE_STATE_MEASURED
-            and float(center_distance) > (
-                BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
-                .minimum_rotation_clearance_mm()
-            )
-        ) or (
-            permit_allows_no_return
-            and center_state == RANGE_STATE_NO_VALID_DISTANCE
-        )
-        if not (
-            start_drive_angles is not None
-            and sensor.matches_navigation_body_angle(
-                _body_motor_angle(center)
-            )
-            and range_allows_start
-        ):
-            raise BlastControllerError(
-                "scan_start_clearance_unverified",
-                "BLAST scan lacks usable idle range evidence or sensor pose",
-                motion_started=False,
-            )
-        sweep_samples = []
-        partial_reason = None
-        final = center
-        while (next_turn := surroundings_scan_next_turn(
-            center, start_drive_angles, final, len(sweep_samples),
-        )) is not None:
-            try:
-                sweep_samples.append(await self._scan_turn(
-                    runtime, generation, next_turn[0],
-                    start_drive_angles=start_drive_angles,
-                    trim=next_turn[1] == "trim",
-                ))
-            except BlastControllerError as error:
-                sample, can_continue = await self._recover_scan_turn(
-                    runtime, generation, error, sensor,
-                )
-                sweep_samples.append(sample)
-                if not can_continue:
-                    partial_reason = error.code
-                    break
-            final = sweep_samples[-1][1]
-        if partial_reason is not None:
-            final = sweep_samples[-1][1]
-            final_settled = sweep_samples[-1][2]
-            scan = build_blast_partial_scan(
-                center=center, center_settled=center_settled,
-                start_drive_angles=start_drive_angles,
-                sweep_samples=sweep_samples,
-                final=final, final_settled=final_settled,
-                final_body_verified=True,
-            )
-            return {
-                "schema": COMMAND_RESULT_SCHEMA,
-                "robot_id": ROBOT_ID,
-                "controller_id": CONTROLLER_ID,
-                "command": SCAN_COMMAND,
-                "accepted": True,
-                "completed": True,
-                "receipt": {"turn_count": len(sweep_samples),
-                            "coverage_complete": False,
-                            "reason_code": partial_reason},
-                "observation": final,
-                "observation_settled": final_settled,
-                "scan": scan,
-            }
-        final_sample = sweep_samples[-1]
-        turn_count = len(sweep_samples)
-        coverage = abs(scan_sweep_bearing_deg(
-            final_sample[1], start_drive_angles, scan_heading(center)) or 0.0)
-        _receipt, final, final_settled, _evidence = final_sample
-        final_body_verified = sensor.matches_navigation_body_angle(
-            _body_motor_angle(final))
-        try:
-            scan = build_blast_encoder_scan(
-                center=center, center_settled=center_settled,
-                start_drive_angles=start_drive_angles,
-                sweep_samples=sweep_samples,
-                final=final, final_settled=final_settled,
-                final_body_verified=final_body_verified,
-                sweep_turn_count=turn_count,
-            )
-        except ValueError as error:
-            raise BlastControllerError(
-                "scan_sweep_observation_unverified",
-                "BLAST scan encoder geometry was invalid",
-                motion_started=True,
-            ) from error
-        return {
-            "schema": COMMAND_RESULT_SCHEMA,
-            "robot_id": ROBOT_ID,
-            "controller_id": CONTROLLER_ID,
-            "command": SCAN_COMMAND,
-            "accepted": True,
-            "completed": True,
-            "receipt": {
-                "turn_count": turn_count,
-                "coverage_complete": True,
-            },
-            "observation": final,
-            "observation_settled": final_settled,
-            "scan": scan,
-        }
 
     async def _perform_command(
         self, runtime, generation, command: str, *, action_permit=None,
     ):
         if command == SCAN_COMMAND:
-            return await self._perform_scan_front_arc(
-                runtime, generation, action_permit=action_permit,
+            return await _perform_scan_front_arc(self, runtime, generation, action_permit=action_permit,
             )
         if command == SURROUNDINGS_SCAN_COMMAND:
-            return await self._perform_scan_surroundings(
-                runtime, generation, action_permit=action_permit,
+            return await _perform_scan_surroundings(self, runtime, generation, action_permit=action_permit,
             )
         if command == SETTLED_OBSERVATION_COMMAND:
             receipt = {"motion_started": False}
@@ -1728,8 +1168,7 @@ class BlastObservationMonitor:
         if turn_command:
             observation = dict(observation)
             observation["rotation_sweep_window_verified"] = (
-                observation_settled is True
-                or self._scan_sweep_window_allows_continuation(observation)
+                self._scan_sweep_window_allows_continuation(observation)
             )
         result = {
             "schema": COMMAND_RESULT_SCHEMA,
@@ -1781,45 +1220,10 @@ class BlastObservationMonitor:
             await asyncio.sleep(MOTION_POLL_INTERVAL_SECONDS)
 
     @staticmethod
-    def _settling_sample(observation):
-        distance = observation.get("distance_mm")
-        imu = observation.get("imu")
-        tilt = None
-        if isinstance(imu, dict):
-            for key in ("tilt_deg", "raw_tilt_deg"):
-                candidate = imu.get(key)
-                if isinstance(candidate, (list, tuple)) and len(candidate) == 2:
-                    tilt = candidate
-                    break
-        values = (
-            distance,
-            *(tilt if isinstance(tilt, (list, tuple)) else ()),
-        )
-        if (
-            len(values) != 3
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                for value in values
-            )
-        ):
-            return None
-        return tuple(float(value) for value in values)
-
-    @staticmethod
-    def _settling_window_is_stable(samples) -> bool:
-        if len(samples) < POST_MOTION_SETTLE_SAMPLE_COUNT:
-            return False
-        ranges = tuple(
-            max(sample[index] for sample in samples)
-            - min(sample[index] for sample in samples)
-            for index in range(3)
-        )
+    def _post_motion_window_is_idle(samples) -> bool:
         return (
-            ranges[0] <= POST_MOTION_DISTANCE_RANGE_MM
-            and ranges[1] <= POST_MOTION_TILT_RANGE_DEG
-            and ranges[2] <= POST_MOTION_TILT_RANGE_DEG
+            len(samples) >= POST_MOTION_IDLE_SAMPLE_COUNT
+            and all(sample.get("motion_active") is False for sample in samples)
         )
 
     async def _observe_until_settled(
@@ -1830,6 +1234,9 @@ class BlastObservationMonitor:
         initial_observation,
         timeout_seconds=None,
     ):
+        # Keep the receipt's observation_settled field for compatibility. It
+        # confirms idle sampling, not constant range/tilt or obstacle clearance.
+        # Range validity and scan geometry are checked by their own consumers.
         settle_timeout = (
             POST_MOTION_SETTLE_TIMEOUT_SECONDS
             if timeout_seconds is None
@@ -1848,23 +1255,29 @@ class BlastObservationMonitor:
                     "controller_command_interrupted",
                     "BLAST command was interrupted by stop",
                 )
-            sample = self._settling_sample(latest)
-            if latest.get("motion_active") is False and sample is not None:
-                samples.append(sample)
-                del samples[:-POST_MOTION_SETTLE_SAMPLE_COUNT]
+            if latest.get("motion_active") is False:
+                samples.append(latest)
+                del samples[:-POST_MOTION_IDLE_SAMPLE_COUNT]
             else:
                 samples.clear()
-            settled = self._settling_window_is_stable(samples)
+            settled = self._post_motion_window_is_idle(samples)
             timed_out = asyncio.get_running_loop().time() >= deadline
             if settled or timed_out:
                 self._settling_samples = tuple(samples)
+                if not settled:
+                    logger.info(
+                        "BLAST post-motion idle unconfirmed: samples=%s/%s "
+                        "motion_active=%s budget_seconds=%s",
+                        len(samples), POST_MOTION_IDLE_SAMPLE_COUNT,
+                        latest.get("motion_active"), settle_timeout,
+                    )
                 if await self._service_preempt_stop(runtime, generation):
                     raise BlastControllerError(
                         "controller_command_interrupted",
                         "BLAST command was interrupted by stop",
                     )
-                # Stabilisation improves evidence quality, but must not turn a
-                # usable bounded movement into a failed robot episode.
+                # A missing confirmation retains an explicit quality flag;
+                # it does not itself fail the navigation episode.
                 return latest, settled
             await asyncio.sleep(MOTION_POLL_INTERVAL_SECONDS)
             latest = await runtime.observe()

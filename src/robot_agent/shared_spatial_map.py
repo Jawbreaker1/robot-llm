@@ -380,30 +380,33 @@ def _transform_navigation_trace(
         projection = dict(source_projection)
         projection["frame"] = SHARED_FIXED_START
         projection["local_frame"] = source_projection["frame"]
-        points = []
-        for source_point in source_projection["points"]:
-            point = dict(source_point)
-            origin_x, origin_y = _transform_trace_point(
-                source_point["sensor_origin_x_mm"],
-                source_point["sensor_origin_y_mm"],
-                transform,
-            )
-            echo_x, echo_y = _transform_trace_point(
-                source_point["nominal_echo_x_mm"],
-                source_point["nominal_echo_y_mm"],
-                transform,
-            )
-            point.update({
-                "sensor_origin_x_mm": origin_x,
-                "sensor_origin_y_mm": origin_y,
-                "beam_heading_mdeg": _transform_trace_heading(
-                    source_point["beam_heading_mdeg"], transform
-                ),
-                "nominal_echo_x_mm": echo_x,
-                "nominal_echo_y_mm": echo_y,
-            })
-            points.append(point)
-        projection["points"] = points
+        for field in ("points", "uncertain_points"):
+            if field not in source_projection:
+                continue
+            points = []
+            for source_point in source_projection[field]:
+                point = dict(source_point)
+                origin_x, origin_y = _transform_trace_point(
+                    source_point["sensor_origin_x_mm"],
+                    source_point["sensor_origin_y_mm"],
+                    transform,
+                )
+                echo_x, echo_y = _transform_trace_point(
+                    source_point["nominal_echo_x_mm"],
+                    source_point["nominal_echo_y_mm"],
+                    transform,
+                )
+                point.update({
+                    "sensor_origin_x_mm": origin_x,
+                    "sensor_origin_y_mm": origin_y,
+                    "beam_heading_mdeg": _transform_trace_heading(
+                        source_point["beam_heading_mdeg"], transform
+                    ),
+                    "nominal_echo_x_mm": echo_x,
+                    "nominal_echo_y_mm": echo_y,
+                })
+                points.append(point)
+            projection[field] = points
         view["projection"] = projection
         planar_scan_views.append(view)
 

@@ -9,6 +9,7 @@ from robot_agent.blast_episode_adapter import (
 from robot_agent.blast_navigation_motion_execution import (
     BlastNavigationMotionExecutor,
 )
+from robot_agent.blast_navigation_calibration import BLAST_ENCODER_SETTLING_DEGREES
 from robot_agent.blast_observation_monitor import CONTROLLER_ID, ROBOT_ID
 from robot_agent.physical_navigation_contract import (
     SCAN_FRONT_ARC,
@@ -93,6 +94,12 @@ class BlastIMUDeauthorityTests(unittest.TestCase):
         self.assertEqual(admitted["sensors"]["imu"]["heading_deg"], 38.96)
 
         controller.observation["motor_angles_deg"]["left_drive"] += 2
+        self.assertTrue(_encoder_anchor_correlated(
+            adapter._observation(), executor,
+        ))
+        controller.observation["motor_angles_deg"]["left_drive"] += (
+            BLAST_ENCODER_SETTLING_DEGREES - 1
+        )
         drifted = adapter._observation()
         self.assertFalse(_encoder_anchor_correlated(drifted, executor))
         with self.assertRaises(BlastEpisodeError) as raised:

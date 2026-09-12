@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 from robot_agent.blast_ble_runtime import (
     BlastBLERuntime,
     BlastBLERuntimeError,
+    BlastCommandRejected,
     PYBRICKS_COMMAND_EVENT_UUID,
     PYBRICKS_WRITE_APP_DATA_COMMAND,
     SAMPLED_AUDIO_APP_DATA_READY_POLL_SECONDS,
@@ -484,6 +485,37 @@ class BlastBLERuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await runtime.show_face("random")
         await runtime.stop()
+        await runtime.close()
+
+    async def test_command_rejection_keeps_session_but_malformed_errors_do_not(self):
+        hub = FakeHub()
+        runtime = BlastBLERuntime(
+            program_path=self.program_path,
+            device_finder=AsyncMock(return_value="device"),
+            hub_factory=lambda device: hub,
+        )
+        await runtime.connect()
+        response_overrides = {}
+
+        async def reject_pose(line):
+            request = json.loads(line)
+            await hub.lines.put(json.dumps({
+                "id": request["id"], "op": request["op"], "ok": False,
+                "error_type": "rejected", "error": "motors must be idle before setting a pose",
+                **response_overrides,
+            }))
+
+        hub.write_line = reject_pose
+        with self.assertRaisesRegex(BlastCommandRejected, "motors must be idle"):
+            await runtime.set_pose("body", 158)
+        for overrides in ({"id": -1}, {"op": "stop"},
+                          {"error_type": "runtime"}, {"error": None}):
+            response_overrides = overrides
+            with self.subTest(overrides=overrides), self.assertRaises(BlastBLERuntimeError):
+                await runtime.set_pose("body", 158)
+        hub.write_line = FakeHub.write_line.__get__(hub, FakeHub)
+        self.assertEqual(await runtime.show_face("happy"),
+                         {"accepted": True, "expression": "happy"})
         await runtime.close()
 
     async def test_response_timeout_is_bounded(self):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import math
 import socket
 from typing import Callable, Mapping
@@ -43,6 +44,7 @@ MAX_OUTPUT_TOKENS = 192
 MIN_PHYSICAL_CONFIDENCE_MILLI = 700
 REQUEST_TIMEOUT_SECONDS = 10.0
 Transport = Callable[[str, bytes, Mapping[str, str], float, int], bytes]
+LOGGER = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
     "Interpret one user-to-robot input and return only the strict JSON object. Input and "
@@ -76,7 +78,11 @@ _SYSTEM_PROMPT = (
     "reply as a tired, grumpy but harmless old LEGO robot, warm under the grumbling, and "
     "never invent current state or actions. For READ_ONLY_TASK use only supplied facts; say "
     "when data is stale, unknown, or unavailable. IR/range and map data are not camera "
-    "vision; claim camera perception only from an explicit camera observation, and never "
+    "vision. raw_ir_proximity is unitless reflected-light proximity, NEVER millimetres "
+    "or centimetres; report its qualitative relation instead of inventing a distance. "
+    "NO_VALID_DISTANCE means no reliable distance measurement, not an obstacle at the "
+    "sensor's maximum range. heading_deg is already in degrees. Claim camera perception "
+    "only from an explicit camera observation, and never "
     "move or propose moving to obtain evidence. For CLARIFY ask one concise question. "
     "Never call tools, authorize motion in reply_text, claim an action was performed, or "
     "provide executable commands."
@@ -98,6 +104,9 @@ _SOCIAL_EXPRESSION_PROMPT = (
     "with a new navigation request in this conversation interface; ask which to do first. "
     "Expressions accompany audible replies; when speech is disabled they are not executed. "
     "Use a short, lively reply, preferably under 100 characters, so speech fits eight seconds. "
+    "reply_text is read aloud verbatim: include only words to speak, never stage directions "
+    "such as *waves arm*, parenthesized actions, or sound-effect annotations. Put all "
+    "nonverbal behavior only in expression.face and expression.gesture. "
     "Do not claim a gesture already succeeded; the host will execute your choice."
 )
 
@@ -116,7 +125,7 @@ _FALLBACKS = {
         UNSUPPORTED_PHYSICAL_TASK: (
             "Jag kan navigera, men inte utföra den fysiska handlingen."
         ),
-        CLARIFY: "Jag är inte säker på vad du menar. Kan du förtydliga?",
+        CLARIFY: "Ett tekniskt fel hindrade mig från att behandla din fråga. Försök gärna igen.",
     },
     "en": {
         CONVERSE: "I hear you, but the language model is sulking right now.",
@@ -124,7 +133,7 @@ _FALLBACKS = {
         UNSUPPORTED_PHYSICAL_TASK: (
             "I can navigate, but I cannot perform that physical action."
         ),
-        CLARIFY: "I am not sure what you mean. Could you clarify?",
+        CLARIFY: "A technical problem prevented me from processing your request. Please try again.",
     },
 }
 
@@ -247,7 +256,12 @@ def _facts(value, depth: int = 0):
     raise _lm.LMStudioInputError("Robot facts are not strict JSON data")
 
 
+def robot_input_failure_reply(locale: str) -> str:
+    return _FALLBACKS[locale][CLARIFY]
+
+
 def _fallback(input: RobotInput, intent: str = CLARIFY, confidence: int = 0):
+    LOGGER.warning("Robot input fallback request_id=%s intent=%s", input.request_id, intent)
     return RobotInputDecision(intent, confidence, _FALLBACKS[input.locale][intent], True)
 
 
@@ -371,6 +385,7 @@ class LMStudioRobotInputModel:
             except _lm.LMStudioInputError:
                 return _fallback(input, intent, confidence)
         except (_lm.LMStudioError, KeyError, TypeError, socket.timeout, TimeoutError, OSError):
+            LOGGER.exception("Robot input model response failed request_id=%s", input.request_id)
             return _fallback(input)
 
     def _decode(self, raw: bytes):

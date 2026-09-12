@@ -149,14 +149,24 @@ const map = {
         vertical_pitch_compensated: false,
         ultrasonic_beam_width_modeled: false,
         scan_turn_translation_compensated: false, points: [point] } },
-      // NO_VALID_DISTANCE is intentionally absent from validated points.
-      { scan_id: "nvd-only-scan", observed_at_unix_ms: 1951,
+      // Unsettled returns stay visible without creating obstacle hypotheses.
+      { scan_id: "unsettled-scan", observed_at_unix_ms: 1951,
         scan_pose: { x_mm: 0, y_mm: 0, heading_mdeg: 0 },
         projection: { schema: "blast-planar-scan-projection/v1",
           frame: "EPISODE_LOCAL_ODOMETRY", quality: "PROVISIONAL_YAW_ONLY",
           vertical_pitch_compensated: false,
           ultrasonic_beam_width_modeled: false,
-          scan_turn_translation_compensated: false, points: [] } }],
+          scan_turn_translation_compensated: false, points: [],
+          uncertain_points: Array.from({ length: 10 }, (_, index) => {
+            const left = index < 8;
+            const bearing = (left ? index + 1 : 10 - index) * (left ? 10000 : -10000);
+            return { ...point,
+              side: left ? `left_${index + 1}` : `right_${index - 7}`,
+              relative_bearing_mdeg: bearing, beam_heading_mdeg: bearing,
+              nominal_echo_x_mm: Math.round(100 * Math.cos(bearing / 1000 * Math.PI / 180)),
+              nominal_echo_y_mm: Math.round(100 * Math.sin(bearing / 1000 * Math.PI / 180)),
+            };
+          }) } }],
   },
 };
 presenter.render(map, "connected", 2000);
@@ -214,6 +224,14 @@ process.stdout.write(JSON.stringify({
   coarseObstacleCount: withClass("map-coarse-obstacle-cell").length,
   scanViewCount: exactClass("map-blast-scan-view").length,
   rawRayCount: exactClass("map-blast-scan-ray").length,
+  uncertainRayCount: exactClass("map-blast-scan-ray is-uncertain").length,
+  hitsAboveObstacles: nodes["map-local-odometry-layer"].children.findIndex(
+    node => node.attributes.class === "map-navigation-scan-layer"
+  ) > nodes["map-local-odometry-layer"].children.findIndex(
+    node => node.attributes.class === "map-provisional-ultrasonic-obstacle"
+  ),
+  hitsAbovePlan: nodes["map-local-odometry-layer"].children.at(-1).attributes.class
+    === "map-navigation-scan-layer",
   obstacleItemText: obstacleItem.textContent,
   metadataText: nodes["map-metadata"].textContent,
 }));
@@ -257,12 +275,15 @@ process.stdout.write(JSON.stringify({
             "true",
         )
         self.assertEqual(result["rawRayCount"], 1)
+        self.assertEqual(result["uncertainRayCount"], 10)
+        self.assertTrue(result["hitsAboveObstacles"])
+        self.assertTrue(result["hitsAbovePlan"])
         self.assertEqual(result["scanViewCount"], 2)
         self.assertEqual(result["obstacleCount"], 1)
         self.assertEqual(result["coarseGridCellCount"], 121)
         self.assertEqual(result["coarseObstacleCount"], 1)
         self.assertIn("PROVISIONAL INFERENCE", result["obstacleItemText"])
-        self.assertNotIn("nvd-only-scan", result["obstacleItemText"])
+        self.assertNotIn("unsettled-scan", result["obstacleItemText"])
         self.assertIn(".....G.....", result["metadataText"])
         self.assertIn(".....B.....", result["metadataText"])
         self.assertIn("B blast-01 UP", result["metadataText"])
@@ -1498,7 +1519,7 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(result["hasEcho"])
         self.assertEqual(
             result["topLayer"],
-            "map-navigation-overlay-layer",
+            "map-navigation-scan-layer",
         )
         self.assertAlmostEqual(result["distanceRatio"], 2 / 3)
         self.assertIn("PROVISIONAL_ENCODER_ODOMETRY", result["localText"])

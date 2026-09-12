@@ -668,7 +668,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
             "physical left/right at scan start",
             "full angular pattern on both sides",
             "NO_VALID_DISTANCE",
-            "mean unknown",
+            "no ultrasonic echo",
             "you choose the route, detour side",
         ):
             self.assertIn(instruction, system_prompt)

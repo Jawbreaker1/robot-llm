@@ -2,6 +2,7 @@ import copy
 import unittest
 
 from robot_agent.blast_navigation_calibration import (
+    BLAST_ENCODER_SETTLING_DEGREES,
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
 )
 from robot_agent.blast_navigation_motion_result import (
@@ -419,7 +420,8 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "blast_motion_slice_discontinuous")
 
         turns = turn_results("turn_left")
-        turns[1]["receipt"]["before_angles_deg"]["left_drive"] -= 2
+        gap = BLAST_ENCODER_SETTLING_DEGREES + 1
+        turns[1]["receipt"]["before_angles_deg"]["left_drive"] -= gap
         with self.assertRaises(PhysicalNavigationContractError) as caught:
             build(TURN_LEFT_90, turns)
         self.assertEqual(caught.exception.code, "blast_motion_slice_discontinuous")
@@ -428,7 +430,7 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
             (
                 "BLAST motion has an unobserved encoder gap: "
                 "action=TURN_LEFT_90 slice=2 previous=(55, 245) "
-                "before=(53, 245) delta=(-2, 0)"
+                f"before=({55 - gap}, 245) delta=({-gap}, 0)"
             ),
         )
 
@@ -483,7 +485,7 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
             apply_verified_motion(
                 PhysicalPose(),
                 motion,
-                max_uncommanded_drift_degrees=2,
+                max_uncommanded_drift_degrees=-1,
             )
         self.assertEqual(
             invalid.exception.code,

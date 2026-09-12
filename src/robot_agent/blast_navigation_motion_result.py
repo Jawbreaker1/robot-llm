@@ -12,6 +12,7 @@ from .blast_navigation_action_profile import (
     TURN_TRIM_ENCODER_DEGREES,
     TURN_SPEED_DPS,
 )
+from .blast_navigation_calibration import BLAST_ENCODER_SETTLING_DEGREES
 from .blast_observation_monitor import (
     COMMAND_RESULT_SCHEMA,
     CONTROLLER_ID,
@@ -32,7 +33,6 @@ _RESULT_FIELDS = frozenset((
     "schema", "robot_id", "controller_id", "command", "accepted",
     "completed", "receipt", "observation", "observation_settled",
 ))
-_MAX_INTER_SLICE_SETTLING_DEGREES = 1
 
 
 def _fail(code, message):
@@ -293,7 +293,7 @@ def build_blast_navigation_motion_result(
             if (
                 (index == 1 and allow_initial_settling is not True)
                 or any(
-                    abs(delta) > _MAX_INTER_SLICE_SETTLING_DEGREES
+                    abs(delta) > BLAST_ENCODER_SETTLING_DEGREES
                     for delta in settling
                 )
             ):
@@ -307,7 +307,7 @@ def build_blast_navigation_motion_result(
                     ),
                 )
             settling_checks = tuple(
-                abs(delta) <= _MAX_INTER_SLICE_SETTLING_DEGREES
+                abs(delta) <= BLAST_ENCODER_SETTLING_DEGREES
                 for delta in settling
             )
         slices.append(_slice(

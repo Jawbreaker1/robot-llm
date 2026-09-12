@@ -39,9 +39,174 @@
   ]);
   const SCAN_SIDES = new Set([
     "center", "left_near", "left_far", "right_near", "right_far",
-    "left_1", "left_2", "left_3", "left_4",
-    "right_1", "right_2", "right_3", "right_4",
+    ...Array.from({ length: 8 }, (_, index) => `left_${index + 1}`),
+    ...Array.from({ length: 8 }, (_, index) => `right_${index + 1}`),
   ]);
+
+  const COARSE_NAVIGATION_GRID_SCHEMA = (
+    "robot-coarse-navigation-grid/v1"
+  );
+  const COARSE_OBSTACLE_SYMBOLS = new Set(["#", "?", "g", "x"]);
+
+  function normalizeCoarseNavigationGrid(value, helpers) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    const grid = helpers.record(value);
+    const rows = grid.rows;
+    const robots = grid.robots;
+    const rawWindow = grid.window === undefined ? {
+      x_min_mm: -450, x_max_mm: 1050,
+      y_min_mm: -750, y_max_mm: 750,
+    } : helpers.record(grid.window);
+    const windowValues = [
+      rawWindow.x_min_mm, rawWindow.x_max_mm,
+      rawWindow.y_min_mm, rawWindow.y_max_mm,
+    ];
+    if (
+      grid.schema !== COARSE_NAVIGATION_GRID_SCHEMA
+      || grid.frame !== "EPISODE_START"
+      || grid.cell_size_mm !== 150
+      || grid.top_is !== "START_FORWARD"
+      || grid.left_is !== "START_LEFT"
+      || !windowValues.every((item) => (
+        Number.isSafeInteger(item) && item % 150 === 0
+      ))
+      || rawWindow.x_max_mm - rawWindow.x_min_mm !== 1500
+      || rawWindow.y_max_mm - rawWindow.y_min_mm !== 1500
+      || grid.cropped !== Boolean(grid.cropped)
+      || typeof grid.legend !== "string"
+      || !Array.isArray(rows)
+      || rows.length !== 11
+      || !rows.every((row) => (
+        typeof row === "string"
+        && row.length === 11
+        && /^[.o#?GgWXxEB2]+$/.test(row)
+      ))
+      || !Array.isArray(robots)
+      || robots.length < 1
+      || robots.length > 2
+    ) {
+      return undefined;
+    }
+    const normalizedRobots = robots.map((value) => {
+      const robot = helpers.record(value);
+      const row = robot.row;
+      const column = robot.column;
+      const offGrid = row === null && column === null;
+      if (
+        !["B", "E"].includes(robot.symbol)
+        || !["blast-01", "ev3rstorm-01"].includes(robot.robot_id)
+        || !["UP", "LEFT", "DOWN", "RIGHT"].includes(robot.heading)
+        || (
+          !offGrid
+          && !(
+            Number.isSafeInteger(row) && row >= 0 && row < 11
+            && Number.isSafeInteger(column)
+            && column >= 0 && column < 11
+          )
+        )
+      ) {
+        return null;
+      }
+      return Object.freeze({
+        symbol: robot.symbol,
+        robotId: robot.robot_id,
+        row,
+        column,
+        heading: robot.heading,
+      });
+    });
+    if (
+      normalizedRobots.some((robot) => robot === null)
+      || new Set(normalizedRobots.map((robot) => robot.symbol)).size
+        !== normalizedRobots.length
+    ) {
+      return undefined;
+    }
+    return Object.freeze({
+      schema: COARSE_NAVIGATION_GRID_SCHEMA,
+      frame: "EPISODE_START",
+      cellSizeMm: 150,
+      topIs: "START_FORWARD",
+      leftIs: "START_LEFT",
+      window: Object.freeze({
+        xMinMm: rawWindow.x_min_mm,
+        xMaxMm: rawWindow.x_max_mm,
+        yMinMm: rawWindow.y_min_mm,
+        yMaxMm: rawWindow.y_max_mm,
+      }),
+      rows: Object.freeze([...rows]),
+      robots: Object.freeze(normalizedRobots),
+      legend: grid.legend,
+      cropped: grid.cropped,
+    });
+  }
+
+  function coarseGridCells(grid) {
+    if (!grid) {
+      return [];
+    }
+    const cells = [];
+    grid.rows.forEach((row, rowIndex) => {
+      [...row].forEach((symbol, columnIndex) => {
+        cells.push({
+          symbol,
+          sizeMm: grid.cellSizeMm,
+          xMm: grid.window.xMaxMm - rowIndex * grid.cellSizeMm,
+          yMm: grid.window.yMaxMm - columnIndex * grid.cellSizeMm,
+        });
+      });
+    });
+    return cells;
+  }
+
+  function renderCoarseObstacleArea(layer, trace, projection, ui) {
+    const cells = coarseGridCells(trace?.coarseGrid);
+    if (cells.length === 0) {
+      return;
+    }
+    const group = ui.svg("g", {
+      class: "map-coarse-navigation-grid",
+      "data-cell-count": cells.length,
+      "data-obstacle-count": cells.filter((cell) => (
+        COARSE_OBSTACLE_SYMBOLS.has(cell.symbol)
+      )).length,
+      "data-cell-size-mm": trace.coarseGrid.cellSizeMm,
+      "data-frame": trace.coarseGrid.frame,
+    });
+    ui.title(group, [
+      ui.t("map.navigation_trace.coarse_obstacle_area"),
+    ]);
+    cells.forEach((cell) => {
+      const topLeft = projection.point(
+        cell.xMm - cell.sizeMm / 2,
+        cell.yMm + cell.sizeMm / 2,
+      );
+      const bottomRight = projection.point(
+        cell.xMm + cell.sizeMm / 2,
+        cell.yMm - cell.sizeMm / 2,
+      );
+      const obstacle = COARSE_OBSTACLE_SYMBOLS.has(cell.symbol);
+      group.appendChild(ui.svg("rect", {
+        x: Math.min(topLeft.x, bottomRight.x),
+        y: Math.min(topLeft.y, bottomRight.y),
+        width: Math.abs(bottomRight.x - topLeft.x),
+        height: Math.abs(bottomRight.y - topLeft.y),
+        class: `map-coarse-grid-cell${
+          obstacle ? " map-coarse-obstacle-cell" : ""
+        } ${
+          cell.symbol === "?" ? "is-echo"
+            : cell.symbol === "#" ? "is-keep-out"
+              : cell.symbol === "o" ? "is-observed-clear"
+                : "is-reference"
+        }`,
+        "data-symbol": cell.symbol,
+      }));
+    });
+    layer.appendChild(group);
+  }
+
 
   function hasExactFields(value, fields) {
     const keys = Object.keys(value);
@@ -529,6 +694,7 @@
   }
 
   global.RobotBlastMapSemantics = Object.freeze({
+    normalizeCoarseNavigationGrid, coarseGridCells, renderCoarseObstacleArea,
     CLASSIFICATION, GEOMETRY_KIND, SCAN_SIDES,
     appendAdvisoryWaypointPoint, appendGoalPoints, appendObstaclePoints,
     appendRoutePoints, appendSharedObstaclePoints, normalizeAdvisoryWaypoint,

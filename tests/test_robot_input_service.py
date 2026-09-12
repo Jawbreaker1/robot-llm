@@ -213,6 +213,9 @@ class RobotInputServiceTests(unittest.TestCase):
         turn = service.dispatch("Gör något", "sv", "request-3", 3)
 
         self.assertEqual(turn["intent"], CLARIFY)
+        self.assertTrue(turn["fallback"])
+        self.assertIn("tekniskt fel", turn["answer_text"])
+        self.assertNotIn("förtydliga", turn["answer_text"])
         self.assertIsNone(turn["episode"])
         self.assertEqual(control.started, [])
 

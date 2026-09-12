@@ -5,7 +5,10 @@ from copy import deepcopy
 from typing import NamedTuple
 
 from .blast_navigation_action_profile import BLAST_NAVIGATION_COMMANDS
-from .blast_navigation_calibration import BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+from .blast_navigation_calibration import (
+    BLAST_ENCODER_SETTLING_DEGREES,
+    BLAST_PROVISIONAL_NAVIGATION_CALIBRATION,
+)
 from .blast_navigation_motion_result import build_blast_navigation_motion_result
 from .blast_observation_monitor import (
     COMMAND_RESULT_SCHEMA,
@@ -33,7 +36,6 @@ from .physical_odometry import (
 
 
 _DRIVE_ROLES = ("left_drive", "right_drive")
-_MAX_PRE_COMMAND_SETTLING_DEGREES = 1
 MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES = int(round(
     SCAN_RESTORATION_COMMON_MODE_TOLERANCE_MM /
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
@@ -124,7 +126,7 @@ class BlastNavigationMotionExecutor:
         )
 
     def observation_matches_anchor(self, observation) -> bool:
-        """Whether exact drive encoders still match the trusted pose anchor."""
+        """Whether encoders remain within BLAST's mechanical settling allowance."""
 
         motors = (
             observation.get("motor_angles_deg")
@@ -137,7 +139,7 @@ class BlastNavigationMotionExecutor:
                 type(motors.get(role)) is int
                 and abs(
                     motors[role] - self._expected_start_angles[role]
-                ) <= _MAX_PRE_COMMAND_SETTLING_DEGREES
+                ) <= BLAST_ENCODER_SETTLING_DEGREES
                 for role in _DRIVE_ROLES
             )
         )
@@ -166,7 +168,7 @@ class BlastNavigationMotionExecutor:
             self._pose,
             motion,
             BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
-            max_uncommanded_drift_degrees=1,
+            max_uncommanded_drift_degrees=BLAST_ENCODER_SETTLING_DEGREES,
         )
         return final_angles, motion, pose
 
@@ -243,7 +245,7 @@ class BlastNavigationMotionExecutor:
                 and abs(
                     scan_start_angles[role]
                     - self._expected_start_angles[role]
-                ) <= _MAX_PRE_COMMAND_SETTLING_DEGREES
+                ) <= BLAST_ENCODER_SETTLING_DEGREES
                 for role in _DRIVE_ROLES
             )
             and angles == {
@@ -327,7 +329,7 @@ class BlastNavigationMotionExecutor:
             observed_start[role] for role in _DRIVE_ROLES
         )
         if any(
-            abs(delta) > _MAX_PRE_COMMAND_SETTLING_DEGREES
+            abs(delta) > BLAST_ENCODER_SETTLING_DEGREES
             for delta in pre_command_settling
         ):
             self._invalidate(

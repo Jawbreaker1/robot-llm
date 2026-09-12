@@ -94,6 +94,10 @@ class BlastBLERuntimeError(RuntimeError):
     """The persistent BLAST session could not be used reliably."""
 
 
+class BlastCommandRejected(RuntimeError):
+    """The hub declined a command; its protocol session is still usable."""
+
+
 def default_program_path() -> Path:
     return (
         Path(__file__).resolve().parents[2]
@@ -661,6 +665,14 @@ class BlastBLERuntime:
         )
         await self._write_control_bytes(encoded.encode("utf-8") + b"\n")
         response = await self._read_message()
+        if (
+            response.get("id") == request_id
+            and response.get("op") == operation
+            and response.get("ok") is False
+            and response.get("error_type") == "rejected"
+            and isinstance(response.get("error"), str)
+        ):
+            raise BlastCommandRejected(response["error"])
         if (
             response.get("id") != request_id
             or response.get("op") != operation

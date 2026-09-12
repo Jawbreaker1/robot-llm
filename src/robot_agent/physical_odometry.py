@@ -504,7 +504,7 @@ def apply_verified_motion(
 
     if (
         type(max_uncommanded_drift_degrees) is not int
-        or not 0 <= max_uncommanded_drift_degrees <= 1
+        or max_uncommanded_drift_degrees < 0
     ):
         raise PhysicalNavigationContractError(
             "invalid_uncommanded_drift_limit",
