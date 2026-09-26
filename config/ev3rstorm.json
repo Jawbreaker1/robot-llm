@@ -40,8 +40,8 @@
     "odometry": {
       "status": "provisional-live-encoder-derived",
       "linear_mm_per_encoder_degree": 0.35,
-      "turn_mdeg_per_opposed_encoder_degree": 132,
-      "evidence": "Linear scale is the current EV3RSTORM dead-reckoning estimate; turn scale is the rounded 90000 mdeg / 682 encoder-degree live calibration"
+      "turn_mdeg_per_opposed_encoder_degree": 137,
+      "evidence": "Linear scale is the current EV3RSTORM dead-reckoning estimate; turn scale is the provisional 90000 mdeg / 657 encoder-degree calibration from the observed near-90-degree action and full-scan comparison"
     },
     "physical_footprint": {
       "status": "operator-measured-current-build",
@@ -62,8 +62,8 @@
       "speed_dps": 200,
       "segment_duration_ms": 800,
       "segments_for_approx_90_degrees": 4,
-      "mean_abs_encoder_delta_degrees": 682,
-      "approx_encoder_degrees_per_body_degree": 7.58
+      "mean_abs_encoder_delta_degrees": 657,
+      "approx_encoder_degrees_per_body_degree": 7.3
     },
     "infrared_proximity": {
       "status": "provisional-static-and-motor-free-dynamic-evidence",
@@ -126,8 +126,8 @@
       "max_duration_ms": 800
     },
     "arm": {
-      "max_abs_speed_dps": 150,
-      "max_duration_ms": 400
+      "max_abs_speed_dps": 1560,
+      "max_duration_ms": 2000
     },
     "speech": {
       "max_characters": 160,

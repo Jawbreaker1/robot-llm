@@ -23,7 +23,7 @@ from .blast_scan_observation import (
     SCAN_RAY_SIDES,
 )
 from .coarse_navigation_grid import coarse_navigation_grid_valid
-from .local_detour_route import (
+from .spatial_map_contract import (
     ROUTE_ACTIVE,
     ROUTE_COMPLETE,
     ROUTE_INVALID,

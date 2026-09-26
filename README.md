@@ -80,6 +80,13 @@ and heading feedback, including recovery from incomplete observations. The
 next challenge is making that behavior consistent across both robots and a
 wider range of environments.
 
+EV3 now connects to the same model-authored route flow, with hardware-specific
+execution for its motors, encoders and infrared proximity sensor. Both robots
+expose navigation, conversation and speech through the web console. The EV3
+integration is simulation-tested; physical acceptance of this replacement
+flow is still pending. IR observations remain directional evidence rather
+than invented distance measurements.
+
 ## More than navigation
 
 **Talk to the robot.** Use text or push-to-talk in the web interface. The model
@@ -136,7 +143,8 @@ their goal, route, and recovery handling together is the next integration step,
 while keeping hardware-specific behavior in their adapters.
 
 The core stack runs locally: **Qwen3.8 27B through LM Studio**, **whisper.cpp**
-for voice input, and **Piper** for speech. BLAST uses the `en_GB-cori-high` voice.
+for voice input, and **Piper** for speech. BLAST uses `en_GB-cori-high`;
+EV3RSTORM uses `en_US-john-medium` for English.
 The dashboard supports English and Swedish.
 
 ## Our first two bodies

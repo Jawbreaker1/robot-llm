@@ -9,12 +9,14 @@ responsibility.
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 import math
+from pathlib import Path
 import threading
 import time
 from typing import Mapping
 
-from .active_ir_scan import ActiveIrScanExecutor
+from .ev3_navigation_transport import EV3NavigationRemoteError, EV3NavigationTransportError
 from .blast_navigation_action_profile import (
     DRIVE_ENCODER_DEGREES,
     DRIVE_SPEED_DPS,
@@ -51,10 +53,12 @@ from .physical_navigation_contract import (
     EXPECTED_WORKER_OPERATIONS,
     EXPECTED_WORKER_SAFETY,
     REVERSE,
+    SCAN_TURN_OPERATION,
     TURN_LEFT_90,
     TURN_RIGHT_90,
     expected_scan_sample_profile,
     expected_scan_turn_profile,
+    expected_scan_turn_spec,
 )
 from .physical_odometry import OdometryCalibration, normalize_heading_mdeg
 
@@ -62,6 +66,9 @@ from .physical_odometry import OdometryCalibration, normalize_heading_mdeg
 def _stop_proof() -> Mapping[str, object]:
     return {
         "stop_confirmed": True,
+        "stop_attempts": [],
+        "states": {},
+        "positions": {},
         "errors": [],
         "fault_tokens": {},
     }
@@ -463,27 +470,61 @@ class SharedWorldBlastController:
 class SharedWorldEV3Transport:
     """EV3 worker transport surface backed by the same simulated world."""
 
+    # Mirrored from the deployed ev3/navigation_profile.py; tested for parity.
+    PROCESS_LIMIT_MS, REQUEST_LIMIT = 180_000, 256
+    PULSE_LIMIT, MOTION_LIMIT_MS = 40, 32_000
+
     def __init__(
         self,
         simulation: MultiRobotNavigationSimulator,
         *,
         world_robot_id: str,
         odometry: OdometryCalibration,
-        obstacle_threshold_mm: int = 210,
+        ir_response=((0, 0), (200, 44), (300, 51), (1_000, 100)),
+        clock=time.monotonic,
     ) -> None:
         self.simulation = simulation
         self.world_robot_id = world_robot_id
         self.odometry = odometry
-        self.obstacle_threshold_mm = obstacle_threshold_mm
+        # Reuse the deployed gate: world distance must never bypass IR sensing.
+        from ev3.infrared_safety import InfraredGatePolicy, InfraredObstacleGate
+        config = json.loads((Path(__file__).resolve().parents[2] / "config/ev3rstorm.json").read_text())
+        self._ir_gate = InfraredObstacleGate(InfraredGatePolicy.from_config(config))
+        self.ir_response = tuple(ir_response)
+        if (len(self.ir_response) < 2
+                or any(not 0 <= raw <= 100 or distance < 0 for distance, raw in self.ir_response)
+                or any(a[0] >= b[0] for a, b in zip(self.ir_response, self.ir_response[1:]))):
+            raise ValueError("IR response needs increasing distances and readings in 0..100")
         self.shutdown_complete = False
         self._started = False
         self._aborted = False
         self._version = 1
-        self._left = 0
-        self._right = 0
+        # Encoder counters belong to the simulated robot, not to one worker
+        # process. A worker renewal must observe the same absolute counters as
+        # the worker it replaces, just like the physical EV3.
+        encoder_states = getattr(simulation, "_ev3_encoder_states", None)
+        if encoder_states is None:
+            encoder_states = {}
+            setattr(simulation, "_ev3_encoder_states", encoder_states)
+        state = encoder_states.setdefault(
+            world_robot_id,
+            {"left": 0, "right": 0},
+        )
+        self._encoder_state = state
+        self._left = state["left"]
+        self._right = state["right"]
         self._now_ms = time.monotonic_ns() // 1_000_000
         self._last_outcome = {"kind": "observe", "status": "completed"}
         self._lock = threading.RLock()
+        self._clock = clock
+        self._started_clock = clock()
+        self._started_ms = self._now_ms
+        self._pulse_count = self._motion_ms = self._request_count = 0
+
+    def _process_remaining_ms(self):
+        # Motor time is accelerated; model/host waiting still consumes real time.
+        return max(0, self.PROCESS_LIMIT_MS - (self._now_ms - self._started_ms)
+                   - round((self._clock() - self._started_clock) * 1_000))
 
     def clock_ms(self) -> int:
         with self._lock:
@@ -494,6 +535,8 @@ class SharedWorldEV3Transport:
             if self._started:
                 raise RuntimeError("simulation transport already started")
             self._started = True
+            for _ in range(5):
+                self._observation()
 
     def abort(self) -> None:
         with self._lock:
@@ -502,42 +545,36 @@ class SharedWorldEV3Transport:
     def close(self) -> None:
         return None
 
-    @staticmethod
-    def _ir_value(clearance_mm: int, threshold_mm: int) -> int:
-        return 20 if clearance_mm <= threshold_mm else 60
+    def _ir_value(self, clearance_mm: int) -> int:
+        # Interpolation is a sensor hypothesis, not a metric fact given to Qwen.
+        for (d0, r0), (d1, r1) in zip(self.ir_response, self.ir_response[1:]):
+            if clearance_mm <= d1:
+                fraction = max(0, (clearance_mm - d0) / (d1 - d0))
+                return round(r0 + fraction * (r1 - r0))
+        return self.ir_response[-1][1]
 
     def _clearance_mm(self) -> int:
         return self.simulation.scan(self.world_robot_id, (0,))[0][1]
 
     def _observation(self) -> Mapping[str, object]:
         clearance = self._clearance_mm()
-        blocked = clearance <= self.obstacle_threshold_mm
-        raw = self._ir_value(clearance, self.obstacle_threshold_mm)
+        infrared = self._ir_gate.observe(self._ir_value(clearance))
         return {
             "state_version": self._version,
             "observed_monotonic_ms": self._now_ms,
             "touch": {"value0": 0, "pressed": False},
-            "infrared": {
-                "raw": raw,
-                "filtered": raw,
-                "blocked": blocked,
-                "reason": (
-                    "blocked_hysteresis_hold"
-                    if blocked else "clear_hysteresis_hold"
-                ),
-                "sample_count": 5,
-            },
+            "infrared": infrared,
             "motors": [
                 {"role": "drive_b", "position": self._left, "state": ""},
                 {"role": "drive_c", "position": self._right, "state": ""},
             ],
             "last_outcome": deepcopy(self._last_outcome),
             "budgets": {
-                "pulse_count": 0,
-                "pulse_count_remaining": 1_000,
-                "pulse_duration_ms": 0,
-                "pulse_duration_ms_remaining": 1_000_000,
-                "process_ms_remaining": 180_000,
+                "pulse_count": self._pulse_count,
+                "pulse_count_remaining": self.PULSE_LIMIT - self._pulse_count,
+                "pulse_duration_ms": self._motion_ms,
+                "pulse_duration_ms_remaining": self.MOTION_LIMIT_MS - self._motion_ms,
+                "process_ms_remaining": self._process_remaining_ms(),
                 "motion_fault_latched": False,
             },
         }
@@ -559,15 +596,15 @@ class SharedWorldEV3Transport:
                 "operations": sorted(EXPECTED_WORKER_OPERATIONS),
                 "pulse": {
                     "actions": deepcopy(EXPECTED_ACTION_SPECS),
-                    "max_pulses": 1_000,
-                    "max_total_duration_ms": 1_000_000,
+                    "max_pulses": self.PULSE_LIMIT,
+                    "max_total_duration_ms": self.MOTION_LIMIT_MS,
                 },
                 "scan_turn": expected_scan_turn_profile(),
                 "scan_sample": expected_scan_sample_profile(),
                 "safety": deepcopy(EXPECTED_WORKER_SAFETY),
                 "process": {
-                    "absolute_max_ms": 180_000,
-                    "max_requests": 10_000,
+                    "absolute_max_ms": self.PROCESS_LIMIT_MS,
+                    "max_requests": self.REQUEST_LIMIT,
                 },
                 "drive_geometry": {
                     "left_motor_role": "drive_b",
@@ -587,10 +624,34 @@ class SharedWorldEV3Transport:
             for index in range(count)
         ]
 
-    def _pulse(self, action: str) -> Mapping[str, object]:
-        if action not in EXPECTED_ACTION_SPECS:
+    def _pulse(self, action: str, relative_delta_mdeg=None) -> Mapping[str, object]:
+        if action not in EXPECTED_ACTION_SPECS and action != SCAN_TURN_OPERATION:
             raise ValueError("simulation EV3 action is invalid")
-        spec = EXPECTED_ACTION_SPECS[action]
+        spec = (
+            expected_scan_turn_spec(relative_delta_mdeg)
+            if action == SCAN_TURN_OPERATION else EXPECTED_ACTION_SPECS[action]
+        )
+        if (self._pulse_count + spec["slice_count"] > self.PULSE_LIMIT
+                or self._motion_ms + spec["total_duration_ms"] > self.MOTION_LIMIT_MS):
+            raise EV3NavigationRemoteError("pulse_budget_exhausted", "Worker motion budget exhausted", True,
+                                           observation=self._observation(), stop=_stop_proof())
+        if action == ADVANCE and self._observation()["infrared"]["blocked"]:
+            # Mirror the real worker's preflight denial, not a fictitious move.
+            self._advance_state()
+            self._last_outcome = {
+                "kind": "pulse", "action": action, "status": "denied",
+                "reason": "infrared_blocked", "started_monotonic_ms": None,
+                "completed_monotonic_ms": self._now_ms, "stop_confirmed": True,
+                "requested_slice_count": spec["slice_count"], "completed_slice_count": 0,
+                "slices": [], "encoder_verification": {
+                    "passed": False, "verified_slice_count": 0,
+                    "requested_slice_count": spec["slice_count"],
+                },
+            }
+            return {"state_version": self._version, "result": {
+                "action": action, "outcome": deepcopy(self._last_outcome),
+                "observation": self._observation(), "stop": _stop_proof(),
+            }}
         before_left, before_right = self._left, self._right
         target = spec["target_mean_abs_encoder_degrees"]
         left_delta = int(round(
@@ -604,16 +665,27 @@ class SharedWorldEV3Transport:
             right_delta = (1 if right_delta >= 0 else -1) * target
 
         blocked = False
+        blocked_reason = "simulation_body_blocked"
         if action in (ADVANCE, REVERSE):
             requested_mm = int(round(
                 (left_delta + right_delta)
                 / 2.0
                 * self.odometry.linear_mm_per_encoder_degree
             ))
-            moved_mm = self.simulation.move(
-                self.world_robot_id,
-                requested_mm,
-            )
+            # Sample at the worker's polling interval, including its actual
+            # filtering/hysteresis. Geometry only supplies sensor data/contact.
+            from ev3.navigation_profile import POLL_INTERVAL_MS
+            polls = math.ceil(spec["total_duration_ms"] / POLL_INTERVAL_MS)
+            moved_mm = 0
+            for index in range(1, polls + 1):
+                if action == ADVANCE and self._observation()["infrared"]["blocked"]:
+                    blocked_reason = "infrared_blocked"
+                    break
+                step = round(requested_mm * index / polls) - moved_mm
+                actual = self.simulation.move(self.world_robot_id, step)
+                moved_mm += actual
+                if actual != step:
+                    break
             if moved_mm != requested_mm:
                 blocked = True
                 ratio = 0.0 if requested_mm == 0 else moved_mm / requested_mm
@@ -625,9 +697,18 @@ class SharedWorldEV3Transport:
                 / 2.0
                 * self.odometry.turn_mdeg_per_opposed_encoder_degree
             ))
-            before_heading = self.simulation.pose(self.world_robot_id).heading_mdeg
-            after = self.simulation.rotate(self.world_robot_id, turn_mdeg)
-            actual_turn = normalize_heading_mdeg(after.heading_mdeg - before_heading)
+            from ev3.navigation_profile import POLL_INTERVAL_MS
+            polls = math.ceil(spec["total_duration_ms"] / POLL_INTERVAL_MS)
+            actual_turn = 0
+            for index in range(1, polls + 1):
+                step = round(turn_mdeg * index / polls) - actual_turn
+                before_heading = self.simulation.pose(self.world_robot_id).heading_mdeg
+                after = self.simulation.rotate(self.world_robot_id, step)
+                measured = normalize_heading_mdeg(after.heading_mdeg - before_heading)
+                actual_turn += measured
+                self._observation()
+                if measured != step:
+                    break
             if actual_turn != turn_mdeg:
                 blocked = True
                 ratio = actual_turn / turn_mdeg if turn_mdeg else 0.0
@@ -636,9 +717,14 @@ class SharedWorldEV3Transport:
 
         self._left += left_delta
         self._right += right_delta
+        self._encoder_state["left"] = self._left
+        self._encoder_state["right"] = self._right
         count = spec["slice_count"]
-        left_parts = self._split_delta(left_delta, count)
-        right_parts = self._split_delta(right_delta, count)
+        # A blocked action has only an executed prefix, never fabricated
+        # completed zero-motion slices preceding its interrupted slice.
+        executed_count = max(1, min(count, math.ceil(count * ratio))) if blocked else count
+        left_parts = self._split_delta(left_delta, executed_count)
+        right_parts = self._split_delta(right_delta, executed_count)
         slices = []
         running_left, running_right = before_left, before_right
         for index, (duration, left_part, right_part) in enumerate(zip(
@@ -678,20 +764,35 @@ class SharedWorldEV3Transport:
                 "encoder_verification": {
                     "passed": True,
                     "error": None,
-                    "checks": [],
+                    "checks": [{"passed": True, "source": "simulated_encoders"}],
                 },
                 "stop": receipt_stop,
             })
+            if action != SCAN_TURN_OPERATION:
+                # Drive receipts carry temporal segments on the real EV3 worker.
+                segment = {key: deepcopy(slices[-1][key]) for key in (
+                    "duration_ms", "status", "reason", "started_monotonic_ms",
+                    "completed_monotonic_ms", "motors", "encoder_verification", "stop",
+                )}
+                segment.update(segment_index=1, kind="paired", commanded_sides=["left", "right"])
+                slices[-1]["segments"] = [segment]
             running_left, running_right = next_left, next_right
             self._now_ms += duration
+            self._pulse_count += 1
+            self._motion_ms += duration
         status = "interrupted" if blocked else "completed"
         completed_count = 0 if blocked else count
+        if blocked:
+            slices[-1].update(status="interrupted", reason=blocked_reason)
+            if action != SCAN_TURN_OPERATION:
+                slices[-1]["segments"][-1].update(status="interrupted", reason=blocked_reason)
+            completed_count = executed_count - 1
         outcome = {
             "kind": "pulse",
             "action": action,
             "status": status,
             "reason": (
-                "simulation_body_blocked"
+                blocked_reason
                 if blocked else "semantic_action_completed"
             ),
             "started_monotonic_ms": slices[0]["started_monotonic_ms"],
@@ -701,15 +802,33 @@ class SharedWorldEV3Transport:
             "completed_slice_count": completed_count,
             "slices": slices,
             "encoder_verification": {
-                "passed": not blocked,
-                "verified_slice_count": count,
+                "passed": executed_count == count and (not blocked or action != SCAN_TURN_OPERATION),
+                "verified_slice_count": executed_count,
                 "requested_slice_count": count,
             },
         }
         self._advance_state()
         self._last_outcome = outcome
+        if action == SCAN_TURN_OPERATION:
+            outcome.pop("action")
+            outcome.update({
+                "kind": SCAN_TURN_OPERATION,
+                "reason": "simulation_body_blocked" if blocked else "scan_turn_completed",
+                "requested_relative_delta_mdeg": relative_delta_mdeg,
+                "profile_id": spec["profile_id"],
+                "calibration": spec["calibration"],
+            })
+            outcome["encoder_verification"].update({
+                "left_delta_degrees": left_delta,
+                "right_delta_degrees": right_delta,
+                "mean_abs_encoder_degrees": int(round((abs(left_delta) + abs(right_delta)) / 2)),
+                "target_mean_abs_encoder_degrees": target,
+                "max_side_divergence_degrees": expected_scan_turn_profile()["max_side_divergence_degrees"],
+            })
         result = {
-            "action": action,
+            ("relative_delta_mdeg" if action == SCAN_TURN_OPERATION else "action"): (
+                relative_delta_mdeg if action == SCAN_TURN_OPERATION else action
+            ),
             "outcome": deepcopy(outcome),
             "observation": self._observation(),
             "stop": _stop_proof(),
@@ -727,6 +846,12 @@ class SharedWorldEV3Transport:
         with self._lock:
             if self._aborted:
                 raise RuntimeError("simulation transport was aborted")
+            if self.shutdown_complete or self._process_remaining_ms() == 0:
+                raise EV3NavigationTransportError("simulation worker process is closed or expired")
+            self._request_count += 1
+            if self._request_count > self.REQUEST_LIMIT:
+                raise EV3NavigationRemoteError("request_budget_exhausted", "Worker request budget exhausted", True,
+                                               observation=self._observation(), stop=_stop_proof())
             if cancel_requested is not None and cancel_requested():
                 raise RuntimeError("simulation request was cancelled")
             if operation == "describe":
@@ -740,6 +865,25 @@ class SharedWorldEV3Transport:
                 }
             if operation == "pulse":
                 return self._pulse(arguments["action"])
+            if operation == SCAN_TURN_OPERATION:
+                return self._pulse(operation, arguments["relative_delta_mdeg"])
+            if operation == "scan_sample":
+                profile = expected_scan_sample_profile()
+                self._ir_gate = type(self._ir_gate)(self._ir_gate.policy)
+                started = self._now_ms
+                self._advance_state(profile["settled_duration_ms"])
+                raw_samples = []
+                for _ in range(profile["sample_count"]):
+                    obs = self._observation()
+                    raw_samples.append(obs["infrared"]["raw"])
+                return {"state_version": self._version, "result": {
+                    "sample_count": profile["sample_count"],
+                    "raw_samples": raw_samples,
+                    "started_monotonic_ms": started,
+                    "completed_monotonic_ms": self._now_ms,
+                    "observation": obs,
+                    "stop": _stop_proof(),
+                }}
             if operation == "shutdown":
                 self._advance_state()
                 self.shutdown_complete = True
@@ -754,73 +898,6 @@ class SharedWorldEV3Transport:
                     }},
                 }
             raise ValueError("unsupported simulated EV3 operation")
-
-    def build_scan_executor(self) -> ActiveIrScanExecutor:
-        return ActiveIrScanExecutor(
-            rig=_SharedWorldEV3ScanRig(self),
-            clock_ms=self.clock_ms,
-        )
-
-
-class _SharedWorldEV3ScanRig:
-    def __init__(self, transport: SharedWorldEV3Transport) -> None:
-        self.transport = transport
-        self._request = None
-        self._local_heading_mdeg = 0
-
-    def begin_scan(self, request) -> None:
-        self._request = request
-        self._local_heading_mdeg = request.start_pose.heading_mdeg
-
-    def turn_relative_mdeg(self, delta, _calibration, _deadline_ms):
-        before = self.transport.simulation.pose(self.transport.world_robot_id)
-        after = self.transport.simulation.rotate(
-            self.transport.world_robot_id,
-            delta,
-        )
-        actual = normalize_heading_mdeg(after.heading_mdeg - before.heading_mdeg)
-        self._local_heading_mdeg = normalize_heading_mdeg(
-            self._local_heading_mdeg + actual
-        )
-        self.transport._advance_state(max(1, abs(delta) // 100))
-        return {
-            "requested_delta_mdeg": delta,
-            "actual_delta_mdeg": actual,
-            "completed_at_ms": self.transport.clock_ms(),
-            "stop_confirmed": True,
-        }
-
-    def read_snapshot(self, _deadline_ms):
-        self.transport._advance_state()
-        clearance = self.transport._clearance_mm()
-        blocked = clearance <= self.transport.obstacle_threshold_mm
-        raw = self.transport._ir_value(
-            clearance,
-            self.transport.obstacle_threshold_mm,
-        )
-        request = self._request
-        observed_at_ms = self.transport.clock_ms()
-        if request is not None:
-            observed_at_ms = request.created_at_ms + max(
-                0,
-                self.transport.clock_ms() - request.created_monotonic_ms,
-            )
-        return {
-            "state_version": self.transport._version,
-            "observed_at_ms": observed_at_ms,
-            "pose_heading_mdeg": self._local_heading_mdeg,
-            "touch_pressed": False,
-            "motion_fault_latched": False,
-            "infrared": {
-                "raw": raw,
-                "filtered": raw,
-                "blocked": blocked,
-            },
-        }
-
-    def stop(self):
-        return {"stop_confirmed": True}
-
 
 __all__ = (
     "SharedWorldBlastController",

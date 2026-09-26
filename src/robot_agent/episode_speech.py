@@ -1,4 +1,4 @@
-"""Fail-open speech lifecycle for one BLAST navigation episode."""
+"""Shared optional speech lifecycle for a robot navigation episode."""
 
 from __future__ import annotations
 
@@ -35,14 +35,14 @@ def _exception_type_name(error: Exception) -> str:
     return _bounded_speech_error_code(type(error).__name__)
 
 
-def blast_episode_cancelled(context) -> bool:
+def episode_cancelled(context) -> bool:
     return (
         context.stop_requested.is_set()
         or context.emergency_stop_requested.is_set()
     )
 
 
-class BlastEpisodeSpeech:
+class EpisodeSpeech:
     """Own optional speech without giving it navigation authority."""
 
     def __init__(self, *, factory, supported_locales, context) -> None:
@@ -52,12 +52,12 @@ class BlastEpisodeSpeech:
         self._runtime = None
 
     def _cancelled(self) -> bool:
-        return blast_episode_cancelled(self._context)
+        return episode_cancelled(self._context)
 
     def _publish_failed(self, error: Exception, *, stage: str) -> None:
         error_code = _exception_speech_error_code(error)
         logger.warning(
-            "BLAST speech failed stage=%s code=%s error_type=%s",
+            "Robot speech failed stage=%s code=%s error_type=%s",
             stage,
             error_code,
             _exception_type_name(error),
@@ -85,7 +85,7 @@ class BlastEpisodeSpeech:
                 )
                 update["speech_error_code"] = error_code
                 logger.warning(
-                    "BLAST speech failed stage=playback code=%s",
+                    "Robot speech failed stage=playback code=%s",
                     error_code,
                 )
             try:
@@ -158,7 +158,7 @@ class BlastEpisodeSpeech:
             self._runtime.cancel_episode(self._context.episode_id)
         except Exception as error:
             logger.warning(
-                "BLAST speech failed stage=cancel code=%s error_type=%s",
+                "Robot speech failed stage=cancel code=%s error_type=%s",
                 _exception_speech_error_code(error),
                 _exception_type_name(error),
             )
@@ -186,11 +186,11 @@ class BlastEpisodeSpeech:
             return closed
         except Exception as error:
             logger.warning(
-                "BLAST speech failed stage=close code=%s error_type=%s",
+                "Robot speech failed stage=close code=%s error_type=%s",
                 _exception_speech_error_code(error),
                 _exception_type_name(error),
             )
             return False
 
 
-__all__ = ("BlastEpisodeSpeech", "blast_episode_cancelled")
+__all__ = ("EpisodeSpeech", "episode_cancelled")

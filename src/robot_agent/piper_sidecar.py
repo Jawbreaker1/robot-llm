@@ -32,6 +32,12 @@ class VoiceVariant:
 
 
 VOICE_VARIANTS = {
+    "john-medium": VoiceVariant(
+        "en_US-john-medium",
+        1.0,
+        0.667,
+        0.8,
+    ),
     "cori-high": VoiceVariant(
         "en_GB-cori-high",
         1.0,

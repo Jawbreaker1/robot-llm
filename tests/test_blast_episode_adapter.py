@@ -708,6 +708,8 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
             ))
         )
         self.assertNotIn("scan_views", first.local_map_evidence)
+        self.assertEqual(first.local_map_evidence["robot_footprint"]["width_mm"], 205)
+        self.assertEqual(first.local_map_evidence["robot_footprint"]["turn_sweep_radius_mm"], 163)
         self.assertEqual(
             first.local_map_evidence["robot_pose"]["x_mm"], 0,
         )

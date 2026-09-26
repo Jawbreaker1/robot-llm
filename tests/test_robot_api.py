@@ -82,8 +82,9 @@ class RobotAPITests(unittest.TestCase):
         )
         self.assertEqual(
             capabilities.motor("arm").max_abs_speed_dps,
-            150,
+            1560,
         )
+        self.assertEqual(capabilities.motor("arm").max_duration_ms, 2000)
         self.assertEqual(
             capabilities.motion_retry_semantics,
             "at_most_once",

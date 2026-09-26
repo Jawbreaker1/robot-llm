@@ -240,7 +240,7 @@ class AgentLoopTests(unittest.TestCase):
             lambda context: act(
                 context,
                 "proposal-too-fast",
-                speed_dps=151,
+                speed_dps=json.loads(CONFIG_PATH.read_text())["limits"]["arm"]["max_abs_speed_dps"] + 1,
             ),
             lambda context: act(
                 context,
@@ -544,7 +544,7 @@ class AgentLoopTests(unittest.TestCase):
             lambda context: act(
                 context,
                 "proposal-without-replan-budget",
-                speed_dps=151,
+                speed_dps=json.loads(CONFIG_PATH.read_text())["limits"]["arm"]["max_abs_speed_dps"] + 1,
             )
         )
 

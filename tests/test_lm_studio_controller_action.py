@@ -99,6 +99,19 @@ class ControllerActionPlannerTests(unittest.TestCase):
         )
         return planner, transport
 
+    def test_slow_model_response_budget_is_explicit_and_bounded(self):
+        planner, transport = self.planner(completion({
+            "action": "DRIVE_FORWARD", "confidence_milli": 950,
+            "assessment": "Continue.", "plan": ["DRIVE_FORWARD"], "utterance": None,
+        }), timeout_seconds=120, reasoning_effort="low", max_output_tokens=4096)
+        planner.decide(context(completion_allowed=False))
+        self.assertEqual(transport.calls[0][3], 120)
+        payload = json.loads(transport.calls[0][1])
+        self.assertEqual(payload["reasoning_effort"], "low")
+        self.assertEqual(payload["max_tokens"], 4096)
+        with self.assertRaises(LMStudioConfigurationError):
+            LMStudioControllerActionPlanner(timeout_seconds=181)
+
     def test_completion_expression_uses_existing_social_vocabulary(self):
         expression = {"face": "happy", "gesture": "claw_flourish"}
         planner, transport = self.planner(completion({
@@ -280,7 +293,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         supplied = json.loads(request["messages"][1]["content"])
         self.assertEqual(supplied["waypoint_reached_radius_mm"], 75)
         self.assertIn(
-            "a corner may begin that far before its coordinates",
+            "can start a corner early",
             request["messages"][0]["content"],
         )
 
@@ -724,6 +737,25 @@ class ControllerActionPlannerTests(unittest.TestCase):
 
         with self.assertRaises(LMStudioInputError):
             context(local_map_evidence=[])
+
+    def test_ir_context_does_not_claim_metric_map_or_body_clearance_checks(self):
+        planner, transport = self.planner(completion({
+            "action": SCAN_FRONT_ARC, "confidence_milli": 800,
+            "assessment": "Inspect the next leg.", "plan": [SCAN_FRONT_ARC], "utterance": None,
+        }))
+        planner.decide(context(available_actions=(SCAN_FRONT_ARC,), local_map_evidence={
+            "metric_distance_available": False, "ir_survey": {"samples": []},
+        }))
+        prompt = json.loads(transport.calls[0][1])["messages"][0]["content"]
+        self.assertIn("SAME fixed episode frame", prompt)
+        self.assertIn("observed_from", prompt)
+        self.assertIn("whole footprint", prompt)
+        self.assertIn("Motor availability is not evidence of free space", prompt)
+        self.assertIn("ir_reference_observations", prompt)
+        self.assertNotIn("execution checks each leg against", prompt)
+        self.assertNotIn("direct_detour_axis_candidates", prompt)
+        self.assertNotIn("column_y_mm", prompt)
+        self.assertLess(len(prompt), 5_000)
 
     def test_waypoint_round_trips_as_model_owned_advisory_memory(self):
         waypoint = {

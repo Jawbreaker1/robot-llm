@@ -1,5 +1,7 @@
 from copy import deepcopy
 import math
+import subprocess
+import sys
 from unittest import TestCase
 
 from robot_agent.blast_episode_map_trace import _BlastEpisodeMapTrace
@@ -69,6 +71,17 @@ def planned_leg(kind="SIDE_SEARCH", scope="SEARCH_POSITION_ONLY",
 
 
 class BlastSpatialMapBridgeTests(TestCase):
+    def test_blast_map_does_not_load_legacy_ev3_detour_planning(self):
+        subprocess.run(
+            [sys.executable, "-c", (
+                "import sys; import robot_agent.blast_spatial_map; "
+                "import robot_agent.blast_episode_map_trace; "
+                "assert not any(name.startswith('robot_agent.local_detour') "
+                "for name in sys.modules)"
+            )],
+            check=True, capture_output=True, text=True,
+        )
+
     def bridge(self):
         return BlastSpatialMapBridge(
             monotonic_clock_ms=Clock(100),

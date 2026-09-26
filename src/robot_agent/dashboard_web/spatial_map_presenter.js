@@ -200,7 +200,6 @@
           anchorPose.xMm,
           anchorPose.yMm,
           anchorPose.headingMdeg,
-          evidence.relation,
         ].join(":");
         if (cueKeys.has(key)) {
           return;
@@ -226,9 +225,14 @@
           addCue(hypothesis.anchorPose, hypothesis);
         }
       });
+      // Latest sample wins at an unchanged sensor pose; don't stack labels.
+      [...map.qualitativeObservations].reverse().forEach((evidence) => {
+        if (evidence.anchorPose) addCue(evidence.anchorPose, evidence);
+      });
       if (
         map.robotPose
         && map.qualitativeObservations.length > 0
+        && !map.qualitativeObservations[map.qualitativeObservations.length - 1].anchorPose
       ) {
         addCue(
           map.robotPose,
@@ -256,14 +260,13 @@
       };
     }
 
-    function fittedMetricProjection(points) {
+    function fittedMetricProjection(points, padding = 100) {
       const minX = Math.min(...points.map((point) => point.xMm));
       const maxX = Math.max(...points.map((point) => point.xMm));
       const minY = Math.min(...points.map((point) => point.yMm));
       const maxY = Math.max(...points.map((point) => point.yMm));
       const spanX = maxX - minX;
       const spanY = maxY - minY;
-      const padding = 100;
       const scaleCandidates = [];
       if (spanX > 0) {
         scaleCandidates.push((SVG_WIDTH - 2 * padding) / spanX);
@@ -644,7 +647,7 @@
       if (map.navigationTrace) {
         layer.setAttribute("data-geometry", "mixed-local-odometry");
       }
-      const projection = fittedMetricProjection(scene.points);
+      const projection = fittedMetricProjection(scene.points, scene.cues.length ? 150 : 100);
 
       const layerLabel = createSvgElement("text", {
         x: 32,
@@ -656,6 +659,9 @@
           ? "map.navigation_trace.layer_label"
           : "map.local_odometry.layer_label",
       );
+      if (map.robotId) {
+        layerLabel.textContent = `${map.robotId.toUpperCase()} · ${layerLabel.textContent}`;
+      }
       layer.appendChild(layerLabel);
       const layerNote = createSvgElement("text", {
         x: 32,
@@ -665,6 +671,8 @@
       layerNote.textContent = t(
         map.reasonCode === "localization_lost"
           ? "map.local_odometry.localization_lost_note"
+          : map.navigationTrace?.provenance === "LOCAL_ODOMETRY + PROVISIONAL_IR"
+            ? "map.local_odometry.layer_note"
           : map.navigationTrace
             ? "map.navigation_trace.layer_note"
             : "map.local_odometry.layer_note",
@@ -715,59 +723,40 @@
         const heading = (
           anchorPose.headingMdeg / 1000
         ) * Math.PI / 180;
-        const halfAngle = Math.PI / 7;
-        const left = screenPoint(anchor, heading + halfAngle, 64);
-        const right = screenPoint(anchor, heading - halfAngle, 64);
-        const tickStart = screenPoint(anchor, heading, 46);
-        const tickEnd = screenPoint(anchor, heading, 68);
+        // A direction-only observation has no metric endpoint or hit marker.
+        const end = screenPoint(anchor, heading, 100);
+        const raw = evidence.rawIrProximity;
+        const hasReflection = Number.isFinite(raw) && raw < 100;
         let relationClass = "is-unknown";
         if (evidence.relation === "NEAR_OBSTACLE") {
           relationClass = "is-near";
-        } else if (evidence.relation === "NO_NEAR_REFLECTION") {
-          relationClass = "is-no-near-reflection";
+        } else if (hasReflection) {
+          relationClass = "is-reflection";
         }
         const group = createSvgElement("g", {
           class: `map-local-ir-cue ${relationClass}`,
           "data-provisional": "true",
           "data-metric-distance": "none",
+          "data-raw-ir": raw ?? "unknown",
         });
         appendSvgTitle(group, [
           t("map.local_odometry.ir_title", {
-            relation: relationLabel(evidence.relation),
+            relation: relationLabel(hasReflection ? "REFLECTION"
+              : raw === 100 ? "UNKNOWN" : evidence.relation),
           }),
+          t("map.qualitative.raw_value", { value: raw ?? "?" }),
           t("map.local_odometry.nonmetric"),
           ...mapTooltipParts(evidence),
         ]);
-        group.appendChild(createSvgElement("path", {
-          d: [
-            `M ${anchor.x} ${anchor.y}`,
-            `L ${left.x} ${left.y}`,
-            `L ${right.x} ${right.y}`,
-            "Z",
-          ].join(" "),
-          class: "map-local-ir-wedge",
-        }));
         group.appendChild(createSvgElement("line", {
-          x1: tickStart.x,
-          y1: tickStart.y,
-          x2: tickEnd.x,
-          y2: tickEnd.y,
-          class: "map-local-ir-tick",
+          x1: anchor.x,
+          y1: anchor.y,
+          x2: end.x,
+          y2: end.y,
+          class: "map-local-ir-ray",
+          "stroke-width": hasReflection ? 1.5 + (100 - raw) / 40 : 1.5,
         }));
-        group.appendChild(createSvgElement("circle", {
-          cx: anchor.x,
-          cy: anchor.y,
-          r: 7,
-          class: "map-local-ir-anchor",
-        }));
-        const cueLabel = createSvgElement("text", {
-          x: tickEnd.x + 10,
-          y: tickEnd.y - 8,
-          class: "map-local-ir-label",
-        });
-        cueLabel.textContent = t("map.local_odometry.ir_label");
-        group.appendChild(cueLabel);
-        layer.appendChild(group);
+        (navigationScanLayer || layer).appendChild(group);
       });
 
       const scanCounts = retainedScanCounts(map);
@@ -1793,6 +1782,13 @@
 
     function render(spatialMap, connection = "connected", nowUnixMs) {
       const map = normalizeSpatialMap(spatialMap, nowUnixMs);
+      const irOnly = map.navigationTrace?.provenance === "LOCAL_ODOMETRY + PROVISIONAL_IR";
+      ["map-legend-imu", "map-legend-ultrasonic"].forEach((id) => {
+        if (byId(id)) byId(id).hidden = irOnly;
+      });
+      if (byId("map-legend-ir")) {
+        byId("map-legend-ir").hidden = !map.qualitativeObservations?.length;
+      }
       const status = byId("map-connection-status");
       const sharedMap = map.schema === SHARED_SPATIAL_MAP_SCHEMA;
       const sharedScene = sharedMap

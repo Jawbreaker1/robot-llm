@@ -71,12 +71,19 @@ SCAN_TURN_ALLOWED_DELTAS_MDEG = tuple(
     for value in range(-120000, 120001, 15000)
     if value != 0
 )
-SCAN_TURN_PROFILE_ID = "ev3rstorm-provisional-ir-turn-v2"
+SCAN_TURN_PROFILE_ID = "ev3rstorm-provisional-ir-turn-v5"
 SCAN_TURN_CALIBRATION = "provisional_live_encoder_derived"
-SCAN_TURN_SPEED_DPS = 250
+# Keep the scan step within one physical 800 ms pulse.  The previous v3
+# profile over-rotated the body at its faster scan speed; v4 trims the pulse
+# duration and encoder target while retaining the single-pulse rhythm.
+SCAN_TURN_SPEED_DPS = 267
 SCAN_TURN_REFERENCE_BODY_MDEG = 90000
-SCAN_TURN_REFERENCE_ENCODER_DEGREES = 682
-SCAN_TURN_REFERENCE_DURATION_MS = 2560
+# 90,000 mdeg / 137 mdeg per encoder degree, rounded to the nearest whole
+# encoder degree.  This keeps the scan contract internally consistent with
+# the physical turn calibration while the shorter v4 pulse compensates the
+# high-speed scan's measured over-rotation.
+SCAN_TURN_REFERENCE_ENCODER_DEGREES = 657
+SCAN_TURN_REFERENCE_DURATION_MS = 2370
 SCAN_TURN_MAX_SLICE_DURATION_MS = 800
 SCAN_TURN_MAX_SIDE_DIVERGENCE_DEGREES = 80
 SCAN_SAMPLE_COUNT = 5
@@ -204,7 +211,7 @@ ACTION_SPECS = {
         "calibration_evidence": None,
         "calibration": "not_applicable",
     },
-    # The checked-in EV3RSTORM calibration records about 682 encoder degrees
+    # The checked-in EV3RSTORM calibration records about 657 encoder degrees
     # for a visually estimated 90 degree body turn.  A later live 250 dps
     # segment produced a mean 214.5 encoder degrees in 800 ms.  Three full
     # slices plus one 160 ms correction target that same encoder travel while
@@ -217,7 +224,7 @@ ACTION_SPECS = {
         "slice_count": 4,
         "total_duration_ms": 2560,
         "estimated_body_turn_degrees": 90,
-        "target_mean_abs_encoder_degrees": 682,
+        "target_mean_abs_encoder_degrees": 657,
         "calibration_evidence": {
             "source_action": "live_turn_left_segment",
             "source_speed_dps": 250,
@@ -236,7 +243,7 @@ ACTION_SPECS = {
         "slice_count": 4,
         "total_duration_ms": 2560,
         "estimated_body_turn_degrees": -90,
-        "target_mean_abs_encoder_degrees": 682,
+        "target_mean_abs_encoder_degrees": 657,
         "calibration_evidence": {
             "source_action": "live_turn_left_segment",
             "source_speed_dps": 250,

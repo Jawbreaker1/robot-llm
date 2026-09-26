@@ -11,9 +11,10 @@ from robot_agent.piper_sidecar import (
 class PiperSidecarTests(unittest.TestCase):
     def test_robot_voice_contract_is_small_and_explicit(self):
         self.assertEqual(
-            set(VOICE_VARIANTS), {"lisa-bright", "nst-deep", "cori-high"}
+            set(VOICE_VARIANTS), {"lisa-bright", "nst-deep", "cori-high", "john-medium"}
         )
         self.assertEqual(VOICE_VARIANTS["cori-high"].model_name, "en_GB-cori-high")
+        self.assertEqual(VOICE_VARIANTS["john-medium"].model_name, "en_US-john-medium")
         self.assertEqual(
             parse_synthesis_request({
                 "model": "piper-sv",

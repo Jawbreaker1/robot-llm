@@ -11,9 +11,8 @@ from uuid import uuid4
 from typing import Callable, Mapping, Sequence
 
 from . import lm_studio as _lm
-from .blast_personality import (
-    normalize_persona_by_locale, social_expression_schema, valid_social_expression,
-)
+from .blast_personality import normalize_persona_by_locale
+from .social_expression import social_expression_schema, valid_social_expression
 from .navigation_diagnostics import record_navigation_diagnostic
 
 
@@ -66,17 +65,21 @@ _SYSTEM_PROMPT = (
     "executable leg, not to limit future hypotheses. Keep the route until "
     "reached, blocked or disproved; extend it as needed. Useful lateral or "
     "backward legs need not reduce distance to the goal. Account for "
-    "waypoint_reached_radius_mm: a corner may begin that far before its "
-    "coordinates. When waypoint_required is true, retain or replace the "
+    "robot_footprint and turn_sweep_radius_mm around each waypoint center. "
+    "waypoint_reached_radius_mm "
+    "can start a corner early. When waypoint_required is true, retain or replace the "
     "intermediate waypoint, not with the final goal.\n\n"
 
     "Evidence and recovery: observation.odometry and local_map_evidence.robot_pose "
     "give the current geometry. robot_relative_side_scan labels the robot's "
     "physical left/right at scan start; compare the full angular pattern on "
     "both sides, not just near rays. Use active_waypoint_geometry and "
-    "active_waypoint_geometry_after for distance and heading error; positive "
+    "active_waypoint_geometry_after for distance and heading error. bearing_deg "
+    "is a fixed episode-frame heading; heading_error_deg is the relative turn needed. Positive "
     "error means left, negative right. Use the resulting pose after partial "
     "motion; do not assume the requested movement completed. "
+    "history.last_motion, when present, identifies the actual primitive and measured progress. "
+    "A blocked turn is not evidence that travel toward the waypoint was attempted or that its side is blocked. "
     "NO_VALID_DISTANCE means no ultrasonic echo; this can be normal in open "
     "space and alone indicates neither a sensor fault nor an obstacle. It does not certify free space "
     "or erase known obstacles. When forward/follow is available, continue the "
@@ -114,11 +117,26 @@ _UTTERANCE_LENGTH_PROMPT = (
 )
 
 _LOCAL_MAP_PROMPT = (
-    "\n\nMap: all positions, echo_bounds_mm, keep-out bounds and waypoints "
+    "\n\nMap: all positions and waypoints "
     "already use the SAME fixed episode frame. Do not rotate or translate "
     "them using the current robot pose. Only robot_relative_side_scan is "
     "robot-relative. Episode-local +x is starting forward, +y is starting left, "
     "-y is starting right. Positive heading turns left. "
+)
+
+_IR_MAP_PROMPT = (
+    "IR survey rays retain observed_from and ray_heading_deg_in_episode, not "
+    "current-relative bearings. observation.infrared is current. Raw/filtered "
+    "IR is unitless: lower means stronger/closer reflection, not centimetres. "
+    "Use ir_reference_observations and compare directions. Motor availability "
+    "is not evidence of free space; weak reflections can "
+    "still be nearby objects. No metric obstacle bounds or geometric clearance "
+    "checks exist. A ray gives neither object size nor body-wide clearance. "
+    "Allow for the whole footprint. Explore "
+    "and revise routes without inventing obstacle sizes or treating unknown as blocked."
+)
+
+_METRIC_MAP_PROMPT = (
     "coarse_grid is a rolling low-resolution view over stable coordinates. "
     "For character j in rows[i].cells, x is rows[i].x_mm and y is column_y_mm[j]. "
     "Read these labels, not guessed row/column positions. "
@@ -510,7 +528,7 @@ class LMStudioControllerActionPlanner:
             or not callable(clock)
             or isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
-            or not 0.1 <= float(timeout_seconds) <= 60.0
+            or not 0.1 <= float(timeout_seconds) <= 180.0
             or reasoning_effort not in REASONING_EFFORTS
             or isinstance(max_output_tokens, bool)
             or not isinstance(max_output_tokens, int)
@@ -636,6 +654,10 @@ class LMStudioControllerActionPlanner:
             )
         if context.local_map_evidence is not None:
             system_prompt += _LOCAL_MAP_PROMPT
+            system_prompt += (
+                _IR_MAP_PROMPT if "ir_survey" in context.local_map_evidence
+                else _METRIC_MAP_PROMPT
+            )
         if self._utterance_persona_by_locale is not None:
             system_prompt += _UTTERANCE_PERSONA_PROMPT.format(
                 persona=self._utterance_persona_by_locale[context.locale]

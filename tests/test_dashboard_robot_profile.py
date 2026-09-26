@@ -255,7 +255,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--robot-target is required"):
             _configured_robot_runtime_adapter(args)
 
-    def test_ev3_profile_builds_binding_and_deferred_planner_factory(self):
+    def test_ev3_profile_builds_hardware_binding_without_legacy_planner(self):
         with tempfile.TemporaryDirectory() as directory:
             args = _parser().parse_args(
                 [
@@ -276,16 +276,11 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 profile_id=EV3RSTORM_PROFILE_ID
             )
             profile.build_adapter.return_value = built_adapter
-            planner = object()
             with (
                 mock.patch(
                     "robot_agent.dashboard_cli.EV3RSTORMProfile",
                     return_value=profile,
                 ),
-                mock.patch(
-                    "robot_agent.dashboard_cli.LMStudioNavigationPlanner",
-                    return_value=planner,
-                ) as planner_type,
             ):
                 result = _configured_robot_runtime_adapter(args)
 
@@ -294,16 +289,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 self.assertIsInstance(binding, EV3SSHBinding)
                 self.assertEqual(binding.target, "robot@ev3dev.local")
                 self.assertTrue(binding.reset_memory)
-                planner_factory = profile.build_adapter.call_args.kwargs[
-                    "planner_factory"
-                ]
-                planner_type.assert_not_called()
-                self.assertIs(planner_factory("model-a"), planner)
-                planner_type.assert_called_once_with(
-                    base_url=args.lm_studio_url,
-                    model="model-a",
-                    timeout_seconds=7.5,
-                )
+            profile.build_adapter.assert_called_once_with(binding, planner_factory=mock.ANY)
 
     def test_blast_profile_requires_and_reuses_one_monitor(self):
         # The live 120-character navigation remark in
@@ -534,6 +520,9 @@ class DashboardRobotProfileTests(unittest.TestCase):
 
     def test_run_configures_ev3_and_blast_as_selectable_targets(self):
         adapter = mock.Mock()
+        adapter.navigation_adapter = None
+        adapter.navigation_unavailable_reason = "EV3 navigation is temporarily unavailable."
+        adapter.robot_description = {"robot_id": "ev3rstorm-01", "capabilities": ["motor.arm"]}
         blast_adapter = mock.Mock()
         reachability = mock.Mock(spec=("snapshot", "check"))
         adapter.controller_runtime_provider = reachability
@@ -593,6 +582,9 @@ class DashboardRobotProfileTests(unittest.TestCase):
             input_services = server_type.call_args.kwargs[
                 "robot_input_services"
             ]
+            self.assertEqual(input_services["ev3rstorm-01"]._facts()["robot_description"],
+                             adapter.robot_description)
+            self.assertEqual(input_services["blast-01"]._facts()["robot_description"], {})
             built_ev3_model = input_services[
                 "ev3rstorm-01"
             ]._model_factory("model-a")
@@ -610,6 +602,12 @@ class DashboardRobotProfileTests(unittest.TestCase):
             monitor,
         )
         self.assertEqual(control_type.call_count, 2)
+        self.assertIsNone(control_type.call_args_list[0].args[0])
+        self.assertEqual(
+            control_type.call_args_list[0].kwargs["disabled_reason"],
+            adapter.navigation_unavailable_reason,
+        )
+        self.assertIs(control_type.call_args_list[1].args[0], blast_adapter)
         ev3_gate = control_type.call_args_list[0].kwargs["episode_gate"]
         blast_gate = control_type.call_args_list[1].kwargs["episode_gate"]
         self.assertIs(ev3_gate, blast_gate)
@@ -648,6 +646,8 @@ class DashboardRobotProfileTests(unittest.TestCase):
                     base_url="http://127.0.0.1:1234",
                     model="model-a",
                     timeout_seconds=10.0,
+                    social_expressions=True,
+                    social_profile="ev3",
                 ),
                 mock.call(
                     base_url="http://127.0.0.1:1234",

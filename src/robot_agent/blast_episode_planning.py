@@ -6,7 +6,7 @@ import copy
 import math
 from typing import Mapping
 from .blast_action_admission import BlastActionEvidenceChanged
-from .blast_episode_speech import blast_episode_cancelled
+from .episode_speech import episode_cancelled as blast_episode_cancelled
 from .blast_observation_monitor import (
     CONTROLLER_ID,
     RANGE_STATE_MEASURED,
@@ -36,6 +36,11 @@ from .blast_episode_execution import (
     _STARTUP_SURROUNDINGS_ACTION,
     BlastEpisodeError,
 )
+from .waypoint_geometry import (
+    WAYPOINT_REACHED_RADIUS_MM as _WAYPOINT_REACHED_RADIUS_MM,
+    WAYPOINT_ALIGNMENT_TRIGGER_DEG as _WAYPOINT_ALIGNMENT_TRIGGER_DEG,
+    consume_reached_waypoints,
+)
 
 
 BLAST_PLAN_ACTIONS = (
@@ -49,12 +54,6 @@ BLAST_PLAN_ACTIONS = (
 
 _PLANNER_ACTION_SOURCE = "PLANNER_ACTION"
 _PLAN_CONTINUATION_ACTION_SOURCE = "PLAN_CONTINUATION"
-
-# Finish the commanded axis close to its target. Cross-axis LEGO odometry
-# drift is handled separately; a large circular radius cuts corner legs short.
-_WAYPOINT_REACHED_RADIUS_MM = 25
-
-_WAYPOINT_ALIGNMENT_TRIGGER_DEG = 12.0
 
 def _planner_navigation_value(value):
     """Expose coarse episode facts without hardware-scale angle precision."""
@@ -395,16 +394,9 @@ def _admit_waypoint_step(
         motion_executor.pose,
         step["waypoint_plan"],
     )
-    reached_waypoints = []
-    while (
-        waypoint_plan
-        and adapter._waypoint_reached(
-            motion_executor.pose, waypoint_plan[0],
-            mission=map_trace.mission,
-        )
-    ):
-        reached_waypoints.append(waypoint_plan[0])
-        waypoint_plan = waypoint_plan[1:]
+    waypoint_plan, reached_waypoints = consume_reached_waypoints(
+        motion_executor.pose, waypoint_plan, mission=map_trace.mission,
+    )
     if (
         requested_action == FOLLOW_WAYPOINT
         and reached_waypoints

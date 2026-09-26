@@ -4,9 +4,7 @@ import unittest
 from pathlib import Path
 
 from robot_agent.ev3rstorm_profile import (
-    EV3RSTORM_PROFILE_ID,
     EV3RSTORMProfile,
-    EV3SSHBinding,
 )
 from robot_agent.physical_navigation_contract import (
     ADVANCE,
@@ -16,6 +14,7 @@ from robot_agent.physical_navigation_contract import (
     TURN_RIGHT_90,
 )
 from robot_agent.physical_footprint import RobotFootprint
+from robot_agent.blast_navigation_calibration import BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
 from robot_agent.physical_odometry import PhysicalPose
 from robot_agent.physical_scan_evidence import (
     ScanAttemptEvidence,
@@ -56,6 +55,19 @@ def hazard_map(*, footprint=None, x_mm=100, y_mm=-120, radius_mm=10):
 
 
 class ProvisionalHazardFootprintTests(unittest.TestCase):
+    def test_shared_planner_view_uses_each_robots_existing_dimensions(self):
+        for body, length, width, radius in (
+            (EV3RSTORMProfile().hazard_calibration.robot_footprint, 200, 230, 181),
+            (BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.robot_footprint, 170, 205, 163),
+        ):
+            with self.subTest(width=width):
+                view = body.planner_view()
+                self.assertEqual(view["length_mm"], length)
+                self.assertEqual(view["width_mm"], width)
+                self.assertEqual(view["turn_sweep_radius_mm"], radius)
+                self.assertEqual(view["clearance_margin_mm"], 10)
+                self.assertEqual({key: view[key] for key in body.to_dict()}, body.to_dict())
+
     def setUp(self):
         self.pose = PhysicalPose()
         self.asymmetric = RobotFootprint(
@@ -327,7 +339,7 @@ class ProvisionalHazardFootprintTests(unittest.TestCase):
         self.assertFalse(close_scan["allowed"])
         self.assertTrue(backed_scan["allowed"])
 
-    def test_ev3_profile_injects_operator_measured_asymmetric_geometry(self):
+    def test_ev3_profile_retains_operator_measured_asymmetric_geometry(self):
         profile = EV3RSTORMProfile()
         footprint = profile.hazard_calibration.robot_footprint
 
@@ -336,34 +348,20 @@ class ProvisionalHazardFootprintTests(unittest.TestCase):
             footprint.right_extent_mm,
             footprint.left_extent_mm,
         )
-        with tempfile.TemporaryDirectory() as directory:
-            adapter = profile.build_adapter(
-                EV3SSHBinding(
-                    profile_id=EV3RSTORM_PROFILE_ID,
-                    target="robot@ev3dev.local",
-                    memory_path=Path(directory) / "memory.json",
-                ),
-                planner_factory=lambda _model: object(),
-            )
-            memory = adapter.memory_factory()
-
-        self.assertIs(
-            memory.hazard_map.calibration,
-            profile.hazard_calibration,
+        geometry = footprint.to_dict()
+        self.assertEqual(
+            geometry["right_extent_mm"],
+            130,
         )
         self.assertEqual(
-            memory.context()["collision_geometry"]["right_extent_mm"],
-            footprint.right_extent_mm,
-        )
-        self.assertEqual(
-            memory.context()["collision_geometry"][
+            geometry[
                 "calibration_status"
             ],
             "operator-measured-current-build",
         )
         self.assertIn(
             "100 mm left and 130 mm right",
-            memory.context()["collision_geometry"][
+            geometry[
                 "calibration_evidence"
             ],
         )

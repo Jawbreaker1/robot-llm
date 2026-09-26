@@ -48,7 +48,6 @@ from .ev3rstorm_profile import (
     EV3SSHBinding,
 )
 from .lm_studio import DEFAULT_BASE_URL, DEFAULT_MODEL
-from .lm_studio_navigation import LMStudioNavigationPlanner
 from .lm_studio_controller_action import (
     LMStudioControllerActionPlanner,
     REASONING_EFFORTS,
@@ -641,12 +640,6 @@ def _configured_robot_runtime_adapter(args, *, blast_monitor=None):
         raise ValueError(
             "--robot-target is required with --robot-profile ev3rstorm-01"
         )
-    if (
-        not math.isfinite(args.robot_planner_timeout_seconds)
-        or not 0.5 <= args.robot_planner_timeout_seconds <= 60.0
-    ):
-        raise ValueError("physical planner timeout is invalid")
-
     profile = EV3RSTORMProfile()
     binding = EV3SSHBinding(
         profile_id=profile.descriptor.profile_id,
@@ -655,17 +648,9 @@ def _configured_robot_runtime_adapter(args, *, blast_monitor=None):
         reset_memory=args.robot_reset_memory,
     )
 
-    def planner_factory(model):
-        return LMStudioNavigationPlanner(
-            base_url=args.lm_studio_url,
-            model=model,
-            timeout_seconds=args.robot_planner_timeout_seconds,
-        )
-
-    return profile.build_adapter(
-        binding,
-        planner_factory=planner_factory,
-    )
+    return profile.build_adapter(binding, planner_factory=lambda model: LMStudioControllerActionPlanner(
+        base_url=args.lm_studio_url, model=model, timeout_seconds=args.robot_planner_timeout_seconds,
+        reasoning_effort=args.blast_reasoning_effort, max_output_tokens=4096))
 
 
 def _configured_blast_runtime_adapter(args, blast_monitor):
@@ -1068,6 +1053,9 @@ def _run(
                     options["reply_persona_by_locale"] = (
                         BLAST_PERSONA_BY_LOCALE
                     )
+                elif profile_id == "ev3rstorm-01":
+                    options["social_expressions"] = True
+                    options["social_profile"] = "ev3"
                 return LMStudioRobotInputModel(**options)
 
             return build_input_model
@@ -1087,7 +1075,8 @@ def _run(
             if shared_episode_gate is not None:
                 control_options["episode_gate"] = shared_episode_gate
             control = RobotControlService(
-                adapter,
+                state.get("navigation_adapter", adapter),
+                disabled_reason=state.get("navigation_unavailable_reason"),
                 **control_options,
             )
             robot_control_resources.append(control)
@@ -1095,7 +1084,7 @@ def _run(
             speech_factory = state.get("speech_runtime_factory")
             speech_locales = state.get("speech_locales", ())
             if callable(speech_factory) and speech_locales:
-                if profile_id == BLAST_PROFILE_ID:
+                if profile_id in (BLAST_PROFILE_ID, "ev3rstorm-01"):
                     speech_factory = partial(
                         speech_factory,
                         gesture_allowed=lambda control=control: control.status()["state"] == "IDLE",
@@ -1109,6 +1098,7 @@ def _run(
                 control_service=control,
                 model_factory=input_model_factory(profile_id),
                 spatial_map_provider=local_map,
+                robot_description=state.get("robot_description"),
                 speech_sink=(
                     speech.submit if speech is not None else None
                 ),
@@ -1177,7 +1167,10 @@ def _run(
                     "status": "ready",
                     "url": address,
                     "physical_control_enabled": (
-                        robot_runtime_adapter is not None
+                        any(
+                            state.get("navigation_adapter", adapter) is not None
+                            for _, adapter, state, _, _ in entry_states
+                        )
                     ),
                     "robot_profile": (
                         "injected"

@@ -396,8 +396,8 @@
       || text(trace.frame_id) === null
       || frameId === null
       || trace.frame_id !== frameId
-      || trace.provenance
-        !== "PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY"
+      || !["PROVISIONAL_ENCODER_ODOMETRY + PROVISIONAL_YAW_ONLY",
+        "LOCAL_ODOMETRY + PROVISIONAL_IR"].includes(trace.provenance)
       || !sharedIdentityValid
       || finalGoal === null
       || !Array.isArray(trace.planar_scan_views)
@@ -1432,6 +1432,7 @@
       const rawIr = finite(observation.raw_ir_proximity);
       const confidence = finite(observation.confidence_milli);
       return [Object.freeze({
+        ...(observation.anchor_pose ? { anchorPose: normalizeTracePose(observation.anchor_pose) } : {}),
         bearing: text(observation.bearing),
         relation,
         rawIrProximity: (

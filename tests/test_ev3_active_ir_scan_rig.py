@@ -857,10 +857,10 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
 
     def test_real_motor_profile_fits_derived_scan_deadline(self):
         budget = worst_case_scan_budget()
-        self.assertEqual(budget["turn_duration_ms"], 11_945)
-        self.assertEqual(budget["turn_slice_count"], 22)
+        self.assertEqual(budget["turn_duration_ms"], 11_060)
+        self.assertEqual(budget["turn_slice_count"], 15)
         self.assertEqual(budget["request_round_trip_headroom_ms"], 250)
-        self.assertEqual(budget["minimum_deadline_ms"], 19_145)
+        self.assertEqual(budget["minimum_deadline_ms"], 18_260)
         clock = FakeClock()
         transport = FakeScanTransport(clock, use_profile_timing=True)
         executor = build_ev3_active_ir_scan_executor(
@@ -888,7 +888,7 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
 
         self.assertEqual(budget["worker_request_count"], 20)
         self.assertEqual(budget["request_round_trip_headroom_ms"], 750)
-        self.assertEqual(budget["minimum_deadline_ms"], 29_145)
+        self.assertEqual(budget["minimum_deadline_ms"], 28_260)
         self.assertGreater(budget["minimum_deadline_ms"], 20_071)
 
     def test_live_wifi_latency_needs_ev3_profile_scan_deadline(self):
@@ -912,7 +912,7 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
             ).execute(request)
             return request, result
 
-        short_request, short_result = execute_with_deadline(20_000)
+        short_request, short_result = execute_with_deadline(19_500)
         with self.assertRaises(ActiveIrScanContractError) as caught:
             validate_scan_result(
                 short_result,
@@ -976,7 +976,7 @@ class EV3ActiveIrScanRigTests(unittest.TestCase):
 
         self.assertIs(checked, result)
         self.assertEqual(result.status, "CANCELLED")
-        self.assertEqual(result.reason, "scan_deadline_exceeded")
+        self.assertEqual(result.reason, "scan_deadline_reserve")
         self.assertTrue(result.stop_confirmed)
         self.assertTrue(result.restored_start_heading)
         self.assertGreater(len(result.rays), 0)

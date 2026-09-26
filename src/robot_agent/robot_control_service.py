@@ -233,6 +233,7 @@ class RobotControlService:
         *,
         settings: Optional[RobotControlSettings] = None,
         target: Optional[RobotControlTarget] = None,
+        disabled_reason: Optional[str] = None,
         event_capacity: int = MAX_EVENTS,
         snapshot_capacity: int = MAX_SNAPSHOTS,
         event_byte_capacity: int = MAX_EVENT_HISTORY_BYTES,
@@ -275,9 +276,9 @@ class RobotControlService:
         if (
             target is not None
             and not isinstance(target, RobotControlTarget)
-        ) or ((target is None) != (runtime_adapter is None)):
+        ) or (target is None and runtime_adapter is not None):
             raise ValueError(
-                "Robot control target must exist exactly when a runtime "
+                "Robot control target must exist when a runtime "
                 "adapter is configured"
             )
         self._adapter = runtime_adapter
@@ -299,6 +300,7 @@ class RobotControlService:
         self._last_primary_error_code = None
         self._last_primary_error_message = None
         self._runtime = RobotRuntimeUpdate(
+            message=disabled_reason if runtime_adapter is None else None,
             speech_status=(
                 "idle"
                 if self._settings.speech_enabled
@@ -625,7 +627,7 @@ class RobotControlService:
                 raise RobotControlServiceError(
                     503,
                     "robot_control_disabled",
-                    "No physical robot runtime is configured",
+                    self._runtime.message or "No physical robot runtime is configured",
                 )
             if self._state != IDLE or self._control_signals_inflight:
                 raise RobotControlServiceError(

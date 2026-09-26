@@ -80,6 +80,16 @@ class RobotFootprint:
             "calibration_evidence": self.calibration_evidence,
         }
 
+    def planner_view(self) -> Mapping[str, object]:
+        """The same measured body for every planner, with geometry made explicit."""
+        return {
+            **self.to_dict(),
+            "length_mm": self.front_extent_mm + self.rear_extent_mm,
+            "width_mm": self.left_extent_mm + self.right_extent_mm,
+            "turn_sweep_radius_mm": math.ceil(self.maximum_corner_radius_mm + self.clearance_margin_mm),
+            "reference": "Waypoints and odometry locate the drive origin, not the body edge. The in-place turn circle stays centered on that same origin and includes the existing margin; do not add it to already-expanded keep-outs.",
+        }
+
 
 def _point_distance(
     px: float,

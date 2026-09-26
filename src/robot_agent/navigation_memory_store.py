@@ -12,6 +12,7 @@ from typing import Callable, Mapping, Optional
 from .active_ir_scan_contract import ActiveIrScanResult
 from .physical_navigation_contract import (
     MOTION_ACTIONS,
+    SCAN_TURN_OPERATION,
     PhysicalNavigationContractError,
     json_bytes,
     strict_json_loads,
@@ -503,7 +504,7 @@ class NavigationMemoryStore:
         record_hazard_evidence: bool = True,
     ) -> Optional[ProvisionalHazard]:
         if (
-            action not in MOTION_ACTIONS
+            action not in MOTION_ACTIONS | {SCAN_TURN_OPERATION}
             or type(record_hazard_evidence) is not bool
         ):
             raise NavigationMemoryError("action is not motion")
@@ -549,52 +550,6 @@ class NavigationMemoryStore:
             )
             if record_hazard_evidence
             else None
-        )
-        self.updated_at_ms = max(self.updated_at_ms, int(now_ms))
-        self.save()
-        return hazard
-
-    def ingest_verified_heading_trim(
-        self,
-        sampled_observation: Mapping[str, object],
-        now_ms: int,
-    ) -> Optional[ProvisionalHazard]:
-        """Re-anchor after a verified trim without moving logical pose.
-
-        The transport/runtime validates the stopped turn and fresh sample.
-        Memory owns only the resulting encoder anchor and map observation.
-        """
-        try:
-            checked = validate_observation(sampled_observation)
-        except PhysicalNavigationContractError as error:
-            self.invalidate_localization(
-                "Unverifiable route heading trim",
-                now_ms,
-            )
-            raise NavigationMemoryError(
-                "heading trim sample is invalid"
-            ) from error
-        if self.drive_roles is None:
-            self.invalidate_localization(
-                "Unverifiable route heading trim",
-                now_ms,
-            )
-            raise NavigationMemoryError("drive motor roles are not bound")
-        positions = _motor_positions(checked, self.drive_roles)
-        if set(positions) != {self.drive_roles.left, self.drive_roles.right}:
-            self.invalidate_localization(
-                "Unverifiable route heading trim",
-                now_ms,
-            )
-            raise NavigationMemoryError(
-                "heading trim sample lacks configured drive roles"
-            )
-
-        self.motor_positions = dict(positions)
-        hazard = self.hazard_map.record_observation(
-            self.pose,
-            checked,
-            int(now_ms),
         )
         self.updated_at_ms = max(self.updated_at_ms, int(now_ms))
         self.save()

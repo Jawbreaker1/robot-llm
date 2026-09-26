@@ -36,6 +36,7 @@ const ids = [
   "map-qualitative-list", "map-qualitative-count", "map-object-list",
   "map-object-count", "map-local-odometry-layer", "map-cell-layer",
   "map-path-layer", "map-ray-layer", "map-object-layer", "map-robot-layer",
+  "map-legend-ir", "map-legend-imu", "map-legend-ultrasonic",
 ];
 const nodes = Object.fromEntries(ids.map((id) => [id, new FakeNode("div", id)]));
 const document = {
@@ -57,6 +58,7 @@ const translations = {
   "mission.route.waypoint.PASS_BEYOND_TARGET": "PASS BEYOND TARGET",
 };
 const translate = (key, args = {}) => {
+  if (key === "map.qualitative.raw_value") return `${args.value} / 100`;
   if (key === "map.objects.ultrasonic_support") return `${args.count}/${args.radius}`;
   if (key === "map.objects.source_scans") return args.scans;
   if (key === "map.navigation_trace.route_title") return `ROUTE ${args.side}`;
@@ -234,6 +236,36 @@ process.stdout.write(JSON.stringify({
     === "map-navigation-scan-layer",
   obstacleItemText: obstacleItem.textContent,
   metadataText: nodes["map-metadata"].textContent,
+  ev3: (() => {
+    presenter.render({
+      ...map, robot_id: "ev3rstorm-01", object_hypotheses: [],
+      qualitative_observations: [0, 54, 108].map((x, index) => ({
+        anchor_pose: {x_mm:x, y_mm:0, heading_mdeg:0},
+        bearing:"FORWARD", relation:"NO_NEAR_REFLECTION", provisional:true,
+        raw_ir_proximity:[44,71,100][index], provenance:"PROVISIONAL_IR",
+      })),
+      navigation_trace: {...map.navigation_trace,
+        provenance:"LOCAL_ODOMETRY + PROVISIONAL_IR", planar_scan_views:[],
+        coarse_grid:null, planned_leg:null},
+    }, "connected", 2000);
+    const layer = nodes["map-local-odometry-layer"];
+    const all = descendants(layer);
+    const cues = all.filter(n => String(n.attributes.class || "").startsWith("map-local-ir-cue"));
+    const result = {
+      heading:layer.children[0].textContent, note:layer.children[1].textContent,
+      cues:cues.map(n => n.children.map(child => child.tag)),
+      readings:cues.map(n => n.attributes["data-raw-ir"]),
+      labels:cues.flatMap(n => n.children.filter(child => child.tag === "text").map(child => child.textContent)),
+      tooltips:cues.map(n => n.children.find(child => child.tag === "title").textContent),
+      classes:cues.map(n => n.attributes.class),
+      directions:cues.map(n => n.attributes["data-metric-distance"]),
+      routeCount:all.filter(n => n.attributes.class === "map-local-detour-route").length,
+      legend:[nodes["map-legend-ir"].hidden,nodes["map-legend-imu"].hidden,nodes["map-legend-ultrasonic"].hidden],
+    };
+    presenter.render(map, "connected", 2000);
+    result.blastLegend = [nodes["map-legend-ir"].hidden,nodes["map-legend-imu"].hidden,nodes["map-legend-ultrasonic"].hidden];
+    return result;
+  })(),
 }));
 """
         completed = subprocess.run(
@@ -252,6 +284,19 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(completed.returncode, 0, completed.stderr)
         result = json.loads(completed.stdout)
         self.assertEqual(result["route"]["data-route-id"], "route-a")
+        self.assertTrue(result["ev3"]["heading"].startswith("EV3RSTORM-01 · "))
+        self.assertEqual(result["ev3"]["note"], "map.local_odometry.layer_note")
+        self.assertEqual(result["ev3"]["cues"], [["title", "line"]] * 3)
+        self.assertEqual(result["ev3"]["readings"], ["100", "71", "44"])
+        self.assertEqual(result["ev3"]["labels"], [])
+        for value, tooltip in zip((100, 71, 44), result["ev3"]["tooltips"]):
+            self.assertIn(str(value), tooltip)
+        self.assertEqual(result["ev3"]["classes"], ["map-local-ir-cue is-unknown",
+            "map-local-ir-cue is-reflection", "map-local-ir-cue is-reflection"])
+        self.assertEqual(result["ev3"]["directions"], ["none"] * 3)
+        self.assertEqual(result["ev3"]["routeCount"], 1)
+        self.assertEqual(result["ev3"]["legend"], [False, True, True])
+        self.assertEqual(result["ev3"]["blastLegend"], [True, False, False])
         self.assertEqual(
             result["waypointStatuses"],
             ["COMPLETED", "ACTIVE", "UPCOMING"],
@@ -326,6 +371,7 @@ class FakeNode {
 }
 
 const requiredIds = [
+  "map-legend-ir", "map-legend-imu", "map-legend-ultrasonic",
   "map-connection-status",
   "map-frame-label",
   "map-empty-state",
@@ -633,6 +679,7 @@ class FakeNode {
 
 const requiredIds = [
   "map-connection-status",
+  "map-legend-ir", "map-legend-imu", "map-legend-ultrasonic",
   "map-frame-label",
   "map-empty-state",
   "map-empty-title",
@@ -722,7 +769,6 @@ const translations = {
   "map.frame.unavailable": "No frame",
   "map.legend.robot": "Robot",
   "map.legend.sensor_ray": "Ray",
-  "map.local_odometry.ir_label": "PROVISIONAL IR",
   "map.local_odometry.ir_title": ({ relation }) => (
     `Provisional IR cue · ${relation}`
   ),
@@ -749,6 +795,7 @@ const translations = {
     `${shown} shown · ${retained} retained · ${evicted} evicted · ${total} observed`
   ),
   "map.qualitative.relation.near_obstacle": "Near reflection",
+  "map.qualitative.relation.reflection": "IR reflection; range unknown",
   "map.qualitative.relation.no_near_reflection": "No near reflection",
   "map.qualitative.relation.unknown": "Unknown relation",
   "map.read_only": "Read only",
@@ -868,12 +915,12 @@ const qualitativeResult = {
     .children[2].attributes,
   cueTags: nodes["map-local-odometry-layer"]
     .children[2].children.map((node) => node.tag),
-  wedgeScreenLength: (() => {
-    const path = nodes["map-local-odometry-layer"]
-      .children[2].children[1].attributes.d.split(" ");
+  rayScreenLength: (() => {
+    const ray = nodes["map-local-odometry-layer"]
+      .children[2].children[1].attributes;
     return Math.hypot(
-      Number(path[4]) - Number(path[1]),
-      Number(path[5]) - Number(path[2]),
+      Number(ray.x2) - Number(ray.x1),
+      Number(ray.y2) - Number(ray.y1),
     );
   })(),
 };
@@ -1150,13 +1197,12 @@ process.stdout.write(JSON.stringify({
         )
         self.assertEqual(
             qualitative["cueTags"],
-            ["title", "path", "line", "circle", "text"],
+            ["title", "line"],
         )
-        self.assertAlmostEqual(qualitative["wedgeScreenLength"], 64)
+        self.assertAlmostEqual(qualitative["rayScreenLength"], 100)
         for expected in (
             "PROVISIONAL LOCAL ODOMETRY",
             "no measured distance",
-            "PROVISIONAL IR",
             "Near reflection",
             "No metric IR distance",
         ):

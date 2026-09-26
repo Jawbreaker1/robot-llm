@@ -16,7 +16,6 @@ from .blast_episode_execution import (
 )
 from .blast_episode_planning import (
     _PLAN_CONTINUATION_ACTION_SOURCE,
-    _WAYPOINT_REACHED_RADIUS_MM,
     _WAYPOINT_ALIGNMENT_TRIGGER_DEG,
     _planner_history,
     _planner_map_with_route_feedback,
@@ -43,7 +42,7 @@ from .blast_episode_deadline import (
     blast_action_deadline_headroom_ms,
 )
 from .blast_episode_map_trace import _BlastEpisodeMapTrace
-from .blast_episode_speech import BlastEpisodeSpeech, blast_episode_cancelled
+from .episode_speech import EpisodeSpeech as BlastEpisodeSpeech, episode_cancelled as blast_episode_cancelled
 from .blast_observation_monitor import (
     CONTROLLER_ID,
     RANGE_STATE_MEASURED,
@@ -79,6 +78,10 @@ from .physical_navigation_contract import (
 )
 from .physical_odometry import normalize_heading_mdeg
 from .robot_control_service import RobotEpisodeOutcome
+from .waypoint_geometry import (
+    waypoint_geometry, waypoint_axis_heading_mdeg, waypoint_reached,
+    waypoint_follow_motion_action,
+)
 BLAST_PROFILE_ID = ROBOT_ID
 DEFAULT_MAX_DECISIONS = 16
 DEFAULT_MAX_OBSERVATION_AGE_MS = 3_000
@@ -759,25 +762,7 @@ class BlastEpisodeRuntimeAdapter:
             + (target_y - pose.y_mm) * math.sin(heading)
         ) > 0
 
-    @staticmethod
-    def _waypoint_reached(pose, waypoint, *, mission=None) -> bool:
-        if waypoint is None:
-            return False
-        if mission is not None and (
-            waypoint["x_mm"], waypoint["y_mm"]
-        ) == mission.target_point():
-            return BlastEpisodeRuntimeAdapter._goal_corridor_entered(mission, pose)
-        delta_x = abs(waypoint["x_mm"] - pose.x_mm)
-        delta_y = abs(waypoint["y_mm"] - pose.y_mm)
-        heading = math.radians(pose.heading_mdeg / 1_000.0)
-        if abs(math.cos(heading)) >= abs(math.sin(heading)):
-            along_axis, cross_axis = delta_x, delta_y
-        else:
-            along_axis, cross_axis = delta_y, delta_x
-        return (
-            along_axis <= _WAYPOINT_REACHED_RADIUS_MM
-            and cross_axis <= _WAYPOINT_CROSS_AXIS_TOLERANCE_MM
-        )
+    _waypoint_reached = staticmethod(waypoint_reached)
 
     @staticmethod
     def _intermediate_waypoint_plan(mission, pose, waypoints):
@@ -802,65 +787,11 @@ class BlastEpisodeRuntimeAdapter:
     def _goal_corridor_entered(mission, pose) -> bool:
         return mission.distance_to_target_mm(pose) <= BLAST_GOAL_RADIUS_MM
 
-    @staticmethod
-    def _active_waypoint_geometry(pose, waypoint):
-        if waypoint is None:
-            return None
-        delta_x = waypoint["x_mm"] - pose.x_mm
-        delta_y = waypoint["y_mm"] - pose.y_mm
-        bearing_mdeg = normalize_heading_mdeg(round(
-            math.degrees(math.atan2(delta_y, delta_x)) * 1_000
-        ))
-        return {
-            "distance_mm": round(math.hypot(delta_x, delta_y)),
-            "bearing_mdeg": bearing_mdeg,
-            "heading_error_mdeg": normalize_heading_mdeg(
-                bearing_mdeg - pose.heading_mdeg
-            ),
-        }
+    _active_waypoint_geometry = staticmethod(waypoint_geometry)
 
-    @staticmethod
-    def _waypoint_axis_heading_mdeg(pose, waypoint):
-        """Translate an accepted coarse leg into one cardinal heading."""
+    _waypoint_axis_heading_mdeg = staticmethod(waypoint_axis_heading_mdeg)
 
-        delta_x = waypoint["x_mm"] - pose.x_mm
-        delta_y = waypoint["y_mm"] - pose.y_mm
-        if (
-            abs(delta_x) > MODEL_ROUTE_AXIS_TOLERANCE_MM
-            and abs(delta_y) > MODEL_ROUTE_AXIS_TOLERANCE_MM
-        ):
-            return normalize_heading_mdeg(round(
-                math.degrees(math.atan2(delta_y, delta_x)) * 1_000
-            ))
-        if abs(delta_x) >= abs(delta_y):
-            return 0 if delta_x >= 0 else -180_000
-        return 90_000 if delta_y >= 0 else -90_000
-
-    @classmethod
-    def _waypoint_follow_motion_action(
-        cls, pose, waypoint, available_actions, *, mission=None,
-    ):
-        """Resolve one explicit waypoint-follow request to a bounded primitive."""
-
-        geometry = cls._active_waypoint_geometry(pose, waypoint)
-        if geometry is None or cls._waypoint_reached(pose, waypoint, mission=mission):
-            return None
-        heading_error = normalize_heading_mdeg(
-            cls._waypoint_axis_heading_mdeg(pose, waypoint)
-            - pose.heading_mdeg
-        )
-        target_turn = (
-            TURN_LEFT_90 if heading_error > 0 else TURN_RIGHT_90
-        )
-        if abs(heading_error) >= round(
-            _WAYPOINT_ALIGNMENT_TRIGGER_DEG * 1_000
-        ):
-            action = target_turn
-        elif ADVANCE in available_actions:
-            action = ADVANCE
-        else:
-            return None
-        return action if action in available_actions else None
+    _waypoint_follow_motion_action = staticmethod(waypoint_follow_motion_action)
 
     @classmethod
     def _desired_heading_turn_alignment(

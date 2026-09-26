@@ -242,8 +242,7 @@
   function composerPolicy(control, target, chatEnabled, busy = false) {
     const robotTarget = isRobotTarget(target);
     const robotReady = (
-      control.enabled
-      && control.target !== null
+      control.target !== null
       && control.accepting
       && !busy
     );
@@ -251,7 +250,7 @@
       robotTarget,
       composerEnabled: robotTarget ? robotReady : chatEnabled === true,
       robotInputEnabled: robotReady,
-      robotStartEnabled: robotReady,
+      robotStartEnabled: robotReady && control.enabled,
       turnModeEnabled: !robotTarget && chatEnabled === true,
       newConversationEnabled: !robotTarget && chatEnabled === true,
     };

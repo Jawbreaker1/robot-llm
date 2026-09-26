@@ -588,7 +588,7 @@ class EV3NavigationProfileTests(unittest.TestCase):
             ACTION_SPECS["TURN_RIGHT_90"][
                 "target_mean_abs_encoder_degrees"
             ],
-            682,
+            657,
         )
 
     def test_every_slice_is_validated_without_starting_motion(self):
@@ -616,7 +616,7 @@ class EV3NavigationProfileTests(unittest.TestCase):
         )
         self.assertEqual(
             scan_turn_spec(30_000)["slice_durations_ms"],
-            [427, 426],
+            [790],
         )
         for delta in SCAN_TURN_ALLOWED_DELTAS_MDEG:
             spec = scan_turn_spec(delta)

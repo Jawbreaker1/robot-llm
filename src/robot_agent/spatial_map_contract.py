@@ -30,6 +30,21 @@ from .spatial_contract_validation import (
 SPATIAL_MAP_SNAPSHOT_SCHEMA = "robot-spatial-map-snapshot/v1"
 SPATIAL_MAP_UPDATE_SCHEMA = "robot-spatial-map-update/v1"
 DASHBOARD_SPATIAL_MAP_SCHEMA = "robot-spatial-map/v1"
+# Shared route display vocabulary. Kept here so drawing a model-authored
+# BLAST route does not import EV3's legacy detour planner.
+ROUTE_SCHEMA = "robot-local-detour-route/v1"
+ROUTE_ACTIVE = "ACTIVE"
+ROUTE_COMPLETE = "COMPLETE"
+ROUTE_INVALID = "INVALID"
+ROUTE_STATUSES = frozenset((ROUTE_ACTIVE, ROUTE_COMPLETE, ROUTE_INVALID))
+LATERAL_CLEARANCE = "LATERAL_CLEARANCE"
+REACQUIRE_GOAL_HEADING = "REACQUIRE_GOAL_HEADING"
+PASS_BEYOND_TARGET = "PASS_BEYOND_TARGET"
+MERGE_GOAL_AXIS = "MERGE_GOAL_AXIS"
+RESUME_GOAL_HEADING = "RESUME_GOAL_HEADING"
+WAYPOINT_KINDS = frozenset((LATERAL_CLEARANCE, REACQUIRE_GOAL_HEADING,
+                            PASS_BEYOND_TARGET, MERGE_GOAL_AXIS,
+                            RESUME_GOAL_HEADING))
 MAX_POSE_HISTORY = 2_048
 MAX_SPATIAL_SCAN_EVIDENCE = MAX_SCAN_ATTEMPTS_PER_MAP
 
@@ -672,6 +687,8 @@ class SpatialSensorRay:
                 or self.relation not in (
                     "NEAR_OBSTACLE",
                     "NO_NEAR_REFLECTION",
+                    "REFLECTION",
+                    "UNKNOWN",
                 )
                 or not self.provisional
                 or self.confidence_milli > 400
@@ -915,6 +932,8 @@ class QualitativeObstacleEvidence:
         if self.relation not in (
             "NEAR_OBSTACLE",
             "NO_NEAR_REFLECTION",
+            "REFLECTION",
+            "UNKNOWN",
         ):
             raise NavigationContractError(
                 "invalid_qualitative_relation",

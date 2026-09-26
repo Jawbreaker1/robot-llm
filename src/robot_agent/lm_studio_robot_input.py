@@ -10,8 +10,9 @@ import socket
 from typing import Callable, Mapping
 
 from . import lm_studio as _lm
-from .blast_personality import (
-    REPLY_FACES, REPLY_GESTURES, normalize_persona_by_locale,
+from .blast_personality import normalize_persona_by_locale
+from .social_expression import (
+    REPLY_FACES, REPLY_GESTURES, EV3_GESTURES, ALL_GESTURES,
     social_expression_schema, valid_social_expression,
 )
 
@@ -77,6 +78,13 @@ _SYSTEM_PROMPT = (
     "is Swedish; en is English), without markdown, at most 160 characters. For CONVERSE, "
     "reply as a tired, grumpy but harmless old LEGO robot, warm under the grumbling, and "
     "never invent current state or actions. For READ_ONLY_TASK use only supplied facts; say "
+    "which body you are from control.target and robot_description. Its capabilities describe "
+    "configured hardware, not permission to operate it from this interface. motor.arm means "
+    "a real motorized arm exists; an unsupported gesture does not mean the robot has no arms. "
+    "If control.enabled is false, navigation is unavailable: classify movement requests as "
+    "UNSUPPORTED_PHYSICAL_TASK and explain robot_description.navigation_status or control.runtime.message. "
+    "Conversation and existing sensor/status questions remain available. "
+    "Do not invent hardware, deny listed hardware, or claim peer communication has happened. Say "
     "when data is stale, unknown, or unavailable. IR/range and map data are not camera "
     "vision. raw_ir_proximity is unitless reflected-light proximity, NEVER millimetres "
     "or centimetres; report its qualitative relation instead of inventing a distance. "
@@ -116,6 +124,20 @@ _REPLY_PERSONA_PROMPT = (
     "replaces the generic tired/grumpy style above. It must never influence intent, "
     "confidence_milli, action, plan, assessment, sensor facts, factual claims, safety, "
     "completion, or whether reply_text must be null."
+)
+
+_EV3_EXPRESSION_PROMPT = (
+    " This robot is EV3, with a motorized LEGO saw on his left arm, not BLAST's claw. "
+    "Choose expression.gesture yourself: none, saw_flourish (one-second full-speed saw spin), "
+    "or saw_celebrate (two-second full-speed saw spin). Either flourish can express happiness, "
+    "frustration or playful emphasis; you choose when it fits, not on every reply. "
+    "These social requests are CONVERSE, not navigation. No EV3 face animation is wired "
+    "yet, so expression.face must be neutral. Choose gesture none unless control.state "
+    "is IDLE. PHYSICAL_TASK and STOP_TASK require expression null; CLARIFY and "
+    "UNSUPPORTED_PHYSICAL_TASK require gesture none. Expressions accompany speech and "
+    "are not executed when speech is disabled. reply_text is spoken verbatim: no "
+    "asterisks, stage directions or claims that a gesture already succeeded. "
+    "The saw is a LEGO prop for expression, not for cutting or moving obstacles."
 )
 
 _FALLBACKS = {
@@ -177,7 +199,7 @@ class RobotInputDecision:
     def __post_init__(self) -> None:
         if self.expression is not None and (
             self.intent in _ACTION_INTENTS or self.fallback
-            or not valid_social_expression(self.expression)
+            or not valid_social_expression(self.expression, gestures=ALL_GESTURES)
             or (self.intent not in (CONVERSE, READ_ONLY_TASK)
                 and self.expression["gesture"] != "none")
         ):
@@ -285,8 +307,9 @@ class LMStudioRobotInputModel:
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         reply_persona_by_locale: Mapping[str, str] | None = None,
         social_expressions: bool = False,
+        social_profile: str = "blast",
     ):
-        if not isinstance(social_expressions, bool) or not callable(transport) or (
+        if social_profile not in ("blast", "ev3") or not isinstance(social_expressions, bool) or not callable(transport) or (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
             or not 0.1 <= timeout_seconds <= 60.0
@@ -305,6 +328,9 @@ class LMStudioRobotInputModel:
         self._transport = transport
         self._timeout = float(timeout_seconds)
         self._social_expressions = social_expressions
+        self._social_profile = social_profile
+        self._gestures = EV3_GESTURES if social_profile == "ev3" else REPLY_GESTURES
+        self._faces = ("neutral",) if social_profile == "ev3" else REPLY_FACES
 
     @property
     def model(self) -> str:
@@ -329,8 +355,9 @@ class LMStudioRobotInputModel:
         }
         system_prompt = _SYSTEM_PROMPT
         if self._social_expressions:
-            properties["expression"] = social_expression_schema()
-            system_prompt += _SOCIAL_EXPRESSION_PROMPT
+            properties["expression"] = social_expression_schema(gestures=self._gestures, faces=self._faces)
+            system_prompt += (_EV3_EXPRESSION_PROMPT if self._social_profile == "ev3"
+                              else _SOCIAL_EXPRESSION_PROMPT)
         if self._reply_persona_by_locale is not None:
             system_prompt += _REPLY_PERSONA_PROMPT.format(
                 persona=self._reply_persona_by_locale[input.locale]
@@ -376,6 +403,10 @@ class LMStudioRobotInputModel:
             reply = value["reply_text"]
             expression = value.get("expression")
             _validate_classification(intent, confidence)
+            if expression is not None and not valid_social_expression(
+                expression, gestures=self._gestures, faces=self._faces,
+            ):
+                return _fallback(input, intent, confidence)
             if intent in _ACTION_INTENTS:
                 if reply is not None or expression is not None:
                     return _fallback(input)

@@ -75,6 +75,49 @@ class Model:
 
 
 class RobotInputServiceTests(unittest.TestCase):
+    def test_disconnected_navigation_preserves_named_conversation_and_speech(self):
+        from unittest.mock import Mock
+        from robot_agent.robot_control_contract import RobotControlTarget
+        from robot_agent.robot_control_service import RobotControlService
+        control = RobotControlService(
+            target=RobotControlTarget("ev3rstorm-01", "EV3RSTORM"),
+            disabled_reason="EV3 navigation is temporarily unavailable.",
+        )
+        self.addCleanup(control.shutdown)
+        seen = []
+        sink = Mock(return_value=True)
+        service = RobotInputService(
+            control_service=control,
+            model_factory=lambda _: Model(RobotInputDecision(CONVERSE, 950, "Still here. Still grumpy."), seen),
+            speech_sink=sink,
+        )
+        turn = service.dispatch("Hello EV3", "en", "disabled-chat-1", control.settings()["revision"])
+        self.assertEqual(turn["answer_text"], "Still here. Still grumpy.")
+        self.assertTrue(turn["speech_queued"])
+        sink.assert_called_once_with("disabled-chat-1", "Still here. Still grumpy.", "en")
+        self.assertIsNone(turn["episode"])
+        self.assertFalse(seen[0][1]["control"]["enabled"])
+        self.assertEqual(seen[0][1]["control"]["target"]["robot_id"], "ev3rstorm-01")
+        self.assertIn("temporarily unavailable", seen[0][1]["control"]["runtime"]["message"])
+        with self.assertRaisesRegex(RobotControlServiceError, "temporarily unavailable"):
+            control.start("Drive forward", "en", "disabled-drive-1", control.settings()["revision"])
+
+    def test_hardware_description_reaches_model_without_granting_arm_actions(self):
+        control = FakeControl()
+        description = {"robot_id": "ev3rstorm-01", "capabilities": ["motor.arm"]}
+        seen = []
+        decision = RobotInputDecision(UNSUPPORTED_PHYSICAL_TASK, 950,
+                                     "I have an arm, but cannot wave it from this interface yet.")
+        service = RobotInputService(control_service=control, robot_description=description,
+                                    model_factory=lambda _: Model(decision, seen))
+        description["capabilities"].clear()
+        turn = service.dispatch("Wave your arm", "en", "arm-1", 3)
+        self.assertEqual(seen[0][1]["robot_description"]["capabilities"], ["motor.arm"])
+        self.assertEqual(turn["intent"], UNSUPPORTED_PHYSICAL_TASK)
+        self.assertEqual(control.started, [])
+        seen[0][1]["robot_description"]["capabilities"].clear()
+        self.assertEqual(service._facts()["robot_description"]["capabilities"], ["motor.arm"])
+
     def test_expression_is_queued_once_with_reply_and_never_starts_navigation(self):
         from unittest.mock import Mock
         expression = {"face": "happy", "gesture": "claw_snap"}

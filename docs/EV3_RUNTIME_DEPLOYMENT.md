@@ -86,13 +86,14 @@ then attempts a final close before returning a non-zero status.
 
 ## Host-generated robot speech
 
-The EV3RSTORM profile synthesizes Swedish speech on the host through
-`http://127.0.0.1:8179/v1/audio/speech`. Its explicit default is model
-`piper-sv`, voice `nst-deep`, WAV output, and speed `1.0`. Text is limited to
+The EV3RSTORM profile synthesizes Swedish and English speech on the host through
+`http://127.0.0.1:8179/v1/audio/speech`. The service model identifier remains
+`piper-sv`; voices are `nst-deep` for Swedish and `john-medium` for English,
+with WAV output and speed `1.0`. No macOS speech provider is used. Text is limited to
 160 characters. Both host and EV3 accept at most 4 MiB and 20 seconds of mono
 16-bit PCM WAV at 8–48 kHz.
 
-Install the two local voice models once with
+Install the local voice models for both robots once with
 `scripts/setup_piper_service.sh`, then start the project-owned loopback service
 with `scripts/start_piper_service.sh` before launching a physical console.
 
@@ -112,10 +113,10 @@ the SSH channel is cancelled, ev3dev may finish that already-buffered clip.
 The validated duration ceiling limits this case to 20 seconds. A future framed
 audio protocol can add an explicit remote cancellation acknowledgement.
 
-Only Swedish is mapped by default. English requires its own tested voice/model
-mapping; the Swedish NST model is deliberately not an implicit English
-fallback. Speech failure remains observable but cannot block navigation or
-motor cleanup.
+The English voice is Piper's [en_US-john-medium](https://huggingface.co/rhasspy/piper-voices/blob/main/en/en_US/john/medium/MODEL_CARD),
+a male voice whose model card lists public-domain LibriVox recordings. BLAST
+keeps its separate Cori voice. Speech failure remains observable but cannot
+block navigation or motor cleanup.
 
 Cancellation during an in-flight motion currently closes the SSH channel so
 the EV3 worker can stop locally. If that prevents a correlated encoder receipt

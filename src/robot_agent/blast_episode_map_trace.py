@@ -6,13 +6,13 @@ import time
 from typing import Mapping
 
 from .blast_observation_monitor import ROBOT_ID
+from .blast_navigation_calibration import BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
 from .blast_mission_completion import (
     BLAST_GOAL_HEADING_TOLERANCE_MDEG,
     BLAST_GOAL_RADIUS_MM,
 )
 from .blast_spatial_map import (
     MAX_PLANAR_SCAN_VIEWS,
-    MODEL_WAYPOINT,
     provisional_obstacle_hypotheses,
 )
 from .coarse_navigation_grid import (
@@ -23,15 +23,12 @@ from .coarse_navigation_grid import (
     model_route_blockage,
     route_blockage_from_echoes,
 )
-from .local_detour_route import (
-    ROUTE_ACTIVE,
-    ROUTE_SCHEMA,
-)
 from .physical_navigation_mission import DirectionalMission
 from .physical_navigation_contract import (
     ADVANCE, REVERSE, SCAN_FRONT_ARC, TURN_LEFT_90, TURN_RIGHT_90,
 )
 from .physical_odometry import PhysicalPose, normalize_heading_mdeg
+from .navigation_map_trace import final_goal_trace, waypoint_route_trace
 
 
 _MOTION_ACTIONS = frozenset((
@@ -97,25 +94,7 @@ class _BlastEpisodeMapTrace:
             return False
 
     def _final_goal(self, pose):
-        distance = self.mission.minimum_forward_progress_mm
-        current = self.mission.longitudinal_progress_mm(pose)
-        target_x, target_y = self.mission.target_point()
-        return {
-            "kind": "DIRECTIONAL_HEADING",
-            "navigation_enforced": False,
-            "origin_x_mm": self.mission.origin_x_mm,
-            "origin_y_mm": self.mission.origin_y_mm,
-            "target_x_mm": target_x,
-            "target_y_mm": target_y,
-            "goal_radius_mm": BLAST_GOAL_RADIUS_MM,
-            "distance_to_goal_mm": self.mission.distance_to_target_mm(pose),
-            "desired_heading_mdeg": self.mission.reference_heading_mdeg,
-            "minimum_forward_progress_mm": distance,
-            "heading_tolerance_mdeg": self.mission.heading_tolerance_mdeg,
-            "current_forward_progress_mm": current,
-            "current_lateral_offset_mm": self.mission.lateral_offset_mm(pose),
-            "remaining_forward_progress_mm": max(0, distance - current),
-        }
+        return final_goal_trace(self.mission, pose)
 
     def _imu_heading(self, observation, observed_at_unix_ms):
         imu = observation.get("imu") if isinstance(observation, Mapping) else None
@@ -158,50 +137,7 @@ class _BlastEpisodeMapTrace:
         )
 
     def _advisory_route(self, pose):
-        """Project Gemma's ordered hypothesis into the existing map shape."""
-
-        if not self.advisory_waypoint_plan:
-            return None
-        start = (pose.x_mm, pose.y_mm)
-        previous = start
-        waypoints = []
-        for index, waypoint in enumerate(self.advisory_waypoint_plan):
-            delta_x = waypoint["x_mm"] - previous[0]
-            delta_y = waypoint["y_mm"] - previous[1]
-            heading = normalize_heading_mdeg(round(
-                math.degrees(math.atan2(delta_y, delta_x)) * 1_000
-            ))
-            waypoints.append({
-                "ordinal": index,
-                "kind": MODEL_WAYPOINT,
-                "purpose": waypoint["purpose"],
-                "x_mm": waypoint["x_mm"],
-                "y_mm": waypoint["y_mm"],
-                "heading_mdeg": heading,
-                "fact_key": None,
-                "status": "ACTIVE" if index == 0 else "UPCOMING",
-            })
-            previous = (waypoint["x_mm"], waypoint["y_mm"])
-        lateral_delta = next((
-            self._episode_axes(item["x_mm"], item["y_mm"])[1]
-            - self.mission.lateral_offset_mm(pose)
-            for item in self.advisory_waypoint_plan
-            if self._episode_axes(item["x_mm"], item["y_mm"])[1]
-            != self.mission.lateral_offset_mm(pose)
-        ), 0)
-        return {
-            "schema": ROUTE_SCHEMA,
-            "read_only": True,
-            "provisional": True,
-            "route_id": "gemma-waypoints-{}".format(self.episode_id)[:128],
-            "version": max(1, self._waypoint_plan_version),
-            "status": ROUTE_ACTIVE,
-            "detour_side": (
-                "LEFT_OF_GOAL" if lateral_delta > 0 else "RIGHT_OF_GOAL"
-            ),
-            "active_index": 0,
-            "waypoints": waypoints,
-        }
+        return waypoint_route_trace(self.mission, pose, self.advisory_waypoint_plan, self._waypoint_plan_version)
 
     def _episode_axes(self, x_mm, y_mm):
         heading = math.radians(
@@ -464,6 +400,7 @@ class _BlastEpisodeMapTrace:
                     "heading_positive": "LEFT_CCW",
                 },
                 "unobserved_space": "UNKNOWN_NOT_FREE",
+                "robot_footprint": BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.robot_footprint.planner_view(),
                 "route_clearance_mm": ROUTE_CLEARANCE_MM,
                 "coarse_grid": planner_grid,
                 "known_clear_axis_reach_mm": (

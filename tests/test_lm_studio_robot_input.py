@@ -154,6 +154,28 @@ class LMStudioRobotInputTests(unittest.TestCase):
             self.assertTrue(result.fallback)
             self.assertIsNone(result.expression)
 
+    def test_ev3_saw_choices_are_model_selected_and_hardware_scoped(self):
+        for profile, gesture, accepted in (
+            ("ev3", "saw_flourish", True), ("ev3", "saw_celebrate", True),
+            ("ev3", "claw_snap", False), ("blast", "saw_flourish", False),
+        ):
+            with self.subTest(profile=profile, gesture=gesture):
+                expression = {"face": "neutral", "gesture": gesture}
+                transport = Transport(completion(CONVERSE, "Oh, all right. A little celebration.",
+                                                output_changes={"expression": expression}))
+                decision = LMStudioRobotInputModel(
+                    model=MODEL, transport=transport, social_expressions=True,
+                    social_profile=profile,
+                ).interpret(robot_input("en", "Show me how you celebrate!"), {})
+                self.assertEqual(not decision.fallback, accepted)
+                payload = json.loads(transport.calls[0][1])
+                schema = payload["response_format"]["json_schema"]["schema"]
+                gestures = schema["properties"]["expression"]["oneOf"][1]["properties"]["gesture"]["enum"]
+                self.assertEqual("saw_flourish" in gestures, profile == "ev3")
+                self.assertEqual("claw_snap" in gestures, profile == "blast")
+                if profile == "ev3":
+                    self.assertIn("motorized LEGO saw on his left arm", payload["messages"][0]["content"])
+
     def model(self, response=None, error=None, **options):
         transport = Transport(response, error)
         return LMStudioRobotInputModel(

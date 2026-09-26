@@ -100,7 +100,7 @@ class RobotConfigTests(unittest.TestCase):
         for value in cases:
             with self.subTest(value=value):
                 candidate = raw.replace(
-                    '"approx_encoder_degrees_per_body_degree": 7.58',
+                    '"approx_encoder_degrees_per_body_degree": 7.3',
                     (
                         '"approx_encoder_degrees_per_body_degree": {}'
                     ).format(value),
@@ -143,6 +143,9 @@ class RobotConfigTests(unittest.TestCase):
 
         wrong_profile = self.config()
         wrong_profile["motors"]["drive_b"]["limit_profile"] = "arm"
+        # Isolate role/profile validation from the medium saw motor's higher
+        # speed rating, which the large drive motor cannot use.
+        wrong_profile["limits"]["arm"]["max_abs_speed_dps"] = 800
         cases.append((wrong_profile, "must use the drive limit profile"))
 
         same_role = self.config()

@@ -479,10 +479,10 @@ class RobotControlSnapshot:
         if (
             self.target is not None
             and not isinstance(self.target, RobotControlTarget)
-        ) or ((self.target is None) == self.enabled):
+        ) or (self.target is None and self.enabled):
             raise DashboardContractError(
                 "invalid_robot_control_target",
-                "Robot control target must exist exactly when control is "
+                "Robot control target must exist when control is "
                 "enabled",
             )
         if not isinstance(self.settings, RobotControlSettings):

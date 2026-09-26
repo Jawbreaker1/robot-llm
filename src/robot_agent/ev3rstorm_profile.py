@@ -1,41 +1,34 @@
 """Explicit host composition for the assembled EV3RSTORM controller."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import threading
-from typing import Callable, Optional
+from typing import Optional
 
-from .active_ir_scan_contract import (
-    ActiveIrScanCalibration,
-    worst_case_scan_budget,
-)
 from .controller_runtime_profile import (
     ControllerRuntimeBinding,
     ControllerRuntimeDescriptor,
     ControllerRuntimeProfile,
     ControllerRuntimeProfileError,
 )
-from .ev3_active_ir_scan_rig import build_ev3_active_ir_scan_executor
 from .ev3_audio_transport import EV3WAVSSHSession
+from .ev3_social_speech import EV3SocialSpeaker
 from .ev3_navigation_transport import EV3NavigationSSHTransport
+from .ev3_navigation_body import EV3NavigationBody
 from .ev3_navigation_preflight_cli import run_ev3_navigation_preflight
 from .ev3_reachability import EV3ReachabilityProbe
 from .host_piper_speech import (
     HostPiperEV3Speaker,
-    LocaleSpeechSynthesizer,
-    MacOSSayWAVSynthesizer,
     PiperLoopbackSynthesizer,
     PiperSpeechProfile,
 )
-from .navigation_memory_store import NavigationMemoryStore
 from .physical_footprint import RobotFootprint
-from .physical_navigation_adapter import PhysicalNavigationRuntimeAdapter
-from .physical_navigation_execution_contract import (
-    EV3NavigationExecutionContract,
-)
 from .physical_odometry import OdometryCalibration
 from .physical_spatial_map import PhysicalSpatialMapBridge
+from .ev3_episode_adapter import EV3EpisodeAdapter
+from .lm_studio_controller_action import LMStudioControllerActionPlanner
 from .provisional_hazard_map import HazardMapCalibration
 from .robot_speech_runtime import RobotSpeechRuntime
 from .robot_turn_speech import cancellable_serialized_speaker
@@ -44,44 +37,6 @@ from .robot_turn_speech import cancellable_serialized_speaker
 EV3RSTORM_PROFILE_ID = "ev3rstorm-01"
 EV3RSTORM_REMOTE_WORKER_PATH = (
     "/home/robot/robot-llm/ev3/navigation_worker_cli.py"
-)
-EV3RSTORM_STARTUP_TIMEOUT_SECONDS = 30.0
-EV3RSTORM_REQUEST_TIMEOUT_SECONDS = 30.0
-EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS = 45.0
-# The EV3's coarse 90-degree action and asymmetric drive motors accumulated
-# about 16 degrees of heading error in the first live detour.  This profile
-# accepts that measured dead-reckoning precision while faster controllers can
-# keep the generic five-degree default.
-EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG = 20_000
-# Live Wi-Fi evidence shows that EV3 worker operations vary from roughly
-# 1.5 seconds for a stationary sample to more than 8 seconds for a sliced
-# 90-degree turn. Spread measured controller/SSH headroom across the fixed
-# request budget, then keep a separate cleanup reserve for stop, heading
-# restoration and the final encoder observation.
-EV3RSTORM_SCAN_REQUEST_ROUND_TRIP_HEADROOM_MS = 2_500
-EV3RSTORM_SCAN_RESTORATION_HEADROOM_MS = 15_000
-EV3RSTORM_SCAN_REQUEST_TIMEOUT_SECONDS = 30.0
-EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION = ActiveIrScanCalibration(
-    # Two live bilateral sweeps left the chassis about four and six degrees
-    # from its starting heading.  EV3's coarse timed body turns therefore use
-    # the contract's bounded ten-degree maximum.  Every ray still publishes
-    # its exact encoder-derived bearing; other controllers retain the generic
-    # 2.5-degree default.
-    alignment_tolerance_mdeg=10_000,
-)
-EV3RSTORM_SCAN_BUDGET = worst_case_scan_budget(
-    calibration=EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION,
-    request_round_trip_headroom_ms=(
-        EV3RSTORM_SCAN_REQUEST_ROUND_TRIP_HEADROOM_MS
-    )
-)
-EV3RSTORM_SCAN_TIMEOUT_SECONDS = float(
-    (
-        EV3RSTORM_SCAN_BUDGET["minimum_deadline_ms"]
-        + EV3RSTORM_SCAN_RESTORATION_HEADROOM_MS
-        + 999
-    )
-    // 1_000
 )
 DEFAULT_EV3RSTORM_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config" / "ev3rstorm.json"
@@ -397,12 +352,14 @@ class EV3SSHBinding(ControllerRuntimeBinding):
 
 
 class EV3RSTORMProfile(ControllerRuntimeProfile):
-    """Build the existing EV3 runtime without touching the network."""
+    """Compose EV3 hardware and speech without an independent route planner."""
 
     def __init__(
         self,
         config_path: Path = DEFAULT_EV3RSTORM_CONFIG_PATH,
-        speech_profile: PiperSpeechProfile = PiperSpeechProfile(),
+        speech_profile: PiperSpeechProfile = PiperSpeechProfile(
+            voices=(("sv", "nst-deep"), ("en", "john-medium")),
+        ),
     ):
         if not isinstance(speech_profile, PiperSpeechProfile):
             raise ControllerRuntimeProfileError(
@@ -448,24 +405,15 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
     def descriptor(self) -> ControllerRuntimeDescriptor:
         return self._descriptor
 
-    def build_adapter(
-        self,
-        binding,
-        *,
-        planner_factory: Callable[[str], object],
-    ) -> PhysicalNavigationRuntimeAdapter:
+    def build_adapter(self, binding, *, planner_factory=None):
+        """Compose EV3 with the shared planner; no connection or motion at construction."""
         if not isinstance(binding, EV3SSHBinding):
-            raise ControllerRuntimeProfileError(
-                "EV3RSTORM requires an EV3 SSH binding"
-            )
+            raise ControllerRuntimeProfileError("EV3RSTORM requires an EV3 SSH binding")
         if binding.profile_id != self.descriptor.profile_id:
-            raise ControllerRuntimeProfileError(
-                "EV3 binding selected another controller profile"
-            )
-        if not callable(planner_factory):
-            raise ControllerRuntimeProfileError(
-                "EV3 planner factory is invalid"
-            )
+            raise ControllerRuntimeProfileError("EV3 binding selected another controller profile")
+        if planner_factory is None:
+            planner_factory = lambda model: LMStudioControllerActionPlanner(
+                model=model, reasoning_effort="low", max_output_tokens=4096, timeout_seconds=60)
 
         def transport_factory():
             return EV3NavigationSSHTransport(
@@ -475,127 +423,62 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
                 connect_timeout_seconds=binding.connect_timeout_seconds,
             )
 
-        reset_lock = threading.Lock()
-
-        def memory_factory():
-            # EV3 has no absolute localization anchor. Each physical episode
-            # therefore owns a fresh local-odometry frame; reusing a previous
-            # episode after the operator moved the robot would create false
-            # geometry. Persist the new empty generation before startup so a
-            # failed cold start cannot resurrect the preceding run.
-            with reset_lock:
-                memory = NavigationMemoryStore.load(
-                    path=binding.memory_path,
-                    robot_id=self.descriptor.robot_id,
-                    controller_instance_id=self.descriptor.controller_id,
-                    reset=True,
-                    odometry_calibration=self.odometry_calibration,
-                    hazard_calibration=self.hazard_calibration,
-                )
-                memory.save()
-                return memory
-
-        def speech_runtime_factory(*, event_sink):
-            piper = PiperLoopbackSynthesizer(self.speech_profile)
-            synthesizer = LocaleSpeechSynthesizer(
-                {
-                    "sv": piper,
-                    "en": MacOSSayWAVSynthesizer(),
-                }
-            )
+        def speech_runtime_factory(*, event_sink, gesture_allowed=None):
+            synthesizer = PiperLoopbackSynthesizer(self.speech_profile)
             speech_session = EV3WAVSSHSession(
                 binding.target,
                 connect_timeout_seconds=binding.connect_timeout_seconds,
             )
             speaker = cancellable_serialized_speaker(
-                HostPiperEV3Speaker(synthesizer, speech_session),
-                self._speech_lock,
+                EV3SocialSpeaker(
+                    HostPiperEV3Speaker(synthesizer, speech_session),
+                    binding.target, controller_lease, gesture_allowed=gesture_allowed,
+                ), self._speech_lock,
             )
             return RobotSpeechRuntime(
-                speaker=speaker,
-                speaker_close=speech_session.close,
+                speaker=speaker, speaker_close=speech_session.close,
                 event_sink=event_sink,
-                thread_name="{}-speech".format(
-                    self.descriptor.controller_id
-                ),
+                thread_name="{}-speech".format(self.descriptor.controller_id),
             )
-
-        def scan_executor_factory(transport):
-            return build_ev3_active_ir_scan_executor(
-                transport,
-                request_timeout_seconds=(
-                    EV3RSTORM_SCAN_REQUEST_TIMEOUT_SECONDS
-                ),
-                restoration_headroom_ms=(
-                    EV3RSTORM_SCAN_RESTORATION_HEADROOM_MS
-                ),
-            )
-
-        spatial_map_bridge = PhysicalSpatialMapBridge(
-            robot_id=self.descriptor.robot_id,
-            controller_instance_id=self.descriptor.controller_id,
-        )
 
         controller_lease = threading.Lock()
-
-        def check_reachability():
-            return run_ev3_navigation_preflight(
-                binding.target,
-                controller_id=self.descriptor.controller_id,
-                remote_worker_path=binding.remote_worker_path,
-                connect_timeout_seconds=binding.connect_timeout_seconds,
-            )
-
         reachability = EV3ReachabilityProbe(
             robot_id=self.descriptor.robot_id,
             controller_id=self.descriptor.controller_id,
             display_name=self.descriptor.display_name,
             controller_lease=controller_lease,
-            preflight=check_reachability,
+            preflight=lambda: run_ev3_navigation_preflight(
+                binding.target,
+                controller_id=self.descriptor.controller_id,
+                remote_worker_path=binding.remote_worker_path,
+                connect_timeout_seconds=binding.connect_timeout_seconds,
+            ),
         )
-        adapter = PhysicalNavigationRuntimeAdapter(
+        description = asdict(self.descriptor)
+        body_factory = lambda **options: EV3NavigationBody(transport_factory, calibration=self.odometry_calibration, **options)
+        map_provider = PhysicalSpatialMapBridge(robot_id=self.descriptor.robot_id, controller_instance_id=self.descriptor.controller_id)
+        navigation = EV3EpisodeAdapter(body_factory=body_factory, planner_factory=planner_factory,
+            descriptor=self.descriptor, footprint=self.hazard_calibration.robot_footprint,
+            spatial_map_provider=map_provider, speech_runtime_factory=speech_runtime_factory, controller_lease=controller_lease)
+        return SimpleNamespace(
+            navigation_adapter=navigation,
             transport_factory=transport_factory,
-            planner_factory=planner_factory,
-            memory_factory=memory_factory,
-            execution_contract=EV3NavigationExecutionContract(),
-            scan_executor_factory=scan_executor_factory,
+            navigation_body_factory=body_factory,
             speech_runtime_factory=speech_runtime_factory,
             speech_locales=("sv", "en"),
-            spatial_map_bridge=spatial_map_bridge,
-            goal_heading_tolerance_mdeg=(
-                EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG
-            ),
-            startup_timeout_seconds=EV3RSTORM_STARTUP_TIMEOUT_SECONDS,
-            request_timeout_seconds=EV3RSTORM_REQUEST_TIMEOUT_SECONDS,
-            plan_tail_max_age_seconds=(
-                EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS
-            ),
-            scan_timeout_seconds=EV3RSTORM_SCAN_TIMEOUT_SECONDS,
-            active_scan_calibration=(
-                EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION
-            ),
+            spatial_map_provider=map_provider,
             controller_lease=controller_lease,
+            controller_runtime_provider=reachability,
+            controller_reachability_service=reachability,
+            robot_description=description,
         )
-        # Dashboard composition discovers these explicit, read-only seams
-        # without changing the existing profile return type.
-        adapter.controller_runtime_provider = reachability
-        adapter.controller_reachability_service = reachability
-        return adapter
 
 
 __all__ = (
     "DEFAULT_EV3RSTORM_CONFIG_PATH",
     "DEFAULT_EV3RSTORM_MEMORY_PATH",
     "EV3RSTORM_PROFILE_ID",
-    "EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION",
-    "EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG",
-    "EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS",
     "EV3RSTORM_REMOTE_WORKER_PATH",
-    "EV3RSTORM_REQUEST_TIMEOUT_SECONDS",
-    "EV3RSTORM_SCAN_TIMEOUT_SECONDS",
-    "EV3RSTORM_SCAN_RESTORATION_HEADROOM_MS",
-    "EV3RSTORM_SCAN_REQUEST_TIMEOUT_SECONDS",
-    "EV3RSTORM_STARTUP_TIMEOUT_SECONDS",
     "EV3RSTORMProfile",
     "EV3SSHBinding",
 )

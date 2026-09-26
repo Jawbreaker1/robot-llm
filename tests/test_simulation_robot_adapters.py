@@ -3,9 +3,10 @@ import json
 from pathlib import Path
 from dataclasses import replace
 from itertools import product
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from robot_agent.blast_navigation_simulation import run_blast_gemma_scenario
+from robot_agent.ev3_navigation_transport import EV3NavigationSSHTransport
 from robot_agent.navigation_simulation_scenarios import (
     blast_box_front, blast_measured_box_and_chair, blast_open_floor,
 )
@@ -14,12 +15,9 @@ from robot_agent.lm_studio_controller_action import (
 )
 from robot_agent.physical_navigation_contract import (
     ADVANCE, REVERSE, SCAN_FRONT_ARC, TURN_LEFT_90, TURN_RIGHT_90,
+    expected_scan_turn_spec,
 )
 
-from robot_agent.active_ir_scan_contract import (
-    ModelScanChoice,
-    build_scan_request,
-)
 from robot_agent.multi_robot_navigation_simulator import (
     MultiRobotNavigationSimulator,
     RectangleObstacle,
@@ -34,7 +32,6 @@ from robot_agent.physical_navigation_execution_contract import (
 from robot_agent.physical_odometry import (
     DriveMotorRoles,
     OdometryCalibration,
-    PhysicalPose,
     verified_motion_from_result,
 )
 from robot_agent.simulation_robot_adapters import (
@@ -87,6 +84,10 @@ def shared_world(*, obstacles=()):
 
 
 class SimulationRobotAdapterTests(unittest.TestCase):
+
+
+
+
     def test_front_scan_at_recorded_stall_returns_partial_without_spinning_on(self):
         scenario = blast_measured_box_and_chair()
         scenario = replace(scenario, robots=(replace(
@@ -233,9 +234,17 @@ class SimulationRobotAdapterTests(unittest.TestCase):
                         world, world_robot_id=robot_id, odometry=EV3_ODOMETRY,
                     )
                     transport.start()
-                    outcome = transport.request("pulse", {"action": TURN_LEFT_90}, 1.0)["result"]["outcome"]
+                    response = transport.request("pulse", {"action": TURN_LEFT_90}, 1.0)
+                    validator = EV3NavigationSSHTransport(target="unused.local", controller_id="ev3", remote_worker_path="/unused.py")
+                    validator._validate_success_result("pulse", {"action": TURN_LEFT_90}, response)
+                    outcome = response["result"]["outcome"]
                     self.assertEqual(outcome["status"], "interrupted")
+                    # Verified partial travel is not successful completion of
+                    # the requested turn, nor an invented encoder fault.
+                    self.assertTrue(all(item["encoder_verification"]["passed"] for item in outcome["slices"]))
+                    self.assertEqual(outcome["encoder_verification"]["verified_slice_count"], len(outcome["slices"]))
                     self.assertFalse(outcome["encoder_verification"]["passed"])
+                    self.assertLess(outcome["completed_slice_count"], outcome["requested_slice_count"])
                 self.assertTrue(any(event.kind == "blocked" for event in world.events))
                 self.assertLess(abs(world.pose(robot_id).heading_mdeg), 22_050)
 
@@ -419,46 +428,6 @@ class SimulationRobotAdapterTests(unittest.TestCase):
         self.assertEqual(ev3_observation["state_version"], 2)
         self.assertEqual(motion.left_encoder_delta_degrees, 150)
 
-    def test_ev3_active_scan_uses_world_geometry_and_restores_heading(self):
-        world = MultiRobotNavigationSimulator(
-            bounds=(-1_000, -1_000, 2_000, 1_000),
-            obstacles=(RectangleObstacle("box", 200, -100, 400, 100),),
-            robots=(SimulatedRobot(
-                "ev3",
-                PoseEstimate(0, 0, 0),
-                footprint(rear=90, right=130),
-                1_000,
-            ),),
-            goals=(SimulationGoal("ev3", 1_000, 0),),
-        )
-        ev3 = SharedWorldEV3Transport(
-            world,
-            world_robot_id="ev3",
-            odometry=EV3_ODOMETRY,
-        )
-        ev3.start()
-        monotonic_ms = ev3.clock_ms()
-        request = build_scan_request(
-            choice=ModelScanChoice("hazard-1"),
-            frame_id="simulation-frame",
-            map_generation_id="simulation-map",
-            map_version=0,
-            start_pose=PhysicalPose(),
-            start_state_version=1,
-            created_at_ms=1_700_000_000_000,
-            deadline_ms=1_700_000_060_000,
-            created_monotonic_ms=monotonic_ms,
-            deadline_monotonic_ms=monotonic_ms + 60_000,
-        )
-
-        result = ev3.build_scan_executor().execute(request)
-
-        self.assertEqual(result.status, "COMPLETED")
-        self.assertTrue(result.bilateral_complete)
-        self.assertTrue(any(ray.blocked for ray in result.rays))
-        self.assertTrue(any(not ray.blocked for ray in result.rays))
-        self.assertEqual(world.pose("ev3").heading_mdeg, 0)
-
     def test_both_adapters_observe_the_same_obstacle_without_route_hints(self):
         obstacles = (
             RectangleObstacle("blast-box", 250, -450, 500, -250),
@@ -479,7 +448,11 @@ class SimulationRobotAdapterTests(unittest.TestCase):
         )[0]
 
         self.assertLess(blast_observation["distance_mm"], 200)
-        self.assertTrue(ev3_description["infrared"]["blocked"])
+        # The measured white-box return is visible but does not trip the
+        # actual gate; unlike ultrasound it must not get an oracle stop.
+        self.assertGreater(ev3_description["infrared"]["raw"], 35)
+        self.assertLess(ev3_description["infrared"]["raw"], 60)
+        self.assertFalse(ev3_description["infrared"]["blocked"])
         self.assertFalse(hasattr(blast, "route"))
         self.assertFalse(hasattr(ev3, "waypoints"))
 

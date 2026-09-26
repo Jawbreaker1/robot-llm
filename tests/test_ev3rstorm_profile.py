@@ -4,21 +4,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ev3.navigation_profile import MAX_PROCESS_SECONDS
 from robot_agent.controller_runtime_profile import (
     ControllerRuntimeProfileError,
 )
 from robot_agent.ev3rstorm_profile import (
-    EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION,
-    EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG,
-    EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS,
     EV3RSTORM_PROFILE_ID,
     EV3RSTORM_REMOTE_WORKER_PATH,
-    EV3RSTORM_REQUEST_TIMEOUT_SECONDS,
-    EV3RSTORM_SCAN_REQUEST_TIMEOUT_SECONDS,
-    EV3RSTORM_SCAN_RESTORATION_HEADROOM_MS,
-    EV3RSTORM_SCAN_TIMEOUT_SECONDS,
-    EV3RSTORM_STARTUP_TIMEOUT_SECONDS,
     EV3RSTORMProfile,
     EV3SSHBinding,
 )
@@ -46,7 +37,7 @@ class EV3RSTORMProfileTests(unittest.TestCase):
             self.profile.odometry_calibration,
             OdometryCalibration(
                 linear_mm_per_encoder_degree=0.35,
-                turn_mdeg_per_opposed_encoder_degree=132,
+                turn_mdeg_per_opposed_encoder_degree=137,
             ),
         )
         self.assertEqual(
@@ -58,16 +49,6 @@ class EV3RSTORMProfileTests(unittest.TestCase):
             30,
         )
 
-    def test_worker_lifetime_can_cover_default_plan_scan_and_reanchor(self):
-        # Dashboard planner (30 s) + EV3 scan (80 s) + post-scan request
-        # (30 s) + the runtime's fixed 2 s cleanup margin.
-        required_seconds = (
-            30.0
-            + EV3RSTORM_SCAN_TIMEOUT_SECONDS
-            + EV3RSTORM_REQUEST_TIMEOUT_SECONDS
-            + 2.0
-        )
-        self.assertGreaterEqual(MAX_PROCESS_SECONDS, required_seconds)
 
     def test_legacy_schema_v1_config_keeps_prior_hazard_offset(self):
         config = json.loads(self.profile.config_path.read_text("utf-8"))
@@ -120,207 +101,63 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                         memory_path="memory.json",
                     )
 
-    def test_adapter_is_lazy_and_memory_is_fresh_per_episode(self):
-        with tempfile.TemporaryDirectory() as directory:
-            binding = EV3SSHBinding(
-                profile_id=EV3RSTORM_PROFILE_ID,
+    def test_shared_navigation_is_wired_but_hardware_and_speech_stay_lazy(self):
+        binding = EV3SSHBinding(
+            profile_id=EV3RSTORM_PROFILE_ID,
+            target="robot@ev3dev.local",
+            memory_path="/tmp/unused-ev3-memory.json",
+        )
+        with (
+            mock.patch("robot_agent.ev3rstorm_profile.EV3NavigationSSHTransport") as transport,
+            mock.patch("robot_agent.ev3rstorm_profile.PiperLoopbackSynthesizer") as synth,
+            mock.patch("robot_agent.ev3rstorm_profile.EV3WAVSSHSession") as player,
+            mock.patch("robot_agent.ev3rstorm_profile.HostPiperEV3Speaker") as speaker,
+            mock.patch("robot_agent.ev3rstorm_profile.RobotSpeechRuntime") as speech,
+        ):
+            adapter = self.profile.build_adapter(binding)
+            for factory in (transport, synth, player, speaker, speech):
+                factory.assert_not_called()
+            self.assertTrue(callable(adapter.navigation_adapter.run))
+            self.assertFalse(hasattr(adapter, "navigation_unavailable_reason"))
+            self.assertIs(adapter.navigation_adapter.spatial_map_provider, adapter.spatial_map_provider)
+            self.assertIs(adapter.navigation_adapter.controller_lease, adapter.controller_lease)
+            self.assertFalse(hasattr(adapter, "run"))
+            self.assertFalse(hasattr(adapter, "planner_factory"))
+            self.assertIsInstance(adapter.spatial_map_provider, PhysicalSpatialMapBridge)
+            self.assertEqual(adapter.spatial_map_provider.snapshot()["status"], "unavailable")
+            self.assertIs(adapter.controller_runtime_provider, adapter.controller_reachability_service)
+            self.assertIs(adapter.controller_lease, adapter.controller_reachability_service._lease)
+            self.assertEqual(adapter.controller_runtime_provider.snapshot()["reachability"]["status"], "not_checked")
+
+            self.assertIs(adapter.transport_factory(), transport.return_value)
+            transport.assert_called_once_with(
                 target="robot@ev3dev.local",
-                memory_path=Path(directory) / "memory.json",
+                controller_id="ev3rstorm-01.ev3-main",
+                remote_worker_path=EV3RSTORM_REMOTE_WORKER_PATH,
+                connect_timeout_seconds=5,
             )
-            planner_factory = mock.Mock(name="planner_factory")
-            transport_value = mock.Mock(name="transport")
-            memory_value = mock.Mock(name="memory")
-            scan_value = mock.Mock(name="scan")
-            synthesizer_value = mock.Mock(name="synthesizer")
-            english_synthesizer_value = mock.Mock(
-                name="english_synthesizer"
+            event_sink = mock.Mock()
+            self.assertIs(adapter.speech_runtime_factory(event_sink=event_sink), speech.return_value)
+            self.assertEqual(adapter.speech_locales, ("sv", "en"))
+            synth.assert_called_once_with(self.profile.speech_profile)
+            player.assert_called_once_with("robot@ev3dev.local", connect_timeout_seconds=5)
+            speaker.assert_called_once_with(synth.return_value, player.return_value)
+            speech.assert_called_once_with(
+                speaker=mock.ANY, speaker_close=player.return_value.close,
+                event_sink=event_sink, thread_name="ev3rstorm-01.ev3-main-speech",
             )
-            player_value = mock.Mock(name="player")
-            speaker_value = mock.Mock(name="speaker")
-            speech_runtime_value = mock.Mock(name="speech_runtime")
-            with (
-                mock.patch(
-                    "robot_agent.ev3rstorm_profile."
-                    "EV3NavigationSSHTransport",
-                    return_value=transport_value,
-                ) as transport_factory,
-                mock.patch(
-                    "robot_agent.ev3rstorm_profile."
-                    "NavigationMemoryStore.load",
-                    return_value=memory_value,
-                ) as memory_factory,
-                mock.patch(
-                    "robot_agent.ev3rstorm_profile."
-                    "build_ev3_active_ir_scan_executor",
-                    return_value=scan_value,
-                ) as scan_factory,
-                mock.patch(
-                    "robot_agent.ev3rstorm_profile."
-                    "PiperLoopbackSynthesizer",
-                    return_value=synthesizer_value,
-                ) as synthesizer_factory,
-                mock.patch(
-                    "robot_agent.ev3rstorm_profile."
-                    "MacOSSayWAVSynthesizer",
-                    return_value=english_synthesizer_value,
-                ) as english_synthesizer_factory,
-                mock.patch(
-                    "robot_agent.ev3rstorm_profile.EV3WAVSSHSession",
-                    return_value=player_value,
-                ) as player_factory,
-                mock.patch(
-                    "robot_agent.ev3rstorm_profile.HostPiperEV3Speaker",
-                    return_value=speaker_value,
-                ) as speaker_factory,
-                mock.patch(
-                    "robot_agent.ev3rstorm_profile.RobotSpeechRuntime",
-                    return_value=speech_runtime_value,
-                ) as speech_runtime_factory,
-            ):
-                adapter = self.profile.build_adapter(
-                    binding,
-                    planner_factory=planner_factory,
-                )
+            self.assertTrue(callable(speech.call_args.kwargs["speaker"]))
+            self.assertEqual(adapter.robot_description["robot_id"], "ev3rstorm-01")
+            self.assertIn("motor.arm", adapter.robot_description["capabilities"])
+            self.assertNotIn("navigation_status", adapter.robot_description)
 
-                transport_factory.assert_not_called()
-                memory_factory.assert_not_called()
-                scan_factory.assert_not_called()
-                synthesizer_factory.assert_not_called()
-                english_synthesizer_factory.assert_not_called()
-                player_factory.assert_not_called()
-                speaker_factory.assert_not_called()
-                speech_runtime_factory.assert_not_called()
-                planner_factory.assert_not_called()
-                self.assertEqual(
-                    adapter.startup_timeout_seconds,
-                    EV3RSTORM_STARTUP_TIMEOUT_SECONDS,
-                )
-                self.assertEqual(
-                    adapter.request_timeout_seconds,
-                    EV3RSTORM_REQUEST_TIMEOUT_SECONDS,
-                )
-                self.assertEqual(adapter.request_timeout_seconds, 30.0)
-                self.assertEqual(
-                    adapter.scan_timeout_seconds,
-                    EV3RSTORM_SCAN_TIMEOUT_SECONDS,
-                )
-                self.assertEqual(adapter.scan_timeout_seconds, 80.0)
-                self.assertEqual(
-                    adapter.goal_heading_tolerance_mdeg,
-                    EV3RSTORM_GOAL_HEADING_TOLERANCE_MDEG,
-                )
-                self.assertEqual(
-                    adapter.plan_tail_max_age_seconds,
-                    EV3RSTORM_PLAN_TAIL_MAX_AGE_SECONDS,
-                )
-                self.assertIs(
-                    adapter.active_scan_calibration,
-                    EV3RSTORM_ACTIVE_IR_SCAN_CALIBRATION,
-                )
-                self.assertEqual(
-                    adapter.active_scan_calibration.alignment_tolerance_mdeg,
-                    10_000,
-                )
-                self.assertIsInstance(
-                    adapter.spatial_map_provider,
-                    PhysicalSpatialMapBridge,
-                )
-                self.assertEqual(
-                    adapter.spatial_map_provider.snapshot()["status"],
-                    "unavailable",
-                )
-                self.assertIs(
-                    adapter.controller_runtime_provider,
-                    adapter.controller_reachability_service,
-                )
-                self.assertIs(
-                    adapter.controller_lease,
-                    adapter.controller_reachability_service._lease,
-                )
-                self.assertEqual(
-                    adapter.controller_runtime_provider.snapshot()[
-                        "reachability"
-                    ]["status"],
-                    "not_checked",
-                )
-
-                self.assertIs(adapter.transport_factory(), transport_value)
-                transport_factory.assert_called_once_with(
-                    target="robot@ev3dev.local",
-                    controller_id="ev3rstorm-01.ev3-main",
-                    remote_worker_path=EV3RSTORM_REMOTE_WORKER_PATH,
-                    connect_timeout_seconds=5,
-                )
-                self.assertIs(adapter.memory_factory(), memory_value)
-                self.assertIs(adapter.memory_factory(), memory_value)
-                self.assertEqual(memory_factory.call_count, 2)
-                self.assertEqual(
-                    [
-                        call.kwargs["reset"]
-                        for call in memory_factory.call_args_list
-                    ],
-                    [True, True],
-                )
-                self.assertEqual(memory_value.save.call_count, 2)
-                for call in memory_factory.call_args_list:
-                    self.assertEqual(call.kwargs["path"], binding.memory_path)
-                    self.assertEqual(call.kwargs["robot_id"], "ev3rstorm-01")
-                    self.assertEqual(
-                        call.kwargs["controller_instance_id"],
-                        "ev3rstorm-01.ev3-main",
-                    )
-                    self.assertEqual(
-                        call.kwargs["odometry_calibration"],
-                        self.profile.odometry_calibration,
-                    )
-                self.assertIs(
-                    adapter.scan_executor_factory(transport_value),
-                    scan_value,
-                )
-                scan_factory.assert_called_once_with(
-                    transport_value,
-                    request_timeout_seconds=(
-                        EV3RSTORM_SCAN_REQUEST_TIMEOUT_SECONDS
-                    ),
-                    restoration_headroom_ms=(
-                        EV3RSTORM_SCAN_RESTORATION_HEADROOM_MS
-                    ),
-                )
-                event_sink = mock.Mock(name="event_sink")
-                self.assertIs(
-                    adapter.speech_runtime_factory(event_sink=event_sink),
-                    speech_runtime_value,
-                )
-                self.assertEqual(adapter.speech_locales, ("sv", "en"))
-                synthesizer_factory.assert_called_once_with(
-                    self.profile.speech_profile,
-                )
-                english_synthesizer_factory.assert_called_once_with()
-                player_factory.assert_called_once_with(
-                    "robot@ev3dev.local",
-                    connect_timeout_seconds=5,
-                )
-                routed_synthesizer = speaker_factory.call_args.args[0]
-                self.assertEqual(routed_synthesizer.locales, ("sv", "en"))
-                self.assertIs(
-                    routed_synthesizer._synthesizers["sv"],
-                    synthesizer_value,
-                )
-                self.assertIs(
-                    routed_synthesizer._synthesizers["en"],
-                    english_synthesizer_value,
-                )
-                self.assertIs(speaker_factory.call_args.args[1], player_value)
-                speech_runtime_factory.assert_called_once_with(
-                    speaker=mock.ANY,
-                    speaker_close=player_value.close,
-                    event_sink=event_sink,
-                    thread_name="ev3rstorm-01.ev3-main-speech",
-                )
-                self.assertTrue(callable(
-                    speech_runtime_factory.call_args.kwargs["speaker"]
-                ))
-                planner_factory.assert_not_called()
+    def test_profile_uses_shared_controller_action_planner_with_low_reasoning(self):
+        adapter = self.profile.build_adapter(
+            EV3SSHBinding(profile_id=EV3RSTORM_PROFILE_ID, target="robot@ev3dev.local",
+                          memory_path="/tmp/unused-ev3-memory.json"))
+        with mock.patch("robot_agent.ev3rstorm_profile.LMStudioControllerActionPlanner") as planner:
+            self.assertIs(adapter.navigation_adapter.planner_factory("qwen-test"), planner.return_value)
+            planner.assert_called_once_with(model="qwen-test", reasoning_effort="low", max_output_tokens=4096, timeout_seconds=60)
 
     def test_reachability_uses_the_bound_motion_free_preflight(self):
         report = {
@@ -345,7 +182,6 @@ class EV3RSTORMProfileTests(unittest.TestCase):
             ) as preflight:
                 adapter = self.profile.build_adapter(
                     binding,
-                    planner_factory=mock.Mock(),
                 )
                 preflight.assert_not_called()
                 result = adapter.controller_reachability_service.check()
@@ -358,11 +194,11 @@ class EV3RSTORMProfileTests(unittest.TestCase):
             connect_timeout_seconds=5,
         )
 
-    def test_default_speech_profile_is_swedish_nst_deep_only(self):
+    def test_default_speech_profile_uses_piper_for_both_languages(self):
         self.assertEqual(
             self.profile.speech_profile,
             PiperSpeechProfile(
-                voices=(("sv", "nst-deep"),),
+                voices=(("sv", "nst-deep"), ("en", "john-medium")),
             ),
         )
 
@@ -394,7 +230,6 @@ class EV3RSTORMProfileTests(unittest.TestCase):
             ):
                 adapter = self.profile.build_adapter(
                     binding,
-                    planner_factory=mock.Mock(),
                 )
                 adapter.speech_runtime_factory(event_sink=None)
                 adapter.speech_runtime_factory(event_sink=None)

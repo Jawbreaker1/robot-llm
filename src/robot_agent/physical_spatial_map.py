@@ -12,6 +12,7 @@ import time
 from typing import Callable, Mapping
 
 from .navigation_memory_store import NavigationMemoryStore
+from .navigation_map_trace import final_goal_trace, waypoint_route_trace
 from .physical_navigation_contract import validate_observation
 from .physical_scan_evidence import (
     MAX_SCAN_ATTEMPTS_PER_HAZARD,
@@ -42,6 +43,13 @@ PHYSICAL_IR_TTL_MS = 5_000
 
 def _unix_ms() -> int:
     return time.time_ns() // 1_000_000
+
+
+def _ir_relation(raw, blocked):
+    # The motor stop threshold is not a reflection-detection threshold.
+    if raw is None or raw == 100:
+        return "UNKNOWN"
+    return "NEAR_OBSTACLE" if blocked is True else "REFLECTION"
 
 
 def _identifier(name: str, value: object) -> str:
@@ -211,6 +219,54 @@ class PhysicalSpatialMapBridge:
             self._pose_history_evicted += 1
         self._pose_history.append(dict(pose))
 
+    def offer_navigation(self, *, body, mission, waypoints, footprint):
+        """Project the shared EV3 session directly, without a second pose/map engine."""
+        with self._lock:
+            if not self._accepting:
+                return False
+            generation = mission.episode_id
+            frame = (self.robot_id + "-" + generation)[:128]
+            if self._generation_id != generation:
+                self._pose_history.clear()
+                self._pose_history_evicted = 0
+                self._generation_id = generation
+            self._publication_sequence += 1
+            version = self._publication_sequence
+            now = self._clock_ms()
+            pose = {"x_mm": body.pose.x_mm, "y_mm": body.pose.y_mm, "heading_mdeg": body.pose.heading_mdeg,
+                    "frame_id": frame, "state_version": version, "source_id": "navigation-pose",
+                    "provenance": LOCAL_ODOMETRY, "observed_at_unix_ms": now, "age_ms": 0}
+            self._retain_pose(pose)
+            observations = [{
+                "evidence_id": "ir-{}-{}".format(generation, index), "bearing": "FORWARD",
+                "anchor_pose": {key: item["pose"][key] for key in ("x_mm", "y_mm", "heading_mdeg")},
+                "relation": _ir_relation(item["raw_ir_proximity"], item["near_obstacle"]),
+                "raw_ir_proximity": item["raw_ir_proximity"], "confidence_milli": PHYSICAL_IR_CONFIDENCE_MILLI,
+                "source_id": PHYSICAL_IR_REFLECTION, "provenance": "PROVISIONAL_IR", "provisional": True,
+                "observed_at_unix_ms": item["observed_at_unix_ms"], "age_ms": max(0, now - item["observed_at_unix_ms"]),
+            } for index, item in enumerate(body.ir_observations)]
+            snapshot = _empty_snapshot(self.robot_id, self.controller_instance_id)
+            snapshot.update({
+                "status": "qualitative_only" if observations else "pose_only", "reason_code": "provisional_ir_only",
+                "frame_id": frame, "local_generation_id": generation, "map_quality": MAP_PROVISIONAL_IR,
+                "map_version": version, "based_on_state_version": version, "based_on_world_model_version": version,
+                "source_id": "ev3-navigation-execution", "provenance": "LOCAL_ODOMETRY + PROVISIONAL_IR",
+                "robot_pose": pose, "pose_history": deepcopy(self._pose_history),
+                "pose_history_evicted": self._pose_history_evicted, "collision_geometry": footprint.to_dict(),
+                "qualitative_observations": observations, "captured_at_unix_ms": now,
+                "observed_at_unix_ms": now, "observed_age_ms": 0, "age_ms": 0,
+                "localization": {"valid": True, "error": None},
+                "navigation_trace": {
+                    "schema": "robot-navigation-trace/v1", "read_only": True, "frame_id": frame,
+                    "provenance": "LOCAL_ODOMETRY + PROVISIONAL_IR", "final_goal": final_goal_trace(mission, body.pose),
+                    "imu_heading": None, "planned_leg": None, "advisory_waypoint": deepcopy(waypoints[0]) if waypoints else None,
+                    "local_detour_route": waypoint_route_trace(mission, body.pose, waypoints, version),
+                    "planar_scan_views": [], "coarse_grid": None,
+                },
+            })
+            self._snapshot = snapshot
+        return True
+
     def offer(
         self,
         *,
@@ -317,11 +373,7 @@ class PhysicalSpatialMapBridge:
                 else infrared["filtered"]
             )
             has_current_ir = raw_ir is not None
-            relation = (
-                "NEAR_OBSTACLE"
-                if infrared["blocked"]
-                else "NO_NEAR_REFLECTION"
-            )
+            relation = _ir_relation(raw_ir, infrared["blocked"])
             if has_current_ir:
                 if len(self._qualitative) == MAX_QUALITATIVE_OBSERVATIONS:
                     del self._qualitative[0]

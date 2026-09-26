@@ -288,10 +288,14 @@ class RobotControlServiceTests(unittest.TestCase):
         self.assertEqual(RobotControlSettings().model, DEFAULT_MODEL)
 
     def test_runtime_and_immutable_target_are_configured_together(self):
-        with self.assertRaisesRegex(ValueError, "exactly when"):
+        with self.assertRaisesRegex(ValueError, "must exist when"):
             RobotControlService(FakeRuntimeAdapter())
-        with self.assertRaisesRegex(ValueError, "exactly when"):
-            RobotControlService(target=TEST_TARGET)
+        service = RobotControlService(target=TEST_TARGET, disabled_reason="Navigation is being replaced")
+        self.addCleanup(service.shutdown)
+        status = service.status()
+        self.assertFalse(status["enabled"])
+        self.assertEqual(status["target"], TEST_TARGET.to_dict())
+        self.assertEqual(status["runtime"]["message"], "Navigation is being replaced")
 
     def make_service(self, adapter=None, **kwargs):
         values = DeterministicValues()

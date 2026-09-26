@@ -63,6 +63,7 @@ def project_robot_status_facts(
     control = _select(
         control_snapshot,
         (
+            "target",
             "state",
             "enabled",
             "accepting",

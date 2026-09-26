@@ -36,7 +36,7 @@ MAX_PLAN_ACTIONS = 3
 
 SCAN_TURN_OPERATION = "scan_turn"
 SCAN_SAMPLE_OPERATION = "scan_sample"
-SCAN_TURN_PROFILE_ID = "ev3rstorm-provisional-ir-turn-v2"
+SCAN_TURN_PROFILE_ID = "ev3rstorm-provisional-ir-turn-v5"
 SCAN_TURN_CALIBRATION = "provisional_live_encoder_derived"
 SCAN_TURN_ALLOWED_DELTAS_MDEG = tuple(
     value
@@ -44,9 +44,12 @@ SCAN_TURN_ALLOWED_DELTAS_MDEG = tuple(
     if value != 0
 )
 SCAN_TURN_REFERENCE_BODY_MDEG = 90_000
-SCAN_TURN_REFERENCE_ENCODER_DEGREES = 682
-SCAN_TURN_REFERENCE_DURATION_MS = 2_560
-SCAN_TURN_SPEED_DPS = 250
+SCAN_TURN_REFERENCE_ENCODER_DEGREES = 657
+# Keep each recurring 30-degree scan step in one physical 800 ms pulse.  v4
+# trims the faster scan pulse after the physical 360-degree comparison showed
+# that v3 over-rotated, without adding a correction loop.
+SCAN_TURN_REFERENCE_DURATION_MS = 2_370
+SCAN_TURN_SPEED_DPS = 267
 SCAN_TURN_MAX_SLICE_DURATION_MS = 800
 SCAN_TURN_MAX_SIDE_DIVERGENCE_DEGREES = 80
 SCAN_SAMPLE_COUNT = 5
@@ -120,7 +123,7 @@ EXPECTED_ACTION_SPECS = {
         "slice_count": 4,
         "total_duration_ms": 2560,
         "estimated_body_turn_degrees": 90,
-        "target_mean_abs_encoder_degrees": 682,
+        "target_mean_abs_encoder_degrees": 657,
         "calibration_evidence": {
             "source_action": "live_turn_left_segment",
             "source_speed_dps": 250,
@@ -139,7 +142,7 @@ EXPECTED_ACTION_SPECS = {
         "slice_count": 4,
         "total_duration_ms": 2560,
         "estimated_body_turn_degrees": -90,
-        "target_mean_abs_encoder_degrees": 682,
+        "target_mean_abs_encoder_degrees": 657,
         "calibration_evidence": {
             "source_action": "live_turn_left_segment",
             "source_speed_dps": 250,

@@ -2,7 +2,7 @@ import threading
 import unittest
 from types import SimpleNamespace
 
-from robot_agent.blast_episode_speech import BlastEpisodeSpeech
+from robot_agent.episode_speech import EpisodeSpeech as BlastEpisodeSpeech
 from robot_agent.dashboard_contract import DashboardContractError
 from robot_agent.robot_control_contract import RobotRuntimeUpdate
 from robot_agent.robot_speech_runtime import RobotSpeechRuntime
@@ -63,7 +63,7 @@ class BlastEpisodeSpeechObservabilityTests(unittest.TestCase):
         speech.start()
 
         with self.assertLogs(
-            "robot_agent.blast_episode_speech",
+            "robot_agent.episode_speech",
             level="WARNING",
         ) as logged:
             admission = speech.offer("Hej", progress_revision=1)
@@ -97,7 +97,7 @@ class BlastEpisodeSpeechObservabilityTests(unittest.TestCase):
         speech.start()
 
         with self.assertLogs(
-            "robot_agent.blast_episode_speech",
+            "robot_agent.episode_speech",
             level="WARNING",
         ) as logged:
             captured["event_sink"]({
@@ -143,7 +143,7 @@ class BlastEpisodeSpeechObservabilityTests(unittest.TestCase):
         speech.start()
 
         with self.assertLogs(
-            "robot_agent.blast_episode_speech",
+            "robot_agent.episode_speech",
             level="WARNING",
         ) as logged:
             speech.offer("Hej", progress_revision=1)
@@ -174,7 +174,7 @@ class BlastEpisodeSpeechObservabilityTests(unittest.TestCase):
         )
         speech.start()
         with self.assertLogs(
-            "robot_agent.blast_episode_speech",
+            "robot_agent.episode_speech",
             level="WARNING",
         ) as logged:
             captured["event_sink"]({

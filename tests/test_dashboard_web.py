@@ -1049,7 +1049,12 @@ function ev3Button(status) {
             '"data-metric-distance": "none"',
             self.spatial_map_presenter,
         )
-        self.assertIn(".map-local-ir-wedge", self.css)
+        self.assertIn(".map-local-ir-ray", self.css)
+        self.assertNotIn("map-local-ir-label", self.css)
+        self.assertNotIn('label.textContent = `IR ${raw ?? "?"}`', self.spatial_map_presenter)
+        for retired in ("map-local-ir-wedge", "map-local-ir-tick", "map-local-ir-anchor"):
+            self.assertNotIn(retired, self.css)
+            self.assertNotIn(retired, self.spatial_map_presenter)
         self.assertIn(".map-local-robot-heading", self.css)
         self.assertIn(".map-path", self.css)
         self.assertIn(".map-mission-panel", self.css)
@@ -1059,7 +1064,7 @@ function ev3Button(status) {
         self.assertNotIn("function mapProjection", self.javascript)
         self.assertIn("map.reason.observation_gap", self.i18n)
         self.assertIn("SIMULATION", self.i18n)
-        self.assertIn("PROVISIONAL IR", self.i18n)
+        self.assertIn("map.legend.ir_direction", self.i18n)
         self.assertIn("map.local_odometry.layer_label", self.i18n)
         self.assertIn("Ingen karta ännu", self.html)
         self.assertNotIn("map-drive", self.html)
@@ -2457,6 +2462,7 @@ process.stdout.write(JSON.stringify({
   preferredFaultedTarget: api.preferredInitialTarget(faulted, false),
   preferredAfterUserChoice: api.preferredInitialTarget(idle, true),
   robotPolicy: api.composerPolicy(idle, "blast-01", true, false),
+  chatOnlyRobotPolicy: api.composerPolicy(disabledWithTarget, "blast-01", true, false),
   runningRobotPolicy: api.composerPolicy(running, "blast-01", true, false),
   speechFailed,
   stoppingRobotPolicy: api.composerPolicy(stopping, "blast-01", true, false),
@@ -2598,6 +2604,9 @@ process.stdout.write(JSON.stringify({
             contract["robotPolicy"]["composerEnabled"]
         )
         self.assertTrue(contract["robotPolicy"]["robotInputEnabled"])
+        self.assertTrue(contract["chatOnlyRobotPolicy"]["composerEnabled"])
+        self.assertTrue(contract["chatOnlyRobotPolicy"]["robotInputEnabled"])
+        self.assertFalse(contract["chatOnlyRobotPolicy"]["robotStartEnabled"])
         self.assertTrue(contract["runningRobotPolicy"]["composerEnabled"])
         self.assertTrue(contract["stoppingRobotPolicy"]["composerEnabled"])
         self.assertTrue(contract["faultedRobotPolicy"]["composerEnabled"])
@@ -2878,6 +2887,7 @@ const unavailable = {
   sequence: 3,
   state: "DISABLED",
   enabled: false,
+  accepting: false,
   target: { robot_id: "blast-01", display_name: "BLAST" },
 };
 const ev3Unavailable = {

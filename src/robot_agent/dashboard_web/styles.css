@@ -2483,8 +2483,7 @@ textarea:focus-visible,
 }
 
 .map-local-layer-label,
-.map-local-layer-note,
-.map-local-ir-label {
+.map-local-layer-note {
   font-family: "SFMono-Regular", Consolas, monospace;
   paint-order: stroke;
   stroke: var(--panel-deep);
@@ -2503,51 +2502,24 @@ textarea:focus-visible,
   font-size: 11px;
 }
 
-.map-local-ir-wedge {
-  fill: rgb(242 184 75 / 10%);
+.map-local-ir-ray {
   stroke: var(--warning);
-  stroke-dasharray: 8 6;
-  stroke-linejoin: round;
-  stroke-width: 3;
-}
-
-.map-local-ir-cue.is-near .map-local-ir-wedge {
-  fill: rgb(255 107 98 / 18%);
-  stroke: var(--danger);
-}
-
-.map-local-ir-cue.is-no-near-reflection .map-local-ir-wedge {
-  fill: rgb(116 167 255 / 8%);
-  stroke: var(--evidence);
-}
-
-.map-local-ir-tick {
-  stroke: var(--warning);
-  stroke-dasharray: 4 4;
+  stroke-dasharray: 5 4;
   stroke-linecap: round;
-  stroke-width: 5;
+  opacity: 0.85;
 }
 
-.map-local-ir-cue.is-near .map-local-ir-tick {
+.map-local-ir-cue.is-near .map-local-ir-ray {
   stroke: var(--danger);
+  opacity: 0.9;
 }
 
-.map-local-ir-cue.is-no-near-reflection .map-local-ir-tick {
+.map-local-ir-cue.is-reflection .map-local-ir-ray {
   stroke: var(--evidence);
 }
 
-.map-local-ir-anchor {
-  fill: var(--panel-deep);
-  stroke: var(--warning);
-  stroke-dasharray: 3 3;
-  stroke-width: 3;
-}
-
-.map-local-ir-label {
-  fill: var(--warning);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.07em;
+.map-legend [hidden] {
+  display: none;
 }
 
 .map-local-scan-ray-line {

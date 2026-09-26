@@ -56,7 +56,7 @@ def cancellable_serialized_speaker(
     ):
         raise ValueError("serialized speech poll interval is invalid")
 
-    def speak(text: str, locale: str, cancel_event: threading.Event):
+    def speak(text: str, locale: str, cancel_event: threading.Event, *, expression=None):
         if not isinstance(cancel_event, threading.Event):
             raise ValueError("serialized speech cancellation is invalid")
         acquired = False
@@ -67,7 +67,8 @@ def cancellable_serialized_speaker(
                     break
             if not acquired or cancel_event.is_set():
                 return None
-            return speaker(text, locale, cancel_event)
+            return speaker(text, locale, cancel_event,
+                           **({"expression": expression} if expression is not None else {}))
         finally:
             if acquired:
                 lock.release()

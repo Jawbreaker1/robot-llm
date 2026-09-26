@@ -45,6 +45,7 @@ class RobotInputService:
         control_service,
         model_factory: Callable[[str], object],
         spatial_map_provider=None,
+        robot_description: Optional[Mapping[str, object]] = None,
         speech_sink: Optional[Callable[[str, str, str], bool]] = None,
         clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
     ):
@@ -52,6 +53,7 @@ class RobotInputService:
             control_service is None
             or not callable(model_factory)
             or not callable(clock_ms)
+            or robot_description is not None and not isinstance(robot_description, Mapping)
             or speech_sink is not None
             and not callable(speech_sink)
         ):
@@ -63,6 +65,7 @@ class RobotInputService:
         self._model_factory = model_factory
         self._map_snapshot = snapshot
         self._speech_sink = speech_sink
+        self._robot_description = deepcopy(dict(robot_description or {}))
         self._clock_ms = clock_ms
         self._history = OrderedDict()
         self._inflight = set()
@@ -76,11 +79,13 @@ class RobotInputService:
                 spatial = self._map_snapshot()
             except Exception:
                 spatial = None
-        return project_robot_status_facts(
+        facts = project_robot_status_facts(
             self._control.status(),
             spatial,
             captured_at_unix_ms=captured,
         )
+        facts["robot_description"] = deepcopy(self._robot_description)
+        return facts
 
     @staticmethod
     def _fallback(input_value: RobotInput) -> RobotInputDecision:

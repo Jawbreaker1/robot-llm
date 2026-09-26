@@ -47,6 +47,14 @@ class EV3NavigationTransportError(RuntimeError):
     pass
 
 
+class EV3NavigationTimeoutError(EV3NavigationTransportError):
+    code = "worker_response_timeout"
+
+    def __init__(self, operation, timeout_seconds, stderr):
+        self.operation = operation
+        super().__init__("worker {} timed out after {} s: {}".format(operation, timeout_seconds, stderr))
+
+
 class EV3NavigationRemoteError(EV3NavigationTransportError):
     def __init__(
         self,
@@ -437,6 +445,26 @@ class EV3NavigationSSHTransport:
             )
         EV3NavigationSSHTransport._validate_stop_proof(value["stop"])
 
+    @staticmethod
+    def _validate_scan_temporal_continuity(slices) -> None:
+        """Require absolute encoder positions to join across scan slices."""
+
+        previous_after = None
+        for value in slices:
+            before = {
+                motor["side"]: motor["position_before"]
+                for motor in value["motors"]
+            }
+            after = {
+                motor["side"]: motor["position_after"]
+                for motor in value["motors"]
+            }
+            if previous_after is not None and before != previous_after:
+                raise EV3NavigationTransportError(
+                    "scan-turn encoder positions are not continuous"
+                )
+            previous_after = after
+
     def _validate_pulse_result(
         self,
         arguments: Mapping[str, object],
@@ -570,6 +598,7 @@ class EV3NavigationSSHTransport:
                     for motor in receipt["motors"]:
                         totals[motor["side"]] += motor["position_delta"]
             if valid_status_evidence:
+                self._validate_scan_temporal_continuity(slices)
                 mean_abs = int(
                     round(
                         (
@@ -849,6 +878,7 @@ class EV3NavigationSSHTransport:
                 raise EV3NavigationTransportError(
                     "scan-turn slice profile changed"
                 )
+        self._validate_scan_temporal_continuity(outcome["slices"])
         encoder = outcome["encoder_verification"]
         encoder_fields = {
             "passed",
@@ -1075,10 +1105,8 @@ class EV3NavigationSSHTransport:
                         )
                 remaining = response_deadline - time.monotonic()
                 if remaining <= 0:
-                    raise EV3NavigationTransportError(
-                        "worker response timed out: {}".format(
-                            self.stderr_summary()
-                        )
+                    raise EV3NavigationTimeoutError(
+                        operation, timeout_seconds, self.stderr_summary()
                     )
                 try:
                     kind, raw = self._responses.get(

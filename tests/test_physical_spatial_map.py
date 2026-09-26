@@ -100,6 +100,27 @@ class PhysicalSpatialMapBridgeTests(unittest.TestCase):
             ),
         )
 
+    def test_ir_reflection_is_visible_below_the_motor_stop_threshold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = self.memory(directory)
+            for version, (raw, blocked, relation) in enumerate(
+                ((44, False, "REFLECTION"), (71, False, "REFLECTION"),
+                 (29, True, "NEAR_OBSTACLE"), (100, False, "UNKNOWN")), 1
+            ):
+                with self.subTest(raw=raw):
+                    bridge = PhysicalSpatialMapBridge(robot_id=memory.robot_id,
+                        controller_instance_id=memory.controller_instance_id)
+                    bridge.offer(memory=memory,
+                        observation=observation(version, raw=raw, blocked=blocked),
+                        episode_id="ir-reflection-test", captured_at_ms=version * 1000)
+                    snapshot = bridge.snapshot()
+                    evidence = snapshot["qualitative_observations"][-1]
+                    self.assertEqual(evidence["relation"], relation)
+                    self.assertEqual(evidence["raw_ir_proximity"], raw)
+                    self.assertTrue(all(ray["end_x_mm"] is None
+                        for ray in snapshot["sensor_rays"]))
+                    self.assertEqual(snapshot["cells"], [])
+
     def test_projects_authoritative_hazard_without_metric_claims(self):
         with tempfile.TemporaryDirectory() as directory:
             memory = self.memory(directory)
