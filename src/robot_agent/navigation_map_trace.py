@@ -8,6 +8,8 @@ from .waypoint_geometry import GOAL_RADIUS_MM
 
 
 def final_goal_trace(mission, pose):
+    # The persisted heading fields describe the mission axis for map geometry,
+    # not a requirement to turn after arriving at the target position.
     distance = mission.minimum_forward_progress_mm
     current = mission.longitudinal_progress_mm(pose)
     x, y = mission.target_point()
@@ -21,6 +23,11 @@ def final_goal_trace(mission, pose):
             "current_forward_progress_mm": current,
             "current_lateral_offset_mm": mission.lateral_offset_mm(pose),
             "remaining_forward_progress_mm": max(0, distance - current)}
+
+
+def advisory_waypoint_trace(waypoint):
+    """The same model-owned display marker for every robot and provider."""
+    return None if waypoint is None else {**waypoint, "source": "MODEL", "read_only": True}
 
 
 def waypoint_route_trace(mission, pose, waypoints, version=1):

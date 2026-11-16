@@ -343,7 +343,7 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
         )
         self.assertEqual(
             commanded["encoder_verification"]["error"],
-            "encoder direction missing",
+            "encoder target not reached",
         )
         self.assertEqual(raw["outcome"]["status"], "verification_failed")
 
@@ -354,6 +354,16 @@ class BlastNavigationMotionResultTests(unittest.TestCase):
         self.assertTrue(motion.complete)
         self.assertEqual(motion.left_encoder_delta_degrees, 71)
         self.assertEqual(motion.right_encoder_delta_degrees, 83)
+
+    def test_short_translation_is_incomplete_but_keeps_actual_position(self):
+        for action, command, sign in ((ADVANCE,"drive_forward",1), (REVERSE,"drive_reverse",-1)):
+            with self.subTest(action=action):
+                raw = build(action,[command_result(command,(0,0),(20*sign,20*sign))])
+                motion = verified_motion_from_result(action,raw)
+                pose = apply_verified_motion(PhysicalPose(),motion,BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry)
+                self.assertFalse(motion.complete)
+                self.assertEqual(pose.x_mm,10*sign)
+                self.assertEqual(motion.observed_slice_count,1)
 
     def test_failed_slice_keeps_all_observed_encoder_evidence(self):
         results = turn_results("turn_left")

@@ -10,6 +10,7 @@ from http.server import ThreadingHTTPServer
 
 from robot_agent.dashboard_cli import (
     _LoopbackThreadingHTTPServer,
+    _configured_blast_runtime_adapter,
     _handler_class,
     _parser,
     _raise_termination_interrupt,
@@ -110,6 +111,12 @@ class DashboardCLITests(unittest.TestCase):
         )
         self.addCleanup(diagnostics.stop)
         diagnostics.start()
+
+    def test_physical_blast_has_no_implicit_decision_budget(self):
+        args = _parser().parse_args([])
+        adapter = _configured_blast_runtime_adapter(args, mock.Mock())
+        self.addCleanup(adapter.spatial_map_provider.close)
+        self.assertIsNone(adapter.max_decisions)
 
     def test_sigterm_handler_routes_through_keyboard_interrupt_cleanup(self):
         with self.assertRaises(KeyboardInterrupt):

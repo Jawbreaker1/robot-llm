@@ -760,7 +760,14 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         )
         self.assertTrue(result["stop"]["stop_confirmed"])
 
-    def test_scan_sample_filtered_value_uses_published_tail_window(self):
+    def test_scan_middle_band_does_not_invent_a_forward_block(self):
+        self.owner.infrared = 39
+        result = self.worker._scan_sample()
+        self.assertEqual(result["raw_samples"], [39] * SCAN_SAMPLE_COUNT)
+        self.assertFalse(result["observation"]["infrared"]["blocked"])
+        self.assertEqual(self.worker._pulse("ADVANCE")["outcome"]["status"], "completed")
+
+    def test_scan_sample_near_filtered_value_uses_published_tail_window(self):
         raw_samples = [33, 33, 34, 34, 33]
         remaining = iter(raw_samples)
         self.owner.read_infrared_value = lambda: next(remaining)
@@ -1060,6 +1067,33 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
                 self.assertTrue(receipt["encoder_verification"]["passed"])
                 self.assertFalse(worker.motion_fault_latched)
 
+    def test_verified_timed_pulse_does_not_chase_nominal_encoder_distance(self):
+        # Physical 2026-11-16 receipt: both encoders passed the normal check,
+        # but nominal-distance recovery added a useless 20 ms pulse and latched.
+        for action, sign in (("ADVANCE", 1), ("REVERSE", -1)):
+            for transient in (False, True):
+                with self.subTest(action=action, transient=transient):
+                    worker, owner = self.build_worker()
+                    increments = iter(((115, 101), (5, 7)))
+
+                    def recorded_motion(_action, active, **_kwargs):
+                        left, right = next(increments)
+                        owner.positions["drive_b"] += sign * left
+                        owner.positions["drive_c"] += sign * right
+                        self.clock.advance(active["duration_ms"] / 1000.0)
+                        return (("interrupted", "motor_fault") if transient and left == 115
+                                else ("completed", "duration_elapsed"))
+
+                    worker._wait_for_active = recorded_motion
+                    result = worker._pulse(action)
+                    self.assertEqual(result["outcome"]["status"], "completed")
+                    self.assertFalse(worker.motion_fault_latched)
+                    self.assertEqual(worker.pulse_count, 1)
+                    receipt = result["outcome"]["slices"][0]
+                    self.assertEqual(len(receipt["segments"]), 1)
+                    self.assertEqual([m["position_delta"] for m in receipt["motors"]],
+                                     [sign * 115, sign * 101])
+
     def test_transient_one_wheel_fault_gets_bounded_catch_up(self):
         self.owner.blocked_roles.add("drive_c")
         self.owner.transient_fault_roles.add("drive_c")
@@ -1231,7 +1265,7 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         self.assertEqual(self.worker.pulse_count, 2)
         self.assertEqual(self.worker.pulse_duration_ms, 502)
 
-    def test_post_stop_encoder_settling_uses_one_receipt_boundary(self):
+    def test_post_stop_settling_is_retained_in_the_final_observation(self):
         original_finish = self.owner.finish_active
         original_snapshot = self.owner.snapshot_all
         settle_after_finish = [False]
@@ -1262,10 +1296,14 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         )
         self.assertEqual(
             [motor["position_delta"] for motor in receipt["motors"]],
-            [153, 152],
+            [151, 151],
         )
+        # The receipt ends at the verified stop. Later settling remains in the
+        # absolute observation; EV3NavigationBody reconciles this gap once.
+        positions = {m["role"]: m["position"] for m in result["observation"]["motors"]}
+        self.assertEqual([positions["drive_b"], positions["drive_c"]], [153, 152])
 
-    def test_failed_final_recovery_segment_can_complete_cumulative_motion(
+    def test_verified_pair_near_nominal_floor_needs_no_recovery_segment(
         self,
     ):
         self.owner.advance = lambda _seconds: None
@@ -1295,19 +1333,20 @@ class EV3NavigationWorkerSafetyTests(unittest.TestCase):
         self.assertTrue(receipt["encoder_verification"]["passed"])
         self.assertEqual(
             [motor["position_delta"] for motor in receipt["motors"]],
-            [final_positions["drive_b"], final_positions["drive_c"]],
+            [primary_positions["drive_b"], primary_positions["drive_c"]],
         )
         self.assertEqual(
             [segment["kind"] for segment in receipt["segments"]],
-            ["paired", "paired_retry"],
+            ["paired"],
         )
         self.assertEqual(
             [segment["status"] for segment in receipt["segments"]],
-            ["completed", "verification_failed"],
+            ["completed"],
         )
-        self.assertFalse(
+        self.assertTrue(
             receipt["segments"][-1]["encoder_verification"]["passed"]
         )
+        self.assertEqual(self.worker.pulse_count, 1)
 
     def test_partial_single_wheel_recovery_preserves_encoder_motion(self):
         self.owner.blocked_roles.add("drive_c")

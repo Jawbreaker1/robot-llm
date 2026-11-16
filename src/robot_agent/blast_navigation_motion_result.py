@@ -117,9 +117,11 @@ def _decode_result(command, result):
             "blast_motion_encoder_evidence_invalid",
             "BLAST encoder travel is physically implausible",
         )
-    checks = tuple(delta != 0 and delta * sign > 0 for delta, sign in zip(
-        deltas, signs,
-    ))
+    # A stopped run_angle call is not proof that its target was reached.
+    # Keep the measured deltas either way; reuse the existing mechanical
+    # allowance instead of inventing a separate navigation tolerance.
+    minimum_travel = max(1, angle - BLAST_ENCODER_SETTLING_DEGREES)
+    checks = tuple(delta * sign >= minimum_travel for delta, sign in zip(deltas, signs))
     return before, after, deltas, checks
 
 
@@ -187,7 +189,7 @@ def _slice(
         "motors": _motors(before, after),
         "encoder_verification": {
             "passed": verified,
-            "error": None if verified else "encoder direction missing",
+            "error": None if verified else "encoder target not reached",
             "checks": [
                 {"side": side, "passed": passed}
                 for side, passed in zip(_SIDES, checks)
@@ -219,7 +221,7 @@ def _slice(
                 after=after,
                 checks=checks,
                 verified=verified,
-                error=None if verified else "encoder direction missing",
+                error=None if verified else "encoder target not reached",
                 reason="angle_command_completed",
             ),
         ]

@@ -517,7 +517,7 @@ int main(void) {
         self.assertEqual(len(result.payload), BLAST_ADPCM_MAX_BYTES)
         self.assertEqual(_adpcm_sample_count(result.payload), 128_000)
 
-    def test_more_than_eight_seconds_fails_before_controller_upload(self):
+    def test_long_reply_plays_in_bounded_clips_without_losing_samples(self):
         audio = wav_bytes(
             (0,) * (BLAST_ADPCM_MAX_SAMPLES + 1),
             BLAST_ADPCM_SAMPLE_RATE_HZ,
@@ -529,16 +529,27 @@ int main(void) {
                 return audio
 
         class Controller:
-            @staticmethod
-            def play_pcm(*_args, **_kwargs):
-                raise AssertionError("oversized speech must not reach BLAST")
+            def __init__(self):
+                self.samples = []
 
-        with self.assertRaises(HostSpeechError) as raised:
-            BlastHubSpeaker(Synthesizer(), Controller())(
-                "För lång", "sv", threading.Event()
-            )
+            def play_pcm(self, payload, **_kwargs):
+                count = _adpcm_sample_count(payload)
+                self.samples.append(count)
+                return {"accepted": True, "started": True,
+                        "duration_ms": blast_adpcm_duration_ms(count)}
 
-        self.assertEqual(raised.exception.code, "tts_audio_too_long")
+        controller = Controller()
+        cancel = threading.Event()
+        with mock.patch.object(cancel, "wait", return_value=False):
+            receipts = BlastHubSpeaker(Synthesizer(), controller)("Hela svaret", "sv", cancel)
+        self.assertEqual(controller.samples, [BLAST_ADPCM_MAX_SAMPLES, 1])
+        self.assertEqual(len(receipts), 2)
+
+        controller = Controller()
+        with mock.patch.object(cancel, "wait", return_value=True):
+            result = BlastHubSpeaker(Synthesizer(), controller)("Avbrutet", "sv", cancel)
+        self.assertIsNone(result)
+        self.assertEqual(controller.samples, [BLAST_ADPCM_MAX_SAMPLES])
 
     def test_speaker_preloads_once_then_waits_for_whole_utterance(self):
         sample_count = 82_080

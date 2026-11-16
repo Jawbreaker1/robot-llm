@@ -10,6 +10,8 @@ pose or navigation trace.
 from copy import deepcopy
 from typing import Mapping
 
+from .navigation_obstacle_estimates import decode_obstacle_estimates
+
 from .blast_spatial_map import (
     MAX_PROVISIONAL_OBSTACLE_HYPOTHESES,
     NAVIGATION_TRACE_SCHEMA,
@@ -283,6 +285,7 @@ def _transform_navigation_trace(
         or set(value) - set(_NAVIGATION_TRACE_FIELDS) - {
             _NAVIGATION_TRACE_ROUTE_FIELD,
             _NAVIGATION_TRACE_GRID_FIELD,
+            "obstacle_estimates",
         }
         or value.get("schema") != NAVIGATION_TRACE_SCHEMA
         or value.get("read_only") is not True
@@ -295,6 +298,10 @@ def _transform_navigation_trace(
     provenance = _trace_identifier(
         value.get("provenance"), maximum=512
     )
+    try:
+        local_estimates = list(decode_obstacle_estimates(value.get("obstacle_estimates", [])))
+    except ValueError:
+        raise _SourceUnavailable("source_navigation_trace_invalid") from None
     if not _trace_inputs(
         value.get("final_goal"),
         value.get("planned_leg"),
@@ -426,6 +433,10 @@ def _transform_navigation_trace(
         "planned_leg": planned_leg,
         "advisory_waypoint": advisory_waypoint,
         "planar_scan_views": planar_scan_views,
+        # Partial bounds cannot be rotated into new axis-aligned edges without
+        # changing their meaning. Preserve them in local_frame_id; the viewer
+        # applies the robot's existing calibration only when drawing them.
+        "local_obstacle_estimates": local_estimates,
     }
     if _NAVIGATION_TRACE_ROUTE_FIELD in value:
         result[_NAVIGATION_TRACE_ROUTE_FIELD] = local_detour_route

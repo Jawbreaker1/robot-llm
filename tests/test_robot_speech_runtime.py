@@ -11,6 +11,34 @@ from robot_agent.robot_speech_runtime import (
 
 
 class RobotSpeechRuntimeTests(unittest.TestCase):
+    def test_fifo_queue_is_bounded_and_cancel_removes_all_its_pending_replies(self):
+        from robot_agent.robot_speech_runtime import MAX_PENDING_UTTERANCES
+        entered, release = threading.Event(), threading.Event()
+        spoken = []
+        def speaker(text, _locale, _cancel):
+            spoken.append(text)
+            entered.set()
+            release.wait(1)
+        runtime = RobotSpeechRuntime(speaker=speaker)
+        runtime.start()
+        try:
+            runtime.offer(episode_id="active", text="First", locale="en", replace_pending=False)
+            self.assertTrue(entered.wait(1))
+            pending = [runtime.offer_with_admission(episode_id="dialogue", text="Reply " + str(i),
+                       locale="en", progress_revision=i, replace_pending=False)
+                       for i in range(MAX_PENDING_UTTERANCES)]
+            with self.assertRaises(RobotSpeechRuntimeError) as caught:
+                runtime.offer(episode_id="dialogue", text="Full", locale="en", replace_pending=False)
+            self.assertEqual(caught.exception.code, "speech_queue_full")
+            runtime.cancel_episode("dialogue")
+            self.assertTrue(all(item.state == "cancelled" for item in pending))
+            release.set()
+            self.assertTrue(runtime.close(drain=True, timeout_seconds=1))
+            self.assertEqual(spoken, ["First"])
+        finally:
+            release.set()
+            runtime.close(timeout_seconds=1)
+
     def test_admission_waits_for_authoritative_playback_marker(self):
         speaker_entered = threading.Event()
         release = threading.Event()

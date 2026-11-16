@@ -89,6 +89,40 @@ class InfraredGatePolicyTests(unittest.TestCase):
 
 
 class InfraredObstacleGateTests(unittest.TestCase):
+    def test_fresh_middle_band_settles_without_inventing_a_near_obstacle(self):
+        for raw in range(36, 40):
+            with self.subTest(raw=raw):
+                fresh = InfraredObstacleGate(default_policy())
+                established = released_gate()
+                states = [fresh.observe(raw) for _ in range(5)]
+                for _ in range(5):
+                    established.observe(raw)
+                self.assertTrue(all(state["blocked"] for state in states[:4]))
+                self.assertTrue(all(state["reason"] == "warming_up" for state in states[:4]))
+                self.assertFalse(states[-1]["blocked"])
+                self.assertEqual(states[-1]["blocked"], established.blocked)
+
+    def test_middle_band_never_releases_an_observed_near_obstacle(self):
+        for invalidate in (False, True):
+            with self.subTest(invalidate=invalidate):
+                gate = released_gate()
+                gate.observe(12)
+                if invalidate:
+                    gate.fail_closed()
+                for _ in range(20):
+                    self.assertTrue(gate.observe(39)["blocked"])
+                self.assertEqual(gate.snapshot()["reason"], "blocked_hysteresis_hold")
+                for _ in range(5):
+                    gate.observe(40)
+                self.assertFalse(gate.blocked)
+
+    def test_startup_near_returns_are_confirmed_not_startup_hysteresis(self):
+        gate = InfraredObstacleGate(default_policy())
+        states = [gate.observe(35) for _ in range(4)]
+        self.assertTrue(all(state["blocked"] for state in states))
+        self.assertEqual(states[2]["reason"], "warming_up")
+        self.assertEqual(states[3]["reason"], REASON_STABLE_ENTRY)
+
     def test_starts_blocked_and_exposes_only_bounded_state(self):
         gate = InfraredObstacleGate(default_policy())
 

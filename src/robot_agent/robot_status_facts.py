@@ -26,6 +26,7 @@ def _scan_summary(scan, *, with_rays=True):
         "geometry_kind", "provisional", "observation_pattern", "arc_coverage",
         "boundary_coverage", "hypothesis_relation",
         "restoration_verified", "all_observations_settled", "sweep_coverage_deg",
+        "complete", "sweep_degrees",
         "left_boundary_mdeg", "right_boundary_mdeg",
     ))
     rays = scan.get("angular_rays", scan.get("rays"))
@@ -150,6 +151,14 @@ def project_robot_status_facts(
             "observed_at_unix_ms", "age_ms", "scan_boundaries",
         )) for item in hypotheses[-8:]] if isinstance(hypotheses, list) else []
         spatial["robot_pose"] = _pose_in_degrees(spatial.get("robot_pose"))
+        # Keep model beliefs separate from measured/qualitative sensor evidence.
+        # This is the same bounded trace used by the map, not a second inference.
+        trace = spatial_snapshot.get("navigation_trace")
+        if isinstance(trace, Mapping):
+            spatial["navigation_trace"] = _select(trace, (
+                "frame_id", "read_only", "final_goal", "advisory_waypoint",
+                "local_detour_route", "obstacle_estimates",
+            ))
         spatial["pose_history"] = [_pose_in_degrees(pose)
                                    for pose in spatial["pose_history"]]
         for obstacle in spatial["object_hypotheses"]:

@@ -2308,6 +2308,24 @@ textarea:focus-visible,
   filter: drop-shadow(0 0 5px rgb(9 18 21 / 88%));
 }
 
+.map-model-obstacle polygon {
+  fill: rgba(190, 154, 255, 0.09);
+  stroke: #b99aff;
+  stroke-width: 2;
+  stroke-dasharray: 7 5;
+  vector-effect: non-scaling-stroke;
+}
+
+.map-model-obstacle text,
+.map-model-obstacle-note {
+  fill: #d2bdff;
+  font: 12px monospace;
+  paint-order: stroke;
+  stroke: #0d1416;
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
 .map-coarse-grid-cell {
   fill: transparent;
   stroke: rgb(138 158 162 / 13%);

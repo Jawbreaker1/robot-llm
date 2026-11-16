@@ -39,7 +39,6 @@ from .blast_personality import (
     BLAST_MAX_NAVIGATION_UTTERANCE_CHARS,
     BLAST_NAVIGATION_OUTPUT_TOKENS,
     BLAST_NAVIGATION_TIMEOUT_SECONDS,
-    BLAST_NAVIGATION_REASONING_EFFORT,
 )
 from .ev3rstorm_profile import (
     DEFAULT_EV3RSTORM_MEMORY_PATH,
@@ -51,6 +50,7 @@ from .lm_studio import DEFAULT_BASE_URL, DEFAULT_MODEL
 from .lm_studio_controller_action import (
     LMStudioControllerActionPlanner,
     REASONING_EFFORTS,
+    navigation_reasoning_effort,
 )
 from .lm_studio_robot_input import (
     LMStudioRobotInputModel,
@@ -460,7 +460,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        help="Exakt modell-ID som LM Studio ska använda",
+        help="Robotmodell: LM Studio-ID eller codex/gpt-6-astra för Codex/ChatGPT",
     )
     parser.add_argument(
         "--simulation-map-demo",
@@ -518,10 +518,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--blast-reasoning-effort",
         choices=REASONING_EFFORTS,
-        default=BLAST_NAVIGATION_REASONING_EFFORT,
+        default=None,
         help=(
-            "Reasoning effort for BLAST navigation diagnostics "
-            "(default: %(default)s)"
+            "Override navigation reasoning for both robots "
+            "(default: Astra high, Qwen low)"
         ),
     )
     parser.add_argument(
@@ -697,7 +697,6 @@ def _configured_blast_runtime_adapter(args, blast_monitor):
     return BlastEpisodeRuntimeAdapter(
         controller=blast_monitor,
         planner_factory=planner_factory,
-        max_decisions=64,
         speech_runtime_factory=speech_runtime_factory,
         speech_locales=("sv", "en"),
     )
@@ -916,7 +915,8 @@ def _run(
             )
             record_navigation_diagnostic(
                 "runtime_started", source="dashboard", model=args.model,
-                blast_reasoning_effort=args.blast_reasoning_effort,
+                reasoning_effort=navigation_reasoning_effort(args.model, args.blast_reasoning_effort),
+                reasoning_effort_override=args.blast_reasoning_effort,
                 blast_max_output_tokens=BLAST_NAVIGATION_OUTPUT_TOKENS,
             )
         if args.simulation_map_demo:
@@ -1046,7 +1046,7 @@ def _run(
                 options = {
                     "base_url": args.lm_studio_url,
                     "model": model,
-                    "timeout_seconds": args.robot_input_timeout_seconds,
+                    "timeout_seconds": (60 if model.startswith("codex/") else args.robot_input_timeout_seconds),
                 }
                 if profile_id == BLAST_PROFILE_ID:
                     options["social_expressions"] = True

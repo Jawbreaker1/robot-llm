@@ -1,0 +1,3 @@
+# Optional simulator experiment dependency: training AND attention inference.
+# Legacy small-model inference still uses only the standard library.
+numpy==2.3.5

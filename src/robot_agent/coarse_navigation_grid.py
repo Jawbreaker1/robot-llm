@@ -173,17 +173,6 @@ def build_coarse_navigation_grid(
         row, column = result
         cells[row][column] = _POSSIBLE_OBSTACLE
 
-    # Goal, waypoint and robot symbols are visual overlays. Preserve the
-    # measured-clear underlay so those markers cannot make a clear axis appear
-    # unknown to the planner summary.
-    observed_clear_rows = [
-        "".join(
-            _OBSERVED_CLEAR if cell == _OBSERVED_CLEAR else _UNKNOWN
-            for cell in row
-        )
-        for row in cells
-    ]
-
     goal_position = position(goal)
     if goal_position is not None:
         row, column = goal_position
@@ -240,7 +229,6 @@ def build_coarse_navigation_grid(
             "y_max_mm": left_max * GRID_CELL_SIZE_MM,
         },
         "rows": ["".join(row) for row in cells],
-        "observed_clear_rows": observed_clear_rows,
         "robot_center_keep_out_cells": [
             {
                 "x_mm": forward_cell * GRID_CELL_SIZE_MM,
@@ -255,52 +243,6 @@ def build_coarse_navigation_grid(
         "robots": robot_markers,
         "legend": _LEGEND,
         "cropped": cropped,
-    }
-
-
-def known_clear_axis_reach_mm(grid):
-    """Summarize contiguous observed-clear cells from BLAST's grid cell."""
-
-    rows = grid.get("rows") if isinstance(grid, Mapping) else None
-    clear_rows = (
-        grid.get("observed_clear_rows", rows)
-        if isinstance(grid, Mapping) else None
-    )
-    robots = grid.get("robots") if isinstance(grid, Mapping) else None
-    blast = next((
-        robot for robot in robots or ()
-        if isinstance(robot, Mapping) and robot.get("symbol") == "B"
-    ), None)
-    if (
-        not isinstance(rows, list)
-        or not isinstance(clear_rows, list)
-        or len(clear_rows) != len(rows)
-        or blast is None
-        or not isinstance(blast.get("row"), int)
-        or not isinstance(blast.get("column"), int)
-    ):
-        return None
-    origin = (blast["row"], blast["column"])
-
-    def reach(row_delta, column_delta):
-        cells = 0
-        row, column = origin
-        while True:
-            row += row_delta
-            column += column_delta
-            if not (
-                0 <= row < len(rows)
-                and 0 <= column < len(rows[row])
-                and clear_rows[row][column] == _OBSERVED_CLEAR
-            ):
-                return cells * GRID_CELL_SIZE_MM
-            cells += 1
-
-    return {
-        "episode_forward_mm": reach(-1, 0),
-        "episode_left_mm": reach(0, -1),
-        "episode_right_mm": reach(0, 1),
-        "episode_back_mm": reach(1, 0),
     }
 
 
@@ -423,6 +365,8 @@ def coarse_navigation_grid_valid(value):
     rows = value["rows"]
     robots = value["robots"]
     keep_out_cells = value.get("robot_center_keep_out_cells", [])
+    # Read compatibility for saved maps; current producers no longer derive
+    # a supposedly body-clear reach from this narrow-ray underlay.
     observed_clear_rows = value.get("observed_clear_rows")
     window = value.get("window", {
         "x_min_mm": _FORWARD_CELL_MIN * GRID_CELL_SIZE_MM,
@@ -519,7 +463,6 @@ __all__ = (
     "GRID_SIZE",
     "build_coarse_navigation_grid",
     "coarse_navigation_grid_valid",
-    "known_clear_axis_reach_mm",
     "model_route_blockage",
     "route_blockage_from_echoes",
 )

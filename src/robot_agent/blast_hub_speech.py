@@ -197,8 +197,26 @@ def pcm16_wav_to_blast_adpcm(
     )
 
 
+def _hub_wav_chunks(raw):
+    """Keep the hub's eight-second memory bound, not an utterance-length bound."""
+    metadata = validate_pcm16_mono_wav(raw)
+    chunk_frames = 8 * metadata.sample_rate_hz
+    if metadata.frames <= chunk_frames:
+        yield raw
+        return
+    with wave.open(io.BytesIO(raw), "rb") as source:
+        while payload := source.readframes(chunk_frames):
+            output = io.BytesIO()
+            with wave.open(output, "wb") as chunk:
+                chunk.setnchannels(1)
+                chunk.setsampwidth(2)
+                chunk.setframerate(metadata.sample_rate_hz)
+                chunk.writeframes(payload)
+            yield output.getvalue()
+
+
 class BlastHubSpeaker:
-    """Preload one bounded utterance, then play it through BLAST's hub."""
+    """Synthesize once and play the whole reply, one bounded hub clip at a time."""
 
     def __init__(self, synthesizer, controller, *, gesture_allowed=None):
         if not callable(getattr(synthesizer, "synthesize", None)) or not callable(
@@ -218,54 +236,41 @@ class BlastHubSpeaker:
         raw = self.synthesizer.synthesize(text, locale, cancel_event)
         if raw is None or cancel_event.is_set():
             return None
-        audio = pcm16_wav_to_blast_adpcm(raw)
-        if cancel_event.is_set():
-            return None
-        receipt = self.controller.play_pcm(
-            audio.payload,
-            cancel_requested=cancel_event.is_set,
-        )
-        duration_ms = (
-            receipt.get("duration_ms")
-            if isinstance(receipt, dict)
-            else None
-        )
-        if (
-            not isinstance(receipt, dict)
-            or receipt.get("accepted") is not True
-            or receipt.get("started") is not True
-            or isinstance(duration_ms, bool)
-            or not isinstance(duration_ms, int)
-            or not 1 <= duration_ms <= 8_000
-            or duration_ms != audio.duration_ms
-        ):
-            raise HostSpeechError(
-                "invalid_blast_pcm_receipt",
-                "BLAST returned an invalid sampled-audio duration",
-            )
-        mark_started = getattr(
-            cancel_event, "mark_playback_started", None,
-        )
-        if callable(mark_started):
-            mark_started()
-        playback_end = time.monotonic() + duration_ms / 1_000
-        # The hub has already returned to its BLE command loop. This worker
-        # waits only so episode cancellation and speech completion stay exact;
-        # navigation continues on the monitor's separate owner thread.
+        receipts = []
         try:
-            if expression is not None:
-                self._express("face_" + expression["face"], cancel_event)
-                if (expression["gesture"] != "none"
-                        and (self.gesture_allowed is None or self.gesture_allowed())):
-                    self._express(expression["gesture"], cancel_event)
-            remaining = (duration_ms / 1_000 if expression is None
-                         else max(0, playback_end - time.monotonic()))
-            if cancel_event.wait(remaining):
-                return None
+            for chunk in _hub_wav_chunks(raw):
+                audio = pcm16_wav_to_blast_adpcm(chunk)
+                if cancel_event.is_set():
+                    return None
+                receipt = self.controller.play_pcm(audio.payload, cancel_requested=cancel_event.is_set)
+                duration_ms = receipt.get("duration_ms") if isinstance(receipt, dict) else None
+                if (not isinstance(receipt, dict) or receipt.get("accepted") is not True
+                        or receipt.get("started") is not True or isinstance(duration_ms, bool)
+                        or not isinstance(duration_ms, int) or not 1 <= duration_ms <= 8_000
+                        or duration_ms != audio.duration_ms):
+                    raise HostSpeechError("invalid_blast_pcm_receipt",
+                                          "BLAST returned an invalid sampled-audio duration")
+                mark_started = getattr(cancel_event, "mark_playback_started", None)
+                if callable(mark_started):
+                    mark_started()
+                playback_end = time.monotonic() + duration_ms / 1_000
+                first_clip = not receipts
+                receipts.append(receipt)
+                if first_clip and expression is not None:
+                    self._express("face_" + expression["face"], cancel_event)
+                    if (expression["gesture"] != "none"
+                            and (self.gesture_allowed is None or self.gesture_allowed())):
+                        self._express(expression["gesture"], cancel_event)
+                # Playback is asynchronous on the hub; do not replace its clip
+                # until it finishes. Navigation has a separate owner thread.
+                remaining = (max(0, playback_end - time.monotonic())
+                             if first_clip and expression is not None else duration_ms / 1_000)
+                if cancel_event.wait(remaining):
+                    return None
         finally:
             if expression is not None and not cancel_event.is_set():
                 self._express("face_idle", cancel_event)
-        return (receipt,)
+        return tuple(receipts)
 
     def _express(self, command, cancel_event):
         if cancel_event.is_set():

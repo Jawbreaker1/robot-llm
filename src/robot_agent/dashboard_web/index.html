@@ -182,12 +182,17 @@
                 </dl>
                 <form class="robot-settings" id="robot-settings-form">
                   <label class="field">
-                    <span data-i18n="robot.settings.model">Navigationsmodell</span>
-                    <input id="robot-setting-model" type="text" maxlength="256" autocomplete="off" spellcheck="false" disabled>
+                    <span data-i18n="robot.settings.model">AI-modell — samtal och navigation</span>
+                    <select id="robot-setting-model" disabled>
+                      <option value="qwen/qwen3.8-27b">Qwen3.8 — LM Studio</option>
+                      <option value="codex/gpt-6-astra">GPT-6 Astra — Codex / ChatGPT</option>
+                      <option id="robot-setting-custom-model-option" value="" hidden></option>
+                    </select>
+                    <small data-i18n="robot.settings.model_note">Codex använder din ChatGPT-prenumeration och skickar robotens kontext till OpenAI. Byte gäller nästa samtal och uppdrag.</small>
                   </label>
                   <label class="field">
-                    <span data-i18n="robot.settings.max_episode">Maximal episod, ms</span>
-                    <input id="robot-setting-max-episode-ms" type="number" min="1000" max="3600000" step="1000" disabled>
+                    <span data-i18n="robot.settings.max_episode">Tidsgräns för nästa uppdrag, ms (valfri)</span>
+                    <input id="robot-setting-max-episode-ms" type="number" min="1000" max="3600000" step="1000" placeholder="Ingen tidsgräns" data-i18n-placeholder="robot.settings.no_time_limit" disabled>
                   </label>
                   <label class="robot-speech-toggle">
                     <input id="robot-setting-speech-enabled" type="checkbox" disabled>

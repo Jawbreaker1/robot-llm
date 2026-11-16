@@ -5,6 +5,7 @@ from pathlib import Path
 from robot_agent.lm_studio_robot_input import MAX_FACTS_BYTES, MAX_INPUT_CHARS
 from robot_agent.robot_status_facts import project_robot_status_facts
 from robot_agent.physical_spatial_map import PhysicalSpatialMapBridge
+from test_navigation_information_contract import ev3_map, BELIEFS
 
 
 class RobotStatusFactsTests(unittest.TestCase):
@@ -21,7 +22,10 @@ class RobotStatusFactsTests(unittest.TestCase):
         control = {"state": "IDLE", "episode": {
             "goal": "g" * MAX_INPUT_CHARS, "terminal_reason": "completed",
         }, "runtime": {"scan": scan, "message": "Goal reached"}}
+        trace = ev3_map().snapshot()["navigation_trace"]
+        trace["obstacle_estimates"] = [dict(BELIEFS[0], label="b" * 80, basis="e" * 300) for _ in range(8)]
         facts = project_robot_status_facts(control, {
+            "navigation_trace": trace,
             "status": "available", "object_hypotheses": objects,
             "robot_pose": {"x_mm": 841, "y_mm": 27, "heading_mdeg": -17_881},
             "observed_age_ms": 500, "scan_evidence_history": [scan] * 4,

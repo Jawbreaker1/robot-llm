@@ -5,6 +5,7 @@ from robot_agent.lm_studio import (
     LMStudioConfigurationError,
     LMStudioInputError,
     LMStudioProtocolError,
+    LMStudioTimeoutError,
 )
 from robot_agent.blast_personality import (
     BLAST_PERSONA_BY_LOCALE,
@@ -13,6 +14,9 @@ from robot_agent.blast_personality import (
 from robot_agent.lm_studio_controller_action import (
     COMPLETE,
     ControllerActionContext,
+    ControllerActionDecision,
+    MAX_ASSESSMENT_CHARS,
+    MAX_PLAN_STEPS,
     FOLLOW_WAYPOINT,
     LMStudioControllerActionPlanner,
     MAX_UTTERANCE_CHARS,
@@ -88,6 +92,26 @@ class Transport:
 
 
 class ControllerActionPlannerTests(unittest.TestCase):
+    def test_complete_map_and_route_memory_can_exceed_old_64k_envelope(self):
+        planner, transport = self.planner(completion({
+            "action":"DRIVE_FORWARD", "confidence_milli":900,
+            "assessment":"Continue.", "plan":["DRIVE_FORWARD"], "utterance":None,
+        }))
+        evidence = {"route_execution_memory":{"records":[
+            {"waypoint_plan":[{"x_mm":i,"y_mm":0}],"reason":"recorded outcome"}
+            for i in range(1200)]}}
+        planner.decide(context(local_map_evidence=evidence))
+        body = transport.calls[0][1]
+        self.assertGreater(len(body),64*1024)
+        sent = json.loads(json.loads(body)["messages"][1]["content"])
+        self.assertEqual(sent["local_map_evidence"],evidence)
+
+    def test_transport_size_guard_still_rejects_oversized_input(self):
+        planner, transport = self.planner(b"")
+        with self.assertRaises(LMStudioInputError):
+            planner.decide(context(local_map_evidence={"oversized":"x"*(512*1024)}))
+        self.assertEqual(transport.calls,[])
+
     def planner(self, response, clock_values=(1.0, 1.125), **options):
         transport = Transport(response)
         values = iter(clock_values)
@@ -192,7 +216,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
                 "ABORT",
             ],
         )
-        self.assertEqual(request["reasoning_effort"], "none")
+        self.assertEqual(request["reasoning_effort"], "low")
         self.assertEqual(request["temperature"], 1.0)
         self.assertEqual(request["top_p"], 0.95)
         self.assertEqual(request["top_k"], 20)
@@ -223,13 +247,12 @@ class ControllerActionPlannerTests(unittest.TestCase):
         )
         request = json.loads(transport.calls[0][1])
         system_prompt = request["messages"][0]["content"]
-        self.assertIn("ADVANCE is semantic forward progress", system_prompt)
+        self.assertIn("ADVANCE is one short forward step", system_prompt)
         self.assertIn("REVERSE is a bounded retreat", system_prompt)
         self.assertIn("change x or y, not both", system_prompt)
         self.assertIn("RANGE_MEASUREMENT_UNAVAILABLE", system_prompt)
-        self.assertIn("following_waypoints are hypotheses", system_prompt)
+        self.assertIn("ALL waypoints are hypotheses", system_prompt)
         self.assertIn("may extend into unknown space", system_prompt)
-        self.assertIn("not to limit future hypotheses", system_prompt)
         self.assertNotIn("Do not commit a waypoint leg", system_prompt)
         utterance_schema = request["response_format"]["json_schema"][
             "schema"
@@ -277,6 +300,27 @@ class ControllerActionPlannerTests(unittest.TestCase):
 
         request = json.loads(transport.calls[0][1])
         self.assertEqual(request["reasoning_effort"], "low")
+
+    def test_navigation_reasoning_defaults_and_explicit_overrides_in_requests(self):
+        for robot_id in ("ev3rstorm-01", "blast-01"):
+            for model, override, expected in (
+                ("codex/gpt-6-astra", None, "high"),
+                ("qwen/qwen3.8-27b", None, "low"),
+                ("codex/gpt-6-astra", "low", "low"),
+                ("qwen/qwen3.8-27b", "none", "none"),
+            ):
+                with self.subTest(robot=robot_id, model=model, override=override):
+                    transport = Transport(completion({
+                        "action": "DRIVE_FORWARD", "confidence_milli": 940,
+                        "assessment": "Continue.", "plan": ["DRIVE_FORWARD"],
+                        "utterance": None,
+                    }, model=model))
+                    planner = LMStudioControllerActionPlanner(
+                        model=model, reasoning_effort=override, transport=transport)
+                    planner.decide(context(robot_id=robot_id))
+                    request = json.loads(transport.calls[0][1])
+                    self.assertEqual(request["model"], model)
+                    self.assertEqual(request["reasoning_effort"], expected)
 
     def test_waypoint_arrival_tolerance_is_exposed_to_the_model(self):
         planner, transport = self.planner(completion({
@@ -354,6 +398,43 @@ class ControllerActionPlannerTests(unittest.TestCase):
         for budget in (0, 8_193):
             with self.subTest(budget=budget), self.assertRaises(LMStudioConfigurationError):
                 LMStudioControllerActionPlanner(max_output_tokens=budget)
+
+    def test_each_robot_logs_exact_full_packet_for_each_planner_turn(self):
+        output = {"action": "DRIVE_FORWARD", "confidence_milli": 940,
+                  "assessment": "Continue the retained route.", "plan": ["DRIVE_FORWARD"], "utterance": None}
+        for robot_id, map_evidence in (("ev3", {"ir_survey": {"samples": [], "complete": False}}),
+                                       ("blast", {"coarse_grid": {"rows": []}})):
+            with self.subTest(robot_id=robot_id):
+                previous = None
+                request_ids = []
+                for distance in (480, 430):
+                    packet = context(robot_id=robot_id, local_map_evidence=map_evidence,
+                                     observation={"distance_mm": distance}, previous_decision=previous)
+                    planner, transport = self.planner(completion(output))
+                    with self.assertLogs("robot_agent.navigation_diagnostics", "INFO") as logs:
+                        result = planner.decide(packet)
+                    request, response = [json.loads(record.getMessage()) for record in logs.records]
+                    sent = json.loads(transport.calls[0][1])
+                    self.assertEqual(request["request"], sent)
+                    self.assertEqual(json.loads(sent["messages"][1]["content"]), packet.to_dict())
+                    self.assertTrue(sent["messages"][0]["content"])
+                    self.assertIn("schema", sent["response_format"]["json_schema"])
+                    self.assertEqual(request["robot_id"], robot_id)
+                    self.assertEqual(request["request_id"], response["request_id"])
+                    request_ids.append(request["request_id"])
+                    previous = result.decision.memory()
+                self.assertEqual(len(set(request_ids)), 2)
+
+    def test_timed_out_request_keeps_its_exact_context_in_diagnostics(self):
+        planner, transport = self.planner(TimeoutError())
+        packet = context()
+        with self.assertLogs("robot_agent.navigation_diagnostics", "INFO") as logs:
+            with self.assertRaises(LMStudioTimeoutError):
+                planner.decide(packet)
+        self.assertEqual(len(logs.records), 1)
+        request = json.loads(logs.records[0].getMessage())
+        self.assertEqual(request["event"], "planner_request")
+        self.assertEqual(request["request"], json.loads(transport.calls[0][1]))
 
     def test_rejects_unknown_reasoning_effort(self):
         with self.assertRaises(LMStudioConfigurationError):
@@ -604,7 +685,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         with self.assertRaises(LMStudioInputError):
             context(available_actions=(), completion_allowed=False)
 
-    def test_scan_action_is_described_as_a_full_surroundings_sweep(self):
+    def test_scan_action_is_described_as_a_current_heading_sector(self):
         planner, transport = self.planner(completion({
             "action": SCAN_FRONT_ARC,
             "confidence_milli": 900,
@@ -623,7 +704,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         request = json.loads(transport.calls[0][1])
         system_prompt = request["messages"][0]["content"]
         self.assertIn(SCAN_FRONT_ARC, system_prompt)
-        self.assertIn("front half-space", system_prompt)
+        self.assertIn("front sector", system_prompt)
         self.assertIn("returns to its starting direction", system_prompt)
 
     def test_side_scan_context_and_prompt_preserve_gemmas_side_choice(self):
@@ -721,7 +802,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         supplied = json.loads(request["messages"][1]["content"])
         self.assertEqual(supplied["local_map_evidence"], local_map)
         system_prompt = request["messages"][0]["content"]
-        self.assertLess(len(system_prompt), 6_000)
+        self.assertLess(len(system_prompt), 6_300)
         self.assertIn("SAME fixed episode frame", system_prompt)
         self.assertIn("x is rows[i].x_mm and y is column_y_mm[j]", system_prompt)
         self.assertIn("+x is starting forward", system_prompt)
@@ -733,6 +814,9 @@ class ControllerActionPlannerTests(unittest.TestCase):
         self.assertIn("robot_center_keep_out_bounds_mm", system_prompt)
         self.assertIn("direct_detour_axis_candidates", system_prompt)
         self.assertIn("not a chosen route", system_prompt)
+        self.assertIn("not that the whole cell, body", system_prompt)
+        self.assertIn("Unseen edges remain unknown", system_prompt)
+        self.assertNotIn("known_clear_axis_reach_mm", system_prompt)
         self.assertNotIn("local_map_evidence", context().to_dict())
 
         with self.assertRaises(LMStudioInputError):
@@ -749,13 +833,27 @@ class ControllerActionPlannerTests(unittest.TestCase):
         prompt = json.loads(transport.calls[0][1])["messages"][0]["content"]
         self.assertIn("SAME fixed episode frame", prompt)
         self.assertIn("observed_from", prompt)
-        self.assertIn("whole footprint", prompt)
-        self.assertIn("Motor availability is not evidence of free space", prompt)
-        self.assertIn("ir_reference_observations", prompt)
+        self.assertIn("robot_footprint", prompt)
+        self.assertIn("NOT a path-clearance measurement", prompt)
+        self.assertIn("advance_step_mm", prompt)
+        self.assertIn("incomplete sensing, not a wall", prompt)
+        self.assertNotIn("ir_reference_observations", prompt)
+        self.assertIn("execution.scan_front_arc", prompt)
+        self.assertIn("measured pose feedback", prompt)
+        self.assertIn("You choose where to observe", prompt)
+        self.assertNotIn("use SCAN_FRONT_ARC from the lateral waypoint", prompt)
+        self.assertIn("straight_motion_projection", prompt)
+        self.assertIn("NOT the feedback-tracked trajectory or observed clearance", prompt)
+        self.assertIn("not clearance", prompt)
+        self.assertIn("not exact millimetre edges", prompt)
+        self.assertNotIn("NO_VALID_DISTANCE", prompt)
+        self.assertNotIn("range checked between movement pulses", prompt)
+        self.assertNotIn("known_clear_axis_reach_mm", prompt)
+        self.assertNotIn("blocking_echo_point", prompt)
         self.assertNotIn("execution checks each leg against", prompt)
         self.assertNotIn("direct_detour_axis_candidates", prompt)
         self.assertNotIn("column_y_mm", prompt)
-        self.assertLess(len(prompt), 5_000)
+        self.assertLess(len(prompt), 5_300)
 
     def test_waypoint_round_trips_as_model_owned_advisory_memory(self):
         waypoint = {
@@ -868,7 +966,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         with self.assertRaises(LMStudioProtocolError):
             invalid.decide(context())
 
-    def test_off_axis_context_requires_waypoint_and_defers_complete(self):
+    def test_off_axis_context_allows_recovery_without_resending_route(self):
         waypoint = {
             "x_mm": 120,
             "y_mm": 300,
@@ -896,8 +994,8 @@ class ControllerActionPlannerTests(unittest.TestCase):
             "properties"
         ]
         self.assertTrue(supplied["waypoint_required"])
-        self.assertEqual(properties["waypoint"]["type"], "object")
-        self.assertNotIn("oneOf", properties["waypoint"])
+        self.assertEqual(properties["waypoint"]["oneOf"][0]["type"], "object")
+        self.assertEqual(properties["waypoint"]["oneOf"][1], {"type": "null"})
         self.assertNotIn("COMPLETE", properties["plan"]["items"]["enum"])
 
         invalid, _ = self.planner(completion({
@@ -908,14 +1006,26 @@ class ControllerActionPlannerTests(unittest.TestCase):
             "utterance": None,
             "waypoint": None,
         }))
-        with self.assertRaises(LMStudioProtocolError):
-            invalid.decide(context(
-                waypoint_required=True,
-                completion_allowed=False,
-                abort_allowed=False,
-            ))
+        recovery = invalid.decide(context(
+            waypoint_required=True, completion_allowed=False, abort_allowed=False,
+        ))
+        self.assertIsNone(recovery.decision.waypoint)
         with self.assertRaises(LMStudioInputError):
             context(waypoint_required="yes")
+
+    def test_scan_and_follow_may_keep_existing_route_without_resending_it(self):
+        waypoint = {"x_mm": 600, "y_mm": 0, "purpose": "retained goal"}
+        for action in (SCAN_FRONT_ARC, FOLLOW_WAYPOINT):
+            with self.subTest(action=action):
+                planner, _ = self.planner(completion({
+                    "action": action, "confidence_milli": 900, "assessment": "Keep the route.",
+                    "plan": [action], "utterance": None,
+                }))
+                reply = planner.decide(context(available_actions=(action,), waypoint_required=True,
+                    active_waypoint=waypoint, active_waypoint_plan=(waypoint,),
+                    completion_allowed=False, abort_allowed=False))
+                self.assertIsNone(reply.decision.waypoint)
+                self.assertEqual(reply.decision.following_waypoints, ())
 
     def test_follow_waypoint_requires_model_owned_waypoint(self):
         waypoint = {
@@ -939,7 +1049,8 @@ class ControllerActionPlannerTests(unittest.TestCase):
         self.assertEqual(result.decision.waypoint, waypoint)
         request = json.loads(transport.calls[0][1])
         prompt = request["messages"][0]["content"]
-        self.assertIn("follows only the current waypoint", prompt)
+        self.assertIn("tracks the retained endpoint", prompt)
+        self.assertIn("then returns observations to you", prompt)
         self.assertIn("you choose the route, detour side, waypoints", prompt)
 
         invalid, _ = self.planner(completion({
@@ -983,7 +1094,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
             ("TURN_LEFT",),
         )
 
-    def test_minimal_semantic_advance_keeps_bounded_goal_continuation(self):
+    def test_advance_does_not_invent_a_complete_decision(self):
         planner, _ = self.planner(completion({
             "action": ADVANCE,
             "confidence_milli": 900,
@@ -998,7 +1109,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
             completion_allowed=False,
         )).decision
 
-        self.assertEqual(decision.plan, (ADVANCE, COMPLETE))
+        self.assertEqual(decision.plan, (ADVANCE,))
 
     def test_harmless_text_whitespace_is_normalized(self):
         planner, _ = self.planner(completion({
@@ -1053,7 +1164,8 @@ class ControllerActionPlannerTests(unittest.TestCase):
         result = planner.decide(context(
             available_actions=(TURN_RIGHT_90,),
             plan_actions=future,
-            active_plan=("DRIVE_FORWARD", TURN_LEFT_90, COMPLETE),
+            previous_decision={"action": "DRIVE_FORWARD", "assessment": "Follow the right side.",
+                               "plan": ["DRIVE_FORWARD", TURN_LEFT_90, COMPLETE]},
         ))
 
         self.assertEqual(result.decision.plan, (*future, COMPLETE))
@@ -1062,13 +1174,41 @@ class ControllerActionPlannerTests(unittest.TestCase):
         self.assertEqual(supplied["available_actions"], [TURN_RIGHT_90])
         self.assertEqual(supplied["plan_actions"], list(future))
         self.assertEqual(
-            supplied["active_plan"],
+            supplied["previous_decision"]["plan"],
             ["DRIVE_FORWARD", TURN_LEFT_90, COMPLETE],
         )
         plan_schema = request["response_format"]["json_schema"][
             "schema"
         ]["properties"]["plan"]
         self.assertIn("DRIVE_FORWARD", plan_schema["items"]["enum"])
+        self.assertNotIn("active_plan", supplied)
+
+    def test_previous_decision_is_detached_bounded_intent_not_authority(self):
+        decision = ControllerActionDecision(SCAN_FRONT_ARC, 900,
+            " Inspect the edge.\nThen continue. ", (FOLLOW_WAYPOINT,), "Private spoken text")
+        memory = decision.memory()
+        supplied = context(previous_decision=memory)
+        # A prior scan may no longer be available. That does not invalidate its memory.
+        self.assertNotIn(SCAN_FRONT_ARC, supplied.available_actions)
+        self.assertEqual(supplied.previous_decision, memory)
+        self.assertEqual(set(memory), {"action", "assessment", "plan"})
+        memory["plan"].clear()
+        memory["assessment"] = "changed"
+        self.assertEqual(supplied.previous_decision["assessment"], decision.assessment)
+        self.assertEqual(supplied.previous_decision["plan"], [FOLLOW_WAYPOINT])
+        wire = supplied.to_dict()
+        wire["previous_decision"]["plan"].clear()
+        self.assertEqual(supplied.previous_decision["plan"], [FOLLOW_WAYPOINT])
+        self.assertIsNone(context().previous_decision)
+
+    def test_previous_decision_rejects_unbounded_or_extra_context(self):
+        valid = {"action": ADVANCE, "assessment": "Continue.", "plan": [ADVANCE]}
+        invalid = [dict(valid, assessment="x" * (MAX_ASSESSMENT_CHARS + 1)),
+                   dict(valid, plan=[ADVANCE] * (MAX_PLAN_STEPS + 1)),
+                   dict(valid, reasoning="must not be copied"), dict(valid, plan="ADVANCE")]
+        for memory in invalid:
+            with self.subTest(memory=memory), self.assertRaises(LMStudioInputError):
+                context(previous_decision=memory)
 
     def test_model_cannot_invent_an_action(self):
         planner, _ = self.planner(completion({

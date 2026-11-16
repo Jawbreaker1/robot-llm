@@ -56,7 +56,9 @@ class BlastNavigationCalibrationTests(unittest.TestCase):
         for value in (157, 158, 159):
             with self.subTest(value=value):
                 self.assertTrue(sensor.matches_navigation_body_angle(value))
-        self.assertEqual(calibration.minimum_rotation_clearance_mm(), 53)
+        self.assertEqual(calibration.minimum_rotation_clearance_mm(), 57)
+        self.assertEqual(calibration.minimum_rotation_clearance_mm(),
+                         footprint.planner_view()["turn_sweep_radius_mm"] - sensor.forward_offset_mm)
         for value in (156, 160, None, True, 158.0):
             with self.subTest(value=value):
                 self.assertFalse(sensor.matches_navigation_body_angle(value))

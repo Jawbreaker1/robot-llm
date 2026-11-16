@@ -319,7 +319,7 @@ class BlastScanPlanarProjectionTests(TestCase):
             episode_start_heading=0, minimum_forward_progress_mm=800,
         )
         trace.record(pose=pose, observation={}, pose_observed=False, scan_view={
-            "scan_pose": pose.to_dict(), "planar_projection": projection,
+            "scan_pose": pose.to_dict(), "planar_projection": projection, "scan": scan,
         })
         view = trace.planar_scan_views[0]
         self.assertTrue(_scan_view(view, view["observed_at_unix_ms"]))

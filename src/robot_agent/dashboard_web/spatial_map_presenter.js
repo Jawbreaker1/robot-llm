@@ -156,6 +156,7 @@
         );
       }
       blastMapSemantics.appendRoutePoints(trace.localDetourRoute, addPoint);
+      blastMapSemantics.appendEstimatePoints(trace.obstacleEstimates, addPoint, trace.obstacleEstimateTransform);
       trace.planarScanViews.forEach((view) => {
         addPoint(view.scanPose.xMm, view.scanPose.yMm);
         view.points.forEach((point) => {
@@ -440,7 +441,7 @@
 
     function blastRenderUi() {
       return {
-        svg: createSvgElement, title: appendSvgTitle, t,
+        svg: createSvgElement, element: createElement, title: appendSvgTitle, t,
         format: formatNumber, heading: headingArrowPath,
         tooltip: mapTooltipParts,
       };
@@ -460,6 +461,7 @@
       blastMapSemantics.renderGoal(
         layer, trace.finalGoal, projection, blastRenderUi(),
       );
+      blastMapSemantics.renderObstacleEstimates(layer, trace.obstacleEstimates, projection, blastRenderUi(), trace.obstacleEstimateTransform);
 
       const leg = trace.plannedLeg;
       if (leg) {
@@ -678,6 +680,9 @@
             : "map.local_odometry.layer_note",
       );
       layer.appendChild(layerNote);
+      if (map.navigationTrace?.provenance === "LOCAL_ODOMETRY + PROVISIONAL_IR") {
+        blastMapSemantics.renderEstimateNotes(layer, map.navigationTrace.obstacleEstimates, blastRenderUi());
+      }
 
       renderPath(
         layer,
@@ -1225,10 +1230,15 @@
         map,
         SHARED_SPATIAL_MAP_SCHEMA,
       );
+      const estimates = map.schema === SHARED_SPATIAL_MAP_SCHEMA
+        ? map.robots.flatMap(robot => (robot.navigationTrace?.obstacleEstimates || [])
+          .map(estimate => ({...estimate, label: `${robot.robotId} · ${estimate.label}`,
+            basis: `${robot.localFrameId} · ${estimate.basis}`})))
+        : map.navigationTrace?.obstacleEstimates || [];
       byId("map-object-count").textContent = formatNumber(
-        entries.length,
+        entries.length + estimates.length,
       );
-      if (entries.length === 0) {
+      if (entries.length === 0 && estimates.length === 0) {
         list.replaceChildren(createElement(
           "p",
           "map-object-empty",
@@ -1350,6 +1360,7 @@
         ));
         return item;
       }));
+      blastMapSemantics.renderEstimateDetails(list, estimates, blastRenderUi());
     }
 
     function relationLabel(relation) {

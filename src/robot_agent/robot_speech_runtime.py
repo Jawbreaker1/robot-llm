@@ -7,6 +7,7 @@ observe/plan/act loop or motor cleanup.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import json
 import subprocess
@@ -27,6 +28,7 @@ VOICE_BY_LOCALE = {
 DEFAULT_PROCESS_POLL_SECONDS = 0.05
 DEFAULT_PROCESS_STOP_SECONDS = 0.5
 MAX_DEDUPLICATION_UTTERANCES = 64
+MAX_PENDING_UTTERANCES = 32
 
 
 class RobotSpeechRuntimeError(RuntimeError):
@@ -145,7 +147,7 @@ def _normalized_speech_text(value: str) -> str:
 
 
 class RobotSpeechRuntime:
-    """Latest-pending-wins speech worker with explicit cancellation."""
+    """One playback queue: replace stale progress, preserve dialogue order."""
 
     def __init__(
         self,
@@ -174,7 +176,7 @@ class RobotSpeechRuntime:
         self._speaker_closed = False
         self._event_sink = event_sink
         self._condition = threading.Condition()
-        self._pending = None
+        self._pending = deque()
         self._active = None
         self._active_cancel = None
         self._sequence = 0
@@ -229,6 +231,7 @@ class RobotSpeechRuntime:
         cancel_requested: Optional[Callable[[], bool]] = None,
         admission: Optional[SpeechAdmission] = None,
         expression: Optional[Mapping[str, str]] = None,
+        replace_pending: bool = True,
     ) -> int:
         checked_episode = _identifier(episode_id)
         checked_text = _bounded_text(text)
@@ -256,8 +259,10 @@ class RobotSpeechRuntime:
                 "invalid_speech_progress_revision",
                 "Speech progress revision is invalid",
             )
+        if not isinstance(replace_pending, bool):
+            raise ValueError("speech queue policy is invalid")
         fingerprint = (locale, _normalized_speech_text(checked_text))
-        dropped = None
+        dropped = []
         duplicate = None
         with self._condition:
             if not self._started or not self._accepting or self._closed:
@@ -280,6 +285,8 @@ class RobotSpeechRuntime:
                     "speech_episode_cancelled",
                     "Cancelled episode cannot accept speech",
                 )
+            if not replace_pending and len(self._pending) >= MAX_PENDING_UTTERANCES:
+                raise RobotSpeechRuntimeError("speech_queue_full", "Speech queue is full")
             window = self._deduplication_windows.get(checked_episode)
             if window is None or progress_revision > window[0]:
                 fingerprints = {}
@@ -309,8 +316,10 @@ class RobotSpeechRuntime:
                 if len(fingerprints) >= MAX_DEDUPLICATION_UTTERANCES:
                     del fingerprints[next(iter(fingerprints))]
                 fingerprints[fingerprint] = None
-                dropped = self._pending
-                self._pending = item
+                if replace_pending:
+                    dropped = list(self._pending)
+                    self._pending.clear()
+                self._pending.append(item)
                 self._condition.notify_all()
         if duplicate is not None:
             if duplicate.admission is not None:
@@ -321,10 +330,10 @@ class RobotSpeechRuntime:
                 reason="duplicate_without_progress",
             )
             return duplicate.sequence
-        if dropped is not None:
-            if dropped.admission is not None:
-                dropped.admission.resolve("dropped")
-            self._emit("dropped", dropped, reason="replaced_by_newer")
+        for discarded in dropped:
+            if discarded.admission is not None:
+                discarded.admission.resolve("dropped")
+            self._emit("dropped", discarded, reason="replaced_by_newer")
         self._emit("queued", item)
         return item.sequence
 
@@ -335,15 +344,11 @@ class RobotSpeechRuntime:
 
     def cancel_episode(self, episode_id: str) -> None:
         checked = _identifier(episode_id)
-        dropped = None
+        dropped = []
         with self._condition:
             self._deduplication_windows.pop(checked, None)
-            if (
-                self._pending is not None
-                and self._pending.episode_id == checked
-            ):
-                dropped = self._pending
-                self._pending = None
+            dropped = [item for item in self._pending if item.episode_id == checked]
+            self._pending = deque(item for item in self._pending if item.episode_id != checked)
             if (
                 self._active is not None
                 and self._active.episode_id == checked
@@ -352,10 +357,10 @@ class RobotSpeechRuntime:
                     self._active.admission.resolve("cancelled")
                 self._active_cancel.set()
             self._condition.notify_all()
-        if dropped is not None:
-            if dropped.admission is not None:
-                dropped.admission.resolve("cancelled")
-            self._emit("cancelled", dropped, reason="episode_cancelled")
+        for discarded in dropped:
+            if discarded.admission is not None:
+                discarded.admission.resolve("cancelled")
+            self._emit("cancelled", discarded, reason="episode_cancelled")
 
     def close(
         self,
@@ -369,15 +374,15 @@ class RobotSpeechRuntime:
             or not 0 <= float(timeout_seconds) <= 30
         ):
             raise ValueError("speech close timeout is invalid")
-        dropped = None
+        dropped = []
         with self._condition:
             if self._closed:
                 thread = self._thread
             else:
                 self._accepting = False
                 if not drain:
-                    dropped = self._pending
-                    self._pending = None
+                    dropped = list(self._pending)
+                    self._pending.clear()
                     if self._active_cancel is not None:
                         if (
                             self._active is not None
@@ -388,10 +393,10 @@ class RobotSpeechRuntime:
                 self._closed = True
                 self._condition.notify_all()
                 thread = self._thread
-        if dropped is not None:
-            if dropped.admission is not None:
-                dropped.admission.resolve("cancelled")
-            self._emit("cancelled", dropped, reason="runtime_closed")
+        for discarded in dropped:
+            if discarded.admission is not None:
+                discarded.admission.resolve("cancelled")
+            self._emit("cancelled", discarded, reason="runtime_closed")
         if (
             self._started
             and thread is not threading.current_thread()
@@ -412,12 +417,11 @@ class RobotSpeechRuntime:
     def _run(self) -> None:
         while True:
             with self._condition:
-                while self._pending is None and not self._closed:
+                while not self._pending and not self._closed:
                     self._condition.wait()
-                if self._pending is None and self._closed:
+                if not self._pending and self._closed:
                     return
-                item = self._pending
-                self._pending = None
+                item = self._pending.popleft()
                 cancel_event = _SpeechCancellationEvent(item.admission)
                 self._active = item
                 self._active_cancel = cancel_event

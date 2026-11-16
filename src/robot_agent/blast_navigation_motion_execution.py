@@ -32,10 +32,14 @@ from .physical_navigation_contract import (
 from .physical_odometry import (
     PhysicalPose, VerifiedMotion, apply_verified_motion,
     verified_motion_from_result, normalize_heading_mdeg,
+    apply_encoder_observation_delta,
 )
 
 
 _DRIVE_ROLES = ("left_drive", "right_drive")
+LOST_RESPONSE_CODES = frozenset((
+    "controller_command_timeout", "controller_unavailable", "stale_controller_command",
+))
 MAX_RESTORED_SCAN_COMMON_MODE_RESIDUE_DEGREES = int(round(
     SCAN_RESTORATION_COMMON_MODE_TOLERANCE_MM /
     BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
@@ -98,6 +102,8 @@ class BlastNavigationMotionExecutor:
         self._expected_start_angles = _encoder_angles(initial_observation)
         self._pose = PhysicalPose()
         self._localization_valid = True
+        self._lost_response_generation = None
+        self._response_lost = False
 
     @property
     def pose(self) -> PhysicalPose:
@@ -124,6 +130,35 @@ class BlastNavigationMotionExecutor:
             total_forward_mm=self._pose.total_forward_mm,
             total_turn_mdeg=self._pose.total_turn_mdeg,
         )
+
+    def runtime_generation(self):
+        generation = getattr(self._controller, "runtime_generation", None)
+        return generation() if callable(generation) else generation
+
+    def mark_response_lost(self, generation) -> None:
+        """Keep the last encoder anchor until a stationary endpoint is available."""
+        self._localization_valid = False
+        self._response_lost = True
+        self._lost_response_generation = generation
+
+    def reconcile_lost_response(self, observation) -> None:
+        """Read actual progress once; never fabricate a completed command."""
+        if (not self._response_lost
+                or observation.get("motion_active") is not False
+                or self.runtime_generation()
+                != self._lost_response_generation):
+            _fail("blast_motion_recovery_unverified",
+                  "Lost response requires settled encoders from the same runtime")
+        angles = _encoder_angles(observation)
+        self._pose = apply_encoder_observation_delta(
+            self._pose,
+            angles["left_drive"] - self._expected_start_angles["left_drive"],
+            angles["right_drive"] - self._expected_start_angles["right_drive"],
+            BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry,
+        )
+        self._expected_start_angles = angles
+        self._response_lost = False
+        self._localization_valid = True
 
     def observation_matches_anchor(self, observation) -> bool:
         """Whether encoders remain within BLAST's mechanical settling allowance."""
@@ -344,6 +379,7 @@ class BlastNavigationMotionExecutor:
 
         results = []
         command_attempted = False
+        command_generation = self.runtime_generation()
         try:
             commands = BLAST_NAVIGATION_COMMANDS[action]
             if trim_turn:
@@ -368,7 +404,12 @@ class BlastNavigationMotionExecutor:
                           "BLAST returned an invalid command result")
                 results.append(command_result)
                 if command_index + 1 < len(commands):
-                    self._validated_result(action, results)
+                    _, progress, _ = self._validated_result(action, results)
+                    # A valid stopped receipt can still report a failed pulse.
+                    # Preserve that measured prefix and return it to the route
+                    # owner instead of issuing the rest of the turn blindly.
+                    if progress.verified_slice_count < len(results):
+                        break
                     if (
                         continue_requested is not None
                         and not continue_requested(command_result)
@@ -386,6 +427,8 @@ class BlastNavigationMotionExecutor:
             if not interrupted_before_start:
                 if command_attempted:
                     self._localization_valid = False
+                    self._response_lost = error.code in LOST_RESPONSE_CODES
+                    self._lost_response_generation = command_generation
                 raise
             if not results:
                 raise
@@ -403,7 +446,9 @@ class BlastNavigationMotionExecutor:
         yaw_delta = scan_heading_delta(
             scan_heading(results[-1].get("observation", {})), start_imu,
         )
-        if yaw_delta is not None and motion.verified_slice_count > 0:
+        if yaw_delta is not None and (
+            motion.left_encoder_delta_degrees or motion.right_encoder_delta_degrees
+        ):
             self.reanchor_heading(normalize_heading_mdeg(
                 start_heading - round(yaw_delta * 1000),
             ))

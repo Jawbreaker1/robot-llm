@@ -9,17 +9,16 @@ from pathlib import Path
 import threading
 from typing import Callable
 
-from . import lm_studio as _lm
+from .codex_subscription import robot_model_transport
 from .blast_episode_adapter import BlastEpisodeRuntimeAdapter
 from .blast_personality import (
     BLAST_PERSONA_BY_LOCALE,
     BLAST_MAX_NAVIGATION_UTTERANCE_CHARS,
     BLAST_NAVIGATION_OUTPUT_TOKENS,
     BLAST_NAVIGATION_TIMEOUT_SECONDS,
-    BLAST_NAVIGATION_REASONING_EFFORT,
 )
 from .lm_studio_controller_action import LMStudioControllerActionPlanner
-from .lm_studio_controller_action import REASONING_EFFORTS
+from .lm_studio_controller_action import REASONING_EFFORTS, navigation_reasoning_effort
 from .navigation_diagnostics import (
     enable_navigation_diagnostics,
     record_navigation_diagnostic,
@@ -116,13 +115,14 @@ def run_blast_gemma_scenario(
     *,
     model: str = DEFAULT_MODEL,
     max_decisions: int = 32,
-    reasoning_effort: str = BLAST_NAVIGATION_REASONING_EFFORT,
+    reasoning_effort: str | None = None,
     max_output_tokens: int = BLAST_NAVIGATION_OUTPUT_TOKENS,
     timeout_seconds: float = BLAST_NAVIGATION_TIMEOUT_SECONDS,
     planner_factory: Callable[[str], object] | None = None,
     startup_scan: dict | None = None,
     range_dropout_reads: int = 0,
     goal: str = DEFAULT_GOAL,
+    minimum_forward_progress_mm: int = 800,
 ) -> dict[str, object]:
     """Run the real BLAST episode loop; only hardware is simulated."""
 
@@ -135,7 +135,7 @@ def run_blast_gemma_scenario(
     last_raw_response: list[bytes | None] = [None]
     if planner_factory is None:
         def recording_transport(*args):
-            raw = _lm._stdlib_post(*args)
+            raw = robot_model_transport(*args)
             last_raw_response[0] = raw
             return raw
 
@@ -173,7 +173,6 @@ def run_blast_gemma_scenario(
         ),
         settings=RobotControlSettings(
             model=model,
-            max_episode_ms=10 * 60 * 1_000,
             speech_enabled=False,
         ),
         stop_requested=threading.Event(),
@@ -187,7 +186,7 @@ def run_blast_gemma_scenario(
             planner_records,
         ),
         max_decisions=max_decisions,
-        minimum_forward_progress_mm=800,
+        minimum_forward_progress_mm=minimum_forward_progress_mm,
         monotonic_ms=controller.monotonic_ms,
     )
     outcome = None
@@ -296,7 +295,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reasoning-effort",
         choices=REASONING_EFFORTS,
-        default=BLAST_NAVIGATION_REASONING_EFFORT,
+        default=None,
+        help="Override navigation reasoning (default: Astra high, Qwen low)",
     )
     parser.add_argument("--max-output-tokens", type=int, default=BLAST_NAVIGATION_OUTPUT_TOKENS)
     parser.add_argument("--startup-scan-json", type=Path,
@@ -359,6 +359,7 @@ def _compact_cli_result(result: dict[str, object]) -> dict[str, object]:
 
 def main() -> None:
     args = _parser().parse_args()
+    args.reasoning_effort = navigation_reasoning_effort(args.model, args.reasoning_effort)
     enable_navigation_diagnostics(
         Path("local-artifacts/navigation-simulation.jsonl")
     )

@@ -1,5 +1,6 @@
 import threading
 import unittest
+from dataclasses import replace
 
 from robot_agent.multi_robot_navigation_simulator import (
     MultiRobotNavigationSimulator,
@@ -49,6 +50,46 @@ def two_robot_world(*, obstacles=()):
 
 
 class MultiRobotNavigationSimulatorTests(unittest.TestCase):
+    def test_corner_rotation_and_translation_share_one_precise_pose(self):
+        # Recorded Astra failure: integer (632, -159) allowed the 22.2-degree
+        # heading, but the physical fractional position overlapped the margin.
+        for distance in (-45, 45):
+            world = MultiRobotNavigationSimulator(
+                bounds=(-1000, -1000, 2000, 1000),
+                obstacles=(RectangleObstacle('box', 360, -60, 570, 290),),
+                robots=(SimulatedRobot('blast', PoseEstimate(632, -159, 25968),
+                    footprint(front=110, rear=60, left=105, right=100), 2000),),
+                goals=(SimulationGoal('blast', 1800, 0),),
+            )
+            world._poses['blast'] = replace(world._poses['blast'],
+                x_mm=631.579662, y_mm=-158.660128)
+            before = world._poses['blast']
+            self.assertFalse(world._pose_collides('blast', before))
+            world.rotate('blast', -3768)
+            self.assertEqual(world._poses['blast'], before)
+            self.assertEqual(world.events[-1].kind, 'blocked')
+            self.assertEqual(world.move('blast', distance), distance)
+            self.assertFalse(world._pose_collides('blast', world._poses['blast']))
+            self.assertFalse(hasattr(world, '_positions_mm'))
+
+    def test_motor_polling_does_not_round_away_physical_drift(self):
+        for heading in (1_689, 45_000, -91_689):
+            with self.subTest(heading=heading):
+                continuous = two_robot_world()
+                polled = two_robot_world()
+                for world in (continuous, polled):
+                    world.rotate("blast", heading)
+                continuous.move("blast", 300)
+                for _ in range(300):
+                    polled.move("blast", 1)
+                self.assertEqual(polled.pose("blast"), continuous.pose("blast"))
+                continuous.move("blast", -300)
+                for _ in range(300):
+                    polled.move("blast", -1)
+                self.assertEqual(polled.pose("blast"), continuous.pose("blast"))
+                self.assertEqual(polled.pose("blast").x_mm, 0)
+                self.assertEqual(polled.pose("blast").y_mm, -350)
+
     def test_rotation_checks_swept_body_even_when_final_heading_is_clear(self):
         for direction in (-1, 1):
             with self.subTest(direction=direction):

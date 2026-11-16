@@ -710,6 +710,7 @@ class RobotControlService:
                     {
                         "client_request_id": client_request_id,
                         "settings_revision": self._settings.revision,
+                        "max_episode_ms": context.settings.max_episode_ms,
                         "locale": locale,
                     },
                 )
@@ -744,6 +745,11 @@ class RobotControlService:
                 except Exception:
                     pass
                 raise
+            # The running context retains its immutable limit. A later
+            # mission must not inherit a limit selected for this one.
+            if self._settings.max_episode_ms is not None:
+                self._settings = self._settings.with_updates({"max_episode_ms": None})
+                snapshot = self._record_snapshot_locked()
             return {
                 "accepted_episode_id": episode_id,
                 "idempotent": False,

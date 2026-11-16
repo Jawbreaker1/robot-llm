@@ -8,7 +8,7 @@ from .blast_navigation_action_profile import (
     BLAST_NAVIGATION_ACTION_SPECS,
 )
 from .blast_observation_monitor import SCAN_COMMAND_TIMEOUT_SECONDS
-from .physical_navigation_contract import SCAN_FRONT_ARC
+from .physical_navigation_contract import OBSERVE, SCAN_FRONT_ARC
 
 
 DEADLINE_RESPONSE_HEADROOM_MS = 750
@@ -57,6 +57,8 @@ class BlastEpisodeDeadline:
 def blast_action_deadline_headroom_ms(action: str) -> int:
     """Reserve nominal action time plus the same host slack used by EV3."""
 
+    if action == OBSERVE:
+        return SETTLED_OBSERVATION_HEADROOM_MS
     if action == SCAN_FRONT_ARC:
         return int(round(SCAN_COMMAND_TIMEOUT_SECONDS * 1_000))
     spec = BLAST_NAVIGATION_ACTION_SPECS[action]

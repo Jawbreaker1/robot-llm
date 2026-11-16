@@ -481,7 +481,32 @@
       advisoryWaypoint,
       localDetourRoute,
       coarseGrid,
+      // Beliefs retain their original edges; only display points are transformed.
+      obstacleEstimates: Object.freeze(normalizeObstacleEstimates(
+        shared ? trace.local_obstacle_estimates : trace.obstacle_estimates)),
+      obstacleEstimateTransform: shared ? sharedIdentity.transform : null,
       planarScanViews: Object.freeze(planarScanViews),
+    });
+  }
+
+  function normalizeObstacleEstimates(value) {
+    if (!Array.isArray(value)) return [];
+    return value.slice(0, 8).flatMap((item) => {
+      const estimate = record(item);
+      const bounds = record(estimate.bounds_mm);
+      const edges = ["min_x_mm", "max_x_mm", "min_y_mm", "max_y_mm"];
+      if (typeof estimate.label !== "string" || !estimate.label.trim()
+        || typeof estimate.basis !== "string"
+        || edges.some((key) => bounds[key] !== null
+          && (!Number.isInteger(bounds[key]) || Math.abs(bounds[key]) > 100000))
+        || ["x", "y"].some((axis) => bounds[`min_${axis}_mm`] !== null
+          && bounds[`max_${axis}_mm`] !== null
+          && bounds[`min_${axis}_mm`] >= bounds[`max_${axis}_mm`])) return [];
+      return [Object.freeze({
+        label: estimate.label.slice(0, 80), basis: estimate.basis.slice(0, 300),
+        confidenceMilli: nonnegativeInteger(estimate.confidence_milli),
+        edges: Object.freeze({ ...bounds }), bounds: normalizeBounds(bounds),
+      })];
     });
   }
 
@@ -955,6 +980,7 @@
       Object.freeze({
         ...identity,
         transformProvenance: transform.provenance,
+        transform,
       }),
     );
     const rawObjectHypotheses = robot.object_hypotheses === undefined

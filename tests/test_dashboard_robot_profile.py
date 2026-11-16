@@ -39,7 +39,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
         self.assertEqual(args.model, DEFAULT_MODEL)
         self.assertIsNone(args.robot_target)
         self.assertEqual(args.robot_planner_timeout_seconds, 60.0)
-        self.assertEqual(args.blast_reasoning_effort, "low")
+        self.assertIsNone(args.blast_reasoning_effort)
         from robot_agent.blast_navigation_simulation import _parser as simulation_parser
         simulated = simulation_parser().parse_args([])
         self.assertEqual(simulated.timeout_seconds, args.robot_planner_timeout_seconds)
@@ -290,6 +290,30 @@ class DashboardRobotProfileTests(unittest.TestCase):
                 self.assertEqual(binding.target, "robot@ev3dev.local")
                 self.assertTrue(binding.reset_memory)
             profile.build_adapter.assert_called_once_with(binding, planner_factory=mock.ANY)
+
+    def test_navigation_reasoning_follows_selected_model_for_both_robots(self):
+        for profile_id in (EV3RSTORM_PROFILE_ID, BLAST_PROFILE_ID):
+            for override in (None, "low"):
+                with self.subTest(profile=profile_id, override=override):
+                    options = ["--robot-profile", profile_id, "--model", "qwen/qwen3.8-27b"]
+                    if profile_id == EV3RSTORM_PROFILE_ID:
+                        options += ["--robot-target", "robot@ev3dev.local"]
+                    if override is not None:
+                        options += ["--blast-reasoning-effort", override]
+                    args = _parser().parse_args(options)
+                    with (
+                        mock.patch("robot_agent.dashboard_cli.EV3RSTORMProfile") as ev3,
+                        mock.patch("robot_agent.dashboard_cli.BlastEpisodeRuntimeAdapter") as blast,
+                    ):
+                        ev3.return_value.descriptor.profile_id = EV3RSTORM_PROFILE_ID
+                        _configured_robot_runtime_adapter(args, blast_monitor=object())
+                        builder = ev3.return_value.build_adapter if profile_id == EV3RSTORM_PROFILE_ID else blast
+                        factory = builder.call_args.kwargs["planner_factory"]
+                        # Model changes in the GUI must not reuse startup-model settings.
+                        for model, default in (("codex/gpt-6-astra", "high"),
+                                               ("qwen/qwen3.8-27b", "low"),
+                                               ("codex/gpt-6-astra", "high")):
+                            self.assertEqual(factory(model)._reasoning_effort, override or default)
 
     def test_blast_profile_requires_and_reuses_one_monitor(self):
         # The live 120-character navigation remark in

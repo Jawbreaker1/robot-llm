@@ -6,6 +6,8 @@ import threading
 import time
 from typing import Callable, Mapping, Optional
 
+from .navigation_diagnostics import record_navigation_diagnostic
+
 from .ev3_pulse_contract import (
     EV3PulseContractError,
     validate_pulse_result,
@@ -1080,6 +1082,8 @@ class EV3NavigationSSHTransport:
         request_written = False
         try:
             try:
+                record_navigation_diagnostic("ev3_worker_request", controller_id=self.controller_id,
+                                             request_id=request_id, operation=operation, arguments=args)
                 self._process.stdin.write(frame)
                 request_written = True
                 self._process.stdin.flush()
@@ -1123,6 +1127,10 @@ class EV3NavigationSSHTransport:
                     )
                 )
             value = strict_json_loads(raw, MAX_RESPONSE_BYTES)
+            # Preserve the complete evidence before contract validation can
+            # raise on a partial/failed motion. Diagnostic only, never replayed.
+            record_navigation_diagnostic("ev3_worker_receipt", controller_id=self.controller_id,
+                                         request_id=request_id, operation=operation, response=value)
             response = self._validate_response(value, request_id)
             self._validate_success_result(operation, args, response)
             if operation == "shutdown":

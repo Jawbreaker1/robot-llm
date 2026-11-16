@@ -429,8 +429,9 @@ def validate_blast_scan_ray_contract(scan):
             sweep_coverage, abs(raw_sweep_bearing), abs_tol=1e-9,
         )
         and (
-            raw_sweep_bearing < 0
-            if sweep_direction == "left" else raw_sweep_bearing > 0
+            partial_scan and raw_sweep_bearing == 0
+            or (raw_sweep_bearing < 0
+                if sweep_direction == "left" else raw_sweep_bearing > 0)
         )
     )
     restoration_contract = (
@@ -516,7 +517,9 @@ def validate_blast_scan_ray_contract(scan):
             partial_scan
             and (
                 sweep_coverage is None
-                or not 0.0 < sweep_coverage < 350.0
+                # An interrupted closing pulse can leave almost/full-circle
+                # coverage without a completed scan. Keep the partial status.
+                or not 0.0 <= sweep_coverage <= 390.0
             )
         )
         or (not partial_scan and scan.get("state") != "complete")
@@ -933,19 +936,24 @@ def build_blast_partial_scan(
     """Return honest partial evidence when a safe full sweep cannot continue."""
 
     start_imu_heading = scan_heading(center)
-    candidates = []
+    candidates = {}
     for sample in sweep_samples:
         observation, settled, evidence_use = sample[1:]
         bearing = scan_relative_bearing_deg(
             observation, start_drive_angles, start_imu_heading,
         )
         if bearing not in (None, 0.0):
-            candidates.append((bearing, observation, settled, evidence_use))
+            # A stopped pulse (or the return sweep) can revisit a bearing.
+            # It is another reading, not another angular sector. Prefer the
+            # latest settled sample without replacing it with unstable data.
+            previous = candidates.get(bearing)
+            if previous is None or settled or not previous[2]:
+                candidates[bearing] = (bearing, observation, settled, evidence_use)
 
     def bounded_side(side):
         values = sorted(
             (
-                item for item in candidates
+                item for item in candidates.values()
                 if (item[0] < 0 if side == "left" else item[0] > 0)
             ),
             key=lambda item: abs(item[0]),

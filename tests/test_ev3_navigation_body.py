@@ -81,19 +81,22 @@ def inject_unrecorded_turn(transport, motor_degrees=76):
 
 
 class EV3NavigationBodyTests(unittest.TestCase):
-    def test_startup_timeout_retries_without_losing_scan_pose_or_encoder_anchor(self):
+    def test_caller_can_reconnect_without_losing_scan_pose_or_encoder_anchor(self):
         body, _, _ = ev3_test_body(front=False)
         self.addCleanup(body.close)
         body.scan()
         body.execute(ADVANCE)
-        body.release_for_planning()
+        body.close()
         pose, survey = body.pose, body.survey
         factory = body.transport_factory
         failed = Mock()
         failed.request.side_effect = EV3NavigationTimeoutError("describe", 60, "")
         body.transport_factory = Mock(side_effect=[failed, factory()])
-        events = []
-        body.publish = events.append
+        with self.assertRaises(EV3NavigationTimeoutError):
+            body.observe()
+        self.assertEqual(body.transport_factory.call_count, 1)
+        self.assertEqual(body.pose, pose)
+        self.assertIs(body.survey, survey)
         body.observe()
         failed.request.assert_called_once_with("describe", {}, 60.0, cancel_requested=body.cancel_requested)
         failed.abort.assert_called_once()
@@ -101,13 +104,12 @@ class EV3NavigationBodyTests(unittest.TestCase):
         self.assertEqual(body.transport_factory.call_count, 2)
         self.assertEqual(body.pose, pose)
         self.assertIs(body.survey, survey)
-        self.assertEqual(events[0]["event"], "worker_start_retry")
 
-    def test_startup_retry_is_bounded_and_does_not_hide_protocol_or_cancel_errors(self):
+    def test_body_does_not_hide_or_retry_transport_errors(self):
         for kind in ("timeout", "protocol", "cancelled"):
             with self.subTest(kind=kind):
                 body, _, _ = ev3_test_body(front=False)
-                body.release_for_planning()
+                body.close()
                 failed = Mock()
                 error = (EV3NavigationTransportError("invalid description") if kind == "protocol"
                          else EV3NavigationTimeoutError("describe", 60, ""))
@@ -116,7 +118,7 @@ class EV3NavigationBodyTests(unittest.TestCase):
                 body.cancel_requested = lambda: kind == "cancelled"
                 with self.assertRaises(type(error)):
                     body.start()
-                expected = 2 if kind == "timeout" else 1
+                expected = 1
                 self.assertEqual(body.transport_factory.call_count, expected)
                 self.assertEqual(failed.abort.call_count, expected)
                 self.assertEqual(failed.close.call_count, expected)
@@ -165,10 +167,19 @@ class EV3NavigationBodyTests(unittest.TestCase):
                 self.assertEqual(first["raw_ir_proximity"], raw)
                 self.assertFalse(body.survey["samples"][0]["near_obstacle"])
                 self.assertNotIn("forward_motion_blocked", first)
+                self.assertTrue(context.execution["forward_admission"]["permitted"])
                 self.assertNotIn("forward_motion_blocked", context.observation["infrared"])
+                self.assertIsNone(context.observation["infrared"]["distance_mm"])
+                self.assertEqual(context.execution["forward_admission"]["reason"],
+                                 body.observation["infrared"]["reason"])
                 self.assertNotIn("near_obstacle", first)
-                self.assertIn("ir_reference_observations", context.local_map_evidence)
+                self.assertNotIn("ir_reference_observations", context.local_map_evidence)
+                self.assertNotIn("obstacle_estimates", context.local_map_evidence)
+                self.assertEqual(context.obstacle_estimates, ())
                 self.assertFalse(context.local_map_evidence["metric_distance_available"])
+                self.assertEqual(context.execution["advance_step_mm"], body.advance_step_mm)
+                self.assertGreater(body.advance_step_mm, 40)
+                self.assertLess(body.advance_step_mm, 60)
                 layout = context.local_map_evidence["sensor_layout"]
                 self.assertEqual(layout["infrared_mount"], "head, facing forward")
                 self.assertEqual(layout["color_sensor_mount"], "right hand; not a range sensor")
@@ -231,6 +242,8 @@ class EV3NavigationBodyTests(unittest.TestCase):
         self.assertTrue(survey["complete"])
         self.assertEqual(commands, [30_000] * 12)
         self.assertEqual(len(survey["samples"]), 13)
+        self.assertAlmostEqual(survey["sweep_degrees"], 312, delta=1)
+        self.assertEqual(body.last_motion["sweep_coverage_deg"], survey["sweep_degrees"])
 
     def test_missing_sample_keeps_survey_and_model_authored_route(self):
         body, profile, mission = ev3_test_body(missing_sample=4)
@@ -247,11 +260,20 @@ class EV3NavigationBodyTests(unittest.TestCase):
         self.assertGreater(context.active_waypoint_geometry["heading_error_deg"], 0)
         self.assertTrue(any(item["raw_ir_proximity"] is None for item in context.local_map_evidence["ir_survey"]["samples"]))
 
-    def test_front_half_survey_returns_to_start_and_forward_uses_measured_encoders(self):
+    def test_dense_front_survey_returns_to_start_and_forward_uses_measured_encoders(self):
         body, _, _ = ev3_test_body(front=False)
         self.addCleanup(body.close)
         scan = body.scan(full=False)
         self.assertTrue(scan["complete"])
+        measured_headings = [sample["pose"]["heading_mdeg"] / 1_000 for sample in scan["samples"]]
+        self.assertEqual(scan["sweep_degrees"], round(max(measured_headings) - min(measured_headings), 1))
+        self.assertEqual([sample["requested_bearing_deg"] for sample in scan["samples"]],
+                         [-60, -45, -30, -15, 0, 15, 30, 45, 60, 0])
+        turns = [args["relative_delta_mdeg"] for op, args in body.transport.requests if op == SCAN_TURN_OPERATION]
+        self.assertEqual(turns, [-60_000, *([15_000] * 8), -60_000])
+        for sample in scan["samples"]:
+            self.assertLess(abs(normalize_heading_mdeg(sample["pose"]["heading_mdeg"] -
+                                                       sample["requested_bearing_deg"] * 1_000)), 1_000)
         self.assertLess(abs(body.pose.heading_mdeg), 7_500)
         result = body.execute(ADVANCE)
         self.assertTrue(result["completed"])
@@ -259,6 +281,46 @@ class EV3NavigationBodyTests(unittest.TestCase):
         truth = body.transport.simulation.pose("ev3")
         self.assertLessEqual(abs(body.pose.x_mm - truth.x_mm), 2)
         self.assertLessEqual(abs(body.pose.y_mm - truth.y_mm), 2)
+
+    def test_dense_scan_samples_reflection_boundaries_missed_by_coarse_scan(self):
+        body, profile, mission = ev3_test_body(ir_response=((0, 0), (200, 44), (300, 51), (1_000, 100)))
+        self.addCleanup(body.close)
+        body.scan()
+        initial = tuple(body.ir_observations)
+        scan = body.scan(full=False)
+        rays = {sample["requested_bearing_deg"]: sample["raw_ir_proximity"] for sample in scan["samples"]}
+        self.assertEqual(rays[-30], 100)
+        self.assertLess(rays[-15], 100)
+        self.assertLess(rays[15], 100)
+        self.assertEqual(rays[30], 100)
+        self.assertEqual(tuple(body.ir_observations[:len(initial)]), initial)
+        context = ev3_navigation_context(body=body, descriptor=profile.descriptor,
+            footprint=profile.hazard_calibration.robot_footprint, mission=mission, goal="Reach goal")
+        self.assertEqual(context.execution["scan_front_arc"]["relative_bearings_deg"], list(range(-60, 61, 15)))
+        self.assertTrue(context.execution["scan_front_arc"]["returns_to_start_heading"])
+        self.assertEqual(context.execution["scan_front_arc"]["motion"], "in_place_body_rotation")
+        self.assertEqual(context.local_map_evidence["ir_survey"]["sweep_degrees"], scan["sweep_degrees"])
+        self.assertFalse(context.local_map_evidence["metric_distance_available"])
+        self.assertEqual(context.obstacle_estimates, ())  # No host-invented box.
+
+    def test_dense_scan_is_relative_to_current_heading_and_preserves_missing_ray(self):
+        body, _, _ = ev3_test_body(front=False)
+        self.addCleanup(body.close)
+        body.execute("TURN_LEFT_90")
+        start = body.pose
+        body.transport.missing_sample = body.transport.sample_count + 4
+        scan = body.scan(full=False)
+        self.assertTrue(scan["complete"])
+        self.assertEqual(len(scan["samples"]), 10)
+        self.assertEqual(scan["samples"][3]["error_code"], "sample_missing")
+        self.assertIsNone(scan["samples"][3]["raw_ir_proximity"])
+        self.assertLess(abs(normalize_heading_mdeg(body.pose.heading_mdeg - start.heading_mdeg)), 1_000)
+        self.assertEqual((body.pose.x_mm, body.pose.y_mm), (start.x_mm, start.y_mm))
+        for ray in scan["samples"]:
+            expected = start.heading_mdeg + ray["requested_bearing_deg"] * 1_000
+            self.assertLess(abs(normalize_heading_mdeg(ray["pose"]["heading_mdeg"] - expected)), 1_000)
+        self.assertFalse(any(op == "pulse" and args["action"] == ADVANCE
+                             for op, args in body.transport.requests))
 
     def test_old_scan_stays_at_its_original_position_and_heading_after_a_turn_and_move(self):
         body, profile, mission = ev3_test_body(side="right")
@@ -285,8 +347,31 @@ class EV3NavigationBodyTests(unittest.TestCase):
         body, _, _ = ev3_test_body(cancel_requested=cancelled.is_set)
         cancelled.set()
         self.assertEqual(body.scan()["reason"], "cancelled")
+        self.assertEqual(body.survey["sweep_degrees"], 0)
+        self.assertEqual(body.last_motion["sweep_coverage_deg"], 0)
         body.close()
         self.assertTrue(body.transport.shutdown_complete)
+
+    def test_interrupted_scan_reports_measured_coverage_to_planner(self):
+        for full in (False, True):
+            with self.subTest(full=full):
+                body, profile, mission = ev3_test_body(
+                    ir_response=((0, 0), (200, 44), (300, 51), (1_000, 100)))
+                self.addCleanup(body.close)
+                body.execute(ADVANCE)
+                start = body.pose
+                scan = body.scan(full=full)
+                self.assertFalse(scan["complete"])
+                self.assertEqual(scan["reason"], "simulation_body_blocked")
+                actual = round(abs(normalize_heading_mdeg(body.pose.heading_mdeg - start.heading_mdeg)) / 1_000, 1)
+                self.assertGreater(actual, 0)
+                self.assertLess(actual, 30)
+                self.assertEqual(scan["sweep_degrees"], actual)
+                context = ev3_navigation_context(body=body, descriptor=profile.descriptor,
+                    footprint=profile.hazard_calibration.robot_footprint, mission=mission, goal="Reach goal",
+                    history=({"last_motion": body.last_motion, "pose": body.pose.to_dict()},))
+                self.assertEqual(context.local_map_evidence["ir_survey"]["sweep_degrees"], actual)
+                self.assertEqual(context.observation["last_motion"]["sweep_coverage_deg"], actual)
 
     def test_worker_limits_match_deployed_profile_and_are_enforced(self):
         from ev3.navigation_profile import MAX_PROCESS_SECONDS, MAX_REQUESTS, MAX_PULSES, MAX_PULSE_DURATION_MS
@@ -352,6 +437,7 @@ class EV3NavigationBodyTests(unittest.TestCase):
         )
 
     def test_execute_reconciles_encoder_gap_inside_motion_receipt(self):
+        # This gap is AFTER the commanded turn, and must stay after it.
         body, _, _ = ev3_test_body(front=False)
         self.addCleanup(body.close)
         transport = body.transport
@@ -376,7 +462,34 @@ class EV3NavigationBodyTests(unittest.TestCase):
         self.assertEqual(body.pose.total_turn_mdeg, 40_415)
         self.assertEqual(body.pose.heading_mdeg, 40_415)
 
+    def test_unobserved_translation_before_turn_is_not_drawn_after_the_turn(self):
+        body, _, _ = ev3_test_body(front=False)
+        self.addCleanup(body.close)
+        # Motor counters advance before the next command's receipt begins.
+        # No new command is needed to account for this already-observed travel.
+        body.transport.request("pulse", {"action": ADVANCE}, 30)
+        body.execute(SCAN_TURN_OPERATION, turn_mdeg=90_000)
+        truth = body.transport.simulation.pose("ev3")
+        self.assertEqual((body.pose.x_mm, body.pose.y_mm), (truth.x_mm, truth.y_mm))
+        self.assertEqual((body.pose.x_mm, body.pose.y_mm), (52, 0))
+        pose = body.pose
+        body.observe()
+        self.assertEqual(body.pose, pose)
+
+    def test_unobserved_turn_before_advance_changes_the_travel_direction(self):
+        body, _, _ = ev3_test_body(front=False)
+        self.addCleanup(body.close)
+        inject_unrecorded_turn(body.transport, motor_degrees=657)
+        body.execute(ADVANCE)
+        truth = body.transport.simulation.pose("ev3")
+        self.assertEqual((body.pose.x_mm, body.pose.y_mm), (truth.x_mm, truth.y_mm))
+        self.assertEqual((body.pose.x_mm, body.pose.y_mm), (0, 52))
+        pose = body.pose
+        body.observe()
+        self.assertEqual(body.pose, pose)
+
     def test_worker_renewal_preserves_absolute_encoder_anchor(self):
+        # Worker renewal shares the same commit path as normal observations.
         body, _, _ = ev3_test_body(front=False)
         self.addCleanup(body.close)
         body.execute(ADVANCE)
@@ -387,22 +500,41 @@ class EV3NavigationBodyTests(unittest.TestCase):
         self.assertIsNot(body.transport, old)
         self.assertEqual(body.pose, pose)
 
-    def test_model_wait_releases_worker_and_resumes_sensing_without_rescanning(self):
+    def test_expired_worker_is_renewed_without_losing_pose_or_rescanning(self):
         body, _, _ = ev3_test_body(front=False)
         self.addCleanup(body.close)
         body.scan()
         body.execute(ADVANCE)
         pose, survey, old = body.pose, body.survey, body.transport
-        body.release_for_planning()
-        self.assertTrue(old.shutdown_complete)
         request_count = len(old.requests)
         # The model takes longer than an entire worker lifetime.
         old._started_clock -= 300
+        body._deadline -= 300
+        # An already expired worker cannot acknowledge shutdown. Surface that
+        # transport failure once; the episode retries without replaying motion.
+        with self.assertRaises(EV3NavigationTransportError):
+            body.observe()
+        self.assertEqual(body.pose, pose)
         body.observe()
         self.assertIsNot(body.transport, old)
         self.assertEqual(body.pose, pose)
         self.assertIs(body.survey, survey)
-        self.assertEqual([r[0] for r in old.requests[request_count:]], ["describe", "observe"])
+        self.assertEqual([r[0] for r in old.requests[request_count:]], ["shutdown", "describe", "observe"])
+
+    def test_middle_band_scan_and_reconnect_do_not_change_forward_availability(self):
+        body, profile, mission = ev3_test_body(ir_response=((0, 39), (2_000, 39)))
+        self.addCleanup(body.close)
+        body.scan()
+        pose = body.pose
+        for reconnect in (False, True):
+            if reconnect:
+                body.close()
+            body.observe()
+            context = ev3_navigation_context(body=body, descriptor=profile.descriptor,
+                footprint=profile.hazard_calibration.robot_footprint, mission=mission, goal="Reach goal")
+            self.assertTrue(context.execution["forward_admission"]["permitted"])
+            self.assertIn(ADVANCE, context.available_actions)
+            self.assertEqual(body.pose, pose)
 
     def test_time_and_request_budget_renewal_happen_before_next_sensor_request(self):
         for budget in ("time", "requests"):

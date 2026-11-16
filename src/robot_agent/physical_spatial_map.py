@@ -12,7 +12,7 @@ import time
 from typing import Callable, Mapping
 
 from .navigation_memory_store import NavigationMemoryStore
-from .navigation_map_trace import final_goal_trace, waypoint_route_trace
+from .navigation_map_trace import advisory_waypoint_trace, final_goal_trace, waypoint_route_trace
 from .physical_navigation_contract import validate_observation
 from .physical_scan_evidence import (
     MAX_SCAN_ATTEMPTS_PER_HAZARD,
@@ -219,7 +219,7 @@ class PhysicalSpatialMapBridge:
             self._pose_history_evicted += 1
         self._pose_history.append(dict(pose))
 
-    def offer_navigation(self, *, body, mission, waypoints, footprint):
+    def offer_navigation(self, *, body, mission, waypoints, footprint, obstacle_estimates=()):
         """Project the shared EV3 session directly, without a second pose/map engine."""
         with self._lock:
             if not self._accepting:
@@ -259,9 +259,11 @@ class PhysicalSpatialMapBridge:
                 "navigation_trace": {
                     "schema": "robot-navigation-trace/v1", "read_only": True, "frame_id": frame,
                     "provenance": "LOCAL_ODOMETRY + PROVISIONAL_IR", "final_goal": final_goal_trace(mission, body.pose),
-                    "imu_heading": None, "planned_leg": None, "advisory_waypoint": deepcopy(waypoints[0]) if waypoints else None,
+                    "imu_heading": None, "planned_leg": None,
+                    "advisory_waypoint": advisory_waypoint_trace(waypoints[0] if waypoints else None),
                     "local_detour_route": waypoint_route_trace(mission, body.pose, waypoints, version),
                     "planar_scan_views": [], "coarse_grid": None,
+                    "obstacle_estimates": deepcopy(list(obstacle_estimates)),
                 },
             })
             self._snapshot = snapshot

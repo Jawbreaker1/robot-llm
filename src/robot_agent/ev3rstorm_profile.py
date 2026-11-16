@@ -413,7 +413,7 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             raise ControllerRuntimeProfileError("EV3 binding selected another controller profile")
         if planner_factory is None:
             planner_factory = lambda model: LMStudioControllerActionPlanner(
-                model=model, reasoning_effort="low", max_output_tokens=4096, timeout_seconds=60)
+                model=model, max_output_tokens=4096, timeout_seconds=60)
 
         def transport_factory():
             return EV3NavigationSSHTransport(

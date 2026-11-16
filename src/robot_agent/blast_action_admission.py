@@ -9,7 +9,6 @@ from .blast_observation_monitor import (
 )
 from .physical_navigation_contract import (
     ADVANCE,
-    REVERSE,
     SCAN_FRONT_ARC,
     TURN_LEFT_90,
     TURN_RIGHT_90,
@@ -68,15 +67,10 @@ def fresh_blast_action_observation(
     bounded_evidence_action = (
         allow_no_valid_with_bounded_evidence is True
         and navigation_body_matched(observation["sensors"])
-        and (
-            action == REVERSE
-            or (
-                action in (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90)
-                and blast_range_state(
-                    observation["sensors"].get("distance_mm")
-                ) == RANGE_STATE_NO_VALID_DISTANCE
-            )
-        )
+        and action in (ADVANCE, TURN_LEFT_90, TURN_RIGHT_90)
+        and blast_range_state(
+            observation["sensors"].get("distance_mm")
+        ) == RANGE_STATE_NO_VALID_DISTANCE
     )
     if (
         action != SCAN_FRONT_ARC

@@ -135,7 +135,8 @@ class InfraredGatePolicy(object):
 class InfraredObstacleGate(object):
     """Fail-closed IR gate with fast entry and conservative release.
 
-    Startup is blocked until stable higher readings establish release. Each
+    Startup is blocked until stable readings establish the initial state.
+    Hysteresis holds an observed obstacle, never the startup precaution. Each
     observation returns a fixed-size dictionary rather than retaining or
     publishing an unbounded sample history.
     """
@@ -148,6 +149,7 @@ class InfraredObstacleGate(object):
         self._raw = None
         self._filtered = None
         self._blocked = True
+        self._verified = False
         self._reason = REASON_UNVERIFIED_STARTUP
         self._sample_count = 0
         self._candidate_blocked = None
@@ -169,6 +171,8 @@ class InfraredObstacleGate(object):
             self._candidate_count = 1
 
     def _fail_closed(self):
+        # A failed sample cannot erase an already established near obstacle.
+        self._verified = self._verified and self._blocked
         self._samples.clear()
         self._raw = None
         self._filtered = None
@@ -206,12 +210,15 @@ class InfraredObstacleGate(object):
 
         if raw <= self.policy.immediate_enter_max:
             self._blocked = True
+            self._verified = True
             self._reason = REASON_IMMEDIATE_ENTRY
             self._reset_candidate()
             return self.snapshot()
 
         if len(self._samples) < self.policy.median_window:
-            self._reason = REASON_WARMING_UP
+            self._reason = (REASON_BLOCKED_HOLD
+                            if self._verified and self._blocked
+                            else REASON_WARMING_UP)
             self._reset_candidate()
             return self.snapshot()
 
@@ -219,7 +226,9 @@ class InfraredObstacleGate(object):
             desired_blocked = True
             required = self.policy.enter_consecutive
             pending_reason = REASON_ENTRY_PENDING
-        elif self._filtered >= self.policy.exit_min:
+        elif not self._verified or self._filtered >= self.policy.exit_min:
+            # No established obstacle yet: classify against enter_max.
+            # exit_min only releases a previously observed obstacle.
             desired_blocked = False
             required = self.policy.exit_consecutive
             pending_reason = REASON_EXIT_PENDING
@@ -232,7 +241,7 @@ class InfraredObstacleGate(object):
             self._reset_candidate()
             return self.snapshot()
 
-        if desired_blocked == self._blocked:
+        if self._verified and desired_blocked == self._blocked:
             self._reason = (
                 REASON_BLOCKED_HOLD
                 if self._blocked
@@ -243,10 +252,11 @@ class InfraredObstacleGate(object):
 
         self._set_candidate(desired_blocked)
         if self._candidate_count < required:
-            self._reason = pending_reason
+            self._reason = pending_reason if self._verified else REASON_WARMING_UP
             return self.snapshot()
 
         self._blocked = desired_blocked
+        self._verified = True
         self._reason = (
             REASON_STABLE_ENTRY
             if desired_blocked

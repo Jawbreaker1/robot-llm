@@ -80,15 +80,35 @@ class RobotFootprint:
             "calibration_evidence": self.calibration_evidence,
         }
 
+    @property
+    def turn_sweep_radius_mm(self) -> int:
+        """Enclose the same margin-expanded corners used by collision checks."""
+        return math.ceil(max(
+            math.hypot(x, y) for x, y in self.world_corners(PhysicalPose())
+        ))
+
     def planner_view(self) -> Mapping[str, object]:
         """The same measured body for every planner, with geometry made explicit."""
         return {
             **self.to_dict(),
             "length_mm": self.front_extent_mm + self.rear_extent_mm,
             "width_mm": self.left_extent_mm + self.right_extent_mm,
-            "turn_sweep_radius_mm": math.ceil(self.maximum_corner_radius_mm + self.clearance_margin_mm),
+            "turn_sweep_radius_mm": self.turn_sweep_radius_mm,
             "reference": "Waypoints and odometry locate the drive origin, not the body edge. The in-place turn circle stays centered on that same origin and includes the existing margin; do not add it to already-expanded keep-outs.",
         }
+
+    def world_corners(self, pose):
+        """Body and its existing margin, rotated about the measured drive origin."""
+        margin = self.clearance_margin_mm
+        heading = math.radians(pose.heading_mdeg / 1_000)
+        cosine, sine = math.cos(heading), math.sin(heading)
+        return tuple((pose.x_mm + forward * cosine - left * sine,
+                      pose.y_mm + forward * sine + left * cosine)
+                     for forward, left in (
+                         (self.front_extent_mm + margin, self.left_extent_mm + margin),
+                         (-self.rear_extent_mm - margin, self.left_extent_mm + margin),
+                         (-self.rear_extent_mm - margin, -self.right_extent_mm - margin),
+                         (self.front_extent_mm + margin, -self.right_extent_mm - margin)))
 
 
 def _point_distance(

@@ -202,7 +202,7 @@
         model: safeText(settings.model, ""),
         max_episode_ms: Number.isSafeInteger(settings.max_episode_ms)
           ? settings.max_episode_ms
-          : 900000,
+          : null,
         speech_enabled: settings.speech_enabled === true,
       },
       episode: {
@@ -474,8 +474,14 @@
       const maximum = byId("robot-setting-max-episode-ms");
       const speech = byId("robot-setting-speech-enabled");
       if (!settingsDirty || force) {
+        const customModel = byId("robot-setting-custom-model-option");
+        customModel.hidden = ["qwen/qwen3.8-27b", "codex/gpt-6-astra"].includes(control.settings.model);
+        customModel.value = customModel.hidden ? "" : control.settings.model;
+        customModel.textContent = customModel.hidden ? "" : control.settings.model;
         model.value = control.settings.model;
-        maximum.value = String(control.settings.max_episode_ms);
+        maximum.value = control.settings.max_episode_ms === null
+          ? ""
+          : String(control.settings.max_episode_ms);
         speech.checked = control.settings.speech_enabled;
         settingsDirty = false;
       }
@@ -818,9 +824,9 @@
       const targetControl = controlsById[target];
       const changes = {
         model: byId("robot-setting-model").value.trim(),
-        max_episode_ms: Number(
-          byId("robot-setting-max-episode-ms").value,
-        ),
+        max_episode_ms: byId("robot-setting-max-episode-ms").value.trim() === ""
+          ? null
+          : Number(byId("robot-setting-max-episode-ms").value),
         speech_enabled: byId(
           "robot-setting-speech-enabled",
         ).checked,

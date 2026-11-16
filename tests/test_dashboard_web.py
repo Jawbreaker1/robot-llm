@@ -2452,6 +2452,7 @@ process.stdout.write(JSON.stringify({
   directory: api.normalizeRobotDirectory({ controls: [idle] }),
   idle,
   disabled,
+  unlimited: api.normalizeControl({ settings: { max_episode_ms: null } }),
   preferredLiveTarget: api.preferredInitialTarget(idle, false),
   preferredDisabledTarget: api.preferredInitialTarget(disabled, false),
   preferredDisabledNamedTarget: api.preferredInitialTarget(
@@ -2530,6 +2531,9 @@ process.stdout.write(JSON.stringify({
         if completed.returncode != 0:
             raise AssertionError(completed.stderr)
         contract = json.loads(completed.stdout)
+        self.assertIsNone(contract["disabled"]["settings"]["max_episode_ms"])
+        self.assertIsNone(contract["unlimited"]["settings"]["max_episode_ms"])
+        self.assertEqual(contract["idle"]["settings"]["max_episode_ms"], 120000)
         self.assertTrue(contract["frozen"])
         self.assertEqual(
             contract["exports"],
@@ -2815,7 +2819,7 @@ process.stdout.write(JSON.stringify({
             target_change,
         )
 
-    def test_robot_selector_keeps_both_named_targets_visible_when_offline(self):
+    def test_robot_selector_and_optional_mission_settings_round_trip(self):
         script = r"""
 const fs = require("fs");
 const vm = require("vm");
@@ -2850,6 +2854,7 @@ const ids = [
   "robot-emergency-stop-button", "robot-current-action",
   "robot-obstacle", "robot-plan", "robot-scan", "robot-model-latency",
   "robot-speech-status", "robot-setting-model",
+  "robot-setting-custom-model-option",
   "robot-setting-max-episode-ms", "robot-setting-speech-enabled",
   "robot-save-settings-button", "robot-settings-status",
   "robot-settings-form", "status-motion",
@@ -2877,7 +2882,7 @@ const named = {
   settings: {
     revision: 1,
     model: "gemma",
-    max_episode_ms: 900000,
+    max_episode_ms: null,
     speech_enabled: true,
   },
   runtime: { speech_status: "idle", plan: [] },
@@ -2915,7 +2920,11 @@ vm.runInNewContext(source, { window }, { filename: process.argv[1] });
 const ui = window.RobotControlUI.create({
   document: { getElementById: (id) => nodes[id] },
   request: async (path, options = {}) => {
-    requests.push({ path, method: options.method || "GET" });
+    requests.push({ path, method: options.method || "GET", body: options.body });
+    if (path === "/api/v1/robots/blast-01/settings" && options.method === "PUT") {
+      return { settings: { ...named.settings, ...options.body.changes,
+        revision: options.body.expected_revision + 1 } };
+    }
     if (path === "/api/v1/robots") {
       return { schema: "robot-control-directory/v1", controls: [
         ev3Unavailable, named,
@@ -2944,6 +2953,22 @@ const ui = window.RobotControlUI.create({
 
 (async () => {
   await ui.initialize();
+  const limitField = nodes["robot-setting-max-episode-ms"];
+  const defaultLimitValue = limitField.value;
+  for (const value of ["60000", ""]) {
+    limitField.value = value;
+    limitField.listeners.input();
+    await nodes["robot-settings-form"].listeners.submit({ preventDefault() {} });
+  }
+  const clearedLimitValue = limitField.value;
+  const customBeforeSwitch = nodes["robot-setting-custom-model-option"].value;
+  for (const model of ["codex/gpt-6-astra", "qwen/qwen3.8-27b"]) {
+    nodes["robot-setting-model"].value = model;
+    nodes["robot-setting-model"].listeners.input();
+    await nodes["robot-settings-form"].listeners.submit({ preventDefault() {} });
+  }
+  const customHidden = nodes["robot-setting-custom-model-option"].hidden;
+  const customValueAfterSwitch = nodes["robot-setting-custom-model-option"].value;
   const ready = {
     selected: ui.selectedTarget(),
     value: nodes["composer-target"].value,
@@ -2970,6 +2995,15 @@ const ui = window.RobotControlUI.create({
     unavailableView,
     accepted,
     postRequests: requests.filter((request) => request.method === "POST"),
+    defaultLimitValue,
+    clearedLimitValue,
+    customBeforeSwitch,
+    customHidden,
+    customValueAfterSwitch,
+    savedModels: requests.filter((request) => request.method === "PUT")
+      .map((request) => request.body.changes.model),
+    savedLimits: requests.filter((request) => request.method === "PUT")
+      .map((request) => request.body.changes.max_episode_ms),
     targetChanges,
   }));
 })();
@@ -3014,6 +3048,13 @@ const ui = window.RobotControlUI.create({
         )
         self.assertFalse(result["accepted"])
         self.assertEqual(result["postRequests"], [])
+        self.assertEqual(result["defaultLimitValue"], "")
+        self.assertEqual(result["clearedLimitValue"], "")
+        self.assertEqual(result["savedLimits"], [60000, None, None, None])
+        self.assertEqual(result["savedModels"], ["gemma", "gemma", "codex/gpt-6-astra", "qwen/qwen3.8-27b"])
+        self.assertEqual(result["customBeforeSwitch"], "gemma")
+        self.assertTrue(result["customHidden"])
+        self.assertEqual(result["customValueAfterSwitch"], "")
         self.assertEqual(result["targetChanges"][-1], "blast-01")
 
     def test_robot_mission_history_is_cursor_safe_and_semantically_deduplicated(self):

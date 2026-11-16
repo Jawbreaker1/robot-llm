@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 from copy import deepcopy
+import json
 import logging
 import threading
 import time
@@ -21,6 +22,8 @@ from .robot_status_facts import project_robot_status_facts
 
 ROBOT_INPUT_TURN_SCHEMA = "robot-input-turn/v1"
 MAX_INPUT_HISTORY = 128
+MAX_DIALOGUE_TURNS = 20
+MAX_DIALOGUE_BYTES = 8_000
 LOGGER = logging.getLogger(__name__)
 
 
@@ -67,7 +70,7 @@ class RobotInputService:
         self._speech_sink = speech_sink
         self._robot_description = deepcopy(dict(robot_description or {}))
         self._clock_ms = clock_ms
-        self._history = OrderedDict()
+        self._history = OrderedDict()  # Completed turns: deduplication and dialogue.
         self._inflight = set()
         self._lock = threading.Lock()
 
@@ -85,6 +88,22 @@ class RobotInputService:
             captured_at_unix_ms=captured,
         )
         facts["robot_description"] = deepcopy(self._robot_description)
+        # Reuse completed turns as the one conversation memory for this robot.
+        # Bound whole turns, never silently truncate a user's sentence.
+        with self._lock:
+            turns = list(self._history.values())
+        dialogue = []
+        size_bytes = 0
+        for signature, result in reversed(turns):
+            user_text = signature[0]
+            answer = result["answer_text"]
+            turn = {"user": user_text, "assistant": answer, "intent": result["intent"]}
+            size = len(json.dumps(turn, ensure_ascii=False).encode("utf-8"))
+            if len(dialogue) >= MAX_DIALOGUE_TURNS or size_bytes + size > MAX_DIALOGUE_BYTES:
+                break
+            dialogue.append(turn)
+            size_bytes += size
+        facts["conversation_history"] = list(reversed(dialogue))
         return facts
 
     @staticmethod
@@ -221,16 +240,14 @@ class RobotInputService:
             }
             if decision.expression is not None:
                 result["expression"] = decision.expression
+            with self._lock:
+                self._history[client_request_id] = (signature, deepcopy(result))
+                while len(self._history) > MAX_INPUT_HISTORY:
+                    self._history.popitem(last=False)
+            return result
         finally:
             with self._lock:
                 self._inflight.discard(client_request_id)
-
-        with self._lock:
-            self._history[client_request_id] = (signature, deepcopy(result))
-            self._history.move_to_end(client_request_id)
-            while len(self._history) > MAX_INPUT_HISTORY:
-                self._history.popitem(last=False)
-        return result
 
 
 __all__ = ("ROBOT_INPUT_TURN_SCHEMA", "RobotInputService")

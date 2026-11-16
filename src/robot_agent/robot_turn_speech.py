@@ -77,7 +77,7 @@ def cancellable_serialized_speaker(
 
 
 class RobotTurnSpeechSink:
-    """Submit independent robot replies to one latest-pending speech worker."""
+    """Submit conversation replies in order to the existing speech worker."""
 
     def __init__(
         self,
@@ -118,6 +118,7 @@ class RobotTurnSpeechSink:
                     text=text,
                     locale=locale,
                     progress_revision=self._progress_revision,
+                    replace_pending=False,
                     **({"expression": expression} if expression is not None else {}),
                 )
             return True

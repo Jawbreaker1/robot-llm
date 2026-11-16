@@ -172,6 +172,7 @@ class VerifiedMotion:
     status: str
     segments: Tuple[EncoderMotionSegment, ...] = ()
     requested_turn_mdeg: int = 0
+    encoder_start: Tuple[int, int] | None = None
 
     @property
     def complete(self) -> bool:
@@ -345,6 +346,7 @@ def verified_motion_from_result(
 
     segments = []
     verified_count = 0
+    encoder_start = None
     previous_segment_after = None
     for expected_index, receipt in enumerate(slices, 1):
         if not isinstance(receipt, dict):
@@ -430,6 +432,8 @@ def verified_motion_from_result(
                 "right",
             )
             segment_before = {"left": left_before, "right": right_before}
+            if encoder_start is None:
+                encoder_start = (left_before, right_before)
             if previous_segment_after is not None and segment_before != previous_segment_after:
                 raise PhysicalNavigationContractError(
                     "encoder_position_discontinuity",
@@ -508,6 +512,7 @@ def verified_motion_from_result(
         status=status,
         segments=tuple(segments),
         requested_turn_mdeg=requested_turn,
+        encoder_start=encoder_start,
     )
 
 

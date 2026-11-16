@@ -3,6 +3,7 @@ import io
 import json
 import threading
 import unittest
+from unittest.mock import patch
 
 from robot_agent.active_ir_scan_contract import (
     ActiveIrScanCalibration,
@@ -1323,6 +1324,20 @@ class FakeProcess:
 
 
 class EV3NavigationCancellationTests(unittest.TestCase):
+    def test_full_receipt_is_logged_even_when_validation_rejects_it(self):
+        transport, process = self._transport_with_process()
+        receipt = {"ok": True, "result": {"outcome": {"slices": [
+            {"motors": [{"position_before": 123, "position_after": 456}]}]}}}
+        transport._responses.put(("line", json.dumps(receipt).encode() + b"\n"))
+        with patch("robot_agent.ev3_navigation_transport.record_navigation_diagnostic") as record:
+            with self.assertRaises(EV3NavigationTransportError):
+                transport.request("pulse", {"action": "ADVANCE"})
+        self.assertEqual(record.call_args_list[0].args, ("ev3_worker_request",))
+        self.assertEqual(record.call_args_list[1].args, ("ev3_worker_receipt",))
+        self.assertEqual(record.call_args_list[1].kwargs["response"], receipt)
+        self.assertEqual(record.call_args_list[1].kwargs["request_id"], "host-0001")
+        self.assertEqual(process.stdin.write_count, 1)
+
     @staticmethod
     def _transport_with_process():
         transport = EV3NavigationSSHTransport(

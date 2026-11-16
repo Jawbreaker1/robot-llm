@@ -9,7 +9,6 @@ from robot_agent.blast_mission_completion import BLAST_GOAL_RADIUS_MM
 from robot_agent.blast_spatial_map import BlastSpatialMapBridge
 from robot_agent.coarse_navigation_grid import (
     build_coarse_navigation_grid,
-    known_clear_axis_reach_mm,
     model_route_blockage,
     route_blockage_from_echoes,
 )
@@ -71,6 +70,29 @@ def planned_leg(kind="SIDE_SEARCH", scope="SEARCH_POSITION_ONLY",
 
 
 class BlastSpatialMapBridgeTests(TestCase):
+    def test_echo_groups_use_world_positions_not_unrelated_scan_bearings(self):
+        from robot_agent.blast_spatial_map import _cluster_echo_points
+        points = [
+            {"nominal_echo_x_mm": x, "nominal_echo_y_mm": y,
+             "relative_bearing_mdeg": bearing}
+            for x, y, bearing in ((394, 225, 30_000), (397, 80, -60_000),
+                                 (437, -39, 0), (394, -184, 120_000),
+                                 (594, -187, -30_000), (1400, 500, 0))
+        ]
+        clusters = _cluster_echo_points(points)
+        self.assertEqual([len(group) for group in clusters], [5, 1])
+        self.assertEqual(clusters, _cluster_echo_points(list(reversed(points))))
+        self.assertEqual(max(p["nominal_echo_x_mm"] for p in clusters[0]), 594)
+        self.assertEqual(min(p["nominal_echo_y_mm"] for p in clusters[0]), -187)
+
+    def test_a_ray_past_an_edge_does_not_erase_that_obstacle(self):
+        trace = object.__new__(_BlastEpisodeMapTrace)
+        old = {"nominal_echo_x_mm": 594, "nominal_echo_y_mm": -187}
+        trace._obstacle_points = [old]
+        trace._remember_obstacles([{"nominal_echo_x_mm": 1400, "nominal_echo_y_mm": -225,
+                                    "sensor_origin_x_mm": 0, "sensor_origin_y_mm": -225}])
+        self.assertIn(old, trace._obstacle_points)
+
     def test_blast_map_does_not_load_legacy_ev3_detour_planning(self):
         subprocess.run(
             [sys.executable, "-c", (
@@ -189,7 +211,7 @@ class BlastSpatialMapBridgeTests(TestCase):
         self.assertEqual(blocked_waypoint["rows"][2], ".....G.....")
         self.assertEqual(blocked_waypoint["rows"][4], "....#x#....")
 
-    def test_coarse_grid_summarizes_known_clear_episode_axes(self):
+    def test_coarse_grid_keeps_narrow_ray_cells_without_certifying_clear_reach(self):
         grid = build_coarse_navigation_grid(
             robots=({
                 "symbol": "B", "robot_id": "blast-01",
@@ -204,14 +226,11 @@ class BlastSpatialMapBridgeTests(TestCase):
             ),
         )
 
-        self.assertEqual(known_clear_axis_reach_mm(grid), {
-            "episode_forward_mm": 600,
-            "episode_left_mm": 600,
-            "episode_right_mm": 150,
-            "episode_back_mm": 150,
-        })
+        self.assertEqual(grid["rows"][5], ".....o.....")
+        self.assertNotIn("known_clear_axis_reach_mm", grid)
+        self.assertNotIn("observed_clear_rows", grid)
 
-    def test_goal_and_waypoint_overlay_preserve_known_clear_reach(self):
+    def test_goal_and_waypoint_overlay_preserve_other_ray_cells(self):
         grid = build_coarse_navigation_grid(
             robots=({
                 "symbol": "B", "robot_id": "blast-01",
@@ -223,10 +242,8 @@ class BlastSpatialMapBridgeTests(TestCase):
         )
 
         self.assertIn("X", grid["rows"][6])
-        self.assertEqual(
-            known_clear_axis_reach_mm(grid)["episode_forward_mm"],
-            600,
-        )
+        self.assertEqual(grid["rows"][5], ".....o.....")
+        self.assertEqual(grid["rows"][4], ".....o.....")
 
     def test_blocked_goal_marker_preserves_keep_out_meaning(self):
         goal_only = build_coarse_navigation_grid(
@@ -750,6 +767,7 @@ class BlastSpatialMapBridgeTests(TestCase):
             ".....B.....",
         )
         scan_view = {
+            "scan": {"rays": []},
             "scan_pose": {"x_mm": 0, "y_mm": 0, "heading_mdeg": 0},
             "planar_projection": {
                 "schema": "blast-planar-scan-projection/v1",
@@ -832,12 +850,7 @@ class BlastSpatialMapBridgeTests(TestCase):
         self.assertEqual(evidence["schema"], "blast-local-map-evidence/v1")
         self.assertEqual(evidence["unobserved_space"], "UNKNOWN_NOT_FREE")
         self.assertEqual(evidence["route_clearance_mm"], 150)
-        self.assertEqual(evidence["known_clear_axis_reach_mm"], {
-            "episode_forward_mm": 0,
-            "episode_left_mm": 0,
-            "episode_right_mm": 0,
-            "episode_back_mm": 0,
-        })
+        self.assertNotIn("known_clear_axis_reach_mm", evidence)
         self.assertEqual(
             evidence["direct_goal_blockage"]["reason"],
             "KNOWN_ECHO_CLEARANCE_INTERSECTION",
@@ -853,8 +866,6 @@ class BlastSpatialMapBridgeTests(TestCase):
         self.assertEqual(evidence["directional_goal"], {
             "target_x_mm": 420,
             "target_y_mm": 0,
-            "desired_heading_mdeg": 0,
-            "heading_error_mdeg": 90_000,
             "goal_radius_mm": BLAST_GOAL_RADIUS_MM,
             "distance_to_goal_mm": 375,
             "remaining_forward_progress_mm": 375,
@@ -866,7 +877,6 @@ class BlastSpatialMapBridgeTests(TestCase):
                 "distance_mm": 375,
             },
             "corridor_entered": False,
-            "heading_aligned": False,
         })
         self.assertEqual(evidence["coarse_grid"], {
             "cell_size_mm": 150,
@@ -988,8 +998,8 @@ class BlastSpatialMapBridgeTests(TestCase):
         self.assertEqual(rows[4][5], "?")
         self.assertEqual(rows[4][2], "?")
         self.assertEqual(len(evidence["current_echo_clusters"]), 2)
-        self.assertEqual(evidence["current_echo_clusters"][:1], [{
-            "cluster": 1,
+        self.assertEqual(evidence["current_echo_clusters"][1:], [{
+            "cluster": 2,
             "provisional": True,
             "evidence_count": 1,
             "echo_bounds_mm": {

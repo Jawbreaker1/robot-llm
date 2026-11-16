@@ -1,7 +1,6 @@
-"""Typed BLAST navigation facts, deliberately not wired into runtime yet."""
+"""Shared BLAST body, sensor and odometry calibration."""
 
 from dataclasses import dataclass
-import math
 from typing import Optional, Tuple
 
 from .physical_footprint import RobotFootprint
@@ -144,11 +143,7 @@ class BlastNavigationCalibration:
 
         footprint, sensor = self.require_complete()
         assert sensor.forward_offset_mm is not None
-        return max(0, math.ceil(
-            footprint.maximum_corner_radius_mm
-            + footprint.clearance_margin_mm
-            - sensor.forward_offset_mm
-        ))
+        return max(0, footprint.turn_sweep_radius_mm - sensor.forward_offset_mm)
 
 
 BLAST_PROVISIONAL_NAVIGATION_CALIBRATION = BlastNavigationCalibration(

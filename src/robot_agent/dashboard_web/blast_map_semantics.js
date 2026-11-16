@@ -348,10 +348,10 @@
     if (
       !hasExactFields(waypoint, ADVISORY_WAYPOINT_FIELDS)
       || xMm === null || yMm === null || purpose === null
-      || waypoint.source !== "GEMMA_MODEL" || waypoint.read_only !== true
+      || !["MODEL", "GEMMA_MODEL"].includes(waypoint.source) || waypoint.read_only !== true
     ) return undefined;
     return Object.freeze({
-      xMm, yMm, purpose, source: "GEMMA_MODEL", readOnly: true,
+      xMm, yMm, purpose, source: waypoint.source, readOnly: true,
     });
   }
 
@@ -693,7 +693,86 @@
     });
   }
 
+  // Model estimates share the existing route/map renderer, but never become echoes.
+  function estimateCorners(bounds, transform = null) {
+    const corners = [[bounds.minX, bounds.maxY], [bounds.maxX, bounds.maxY],
+      [bounds.maxX, bounds.minY], [bounds.minX, bounds.minY]];
+    if (!transform) return corners;
+    const angle = transform.yawMdeg / 1000 * Math.PI / 180;
+    return corners.map(([x, y]) => [
+      transform.txMm + x * Math.cos(angle) - y * Math.sin(angle),
+      transform.tyMm + x * Math.sin(angle) + y * Math.cos(angle),
+    ]);
+  }
+
+  function appendEstimatePoints(estimates = [], addPoint, transform = null) {
+    estimates.forEach(({ bounds }) => {
+      if (bounds) {
+        estimateCorners(bounds, transform).forEach(([x, y]) => addPoint(x, y));
+      }
+    });
+  }
+
+  function estimateDimensions(estimate, ui) {
+    const span = (axis) => {
+      const low = estimate.edges[`min_${axis}_mm`], high = estimate.edges[`max_${axis}_mm`];
+      return low === null || high === null ? ui.t("map.model_obstacle.unknown") : `≈${ui.format(high - low)} mm`;
+    };
+    return ui.t("map.model_obstacle.dimensions", { width: span("y"), depth: span("x") });
+  }
+
+  function estimateEdges(estimate, ui) {
+    const value = key => estimate.edges[key] === null ? "?" : `≈${ui.format(estimate.edges[key])}`;
+    return `x: ${value("min_x_mm")} … ${value("max_x_mm")} mm · y: ${value("min_y_mm")} … ${value("max_y_mm")} mm`;
+  }
+
+  function renderObstacleEstimates(layer, estimates = [], projection, ui, transform = null) {
+    estimates.forEach(estimate => {
+      // Without all edges we cannot place a finite rectangle honestly.
+      const bounds = estimate.bounds;
+      if (!bounds) return;
+      const points = estimateCorners(bounds, transform).map(([x, y]) => projection.point(x, y));
+      const a = points[0];
+      const group = ui.svg("g", {
+        class: "map-model-obstacle", "data-source": "model-estimate", "data-measured": "false",
+      });
+      ui.title(group, [ui.t("map.model_obstacle.title"), estimate.label,
+        estimateDimensions(estimate, ui), ...(transform ? [] : [estimateEdges(estimate, ui)]), estimate.basis]);
+      group.appendChild(ui.svg("polygon", { points: points.map(p => `${p.x},${p.y}`).join(" ") }));
+      const label = ui.svg("text", { x: a.x, y: a.y - 8 });
+      label.textContent = `${estimate.label} · ${estimateDimensions(estimate, ui)}`;
+      group.appendChild(label);
+      layer.appendChild(group);
+    });
+  }
+
+  function renderEstimateNotes(layer, estimates = [], ui) {
+    const heading = ui.svg("text", { x: 32, y: 88, class: "map-model-obstacle-note" });
+    heading.textContent = ui.t(estimates.length ? "map.model_obstacle.title" : "map.model_obstacle.unreported");
+    layer.appendChild(heading);
+    estimates.forEach((estimate, index) => {
+      const note = ui.svg("text", { x: 32, y: 108 + index * 18, class: "map-model-obstacle-note" });
+      note.textContent = `${estimate.label.slice(0, 36)} · ${estimateDimensions(estimate, ui)}`;
+      ui.title(note, [estimateEdges(estimate, ui), estimate.basis]);
+      layer.appendChild(note);
+    });
+  }
+
+  function renderEstimateDetails(list, estimates, ui) {
+    estimates.forEach(estimate => {
+      const item = ui.element("article", "map-object-item");
+      item.appendChild(ui.element("strong", "", estimate.label));
+      item.appendChild(ui.element("span", "map-provenance-badge is-provisional-inference", ui.t("map.model_obstacle.title")));
+      [estimateDimensions(estimate, ui), estimateEdges(estimate, ui), estimate.basis].forEach(text => {
+        item.appendChild(ui.element("small", "", text));
+      });
+      list.appendChild(item);
+    });
+  }
+
   global.RobotBlastMapSemantics = Object.freeze({
+    renderEstimateDetails,
+    appendEstimatePoints, estimateDimensions, estimateEdges, renderObstacleEstimates, renderEstimateNotes,
     normalizeCoarseNavigationGrid, coarseGridCells, renderCoarseObstacleArea,
     CLASSIFICATION, GEOMETRY_KIND, SCAN_SIDES,
     appendAdvisoryWaypointPoint, appendGoalPoints, appendObstaclePoints,

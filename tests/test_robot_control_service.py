@@ -287,6 +287,43 @@ class RobotControlServiceTests(unittest.TestCase):
     def test_control_settings_share_canonical_model_default(self):
         self.assertEqual(RobotControlSettings().model, DEFAULT_MODEL)
 
+    def test_mission_time_limit_is_optional_and_can_be_cleared(self):
+        service = self.make_service(FakeRuntimeAdapter())
+        self.assertIsNone(service.settings()["max_episode_ms"])
+        bounded = service.update_settings(1, {"max_episode_ms": 60_000})
+        self.assertEqual(bounded["max_episode_ms"], 60_000)
+        unlimited = service.update_settings(2, {"max_episode_ms": None})
+        self.assertIsNone(unlimited["max_episode_ms"])
+        self.assertEqual(unlimited["revision"], 3)
+        self.assertIsNone(json.loads(json.dumps(unlimited))["max_episode_ms"])
+
+    def test_explicit_time_limit_only_applies_to_one_mission(self):
+        adapter = FakeRuntimeAdapter()
+        service = self.make_service(adapter)
+        service.update_settings(1, {"max_episode_ms": 60_000})
+        first = self.start(service, revision=2)
+        self.assertTrue(adapter.entered.wait(1.0))
+        self.assertEqual(adapter.contexts[0].settings.max_episode_ms, 60_000)
+        self.assertEqual(first["control"]["settings"]["revision"], 3)
+        self.assertIsNone(first["control"]["settings"]["max_episode_ms"])
+        # Retrying the same start request neither starts nor consumes again.
+        duplicate = self.start(service, revision=2)
+        self.assertTrue(duplicate["idempotent"])
+        adapter.release.set()
+        wait_for_state(service, IDLE)
+        adapter.entered.clear()
+        adapter.release.clear()
+        self.start(service, request_id="second-mission", revision=3)
+        self.assertTrue(adapter.entered.wait(1.0))
+        self.assertIsNone(adapter.contexts[1].settings.max_episode_ms)
+        self.assertEqual(adapter.contexts[0].settings.max_episode_ms, 60_000)
+        adapter.release.set()
+
+    def test_optional_time_limit_still_rejects_invalid_values(self):
+        for value in (0, -1, 999, True, "", "60000", 60_000.5, 3_600_001):
+            with self.subTest(value=value), self.assertRaises(DashboardContractError):
+                RobotControlSettings(max_episode_ms=value)
+
     def test_runtime_and_immutable_target_are_configured_together(self):
         with self.assertRaisesRegex(ValueError, "must exist when"):
             RobotControlService(FakeRuntimeAdapter())
@@ -555,6 +592,7 @@ class RobotControlServiceTests(unittest.TestCase):
         failed = self.make_service(
             FakeRuntimeAdapter(),
             episode_gate=gate,
+            settings=RobotControlSettings(max_episode_ms=60_000),
         )
         second_adapter = FakeRuntimeAdapter()
         second = RobotControlService(
@@ -576,6 +614,8 @@ class RobotControlServiceTests(unittest.TestCase):
             self.start(failed, request_id="failed-start")
 
         self.assertEqual(failed.status()["state"], IDLE)
+        self.assertEqual(failed.settings()["max_episode_ms"], 60_000)
+        self.assertEqual(failed.settings()["revision"], 1)
         self.start(second, request_id="second-start")
         self.assertTrue(second_adapter.entered.wait(1.0))
         second_adapter.release.set()

@@ -151,13 +151,13 @@ class EV3RSTORMProfileTests(unittest.TestCase):
             self.assertIn("motor.arm", adapter.robot_description["capabilities"])
             self.assertNotIn("navigation_status", adapter.robot_description)
 
-    def test_profile_uses_shared_controller_action_planner_with_low_reasoning(self):
+    def test_profile_uses_shared_controller_action_planner_reasoning_defaults(self):
         adapter = self.profile.build_adapter(
             EV3SSHBinding(profile_id=EV3RSTORM_PROFILE_ID, target="robot@ev3dev.local",
                           memory_path="/tmp/unused-ev3-memory.json"))
         with mock.patch("robot_agent.ev3rstorm_profile.LMStudioControllerActionPlanner") as planner:
             self.assertIs(adapter.navigation_adapter.planner_factory("qwen-test"), planner.return_value)
-            planner.assert_called_once_with(model="qwen-test", reasoning_effort="low", max_output_tokens=4096, timeout_seconds=60)
+            planner.assert_called_once_with(model="qwen-test", max_output_tokens=4096, timeout_seconds=60)
 
     def test_reachability_uses_the_bound_motion_free_preflight(self):
         report = {

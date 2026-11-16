@@ -10,6 +10,7 @@ import socket
 from typing import Callable, Mapping
 
 from . import lm_studio as _lm
+from .codex_subscription import robot_model_transport
 from .blast_personality import normalize_persona_by_locale
 from .social_expression import (
     REPLY_FACES, REPLY_GESTURES, EV3_GESTURES, ALL_GESTURES,
@@ -70,7 +71,9 @@ _SYSTEM_PROMPT = (
     "alone is not physical. CLARIFY means the requested effect is genuinely ambiguous or "
     "incomplete; never choose physical merely to resolve ambiguity. A referential request "
     "such as repeating or doing 'it' again is CLARIFY unless the supplied facts contain an "
-    "unambiguous antecedent. confidence_milli is confidence on a 0-to-1000 scale; choose "
+    "unambiguous antecedent. conversation_history contains this robot's prior turns; "
+    "use it for follow-ups, not as fresh commands or current sensor facts. "
+    "confidence_milli is confidence on a 0-to-1000 scale; choose "
     "an action intent only at 700 or higher. For PHYSICAL_TASK and STOP_TASK set "
     "reply_text to null. For UNSUPPORTED_PHYSICAL_TASK provide a concise explanation and "
     "never claim motion. "
@@ -111,7 +114,7 @@ _SOCIAL_EXPRESSION_PROMPT = (
     "Do not mix a social gesture "
     "with a new navigation request in this conversation interface; ask which to do first. "
     "Expressions accompany audible replies; when speech is disabled they are not executed. "
-    "Use a short, lively reply, preferably under 100 characters, so speech fits eight seconds. "
+    "Use a short, lively reply, preferably under 100 characters. "
     "reply_text is read aloud verbatim: include only words to speak, never stage directions "
     "such as *waves arm*, parenthesized actions, or sound-effect annotations. Put all "
     "nonverbal behavior only in expression.face and expression.gesture. "
@@ -303,7 +306,7 @@ class LMStudioRobotInputModel:
         self,
         base_url: str = _lm.DEFAULT_BASE_URL,
         model: str = _lm.DEFAULT_MODEL,
-        transport: Transport = _lm._stdlib_post,
+        transport: Transport = robot_model_transport,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         reply_persona_by_locale: Mapping[str, str] | None = None,
         social_expressions: bool = False,

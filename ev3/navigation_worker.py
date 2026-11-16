@@ -597,8 +597,8 @@ class NavigationWorker(object):
             recovery_runtime = self._encoder_recovery_runtime()
             if verification_error is None:
                 # The kernel token disappeared under a verified stop and both
-                # encoder checks passed.  Let the stricter recovery policy
-                # decide whether the paired travel is already sufficient.
+                # encoder checks passed. Report the measured timed pulse;
+                # nominal speed * time is not a second distance requirement.
                 status = "completed"
                 reason = "motor_fault_encoder_verified"
             elif recovery_runtime.transient_pair_fault_is_catch_up_candidate(
@@ -629,7 +629,7 @@ class NavigationWorker(object):
                 self.motion_fault_latched = True
         if (
             action in ENCODER_RECOVERY_ACTIONS
-            and status in ("completed", "verification_failed")
+            and status == "verification_failed"
             and not self.motion_fault_latched
         ):
             if recovery_runtime is None:

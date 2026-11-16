@@ -397,6 +397,62 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
         self.assertEqual(result.motion.requested_slice_count, 4)
         self.assertEqual(result.pose.heading_mdeg, 47_040)
 
+    def test_failed_turn_pulse_returns_measured_prefix_without_more_commands(self):
+        for action in (TURN_LEFT_90, TURN_RIGHT_90):
+            for stalled_pulse in (1, 2, 3):
+                with self.subTest(action=action, stalled_pulse=stalled_pulse):
+                    controller, executor = self.executor()
+                    command = controller.command
+
+                    def stall(name, **kwargs):
+                        before = dict(controller.angles)
+                        result = command(name, **kwargs)
+                        if len(controller.commands) == stalled_pulse:
+                            controller.angles = before
+                            result["observation"] = controller.observation()
+                        return result
+
+                    controller.command = stall
+                    result = executor.execute(action, continue_requested=lambda result: True)
+                    self.assertEqual(len(controller.commands), stalled_pulse)
+                    self.assertEqual(result.motion.verified_slice_count, stalled_pulse - 1)
+                    self.assertFalse(result.motion.complete)
+                    self.assertTrue(executor.localization_valid)
+                    self.assertEqual(executor.expected_start_angles, controller.angles)
+                    # A new model-owned action remains possible; the failure
+                    # ended a motor sequence, not the mission or localization.
+                    controller.command = command
+                    self.assertTrue(executor.execute(ADVANCE).motion.complete)
+
+    def test_short_turn_keeps_measured_imu_heading_without_completing_target(self):
+        controller = FakeController()
+        observation = controller.observation
+        yaw = {"value": 0}
+        controller.observation = lambda: {
+            **observation(), "imu": {"ready": True, "heading_deg": yaw["value"]},
+        }
+        executor = BlastNavigationMotionExecutor(
+            controller=controller, initial_observation=controller.observation(),
+        )
+        command = controller.command
+
+        def shortened(name, **kwargs):
+            before = dict(controller.angles)
+            result = command(name, **kwargs)
+            controller.angles = {"left_drive": before["left_drive"] - 20,
+                                 "right_drive": before["right_drive"] + 20}
+            yaw["value"] = -3
+            result["observation"] = controller.observation()
+            return result
+
+        controller.command = shortened
+        result = executor.execute(TURN_LEFT_90, continue_requested=lambda result: True)
+        self.assertEqual(controller.commands, ["turn_left"])
+        self.assertFalse(result.motion.complete)
+        self.assertEqual(result.pose.heading_mdeg, 3_000)
+        self.assertTrue(executor.localization_valid)
+        self.assertEqual(executor.expected_start_angles, controller.angles)
+
     def test_prestart_interruption_of_next_slice_retains_verified_prefix(self):
         controller, executor = self.executor()
         original_command = controller.command
@@ -725,6 +781,70 @@ class BlastNavigationMotionExecutorTests(unittest.TestCase):
             raised.exception.code,
             "blast_navigation_localization_invalid",
         )
+
+    def test_lost_response_reconciles_measured_progress_once(self):
+        controller, executor = self.executor()
+        original = controller.command
+        def lose_response(command, **kwargs):
+            original(command, **kwargs)
+            raise BlastControllerError("controller_command_timeout", "lost response")
+        controller.command = lose_response
+        with self.assertRaises(BlastControllerError):
+            executor.execute(ADVANCE)
+        self.assertFalse(executor.localization_valid)
+        self.assertEqual(executor.pose.x_mm, 0)
+        executor.reconcile_lost_response(controller.observation())
+        self.assertTrue(executor.localization_valid)
+        self.assertGreater(executor.pose.x_mm, 40)
+        self.assertEqual(executor.pose.verified_motion_count, 0)
+        pose = executor.pose
+        with self.assertRaises(PhysicalNavigationContractError):
+            executor.reconcile_lost_response(controller.observation())
+        self.assertEqual(executor.pose, pose)
+        self.assertEqual(controller.commands, ["drive_forward"])
+
+    def test_recovery_rejects_moving_or_restarted_controller(self):
+        for changed in ("motion", "generation"):
+            with self.subTest(changed=changed):
+                controller, executor = self.executor()
+                controller.runtime_generation = 1
+                def lose_response(command, **kwargs):
+                    raise BlastControllerError("controller_command_timeout", "lost response")
+                controller.command = lose_response
+                with self.assertRaises(BlastControllerError):
+                    executor.execute(ADVANCE)
+                observation = controller.observation()
+                if changed == "motion":
+                    observation["motion_active"] = True
+                else:
+                    controller.runtime_generation = 2
+                with self.assertRaises(PhysicalNavigationContractError):
+                    executor.reconcile_lost_response(observation)
+                self.assertFalse(executor.localization_valid)
+                self.assertEqual(executor.pose.x_mm, 0)
+
+    def test_recovery_compares_generation_values_not_bound_methods(self):
+        controller, executor = self.executor()
+        generation = [1]
+        controller.runtime_generation = lambda: generation[0]
+        def lose_response(command, **kwargs):
+            raise BlastControllerError("controller_command_timeout", "lost response")
+        controller.command = lose_response
+        with self.assertRaises(BlastControllerError):
+            executor.execute(ADVANCE)
+        generation[0] = 2
+        with self.assertRaises(PhysicalNavigationContractError):
+            executor.reconcile_lost_response(controller.observation())
+        self.assertFalse(executor.localization_valid)
+
+    def test_malformed_receipt_cannot_be_recovered_as_a_lost_response(self):
+        controller, executor = self.executor()
+        controller.command = lambda *args, **kwargs: {}
+        with self.assertRaises(PhysicalNavigationContractError):
+            executor.execute(ADVANCE)
+        with self.assertRaises(PhysicalNavigationContractError):
+            executor.reconcile_lost_response(controller.observation())
+        self.assertFalse(executor.localization_valid)
 
     def test_scripted_l_shape_carries_pose_between_semantic_actions(self):
         controller, executor = self.executor()

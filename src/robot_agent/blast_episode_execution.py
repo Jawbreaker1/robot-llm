@@ -9,6 +9,7 @@ from .blast_episode_deadline import blast_action_deadline_headroom_ms
 from .blast_observation_monitor import (
     RANGE_STATE_NO_VALID_DISTANCE,
     ROBOT_ID,
+    SETTLED_OBSERVATION_COMMAND,
     BlastControllerError,
     blast_range_state,
 )
@@ -18,11 +19,12 @@ from .blast_stationary_recovery_flow import (
     recover_scan_start_observation,
 )
 from .blast_navigation_action_profile import BLAST_NAVIGATION_COMMANDS
-from .blast_navigation_motion_execution import BlastNavigationMotionExecutor
+from .blast_navigation_motion_execution import BlastNavigationMotionExecutor, LOST_RESPONSE_CODES
 from .blast_turn_safety import blast_turn_slice_allows_continuation
 from .navigation_diagnostics import record_navigation_diagnostic
 from .physical_navigation_contract import (
     ADVANCE,
+    OBSERVE,
     REVERSE,
     SCAN_FRONT_ARC,
     TURN_LEFT_90,
@@ -102,6 +104,10 @@ def _dispatch_action(
     turn_continue_requested=None,
     trim_turn=False,
 ):
+    if action == OBSERVE:
+        return adapter.controller.command(
+            SETTLED_OBSERVATION_COMMAND, cancel_requested=control_requested,
+        ), None
     if action == SCAN_FRONT_ARC:
         kwargs = {"cancel_requested": control_requested}
         if action_permit is not None:
@@ -135,24 +141,12 @@ def _dispatch_action(
     )
     return execution.controller_results[-1], execution
 
-def _scan_failure_outcome(adapter, code):
-    if code not in _SCAN_REFUSAL_CODES:
-        return None
-    sweep_stopped = code != "scan_start_clearance_unverified"
-    message = (
-        "BLAST scan stopped between pulses; reposition before retry"
-        if sweep_stopped
-        else "BLAST scan could not start from settled safety evidence"
-    )
-    return adapter._outcome("no_safe_blast_action", False, message)
-
 def _dispatch_episode_action(
     adapter, *, action, observation, geometry_checked, motion_executor,
     prior_receipt,
     allow_turn_no_valid_with_bounded_evidence, context, deadline_ms,
     map_trace=None, perception_only_scan=False,
     surroundings_scan=False, turn_continue_requested=None,
-    scan_refusal_can_replan=False,
     trim_turn=False,
 ):
     outcome = adapter._control_outcome(
@@ -181,6 +175,7 @@ def _dispatch_episode_action(
             perception_only=perception_only_scan,
         )
         try:
+            command_generation = motion_executor.runtime_generation()
             record_navigation_diagnostic(
                 "controller_action_started", episode_id=context.episode_id,
                 robot_id=ROBOT_ID, action=action,
@@ -211,14 +206,11 @@ def _dispatch_episode_action(
                 evidence_uncertain=error.evidence_uncertain,
                 cause=str(error.__cause__) if error.__cause__ else None,
             )
-            if (
-                action == SCAN_FRONT_ARC
-                and error.motion_started is not False
-            ):
-                motion_executor.invalidate_after_failed_scan()
-                if map_trace is not None:
-                    map_trace.invalidate_localization()
             outcome = adapter._control_outcome(context, deadline_ms)
+            if action in ACTION_COMMANDS and error.code in LOST_RESPONSE_CODES:
+                return _recover_motion_response(
+                    adapter, error, motion_executor, observation, context, deadline_ms,
+                )
             if (
                 error.code in (
                     {"controller_command_interrupted"}
@@ -283,23 +275,51 @@ def _dispatch_episode_action(
                     return None, None, observation, outcome
                 observation = retry_observation
                 continue
-            scan_outcome = _scan_failure_outcome(adapter, error.code)
-            if scan_outcome is not None:
-                if (
-                    scan_refusal_can_replan
-                    and error.code
-                    == "scan_start_clearance_unverified"
-                    and error.motion_started is False
-                ):
-                    return {
-                        "recoverable_scan_refusal": {
-                            "code": error.code,
-                            "motion_started": False,
-                        },
-                    }, None, observation, None
-                return None, None, observation, scan_outcome
+            if action == SCAN_FRONT_ARC and error.code in _SCAN_REFUSAL_CODES | LOST_RESPONSE_CODES:
+                motion_executor.mark_response_lost(command_generation)
+                return _recover_motion_response(
+                    adapter, error, motion_executor, observation, context, deadline_ms,
+                )
+            if action == SCAN_FRONT_ARC and error.motion_started is not False:
+                motion_executor.invalidate_after_failed_scan()
+                if map_trace is not None:
+                    map_trace.invalidate_localization()
             raise
     raise AssertionError("BLAST action retry loop exhausted")
+
+def _recover_motion_response(adapter, error, motion_executor, observation, context, deadline_ms):
+    """Wait for stationary evidence, then hand the interrupted leg to Qwen."""
+    context.publish({"current_action": None, "message":
+        "Action interrupted; keeping the route and measuring actual progress."})
+    while True:
+        outcome = adapter._control_outcome(context, deadline_ms)
+        if outcome is not None:
+            return None, None, observation, outcome
+        try:
+            receipt = adapter.controller.command("observe_settled", cancel_requested=lambda:
+                adapter._control_outcome(context, deadline_ms) is not None)
+            if not isinstance(receipt, Mapping) or not all(
+                receipt.get(key) is True for key in ("accepted", "completed", "observation_settled")
+            ):
+                raise BlastEpisodeError("blast_observation_unavailable", "Stationary observation not confirmed")
+            fresh = adapter._observation()
+        except (BlastControllerError, BlastEpisodeError) as read_error:
+            if read_error.code not in LOST_RESPONSE_CODES | {
+                "controller_busy", "blast_observation_unavailable",
+                "blast_observation_stale", "blast_motion_not_idle",
+                "controller_command_interrupted",
+            }:
+                raise
+            context.publish({"current_action": None,
+                "message": "Waiting for a stationary observation; mission and route retained"})
+            context.stop_requested.wait(1.0)
+            continue
+        motion_executor.reconcile_lost_response(fresh["sensors"])
+        return {
+            "action_error": error.code,
+            "motion_outcome": "interrupted action; actual progress reconciled from stationary encoders",
+            "observation": fresh["sensors"], "observation_settled": True,
+        }, None, fresh, None
 
 def _scan_action_permit(
     adapter, *, action, observation, geometry_checked, pose, prior_receipt,
@@ -417,7 +437,6 @@ def _run_startup_perception(
 ):
     """Acquire one complete encoder-measured view before Gemma decides."""
 
-    initial_scan_view_count = len(map_trace.planar_scan_views)
     startup_history = []
     action = SCAN_FRONT_ARC
     try:
@@ -478,25 +497,18 @@ def _run_startup_perception(
         published_action=_STARTUP_SURROUNDINGS_ACTION,
     )
     startup_scan_item = startup_history[-1]
+    if command_result.get("action_error"):
+        history.extend(startup_history)
+        observation = adapter._with_navigation_reference(observation, episode_start_heading)
+        observation["odometry"] = motion_executor.pose.to_dict()
+        available_actions = adapter._available_actions(observation, history, latest_scan_view)
+        return (observation, available_actions, TURN_LEFT_90 in available_actions,
+                latest_scan_view, None)
     outcome = adapter._control_outcome(context, deadline_ms)
     if outcome is not None:
         return (
             observation, available_actions, turns_available,
             latest_scan_view, outcome,
-        )
-    if (
-        latest_scan_view is None
-        or not motion_executor.localization_valid
-        or len(map_trace.planar_scan_views)
-        != initial_scan_view_count + 1
-    ):
-        return (
-            observation, available_actions, turns_available,
-            latest_scan_view,
-            adapter._outcome(
-                "blast_startup_perception_incomplete", False,
-                "BLAST startup scan produced no localized surroundings",
-            ),
         )
     (
         final_observation, outcome, heading_restoration,

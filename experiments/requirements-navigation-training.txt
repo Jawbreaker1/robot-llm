@@ -1,0 +1,3 @@
+# Offline training only. Robot inference continues to use numeric NPZ + NumPy.
+-r requirements-local-navigation.txt
+torch==2.15.0

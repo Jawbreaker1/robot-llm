@@ -14,7 +14,7 @@ from .blast_observation_monitor import (
     blast_range_state,
 )
 from .blast_scan_observation import current_side_scan
-from .lm_studio import LMStudioProtocolError
+from .lm_studio import LMStudioProtocolError, LMStudioTransportError
 from .lm_studio_controller_action import (
     ABORT,
     COMPLETE,
@@ -23,8 +23,10 @@ from .lm_studio_controller_action import (
     ControllerActionPlannerResult,
 )
 from .navigation_diagnostics import record_navigation_diagnostic
+from .route_execution_memory import route_execution_memory, latest_action_feedback
 from .physical_navigation_contract import (
     ADVANCE,
+    OBSERVE,
     REVERSE,
     SCAN_FRONT_ARC,
     TURN_LEFT_90,
@@ -36,10 +38,16 @@ from .blast_episode_execution import (
     _STARTUP_SURROUNDINGS_ACTION,
     BlastEpisodeError,
 )
+from .blast_navigation_calibration import BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+from .blast_navigation_action_profile import (
+    DRIVE_ENCODER_DEGREES, SCAN_TURN_ENCODER_DEGREES_PER_PULSE, SCAN_TURN_PULSES_PER_SIDE,
+)
 from .waypoint_geometry import (
     WAYPOINT_REACHED_RADIUS_MM as _WAYPOINT_REACHED_RADIUS_MM,
     WAYPOINT_ALIGNMENT_TRIGGER_DEG as _WAYPOINT_ALIGNMENT_TRIGGER_DEG,
     consume_reached_waypoints,
+    latest_motion_feedback,
+    waypoint_motion_hint,
 )
 
 
@@ -50,6 +58,7 @@ BLAST_PLAN_ACTIONS = (
     TURN_LEFT_90,
     TURN_RIGHT_90,
     SCAN_FRONT_ARC,
+    OBSERVE,
 )
 
 _PLANNER_ACTION_SOURCE = "PLANNER_ACTION"
@@ -93,9 +102,15 @@ def _planner_history(history):
         "action",
         "requested_action",
         "action_source",
+        "action_error",
+        "result",
+        "action_completed",
+        "observation_acquired",
+        "motion_outcome",
         "observation_settled",
         "pose",
         "motion",
+        "last_motion",
         "odometry_reanchored_after_scan",
         "scan_view_count",
         "scan_state",
@@ -104,7 +119,6 @@ def _planner_history(history):
         "route_rejection",
         "route_interruption",
         "active_waypoint_geometry_after",
-        "scan_refusal",
         "waypoint_plan",
     )
     events = []
@@ -161,6 +175,8 @@ def _planner_map_with_route_feedback(local_map_evidence, history):
 
     if not isinstance(local_map_evidence, Mapping):
         return local_map_evidence
+    local_map_evidence = copy.deepcopy(local_map_evidence)
+    local_map_evidence["route_execution_memory"] = route_execution_memory(history)
     for event in reversed(_planner_history(history)):
         rejection = event.get("route_rejection")
         if isinstance(rejection, Mapping):
@@ -226,18 +242,34 @@ def _planner_step(
     active_waypoint,
     active_waypoint_plan,
     waypoint_required,
-    active_plan,
+    previous_decision,
 ):
     outcome = adapter._control_outcome(context, deadline_ms)
     if outcome is not None: return None, outcome
     try:
+        calibration = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.odometry
+        scan_step_deg = SCAN_TURN_ENCODER_DEGREES_PER_PULSE * calibration.turn_mdeg_per_opposed_encoder_degree / 1_000
         planner_context = ControllerActionContext(
             goal=context.request.goal,
             locale=context.request.locale,
             robot_id=ROBOT_ID,
             controller_id=CONTROLLER_ID,
             available_actions=available_actions,
-            observation=_planner_navigation_value(observation),
+            observation=_planner_navigation_value({**observation,
+                "last_motion": latest_motion_feedback(history),
+                "last_action": latest_action_feedback(history)}),
+            execution={
+                "advance_step_mm": round(calibration.linear_mm_per_encoder_degree * DRIVE_ENCODER_DEGREES),
+                "reverse_step_mm": round(calibration.linear_mm_per_encoder_degree * DRIVE_ENCODER_DEGREES),
+                "follow_waypoint_max_forward_pulses": 1,
+                "rear_range_sensor_available": False,
+                "forward_range_stop_mm": adapter.minimum_forward_clearance_mm,
+                "scan_front_arc": {"nominal_relative_bearings_deg": [0] + [round(sign * i * scan_step_deg, 2)
+                                       for sign in (1, -1) for i in range(1, SCAN_TURN_PULSES_PER_SIDE + 1)],
+                                   "motion": "in_place_body_rotation", "returns_to_start_heading": True},
+                "next_waypoint_motion": waypoint_motion_hint(
+                    motion_executor.pose, active_waypoint,
+                    footprint=BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.robot_footprint)},
             history=_planner_navigation_value(
                 _planner_history(history)[-12:]
             ),
@@ -261,24 +293,28 @@ def _planner_step(
             waypoint_reached_radius_mm=_WAYPOINT_REACHED_RADIUS_MM,
             waypoint_required=waypoint_required,
             plan_actions=BLAST_PLAN_ACTIONS,
-            active_plan=active_plan,
+            previous_decision=previous_decision,
         )
-        # An unusable reply is not a navigation event. Retry once with the
-        # same goal, route, pose and observations; do not scan or move.
-        for attempt in range(2):
+        # Provider trouble is not a navigation event or a consumed decision.
+        # Keep this context until a usable reply, cancellation or the deadline.
+        while True:
+            outcome = adapter._control_outcome(context, deadline_ms)
+            if outcome is not None:
+                return None, outcome
             try:
                 result = planner.decide(planner_context)
                 break
-            except LMStudioProtocolError:
+            except (LMStudioProtocolError, LMStudioTransportError) as error:
                 outcome = adapter._control_outcome(context, deadline_ms)
                 if outcome is not None:
                     return None, outcome
-                if attempt:
-                    raise
                 record_navigation_diagnostic(
                     "planner_reply_retry", robot_id=ROBOT_ID,
                     episode_id=context.episode_id,
+                    error_type=type(error).__name__,
                 )
+                context.publish({"message": "Waiting for the planner; keeping the current goal and route."})
+                context.stop_requested.wait(1.0)
     except Exception:
         outcome = adapter._control_outcome(context, deadline_ms)
         if outcome is not None:
@@ -298,18 +334,7 @@ def _planner_step(
         turns_available
         and action in (TURN_LEFT_90, TURN_RIGHT_90)
     )
-    bounded_reverse = (
-        action == REVERSE
-        and (
-            adapter._current_scan_supports_bounded_reverse(
-                history, latest_scan_view,
-            )
-            or adapter._completed_advance_allows_bounded_reverse(history)
-        )
-    )
-    bounded_no_valid = (
-        bounded_turn or bounded_reverse
-    )
+    bounded_no_valid = bounded_turn
     terminal_actions = tuple(
         action for action in (COMPLETE, ABORT)
         if (
@@ -361,28 +386,26 @@ def _planner_step(
         return None, adapter._outcome(
             "planner_aborted", False, assessment,
         )
+    waypoint_plan = (active_waypoint_plan if decision.waypoint is None else
+                     (decision.waypoint, *decision.following_waypoints))
     return {
         "action": action,
+        "decision_memory": decision.memory(),
         "assessment": assessment,
         "utterance": decision.utterance,
         "plan": list(decision.plan),
         "action_source": _PLANNER_ACTION_SOURCE,
         "observation": observation,
         "bounded_no_valid_eligible": bounded_no_valid,
-        "active_waypoint": decision.waypoint,
-        "waypoint_plan": (
-            () if decision.waypoint is None else (
-                decision.waypoint,
-                *decision.following_waypoints,
-            )
-        ),
+        "active_waypoint": waypoint_plan[0] if waypoint_plan else None,
+        "waypoint_plan": waypoint_plan,
     }, None
 
 
 def _admit_waypoint_step(
     adapter, *, step, map_trace, motion_executor, history, context,
     available_actions, turns_available, latest_scan_view,
-    episode_start_heading, deadline_ms, route_following,
+    episode_start_heading, deadline_ms,
 ):
     """Check the model's route and prepare its next existing motion action."""
     requested_action = step["action"]
@@ -395,7 +418,7 @@ def _admit_waypoint_step(
         step["waypoint_plan"],
     )
     waypoint_plan, reached_waypoints = consume_reached_waypoints(
-        motion_executor.pose, waypoint_plan, mission=map_trace.mission,
+        motion_executor.pose, waypoint_plan,
     )
     if (
         requested_action == FOLLOW_WAYPOINT
@@ -436,7 +459,7 @@ def _admit_waypoint_step(
                 "Gemma waypoint is already reached; replanning"
             ),
         })
-        return waypoint_plan, route_following, True, None
+        return waypoint_plan, True, None
     active_waypoint = (
         waypoint_plan[0] if waypoint_plan else None
     )
@@ -452,11 +475,9 @@ def _admit_waypoint_step(
         motion_executor.pose,
     )
     if requested_action == FOLLOW_WAYPOINT:
-        route_following = active_waypoint is not None
         if route_blockage is not None:
             route_blockage = dict(route_blockage)
         if route_blockage is not None:
-            route_following = False
             history.append({
                 "action": FOLLOW_WAYPOINT,
                 "requested_action": FOLLOW_WAYPOINT,
@@ -476,15 +497,13 @@ def _admit_waypoint_step(
                     "keep-out cell; replanning"
                 ),
             })
-            return waypoint_plan, route_following, True, None
+            return waypoint_plan, True, None
         action = adapter._waypoint_follow_motion_action(
             motion_executor.pose,
             active_waypoint,
             available_actions,
-            mission=map_trace.mission,
         )
         if action is None:
-            route_following = False
             geometry = adapter._active_waypoint_geometry(
                 motion_executor.pose, active_waypoint,
             )
@@ -521,7 +540,7 @@ def _admit_waypoint_step(
                 "current_action": None,
                 "plan": list(plan),
             })
-            return waypoint_plan, route_following, True, None
+            return waypoint_plan, True, None
         bounded_no_valid = (
             action in (TURN_LEFT_90, TURN_RIGHT_90)
             and turns_available
@@ -540,15 +559,14 @@ def _admit_waypoint_step(
                 )
             )
         except BlastActionEvidenceChanged:
-            route_following = False
             context.publish({
                 "current_action": None,
                 "plan": list(plan),
             })
-            return waypoint_plan, route_following, True, None
+            return waypoint_plan, True, None
         if outcome is not None:
-            return waypoint_plan, route_following, False, outcome
+            return waypoint_plan, False, outcome
         step["action"] = action
         step["observation"] = observation
         step["bounded_no_valid_eligible"] = bounded_no_valid
-    return waypoint_plan, route_following, False, None
+    return waypoint_plan, False, None

@@ -84,6 +84,66 @@ def shared_world(*, obstacles=()):
 
 
 class SimulationRobotAdapterTests(unittest.TestCase):
+    def test_long_blast_simulation_uses_the_configured_mission_distance(self):
+        scenario = blast_open_floor()
+        scenario = replace(scenario, goals=(SimulationGoal("blast", 2000, 0),))
+        contexts = []
+
+        class Planner:
+            def decide(self, context):
+                contexts.append(context)
+                return ControllerActionPlannerResult(ControllerActionDecision(
+                    action=ADVANCE, confidence_milli=1000, assessment="Test mission distance",
+                    plan=(), utterance=None,
+                ), latency_ms=0)
+
+        result = run_blast_gemma_scenario(
+            scenario, minimum_forward_progress_mm=2000,
+            goal="Reach the goal 200 cm straight ahead.", max_decisions=1,
+            planner_factory=lambda _: Planner(),
+        )
+        self.assertIsNone(result["error_type"])
+        self.assertEqual(contexts[0].local_map_evidence["directional_goal"]["target_x_mm"], 2000)
+        self.assertFalse(result["goal_reached"])
+
+    def test_default_planner_uses_shared_model_transport_for_both_providers(self):
+        # Scripted reply checks provider wiring, not model navigation ability.
+        for model in ("codex/gpt-6-astra", "qwen/qwen3.8-27b"):
+            with self.subTest(model=model):
+                def reply(url, body, headers, timeout, maximum):
+                    request = json.loads(body)
+                    self.assertEqual(request["model"], model)
+                    return json.dumps({"object": "chat.completion", "model": model,
+                        "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                            "role": "assistant", "content": json.dumps({
+                                "action": FOLLOW_WAYPOINT, "confidence_milli": 1000,
+                                "assessment": "Provider wiring test", "plan": [], "utterance": None,
+                                "waypoint": {"x_mm": 0, "y_mm": 300, "purpose": "Wiring test"},
+                                "following_waypoints": [],
+                            }),
+                        }}]}).encode()
+                with patch("robot_agent.blast_navigation_simulation.robot_model_transport",
+                           side_effect=reply) as transport:
+                    result = run_blast_gemma_scenario(blast_open_floor(), model=model, max_decisions=1)
+                self.assertIsNone(result["error_type"])
+                self.assertEqual(len(result["planner_decisions"]), 1)
+                self.assertEqual(transport.call_count, 1)
+
+    def test_scan_blocked_before_first_turn_retains_center_evidence(self):
+        # Actual pose from the Qwen blocked-corner replay, not ideal free space.
+        scenario = blast_box_front()
+        pose = PoseEstimate(575, 302, -91818)
+        scenario = replace(scenario, robots=(replace(scenario.robots[0], pose=pose),))
+        world = scenario.build()
+        controller = SharedWorldBlastController(world, world_robot_id="blast")
+        result = controller._scan_result(surroundings=False)
+        self.assertEqual(world.pose("blast"), pose)
+        scan = result["scan"]
+        self.assertEqual(scan["state"], "partial")
+        self.assertEqual(scan["sweep_coverage_deg"], 0)
+        self.assertEqual(result["receipt"]["turn_count"], 1)
+        self.assertFalse(scan["restoration_verified"])
+        self.assertEqual([ray["side"] for ray in scan["rays"]], ["center"])
 
 
 
@@ -100,8 +160,8 @@ class SimulationRobotAdapterTests(unittest.TestCase):
         self.assertFalse(result["scan"]["restoration_verified"])
         self.assertFalse(result["observation"]["motion_active"])
 
-    def test_blocked_waypoint_turn_returns_to_model_with_route_and_allows_retreat(self):
-        # Execution replay of three real Qwen choices, not a model navigation pass.
+    def test_interrupted_waypoint_returns_to_model_with_route_and_allows_retreat(self):
+        # Execution near a recorded corner, not a model navigation pass.
         scan = json.loads((Path(__file__).parent / 'fixtures' /
                            'blast_box_scan_20260902.json').read_text())['scans'][0]
         route = [
@@ -119,14 +179,19 @@ class SimulationRobotAdapterTests(unittest.TestCase):
         class Planner:
             def decide(self, context):
                 contexts.append(context)
-                index = len(contexts) - 1
+                index = (0 if not context.active_waypoint or context.active_waypoint == route[0]
+                         else 1 if context.active_waypoint == route[1] else 3)
+                if (index == 1 and context.history
+                        and ADVANCE not in context.available_actions):
+                    index = 2
                 tail = following
                 if index == 0:
                     tail = (route[1], *following[1:])
                 elif index == 1:
                     tail = following[1:]
                 return ControllerActionPlannerResult(ControllerActionDecision(
-                    action=FOLLOW_WAYPOINT if index < 3 else REVERSE,
+                    action=(FOLLOW_WAYPOINT if index < 2 else
+                            TURN_RIGHT_90 if index == 2 else REVERSE if context.previous_decision["action"] == TURN_RIGHT_90 else "OBSERVE"),
                     confidence_milli=1000, assessment="Try the route; retreat if the turn stalls",
                     plan=(), utterance=None, waypoint=route[min(index, 2)],
                     following_waypoints=tail,
@@ -134,15 +199,18 @@ class SimulationRobotAdapterTests(unittest.TestCase):
 
         result = run_blast_gemma_scenario(
             blast_measured_box_and_chair(), startup_scan=scan, range_dropout_reads=4,
-            planner_factory=lambda _: Planner(), max_decisions=4,
+            planner_factory=lambda _: Planner(), max_decisions=64,
         )
         self.assertEqual(result['terminal_reason'], 'decision_budget_exhausted')
-        self.assertEqual(len(contexts), 4)
-        returned = contexts[-1]
+        returned = next(c for c in contexts if c.active_waypoint == route[2])
         self.assertEqual(returned.goal, contexts[0].goal)
         self.assertEqual(returned.active_waypoint, route[2])
         self.assertEqual(returned.active_waypoint_plan, (route[2], *following))
-        self.assertEqual(returned.history[-1]['route_interruption']['reason'], 'MOTION_PROGRESS_STALLED')
+        # Endpoint tracking now stops this approach earlier, while there is
+        # still turning room. The interruption and retained recovery route must
+        # survive the model's subsequent turn; a stalled turn is not required.
+        interrupted = next(c for c in contexts if c.active_waypoint == route[1] and ADVANCE not in c.available_actions)
+        self.assertIn(REVERSE, interrupted.available_actions)
         self.assertEqual(returned.history[-1]['action'], TURN_RIGHT_90)
         self.assertIn(REVERSE, returned.available_actions)
         self.assertLess(result['final_pose']['x_mm'], returned.observation['odometry']['x_mm'])
@@ -171,24 +239,24 @@ class SimulationRobotAdapterTests(unittest.TestCase):
                     def decide(self, context):
                         contexts.append(context)
                         return ControllerActionPlannerResult(ControllerActionDecision(
-                            action=FOLLOW_WAYPOINT, confidence_milli=1000,
+                            action=FOLLOW_WAYPOINT if len(contexts)==1 or context.active_waypoint else "OBSERVE", confidence_milli=1000,
                             assessment="Follow the chosen side", plan=(), utterance=None,
-                            waypoint={"x_mm": 0, "y_mm": side * 750, "purpose": "Side target"},
+                            waypoint={"x_mm": 0, "y_mm": side * 750, "purpose": "Side target"} if len(contexts)==1 else None,
                         ), latency_ms=0)
 
                 with patch("robot_agent.blast_navigation_simulation.SharedWorldBlastController",
                            HeadingDriftController):
                     result = run_blast_gemma_scenario(
                         replace(blast_box_front(), obstacles=(), bounds=(-500, -1200, 1250, 1200)),
-                        planner_factory=lambda _: Planner(), max_decisions=1,
+                        planner_factory=lambda _: Planner(), max_decisions=64,
                     )
                 self.assertIsNone(result["error_code"])
-                self.assertEqual(len(contexts), 1)
+                self.assertGreater(len(contexts), 2)  # Initial route and post-turn review.
                 self.assertEqual(result["scans"], 1)
                 self.assertEqual(result["blocked_moves"], 0)
                 self.assertLess(abs(result["final_pose"]["x_mm"]), 75)
                 self.assertLess(abs(result["final_pose"]["y_mm"] - side * 750), 30)
-                self.assertIn("turn_right_trim" if side > 0 else "turn_left_trim", result["commands_tail"])
+                self.assertTrue(any(abs(c.observation["odometry"]["heading_deg"]-side*90)>5 for c in contexts[2:]))
 
     def test_course_correction_preserves_the_model_selected_box_side(self):
         route = [
@@ -200,15 +268,16 @@ class SimulationRobotAdapterTests(unittest.TestCase):
             def decide(self, context):
                 contexts.append(context)
                 return ControllerActionPlannerResult(ControllerActionDecision(
-                    action=FOLLOW_WAYPOINT, confidence_milli=1000,
+                    action=FOLLOW_WAYPOINT if len(contexts)==1 or context.active_waypoint else "OBSERVE", confidence_milli=1000,
                     assessment="Replay the two real Qwen route legs", plan=(), utterance=None,
-                    waypoint=route[len(contexts) - 1],
+                    waypoint=route[0] if len(contexts)==1 else None,
+                    following_waypoints=(route[1],) if len(contexts)==1 else (),
                 ), latency_ms=0)
         result = run_blast_gemma_scenario(
-            blast_box_front(), planner_factory=lambda _: Planner(), max_decisions=2,
+            blast_box_front(), planner_factory=lambda _: Planner(), max_decisions=32,
         )
         self.assertIsNone(result["error_code"])
-        self.assertEqual(len(contexts), 2)
+        self.assertEqual(len(contexts), 32)
         self.assertEqual(result["blocked_moves"], 0)
         self.assertEqual(result["scans"], 1)
         self.assertLess(abs(result["final_pose"]["x_mm"] - 600), 30)
@@ -267,15 +336,21 @@ class SimulationRobotAdapterTests(unittest.TestCase):
                 side = 450
                 route = [
                     {"x_mm": 0, "y_mm": side, "purpose": "Clear box"},
-                    {"x_mm": 650, "y_mm": side, "purpose": "Pass box"},
-                    {"x_mm": 650, "y_mm": 0, "purpose": "Return behind box"},
+                    # Leave actual body clearance behind the 520 mm box edge.
+                    # The old 650 mm corner only worked because drift carried
+                    # the body farther forward than the requested endpoint.
+                    {"x_mm": 720, "y_mm": side, "purpose": "Pass box"},
+                    {"x_mm": 720, "y_mm": 0, "purpose": "Return behind box"},
                     {"x_mm": 800, "y_mm": 0, "purpose": "Reach goal"},
                 ]
                 contexts = []
                 class Planner:
                     def decide(self, context):
                         contexts.append(context)
-                        index = len(contexts) - 1
+                        index = (0 if len(contexts) == 1 else
+                                 next((i for i, point in enumerate(route)
+                                       if context.active_waypoint is not None
+                                       and point["purpose"] == context.active_waypoint["purpose"]), len(route)))
                         if index == 2:
                             # Use the encoder position for the final perpendicular
                             # leg; the simulator retains real turn/heading residue.
@@ -295,7 +370,7 @@ class SimulationRobotAdapterTests(unittest.TestCase):
                            FinalApproachDropout):
                     result = run_blast_gemma_scenario(
                         blast_box_front(), planner_factory=lambda _: Planner(),
-                        max_decisions=7,
+                        max_decisions=64,
                     )
                 self.assertIsNone(result["error_code"])
                 self.assertTrue(result["completed"], result["terminal_reason"])
@@ -328,14 +403,14 @@ class SimulationRobotAdapterTests(unittest.TestCase):
                 ), latency_ms=0)
         result = run_blast_gemma_scenario(
             blast_open_floor(), startup_scan=scan,
-            planner_factory=lambda _: Planner(), max_decisions=2,
+            planner_factory=lambda _: Planner(), max_decisions=64,
         )
         self.assertTrue(result["completed"], result.get("error_message"))
         self.assertTrue(result["goal_reached"])
         self.assertEqual(result["scans"], 1)
         self.assertEqual(result["blocked_moves"], 0)
         self.assertNotIn("drive_reverse", result["commands_tail"])
-        self.assertEqual(len(contexts), 2)
+        self.assertGreater(len(contexts), 2)
         for context in contexts:
             self.assertIsNone(context.observation["sensors"]["distance_mm"])
             self.assertEqual(context.observation["sensors"]["range_state"], "NO_VALID_DISTANCE")
@@ -351,19 +426,19 @@ class SimulationRobotAdapterTests(unittest.TestCase):
                         def decide(self, context):
                             contexts.append(context)
                             return ControllerActionPlannerResult(ControllerActionDecision(
-                                action=FOLLOW_WAYPOINT, confidence_milli=1000,
+                                action=FOLLOW_WAYPOINT if len(contexts)==1 or context.active_waypoint else "OBSERVE", confidence_milli=1000,
                                 assessment="Follow the chosen point", plan=(FOLLOW_WAYPOINT,),
-                                utterance=None, waypoint=waypoint,
+                                utterance=None, waypoint=waypoint if len(contexts)==1 else None,
                             ), latency_ms=0)
                     result = run_blast_gemma_scenario(
                         replace(blast_box_front(), obstacles=(
                             RectangleObstacle("box", front_x, -180, front_x + 200, 180),
                         )),
-                        planner_factory=lambda _: Planner(), max_decisions=1,
+                        planner_factory=lambda _: Planner(), max_decisions=64,
                         range_dropout_reads=dropout_reads,
                     )
                     self.assertIsNone(result["error_code"])
-                    self.assertEqual(len(contexts), 1)
+                    self.assertGreater(len(contexts), 2)
                     if front_x == 200:
                         self.assertNotIn(ADVANCE, contexts[0].available_actions)
                     self.assertEqual(result["scans"], 1)
@@ -378,8 +453,7 @@ class SimulationRobotAdapterTests(unittest.TestCase):
                         result["estimated_pose"]["heading_mdeg"],
                         result["final_pose"]["heading_mdeg"],
                     )
-                    opposite = "turn_right" if y_mm > 0 else "turn_left"
-                    self.assertNotIn(opposite, result["commands_tail"])
+                    self.assertTrue(all(c.observation["odometry"]["y_mm"] * (1 if y_mm>0 else -1) >= -25 for c in contexts))
 
     def test_blast_and_ev3_commands_move_in_the_same_concurrent_world(self):
         world = shared_world()

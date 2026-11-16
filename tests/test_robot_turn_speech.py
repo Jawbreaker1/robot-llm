@@ -119,7 +119,7 @@ class RobotTurnSpeechSinkTests(unittest.TestCase):
             list(range(1, 101)),
         )
 
-    def test_reuses_latest_pending_behavior_of_speech_runtime(self):
+    def test_dialogue_preserves_every_reply_in_order(self):
         first_started = threading.Event()
         release_first = threading.Event()
         third_completed = threading.Event()
@@ -155,7 +155,7 @@ class RobotTurnSpeechSinkTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.1)
         release_first.set()
         self.assertTrue(third_completed.wait(1))
-        self.assertEqual(spoken, ["first", "third"])
+        self.assertEqual(spoken, ["first", "second", "third"])
 
 
 class SerializedSpeakerTests(unittest.TestCase):

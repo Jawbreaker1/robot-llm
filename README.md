@@ -7,7 +7,7 @@
 
 **One shared AI brain. Many simple bodies. Personality included.**
 
-Robot LLM Lab is a local, LLM-driven application that acts through physical
+Robot LLM Lab is a local-first, LLM-driven application that acts through physical
 devices. The robots are its tools for sensing, moving, speaking, and interacting
 with the world — not separate computers that each need their own AI brain.
 Planning, conversation, mission memory, and interpretation of observations live
@@ -34,7 +34,7 @@ robots are the next integration milestone.
 
 ## Intelligence in the application, capabilities in the body
 
-The application offloads the robots' high-level thinking to a shared local LLM.
+The application offloads the robots' high-level thinking to a shared LLM.
 Each device only needs to expose what it can sense and do through a
 hardware-specific adapter. Its onboard controller still handles motor control
 and immediate feedback; it does not need to run a language model or maintain
@@ -94,7 +94,7 @@ distinguishes conversation, questions about the robot, and requests to act.
 Local Whisper handles speech recognition; Piper gives the reply a voice that
 plays through the robot's own speaker.
 
-**See the personality.** Qwen can choose BLAST's expression and gesture along
+**See the personality.** The model can choose BLAST's expression and gesture along
 with her reply. Her 5×5 display becomes a pair of expressive eyes, with blinking,
 glances, and different moods. Arm waves and claw flourishes make the response
 physical. Gestures return the sensor-carrying arm to its navigation pose;
@@ -105,7 +105,7 @@ waypoints, estimated position, sensor observations, speech, and execution
 events. You can see what the robot is trying to do as well as what it measured.
 
 **Experiment before driving.** A shared-world simulator puts robot bodies,
-sensors, obstacles, and goals in the same room. With Qwen in the loop, the model
+sensors, obstacles, and goals in the same room. With the selected LLM in the loop, the model
 must create its own route; the scenario does not supply the answer.
 
 ## How it fits together
@@ -115,7 +115,7 @@ flowchart TD
     U["You<br/>text or voice"] --> H
     subgraph APP["Shared local application · the brain"]
         H["Conversation and mission memory<br/>goals · plans · observations"]
-        H --> Q["Local Qwen<br/>reason · plan · replan · reply · express"]
+        H --> Q["Qwen (local) or GPT-6 Astra (Codex)<br/>reason · plan · replan · reply · express"]
         Q --> X["Robot-specific adapters<br/>navigation · speech · supported gestures"]
         O["Sensor and motor feedback<br/>maps · estimated poses · execution results"] --> H
         O --> D["Live dashboard and map"]
@@ -133,7 +133,7 @@ flowchart TD
 
 The application owns the high-level agent loop and keeps mission state outside
 the bodies. Adapters translate its decisions into supported operations, while
-each robot's onboard controller handles its motors and reports results. Qwen
+each robot's onboard controller handles its motors and reports results. The model
 chooses the route and expression; it does not need to manage motor ports,
 Bluetooth packets, or audio encoding.
 
@@ -146,6 +146,14 @@ The core stack runs locally: **Qwen3.8 27B through LM Studio**, **whisper.cpp**
 for voice input, and **Piper** for speech. BLAST uses `en_GB-cori-high`;
 EV3RSTORM uses `en_US-john-medium` for English.
 The dashboard supports English and Swedish.
+
+For model comparisons, each robot's settings offer **local Qwen3.8** or
+**GPT-6 Astra through an existing Codex/ChatGPT login**, for both conversation
+and navigation. The robot's observations, action contract and motion executor
+stay the same. Qwen remains the default; selecting Astra sends the supplied
+conversation and robot context to OpenAI. The subscription connection is an
+experimental compatibility adapter, not the public API.
+See [model selection and subscription setup](docs/CODEX_SUBSCRIPTION.md).
 
 ## Our first two bodies
 

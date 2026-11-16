@@ -93,6 +93,18 @@ class SimulationEvent:
     value: int = 0
 
 
+@dataclass(frozen=True)
+class _WorldPose:
+    """One precise physical pose; integer coordinates are publication only."""
+
+    x_mm: float
+    y_mm: float
+    heading_mdeg: int
+
+    def published(self) -> PoseEstimate:
+        return PoseEstimate(round(self.x_mm), round(self.y_mm), self.heading_mdeg)
+
+
 class MultiRobotNavigationSimulator:
     """One synchronized world shared by all simulated robots.
 
@@ -131,7 +143,9 @@ class MultiRobotNavigationSimulator:
         ):
             raise ValueError("simulation robot, goal or obstacle ids differ")
         self._poses = {
-            robot.robot_id: robot.pose for robot in self._robot_specs.values()
+            robot.robot_id: _WorldPose(float(robot.pose.x_mm), float(robot.pose.y_mm),
+                                      robot.pose.heading_mdeg)
+            for robot in self._robot_specs.values()
         }
         self._events: list[SimulationEvent] = []
         self._lock = threading.RLock()
@@ -145,26 +159,6 @@ class MultiRobotNavigationSimulator:
             spec.footprint.maximum_corner_radius_mm
             + spec.footprint.clearance_margin_mm
         )
-
-    @staticmethod
-    def _footprint_polygon(pose, footprint):
-        margin = footprint.clearance_margin_mm
-        local_corners = (
-            (footprint.front_extent_mm + margin,
-             footprint.left_extent_mm + margin),
-            (-footprint.rear_extent_mm - margin,
-             footprint.left_extent_mm + margin),
-            (-footprint.rear_extent_mm - margin,
-             -footprint.right_extent_mm - margin),
-            (footprint.front_extent_mm + margin,
-             -footprint.right_extent_mm - margin),
-        )
-        heading = math.radians(pose.heading_mdeg / 1_000.0)
-        cosine, sine = math.cos(heading), math.sin(heading)
-        return tuple((
-            pose.x_mm + forward * cosine - left * sine,
-            pose.y_mm + forward * sine + left * cosine,
-        ) for forward, left in local_corners)
 
     @staticmethod
     def _obstacle_polygon(obstacle):
@@ -198,9 +192,7 @@ class MultiRobotNavigationSimulator:
         return True
 
     def _pose_collides(self, robot_id: str, pose: PoseEstimate) -> bool:
-        robot_polygon = self._footprint_polygon(
-            pose, self._robot_specs[robot_id].footprint,
-        )
+        robot_polygon = self._robot_specs[robot_id].footprint.world_corners(pose)
         min_x, min_y, max_x, max_y = self.bounds
         if any(
             x <= min_x or y <= min_y or x >= max_x or y >= max_y
@@ -217,9 +209,7 @@ class MultiRobotNavigationSimulator:
         for peer_id, peer_pose in self._poses.items():
             if peer_id == robot_id:
                 continue
-            peer_polygon = self._footprint_polygon(
-                peer_pose, self._robot_specs[peer_id].footprint,
-            )
+            peer_polygon = self._robot_specs[peer_id].footprint.world_corners(peer_pose)
             if self._polygons_intersect(robot_polygon, peer_polygon):
                 return True
         return False
@@ -230,7 +220,7 @@ class MultiRobotNavigationSimulator:
                 sequence=len(self._events) + 1,
                 robot_id=robot_id,
                 kind=kind,
-                pose=self._poses[robot_id],
+                pose=self._poses[robot_id].published(),
                 value=value,
             ))
 
@@ -241,7 +231,7 @@ class MultiRobotNavigationSimulator:
 
     def pose(self, robot_id: str) -> PoseEstimate:
         with self._lock:
-            return self._poses[robot_id]
+            return self._poses[robot_id].published()
 
     def goal_reached(self, robot_id: str) -> bool:
         with self._lock:
@@ -267,18 +257,18 @@ class MultiRobotNavigationSimulator:
             while remaining:
                 step = min(step_mdeg, remaining)
                 attempted = turned + direction * step
-                candidate = PoseEstimate(
+                candidate = _WorldPose(
                     x_mm=start.x_mm, y_mm=start.y_mm,
                     heading_mdeg=normalize_heading_mdeg(start.heading_mdeg + attempted),
                 )
                 if self._pose_collides(robot_id, candidate):
                     self._record(robot_id, "blocked", turned)
-                    return self._poses[robot_id]
+                    return self._poses[robot_id].published()
                 self._poses[robot_id] = candidate
                 turned = attempted
                 remaining -= step
             self._record(robot_id, "rotate", delta_mdeg)
-            return self._poses[robot_id]
+            return self._poses[robot_id].published()
 
     def move(self, robot_id: str, distance_mm: int) -> int:
         """Move until the requested distance or the first blocked substep."""
@@ -294,9 +284,9 @@ class MultiRobotNavigationSimulator:
             while remaining:
                 step = min(10, remaining)
                 attempted = moved + direction * step
-                candidate = PoseEstimate(
-                    x_mm=round(start.x_mm + attempted * math.cos(heading)),
-                    y_mm=round(start.y_mm + attempted * math.sin(heading)),
+                candidate = _WorldPose(
+                    x_mm=start.x_mm + attempted * math.cos(heading),
+                    y_mm=start.y_mm + attempted * math.sin(heading),
                     heading_mdeg=start.heading_mdeg,
                 )
                 if self._pose_collides(robot_id, candidate):

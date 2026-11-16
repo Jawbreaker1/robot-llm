@@ -299,7 +299,55 @@ def blast_gemma_validation_scenarios():
     )
 
 
+def ev3_validation_scenarios():
+    """Route-free EV3 worlds for the production episode runner.
+
+    Reuse the shared layouts, with single-robot starts and straight-ahead goals
+    within the current two-metre mission contract. Nothing here chooses a route.
+    """
+    from .ev3rstorm_profile import EV3RSTORMProfile
+    footprint = EV3RSTORMProfile().hazard_calibration.robot_footprint
+
+    def case(name, bounds, obstacles, *, start=PoseEstimate(0, 0, 0), distance=800):
+        return NavigationSimulationScenario(
+            scenario_id=name, bounds=bounds, obstacles=tuple(obstacles),
+            robots=(SimulatedRobot("ev3", start, footprint, 1_000),),
+            goals=(SimulationGoal("ev3", start.x_mm + distance, start.y_mm, tolerance_mm=50),),
+        )
+
+    bounds = (-1_000, -1_000, 2_000, 1_000)
+    box = RectangleObstacle("front", 200, -100, 400, 100)
+    corridor, bend = blast_straight_corridor(), blast_bent_corridor()
+    staggered, dead_end = staggered_room(), dead_end_room()
+    return (
+        case("open", bounds, ()),
+        case("front", bounds, (box,)),
+        case("front-right", bounds, (box, RectangleObstacle("right", -100, -400, 100, -200))),
+        case("front-left", bounds, (box, RectangleObstacle("left", -100, 200, 100, 400))),
+        case("corridor", corridor.bounds, corridor.obstacles),
+        case("bend", bend.bounds, bend.obstacles),
+        case("staggered", staggered.bounds, staggered.obstacles,
+             start=PoseEstimate(-200, -500, 0), distance=2_000),
+        case("dead-end", dead_end.bounds, dead_end.obstacles,
+             start=PoseEstimate(-300, -550, 0), distance=2_000),
+        case("many-boxes", staggered.bounds, (*staggered.obstacles,
+             RectangleObstacle("box-5", -650, 200, -350, 600),
+             RectangleObstacle("box-6", 0, 900, 300, 1_200),
+             RectangleObstacle("box-7", 850, -1_200, 1_150, -900),
+             RectangleObstacle("box-8", 1_750, -1_200, 2_100, -850)),
+             start=PoseEstimate(-200, -500, 0), distance=2_000),
+        case("maze", (-700, -1_200, 2_400, 1_200), (
+             RectangleObstacle("top-wall", -700, 900, 2_400, 1_050),
+             RectangleObstacle("bottom-wall", -700, -1_050, 2_400, -900),
+             RectangleObstacle("baffle-1", 250, -900, 400, 150),
+             RectangleObstacle("baffle-2", 800, -150, 950, 900),
+             RectangleObstacle("baffle-3", 1_350, -900, 1_500, 150)),
+             start=PoseEstimate(-200, 0, 0), distance=2_000),
+    )
+
+
 __all__ = (
+    "ev3_validation_scenarios",
     "EV3_SIMULATION_FOOTPRINT",
     "NavigationSimulationScenario",
     "blast_bent_corridor",

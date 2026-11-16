@@ -3,7 +3,7 @@
 
 # Goal arrival is independent of map resolution. About one 45 mm drive pulse
 # leaves LEGO-scale slack without skipping the final approach after a turn.
-BLAST_GOAL_RADIUS_MM = 50
+from .waypoint_geometry import GOAL_RADIUS_MM as BLAST_GOAL_RADIUS_MM, goal_reached
 BLAST_GOAL_HEADING_TOLERANCE_MDEG = 20_000
 
 
@@ -14,8 +14,7 @@ def blast_directional_completion_allowed(
 
     return (
         localization_valid is True
-        and mission.heading_aligned(pose)
-        and mission.distance_to_target_mm(pose) <= BLAST_GOAL_RADIUS_MM
+        and goal_reached(mission, pose)
     )
 
 

@@ -7,6 +7,7 @@ from typing import Mapping
 
 from .blast_observation_monitor import ROBOT_ID
 from .blast_navigation_calibration import BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
+from .blast_scan_planar_projection import project_blast_range_ray
 from .blast_mission_completion import (
     BLAST_GOAL_HEADING_TOLERANCE_MDEG,
     BLAST_GOAL_RADIUS_MM,
@@ -19,7 +20,6 @@ from .coarse_navigation_grid import (
     GRID_CELL_SIZE_MM,
     ROUTE_CLEARANCE_MM,
     build_coarse_navigation_grid,
-    known_clear_axis_reach_mm,
     model_route_blockage,
     route_blockage_from_echoes,
 )
@@ -28,7 +28,7 @@ from .physical_navigation_contract import (
     ADVANCE, REVERSE, SCAN_FRONT_ARC, TURN_LEFT_90, TURN_RIGHT_90,
 )
 from .physical_odometry import PhysicalPose, normalize_heading_mdeg
-from .navigation_map_trace import final_goal_trace, waypoint_route_trace
+from .navigation_map_trace import advisory_waypoint_trace, final_goal_trace, waypoint_route_trace
 
 
 _MOTION_ACTIONS = frozenset((
@@ -73,6 +73,7 @@ class _BlastEpisodeMapTrace:
         self._waypoint_plan_version = 0
         self.planar_scan_views = []
         self._obstacle_points = []
+        self.range_observations = []
         self.visited_cells = []
         self._scan_sequence = 0
         self._last_pose = pose
@@ -171,7 +172,7 @@ class _BlastEpisodeMapTrace:
             del self.visited_cells[:-_VISITED_CELL_LIMIT]
 
     def _remember_obstacles(self, points):
-        """Missing echoes do not erase objects; measured free rays can.
+        """Retain obstacle support; a ray beside an edge does not erase it.
 
         Nearby repeat hits replace previous evidence instead of inflating the
         same box on every scan. This is map memory, not route selection.
@@ -184,20 +185,6 @@ class _BlastEpisodeMapTrace:
             for point in points:
                 ex, ey = point["nominal_echo_x_mm"], point["nominal_echo_y_mm"]
                 if math.hypot(ex - ox, ey - oy) <= spacing:
-                    replaced = True
-                    break
-                if not all(k in point for k in (
-                    "sensor_origin_x_mm", "sensor_origin_y_mm",
-                )):
-                    continue
-                sx, sy = point["sensor_origin_x_mm"], point["sensor_origin_y_mm"]
-                dx, dy = ex - sx, ey - sy
-                length = math.hypot(dx, dy)
-                if length == 0:
-                    continue
-                along = ((ox - sx) * dx + (oy - sy) * dy) / length
-                across = abs((ox - sx) * dy - (oy - sy) * dx) / length
-                if 0 < along < length - spacing and across < spacing:
                     replaced = True
                     break
             if not replaced:
@@ -226,6 +213,20 @@ class _BlastEpisodeMapTrace:
                         ),
                     ))
         return tuple(possible_obstacles), tuple(clear_segments)
+
+    def _remember_range_ray(self, pose, distance, *, settled):
+        ray = project_blast_range_ray(pose, distance, settled=settled)
+        origin = self._episode_axes(ray["sensor_origin_x_mm"], ray["sensor_origin_y_mm"])
+        item = {
+            "observed_from": dict(zip(("x_mm", "y_mm"), map(round, origin))),
+            "ray_heading_deg_in_episode": round(normalize_heading_mdeg(
+                ray["beam_heading_mdeg"] - self.mission.reference_heading_mdeg) / 1_000, 1),
+            "range_state": ray["range_state"], "distance_mm": ray["measured_range_mm"],
+            "settled": ray["observation_settled"],
+        }
+        if not self.range_observations or self.range_observations[-1] != item:
+            self.range_observations.append(item)
+            del self.range_observations[:-128]
 
     def _coarse_grid(self, pose):
         possible_obstacles, clear_segments = (
@@ -401,18 +402,21 @@ class _BlastEpisodeMapTrace:
                 },
                 "unobserved_space": "UNKNOWN_NOT_FREE",
                 "robot_footprint": BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.robot_footprint.planner_view(),
+                "sensor_layout": {
+                    "range_origin": "ultrasonic sensor face, not drive center or body edge",
+                    "forward_offset_mm": BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics.forward_offset_mm,
+                    "left_offset_mm": BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics.left_offset_mm,
+                    "yaw_deg": BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics.yaw_mdeg / 1_000,
+                },
+                "range_observations": copy.deepcopy(self.range_observations),
                 "route_clearance_mm": ROUTE_CLEARANCE_MM,
                 "coarse_grid": planner_grid,
-                "known_clear_axis_reach_mm": (
-                    known_clear_axis_reach_mm(coarse_grid)
-                ),
                 "visited_cells": copy.deepcopy(self.visited_cells),
                 "robot_pose": _map_pose(pose),
                 "directional_goal": {
                     key: goal[key]
                     for key in (
                         "target_x_mm", "target_y_mm",
-                        "desired_heading_mdeg",
                         "goal_radius_mm", "distance_to_goal_mm",
                         "remaining_forward_progress_mm",
                     )
@@ -435,11 +439,6 @@ class _BlastEpisodeMapTrace:
                     "corridor_entered": (
                         self.mission.distance_to_target_mm(pose)
                         <= BLAST_GOAL_RADIUS_MM
-                    ),
-                    "heading_aligned": self.mission.heading_aligned(pose),
-                    "heading_error_mdeg": normalize_heading_mdeg(
-                        self.mission.reference_heading_mdeg
-                        - pose.heading_mdeg
                     ),
                 },
             }
@@ -492,12 +491,8 @@ class _BlastEpisodeMapTrace:
 
     def set_advisory_waypoint_plan(
         self, waypoints, *, pose, observation, observed_at_unix_ms,
-        source="GEMMA_MODEL",
     ):
-        """Publish Gemma's ordered hypothesis without selecting its points."""
-
-        if source != "GEMMA_MODEL":
-            return False
+        """Publish the model's ordered hypothesis without selecting its points."""
 
         try:
             plan = tuple({
@@ -511,11 +506,7 @@ class _BlastEpisodeMapTrace:
             return False
         self.advisory_waypoint_plan = plan
         self._waypoint_plan_version += 1
-        self.advisory_waypoint = None if not plan else {
-            **plan[0],
-            "source": source,
-            "read_only": True,
-        }
+        self.advisory_waypoint = advisory_waypoint_trace(plan[0] if plan else None)
         return self._offer_trace(pose, observation, observed_at_unix_ms)
 
     def set_advisory_waypoint(
@@ -557,6 +548,7 @@ class _BlastEpisodeMapTrace:
         observation,
         pose_observed,
         scan_view,
+        observation_settled=False,
     ):
         if not isinstance(observation, Mapping):
             return
@@ -569,6 +561,15 @@ class _BlastEpisodeMapTrace:
                 observation=observation,
             )
         if isinstance(scan_view, Mapping):
+            scan = scan_view["scan"]
+            scan_pose = scan_view["scan_pose"]
+            for ray in scan.get("angular_rays", scan["rays"]):
+                magnitude = abs(ray["relative_heading_deg"])
+                bearing = magnitude if ray["side"].startswith("left_") else -magnitude
+                self._remember_range_ray(PhysicalPose(
+                    x_mm=scan_pose["x_mm"], y_mm=scan_pose["y_mm"],
+                    heading_mdeg=normalize_heading_mdeg(scan_pose["heading_mdeg"] + round(bearing * 1_000)),
+                ), ray["distance_mm"], settled=ray.get("observation_settled"))
             self._scan_sequence += 1
             self._remember_obstacles(scan_view["planar_projection"]["points"])
             self.planar_scan_views.append({
@@ -586,10 +587,12 @@ class _BlastEpisodeMapTrace:
                 ),
             })
             del self.planar_scan_views[:-MAX_PLANAR_SCAN_VIEWS]
+        if pose_observed:
+            self._remember_range_ray(pose, observation.get("distance_mm"), settled=observation_settled)
         self._offer_trace(pose, observation, observed_at_unix_ms)
 
     def record_action(
-        self, action, pose, observation, scan_view, pose_observed=None,
+        self, action, pose, observation, scan_view, pose_observed=None, observation_settled=False,
     ):
         self.record(
             pose=pose,
@@ -599,6 +602,7 @@ class _BlastEpisodeMapTrace:
                 if pose_observed is None else pose_observed
             ),
             scan_view=(scan_view if action == SCAN_FRONT_ARC else None),
+            observation_settled=observation_settled,
         )
 
 

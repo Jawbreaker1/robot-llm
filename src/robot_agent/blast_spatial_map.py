@@ -212,7 +212,8 @@ def _advisory_waypoint(value) -> bool:
         ))
         and _integer(value["x_mm"], -5_000, 5_000)
         and _integer(value["y_mm"], -5_000, 5_000)
-        and value["source"] == "GEMMA_MODEL"
+        # Retain read compatibility for recorded maps; current producers use MODEL.
+        and value["source"] in ("MODEL", "GEMMA_MODEL")
         and value["read_only"] is True
         and isinstance(value["purpose"], str)
         and value["purpose"] == value["purpose"].strip()
@@ -464,32 +465,29 @@ def _trace_inputs(final_goal, planned_leg, imu_heading,
     return len(ids) == len(set(ids))
 
 
-def _cluster_scan_points(points):
-    """Group angular neighbours without claiming persistent object identity."""
+def _cluster_echo_points(points):
+    """Group nearby endpoints in the shared frame, even across scan poses.
 
-    ordered = sorted(
-        points,
-        key=lambda item: item["relative_bearing_mdeg"],
-        reverse=True,
-    )
+    Relative bearings from different scans are not comparable. Clusters bound
+    observed support only; neither an object's unseen edges nor its identity.
+    """
+    remaining = sorted(points, key=lambda item: (
+        item["nominal_echo_x_mm"], item["nominal_echo_y_mm"],
+    ))
     clusters = []
-    for point in ordered:
-        if not clusters:
-            clusters.append([point])
-            continue
-        previous = clusters[-1][-1]
-        bearing_gap = abs(
-            point["relative_bearing_mdeg"]
-            - previous["relative_bearing_mdeg"]
-        )
-        endpoint_gap = math.hypot(
-            point["nominal_echo_x_mm"] - previous["nominal_echo_x_mm"],
-            point["nominal_echo_y_mm"] - previous["nominal_echo_y_mm"],
-        )
-        if bearing_gap <= 30_000 and endpoint_gap <= 225:
-            clusters[-1].append(point)
-        else:
-            clusters.append([point])
+    while remaining:
+        cluster = [remaining.pop(0)]
+        for seed in cluster:
+            neighbours, other = [], []
+            for point in remaining:
+                distance = math.hypot(
+                    point["nominal_echo_x_mm"] - seed["nominal_echo_x_mm"],
+                    point["nominal_echo_y_mm"] - seed["nominal_echo_y_mm"],
+                )
+                (neighbours if distance <= 225 else other).append(point)
+            cluster.extend(neighbours)
+            remaining = other
+        clusters.append(cluster)
     return clusters
 
 
@@ -498,7 +496,7 @@ def provisional_obstacle_hypotheses(planar_scan_views):
 
     values = []
     for view in planar_scan_views:
-        for ordinal, cluster in enumerate(_cluster_scan_points(
+        for ordinal, cluster in enumerate(_cluster_echo_points(
             view["projection"]["points"]
         )):
             centroid_x = int(round(sum(

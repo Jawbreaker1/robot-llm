@@ -35,7 +35,466 @@ blindly replay motion whose result was lost. Keep genuine differences in
 sensors, body geometry, motor execution and transports. Do not add a third
 navigation engine or merge entire loops merely for identical structure.
 
+## Recovery contract and model-error correction (2026-09-27)
+
+`tests/test_navigation_recovery_contract.py` runs six identical requirements
+through each production episode adapter, using the existing shared-world
+motor/sensor simulation. Only the planner is scripted. These tests establish
+execution and mission-lifetime behavior, **not Qwen planning quality or physical
+navigation acceptance**. No physical robot or live model is used in these tests.
+
+BLAST now retains the same planner context across transport failures to the
+model server and invalid model replies. A cancellable one-second wait replaces
+the old two-attempt cutoff; retries neither consume navigation decisions nor
+trigger scanning/motion. Operator stop, emergency stop and any explicitly chosen
+episode deadline still apply. This replaces the existing retry rule, not the navigation engine.
+EV3's already-working model-error handling is unchanged.
+
+| Requirement | BLAST | EV3 |
+| --- | --- | --- |
+| Follow two route legs and reach the fixed goal | Pass | Pass |
+| Preserve progress and route through a model timeout | Pass | Pass |
+| Recover after two invalid model replies | Pass | Pass |
+| Return to the planner after a transport failure before motion | Pass | Pass |
+| Reconcile a lost motion receipt before any further motion | Pass | Pass |
+| Honor operator stop during a model outage | Pass | Pass |
+
+All twelve shared cases now pass, including the four previously failing
+transport cases. The lost-receipt simulation really moves (BLAST 45 mm, EV3
+52 mm), retains absolute encoder counters, then drops the reply. The
+before-motion case moves neither robot. Both adapters must observe, reconcile
+and report the failure to the planner before any subsequent motor command.
+
+EV3's episode/session now owns transport retries. The old two-attempt startup
+loop is removed from the body. Disconnecting an uncertain channel preserves
+pose, survey and route; reconnecting reads absolute counters. Cleanup no longer
+attempts a graceful shutdown on that already-aborted channel. Tests also cover
+three consecutive startup timeouts and operator cancellation during startup.
+
+BLAST pauses the interrupted motion, requests a fresh settled observation and
+reconciles its encoder delta once. It records a lost response, not a fabricated
+successful motion receipt, and returns the retained route to Qwen. Recovery
+requires the same controller runtime: a restart/reset is **not** silently
+treated as travel. Invalid receipts and moving observations remain rejected.
+This does not repair every scan/observation failure path; see the audit below.
+
+### Mission time is opt-in
+
+Physical missions have no time limit by default (`max_episode_ms: null`). The
+GUI's empty field means “No time limit”; it no longer substitutes 15 minutes.
+An explicit limit in robot settings applies only to the next started mission.
+The service captures it in that mission's immutable context, then clears the
+pending limit and advances the settings revision. Duplicate start requests do
+not consume it twice, and a failed thread start leaves the pending limit intact.
+
+BLAST already supports an absent deadline; EV3 now does too. Individual model,
+transport and motor-operation timeouts are unchanged: they detect missing
+responses or bound individual operations, not total mission duration. Tests
+cover explicit limits, clearing the field through the GUI, per-mission capture,
+and two hours of simulated elapsed time without imposing a default deadline.
+The transport-recovery tests above run without a default mission deadline.
+
+## Full navigation revalidation (2026-09-27)
+
+Review scope: application wiring and mission lifecycle; model request/reply
+contract; route retention and leg execution; EV3 worker and BLAST controller
+boundaries; encoder continuity, turns and scan restoration; map evidence and
+goal completion; stop/deadline handling; simulator parity.
+
+The final full quality gate passed all **2,010 tests** and the ten JavaScript
+syntax checks (93.9 seconds), including startup lifecycle coverage. The earlier
+2,008-test gate also passed. `git diff --check` passed. No expected failures or
+skipped recovery cases were introduced.
+
+Additional **live Qwen** tests used the production episode adapters with
+shared-world simulated hardware, a loaded `qwen/qwen3.8-27b`, low reasoning
+and a 4,096-token output budget. The goal contained only the 800 mm target,
+not a supplied route. One actual movement response was deliberately lost:
+
+| Body / scenario | Outcome | Distance from goal | Model decisions |
+| --- | --- | --- | --- |
+| EV3 / open floor + lost response | Recovered, completed | 20 mm | 3 |
+| BLAST / open floor + lost response | Recovered, completed | 35 mm | 5 |
+| BLAST / box ahead, model-authored detour | Completed | 47 mm | 5 |
+
+Both fault-injection model contexts contained the transport failure and retained
+progress. Those runs took 19.2 s and 46.8 s; their individual model replies took
+5.3–13.8 s. In the separate box trial, Qwen chose `(0, -300)`, `(800, -300)`,
+then `(800, 0)`, followed by final heading alignment. The simulator recorded
+one scan, 47 low-level commands and zero blocked moves. The supplied goal did
+not disclose the box or a preferred side. These three trials are not acceptance
+of arbitrary obstacle navigation or physical reliability. The live console
+was not restarted and no physical robot commands were issued.
+
+Local evidence for this validation: `/private/tmp/navigation-full-validation-final-20260927.log`,
+`/private/tmp/navigation-live-validation-20260927.jsonl`, and
+`/private/tmp/navigation-qwen-box-20260927.json`. Full box model traces were
+appended to the existing ignored `local-artifacts/navigation-simulation.jsonl`.
+
+### Findings from that audit (route-contract changes follow below)
+
+1. **Mission lifetime still differs.** BLAST can terminate with
+   `no_safe_blast_action` after scan/observation recovery, and its dashboard
+   wiring still supplies a 64-decision limit (adapter default: 16). Removing
+   the default time limit did not remove these other termination paths.
+   An uncertain scan with possible motion also still invalidates localization.
+2. **The route contract is not enforced equally.** A current-tree EV3 probe
+   accepted `(300, 300)` and began a measured 45.109-degree turn. The route
+   validator used by BLAST rejects the same leg as `NON_ORTHOGONAL_ROUTE_LEG`.
+   This is not a sensor or chassis difference.
+3. **ADVANCE and scan semantics differ.** EV3 still executes ADVANCE as one
+   52 mm pulse; BLAST can continue to a target. The shared decoder still adds
+   COMPLETE to a lone ADVANCE plan. A scan can retain EV3's route without
+   resupplying waypoints, whereas BLAST's waypoint-required request can reject
+   that reply. These should become one action/route contract, not more rules
+   for choosing obstacle sides.
+4. **Physical uncertainty is not fully simulated.** The new fault cases cover
+   delayed/missing responses at the I/O boundary, not Wi-Fi timing, wheel slip,
+   IR reflectivity/height or motor-counter resets after robot reboot. EV3 still
+   closes its worker before each planner call. BLAST rejects a changed runtime
+   during lost-response reconciliation; EV3 lacks an explicit boot-identity
+   check across absolute-counter reconciliation. Do not claim recovery across
+   a robot reboot or infer physical pose solely from passing simulations.
+
+Next: unify the route/action contract and replace the remaining terminal
+small-error paths with retained-mission outcomes. Keep body-specific sensing,
+motor calibration and transport ownership. No third navigation engine or
+host-authored detour is needed. Physical acceptance remains outstanding.
+
+## Shared route/action contract, subsequent validation (2026-09-27)
+
+Implemented by reusing the existing geometry check and removing conflicting
+continuation behavior, not by adding a planner or host-authored detours:
+
+- EV3 now uses the same orthogonal-leg validation as BLAST. A diagonal proposal
+  is retained as a rejected hypothesis, reported to Qwen and not driven. IR
+  still supplies no metric obstacle bounds; no ultrasound map is fabricated.
+- Null waypoint plus an empty tail means retain the existing route, including
+  during SCAN_FRONT_ARC and a subsequent FOLLOW_WAYPOINT. A new waypoint/tail
+  replaces it. Both adapters and the model decoder follow this contract.
+- FOLLOW_WAYPOINT is the one command for executing a full leg with sensor
+  checks between motor pulses. ADVANCE is one bounded forward recovery step,
+  like REVERSE. Removed BLAST's implicit ADVANCE-to-final-goal continuation and
+  the decoder's automatic insertion of COMPLETE. Only the model decides to
+  complete, and only when measured goal completion is allowed.
+- Physical BLAST has no default decision limit, including dashboard wiring.
+  Optional decision limits remain explicit test/simulation bounds. Both bodies
+  passed 66 planning decisions without movement on invalid geometry, then
+  honored operator stop. The default optional mission deadline remains absent.
+
+The shared adapter contract now has 20 tests (ten identical cases per body).
+Targeted route/decoder/body tests: 190 passed. Final full gate: **2,020 tests
+passed in 97.7 seconds**, plus all ten JavaScript syntax checks and
+`git diff --check`. Tests formerly relying on semantic ADVANCE now explicitly
+request FOLLOW_WAYPOINT; short recovery motion is tested separately. The
+production dashboard default also has a regression test.
+
+### Live-model validation did not pass obstacle navigation
+
+Both trials used the loaded Qwen3.8-27B, low reasoning, 4,096 output tokens,
+production episode adapters and simulated hardware. No physical robot was
+commanded and the live console was not restarted. Only the 800 mm goal was
+given to the model, not a route, obstacle dimensions or a preferred side.
+
+| Trial | Observed outcome |
+| --- | --- |
+| BLAST / box ahead | Model chose a left detour but a corner at x=600 was too close to turn. Repeated attempts made no progress. Ended the experiment after roughly six minutes; not completed. |
+| EV3 / box ahead | Model chose y=-250; actual side travel reached y=-260, leaving insufficient body clearance. Translation and later a scan turn were blocked. The model eventually reversed, but did not reach the goal before the explicit 240-second test bound (finished at 257.5 s). |
+
+BLAST's saved model replies were replayed without another model call. The
+estimated and simulated poses both ended at `(592, 315, -69.768 degrees)`,
+377 mm from the goal. The oriented-body collision check verifies that -69
+degrees and -90 degrees are clear there, but -75/-80 degrees collide with the
+box: intermediate turn sweep matters. Replay recorded 21 blocked low-level
+move attempts across seven accepted model decisions, one scan and 53 commands.
+Several additional model requests exhausted the output budget with no final
+answer. Retries kept the mission alive, but did not resolve the blocked turn.
+This is not evidence of successful recovery or a reason to weaken collision
+geometry. It is also not evidence of a coordinate-sign error in this replay.
+
+EV3 used an explicitly approximate IR-response curve anchored by the existing
+white-box observations (raw 44 at ~200 mm, raw 51 at ~300 mm), not the strong
+execution-test fixture. The simulator still has ideal encoders and can detect
+whole-body obstruction more directly than the physical robot. EV3 ended at
+`(180, -312, 84.794 degrees)`, with five model decisions, two surveys and two
+reported blocked motions. This does not validate physical IR obstacle sensing.
+
+Evidence: `/private/tmp/navigation-route-full-final-20260927.log`,
+`/private/tmp/navigation-route-qwen-ev3-20260927.jsonl`,
+`/private/tmp/navigation-route-blast-replay-20260927.json`, and the appended
+model requests/responses in `local-artifacts/navigation-simulation.jsonl`.
+The BLAST CLI was interrupted as a bounded experiment, so its redirected
+summary file is empty; use the trace and deterministic replay instead.
+
+Remaining work: explain actual turn/progress failure and available evidence
+clearly enough for model-owned recovery; remove the remaining terminal
+`no_safe_blast_action`/scan-error paths without pretending uncertain pose is
+known. Robot reboot/counter-reset recovery is also not validated. The route
+contract is simpler and tested; obstacle navigation is **not** ready for a new
+physical acceptance claim.
+
+## Recovery and execution-context corrections (2026-09-27)
+
+The next audit found a host restriction behind the apparent model error:
+BLAST hid ADVANCE and standalone turns whenever an active waypoint could be
+followed. Qwen could describe a forward recovery, but that action was absent
+from its available actions. Removed this restriction; retained waypoints are
+memory, not a prohibition on recovery. Existing motor admission still applies.
+No detour planner, preferred side or obstacle-specific route was added.
+
+Other corrections in the same execution contract:
+
+- Recoverable scan refusals and lost scan replies use the existing stationary
+  encoder reconciliation, just like lost motor replies. The goal, route and
+  earlier map evidence survive. A scan is not blindly replayed after possible
+  movement. Removed the separate terminal scan-refusal outcome and its
+  after-advance-only exception.
+- No currently admitted action means wait for usable evidence, not terminate
+  the mission. Operator stop/emergency stop and an explicit mission deadline
+  remain authoritative. Waiting uses the existing dashboard message contract.
+- Runtime-generation validation now calls the generation method. Comparing
+  bound method objects previously failed to detect a changed connection.
+  Controller restart/reset is still not a supported pose-recovery operation.
+- Both planners receive measured primitive progress, repeated zero-progress
+  attempts, and the next waypoint primitive with its actual remaining angle.
+  A partially completed turn is not described as requiring another full 90°.
+  These are projections of existing execution state, not additional policies.
+- The replay also exposed a scan-validator boundary error: a blocked first
+  scan pulse left a valid center observation and zero angular coverage, which
+  was rejected as invalid. Zero coverage is now accepted only as incomplete
+  scan evidence, never as a completed or clear sweep.
+
+Regression tests cover interrupted scans before/after movement, retaining a
+route through an observation wait, stop during that wait, the bound-method
+generation bug, the exact blocked corner, and the zero-coverage scan at the
+recorded pose `(575, 302, -91.818°)`. Simulator runtime updates are also checked
+against the real dashboard schema.
+
+Live-model experiments used Qwen3.8-27B, low reasoning and 4,096 output tokens:
+
+- Fresh BLAST box trial: arrived 31 mm from the goal, one scan, five model
+  decisions, no blocked movement. This is a model-driven simulation result,
+  not a physical acceptance result.
+- First EV3 repeat: did not arrive within the explicit 240-second experiment
+  budget. Ten decisions, two scans and three blocked motions; the model still
+  chose insufficient lateral clearance from approximate IR evidence.
+- Three recorded Qwen decisions were replayed to recreate BLAST's blocked
+  corner, then live Qwen took over. Feedback alone did not fix recovery while
+  the host still hid its actions. Once available, Qwen immediately chose
+  ADVANCE and escaped the turn stall. It reached 166 mm from the goal but did
+  not finish within the 300-second experiment budget. Do not count these
+  seeded recovery probes as fresh end-to-end successes.
+
+The feedback-only replay also failed on the zero-coverage scan contract; that
+failure is now an automated regression, not a discarded model trial. No
+physical motor commands, model loading or live-console restart were performed.
+Final validation on the corrected code:
+
+- The full quality gate passed: all JavaScript syntax checks and 2,027 Python
+  tests in 96.920 seconds. `git diff --check` also passed.
+- Fresh EV3/Qwen trial: completed in 216.4 seconds, ten decisions, one scan,
+  three blocked motions. Qwen reversed, increased lateral clearance and
+  continued to the goal at `(800, 0)` mm, heading 1.549 degrees. The explicit
+  240-second experiment budget was not reached.
+- Fresh BLAST/Qwen trial: completed 44 mm from the goal at `(762, 22)` mm,
+  heading -10.596 degrees, ten decisions, one scan, seven blocked motions.
+  Qwen used ADVANCE to escape a blocked turn and continued the retained
+  mission. Estimated and simulated physical poses matched. One model reply
+  exhausted its output budget before returning a decision; it was retried
+  without moving or dropping the mission.
+
+These are two fresh model-driven completions, not evidence of contact-free or
+universally reliable navigation. Initial clearance choices still produced
+blocked body motions. The EV3 simulation uses approximate IR response based
+on recorded white-box readings; real material, height and reflection effects
+still require physical validation. No physical run was performed here.
+
+Local evidence (not committed):
+`/private/tmp/navigation-recovery-complete-20260927.log`,
+`/private/tmp/navigation-recovery-qwen-ev3-final-20260927.jsonl`, and
+`/private/tmp/navigation-recovery-qwen-blast-final-20260927.json`.
+
+## Physical EV3 repeat: not accepted (2026-09-27)
+
+After a battery replacement, the deployed 17-file navigation-worker manifest
+matched the checkout and the motion-free worker preflight passed. The mission
+contained only an 800 mm forward target, with no obstacle description or route.
+Qwen used low reasoning and 4,096 output tokens; no mission deadline was set.
+
+The operator confirmed that the initial full scan ended approximately facing
+the original direction (encoder estimate: +3.665 degrees). Qwen nevertheless
+initially chose a direct route despite forward IR readings of 50-54. The
+motor IR gate stopped progress at an estimated x=270 mm. Qwen backed up,
+chose y=-150 mm, encountered a near obstacle again, retried once, scanned the
+front half-space and extended the detour to y=-250 mm. The mission survived
+these results; the operator then reported that the map exaggerated the real
+sideways travel and showed no obstacle. The assistant stopped the test for
+investigation. It did not reach the goal and is not physical acceptance.
+
+The saved map contains 70 qualitative IR observations but zero obstacle
+hypotheses, zero metric sensor rays and no coarse grid. The current EV3
+projection leaves these fields empty; its displayed IR rays are fixed-length
+direction cues without hit endpoints. Qwen received raw directional samples,
+not an identified box extent. Its claims of lateral clearance were hypotheses.
+
+Map and navigation pose agree internally: the first lateral leg contains
+three forward pulses totaling approximately 162 mm, and the later extension
+contains two more totaling approximately 107 mm. Translation uses the
+provisional 0.35 mm per encoder-degree scale. Encoder movement alone cannot
+establish floor travel; calibration, contact/slip and accounting must be
+distinguished before accepting the operator-reported discrepancy. No new
+calibration or obstacle geometry was invented from this run.
+The operator subsequently bounded actual total rightward travel at at most
+100 mm, possibly less, with the body still nowhere near clearing the box.
+The map's y=-252 mm therefore overstates observed lateral displacement by at
+least about 152 mm. Do not derive a replacement scale from this potentially
+contact-constrained run; first compare a single pulse with measured free-floor
+travel, recording raw encoder deltas and the resulting map displacement.
+
+Evidence: episode `episode-17599b893931d5b762e7f5f0` in the existing navigation
+diagnostics, `/private/tmp/ev3-physical-battery-20260927-events.jsonl` and
+`/private/tmp/ev3-physical-map-20260927.json`. No navigation code was changed
+during the physical run.
+
+### Isolated forward-pulse check (2026-09-27)
+
+After the operator reset EV3 in front of the box, a temporary diagnostic harness
+used the production body and worker for exactly one ADVANCE command, without
+Qwen, a scan or an autonomous route. The receipt contains one paired motor
+segment: left +155 degrees and right +150 degrees. Independent absolute-counter
+differences match those values. The existing scale gives 53.375 mm and the body
+and map projection both report x=53 mm, y=0, heading=-0.342 degrees. Two stationary
+observations and a worker reconnect leave that pose unchanged. No double-counting
+was reproduced in this test. The standalone projection was not published to the
+live dashboard, which still showed the stopped mission.
+
+The operator estimated actual floor travel at approximately 40 mm. This is not
+a ruler measurement or sufficient evidence for a replacement calibration; the
+reply did not separately confirm absence of contact. Even if 40 mm per pulse
+were repeatable, the previous five lateral forward pulses would give about
+200 mm, still greater than the reported maximum 100 mm. The earlier discrepancy
+therefore remains unresolved. A measured, unobstructed multi-pulse trial with
+raw counters is needed before changing the linear scale or accepting navigation.
+No navigation code or calibration was changed for this check.
+
+Evidence: `/private/tmp/ev3-single-pulse-audit-20260927.jsonl` contains requests,
+raw replies, receipt/counter comparison and stationary/reconnect checks.
+
+### Refactoring audit: ordering defects reproduced and removed (2026-09-27)
+
+Reviewing the EV3 body/session introduced by checkpoint `566cc10` exposed two
+execution defects, without another physical run or a calibration change:
+
+- The body integrated a command receipt first, then all otherwise-unaccounted
+  encoder movement. That incorrectly put movement which preceded the receipt
+  after it. A regression test with 52 mm of pre-receipt forward travel followed
+  by a quarter-turn produced (0, 52) instead of (52, 0). The inverse test, a
+  pre-receipt turn followed by forward travel, misplaced the same distance.
+- The waypoint follower tested arrival before refreshing the encoders. Tests
+  reproduced both a false arrival from a stale position and a false
+  `near_obstacle` result when the refreshed position had reached the waypoint.
+
+The fix replaces the body's separate receipt and observation update paths with
+one chronological commit: previous observation, receipt start, commanded
+segments, final observation. The existing receipt parser retains its validated
+absolute starting counters; position, observation and counter anchor commit
+together only after integration succeeds. The unused encoder-anchor helper was
+removed. The follower now refreshes before checking arrival. Its diagnostic
+`motion_pulses` field is renamed `motion_attempts`, because denied requests are
+attempts, not evidence that a motor started. No new retry, detour or scan policy
+was added; motor profiles and both odometry scales remain unchanged.
+
+All four new regression tests failed before their respective fixes. Existing
+lost-reply/reconnection checks and an offline replay of the real single-pulse
+receipt still count the one encoder advance only once. These tests reproduce
+software ordering faults, not the entire physical mismatch: the earlier mission
+did not retain the per-command raw encoder evidence needed to establish how
+much of its lateral error these faults caused. Physical acceptance and the
+previously documented qualitative-only IR map limitation remain unresolved.
+
+Validation after the correction: 158 focused execution/recovery tests passed,
+followed by the complete quality gate: 2,031 tests in 97.5 seconds and all ten
+JavaScript syntax checks. Log: `/private/tmp/ev3-refactor-full-validation-20260927.log`.
+The web-console process was not restarted and no motor command was sent during
+this audit; a subsequent live test must first load the corrected host code.
+
 ## Purpose and boundaries
+
+### 2026-09-27: box collision, perception/decision boundary audit
+
+The corrected host was subsequently restarted and ran
+`episode-fbc8cf9ede03d88bed020b89`, with only an 800 mm forward goal. The operator
+reported contact with the box; the episode was explicitly stopped and confirmed
+IDLE. This was **not** a successful navigation acceptance test.
+
+The initial forward IR return was 44–46, versus weaker returns in other
+directions. Qwen interpreted a historical white-box reference (raw 44 at an
+approximately 200 mm distance) as the current obstacle distance, then selected
+a 250 mm side waypoint without knowing the box width. After that leg, its next
+decision used a current ray facing sideways (92.4 degrees). Execution then
+turned forward and drove without another model decision, until the near gate.
+The forward observation immediately after that turn was raw/filtered 84: weak
+IR does not establish clearance for the robot's whole width. Encoder-reported
+positions are not independent confirmation that the body cleared the box.
+
+Audit boundaries and changes:
+
+- Entry point remains `EV3EpisodeAdapter -> EV3NavigationSession ->
+  EV3NavigationBody -> existing worker`. No legacy detour engine is invoked.
+- Removed historical white/dark box distances from active planner context.
+  These were diagnostic measurements, not a transferable IR distance model.
+- Separated ultrasonic recovery/range-check instructions from the shared
+  route prompt. EV3 no longer receives BLAST's metric-clearance assumptions.
+- Split FOLLOW_WAYPOINT execution at completed alignment: fresh forward IR
+  returns to Qwen before translation, with the route retained. Straight motion
+  still executes a coherent leg, not one model request or scan per pulse.
+  Final goal alignment completes in place. No automatic scan was added.
+- The model now reports obstacle beliefs as a bounded list, with each edge
+  independently unknown or estimated. The same retained list is returned in
+  planner context and published on the map. Complete bounds render dashed
+  outlines and approximate x/y dimensions; missing bounds remain visibly
+  unknown. Evidence text is inspectable. These are **not** sensor hit points,
+  occupied/free cells, or input to a second collision planner. Untransformed
+  local estimates are not copied into the shared-world coordinate frame.
+- Encoder integration, motor profiles, body dimensions and calibration were
+  not changed in this audit. Recoverable worker/model retry still preserves
+  mission state. Operator stop and user-configured deadlines remain honoured;
+  no new automatic mission-abort branch was added.
+
+Validation distinguishes three different claims:
+
+1. Execution regression tests verify the post-turn handoff before translation,
+   continuation without a new scan, retained waypoints/beliefs, and detached map
+   snapshots. They do not establish physical box clearance.
+2. Rendering tests and browser inspection verify dimension labels, unknown
+   edges, invalid-overlay isolation, and no fabricated sensor hits. The finite
+   rectangle used to test rendering is explicitly synthetic, not this box.
+3. Six real Qwen calls (three successive prompt versions, two logged states
+   each; low reasoning, 4096 output tokens) **did not establish safe planning**.
+   The final initial-state replay chose a 400 mm forward observation waypoint
+   despite unknown obstacle range; the post-turn replay still called raw 84
+   "clear" and chose the long forward leg. Both reported unknown obstacle
+   edges. This exposes a remaining planning/perception error, not a passed
+   simulated mission. The post-turn context was reconstructed from recorded
+   pre-translation observations; no future collision samples were provided.
+
+Artifacts: `/private/tmp/ev3-collision-events-20260927.jsonl`,
+`/private/tmp/ev3-collision-map-20260927.json`,
+`/private/tmp/ev3-belief-replay-v3-20260927.jsonl` and the read-only preview at
+`http://127.0.0.1:8879/`. No new physical motion was performed after the stop.
+The production console was deliberately not restarted into another mission;
+new host behavior needs a normal restart before later physical validation.
+Do not claim this refactor has solved autonomous IR box navigation. In
+particular, a waypoint reached beside a box is not evidence of its edge.
+
+Quality gate: 2,037 tests passed in 95.8 seconds, with all existing JavaScript
+syntax checks. The last protocol tightening was also checked by 63 focused
+tests. New tests do not loosen the production module-size budgets: rendering
+helpers were moved out of the main map presenter into its existing helper
+module. Logs: `/private/tmp/ev3-obstacle-refactor-full-20260927-final.log` and
+`/private/tmp/ev3-obstacle-final-targeted.log`.
+
+### Architectural boundary
 
 One application owns goals, model-authored routes, conversation and shared
 knowledge. BLAST and EV3 supply different bodies and sensing capabilities.
@@ -991,6 +1450,263 @@ passes all 1,962 tests (82.9 s). Current artifacts:
 remains disabled. Next: rerun real-Qwen obstacle recovery with the corrected
 receipts, preferably without the competing GPU workload. Continue auditing
 whether simulated contact feedback matches what the real worker can observe.
+
+## IR admission and planner-wait regression check (2026-09-27)
+
+The recorded stationary forward return was 39. A fresh gate stayed blocked in
+the 36–39 hysteresis band solely because startup was represented as an observed
+near obstacle. The same readings after a released gate permitted movement.
+The gate now distinguishes unverified startup from an observed obstacle: stable
+non-near samples can establish the initial state, while an established near
+obstacle still needs the existing release threshold. A bad sample does not
+erase an established near stop. Thresholds, motor pulses and odometry
+calibration are unchanged.
+
+The session no longer closes a healthy worker before each model request.
+Existing stopped-worker budget renewal and transport recovery retain the
+mission, route and encoder anchor. Current IR admission and its reason are
+included in model context and observation diagnostics; historical rays are not
+turned into clearance measurements. The calibrated length of ADVANCE is also
+exposed, distinguishing a short exploration step from a complete waypoint leg.
+
+Motor-free checks include fresh/released/near gates, scan batches, reconnects,
+expired workers and incomplete observations. The full quality gate passes
+2,044 tests. However, real Qwen validation is **not accepted**: repeated replays
+of the recorded IR context still sometimes called an unmeasured forward path
+clear. An eight-decision front-box simulation used one worker, preserved
+progress through a blocked turn and backing up, but contacted the simulated
+box twice and did not reach the goal. The simulator uses measured IR anchors
+with assumed interpolation and idealized geometry; its contact oracle is not
+a capability of physical EV3.
+
+Artifacts: `/private/tmp/ev3-gate-final-quality-20260927.log`,
+`/private/tmp/ev3-action-context-validation.jsonl`, and
+`/private/tmp/ev3-gate-qwen-front-20260927.jsonl`. These changes remain local;
+the physical episode is IDLE and no new movement was requested. Do not deploy
+this as proven box navigation or add a scripted detour to hide the model's
+unresolved edge/body-clearance decisions.
+
+## Uncertainty and context separation validation (2026-09-27)
+
+Navigation must allow movement without proof of empty space. Ambiguous or
+missing returns do not constitute a detected obstacle. A detected obstacle
+interrupts the relevant motion, not the mission; the goal, route and verified
+pose remain available for Qwen's next decision. Controller loss and ambiguous
+motor completion still require stopped-wheel reconciliation.
+
+Planner inputs now separate sensor facts, Qwen's retained obstacle hypotheses,
+and execution permissions. Both robots expose waypoint motion through the same
+execution section. EV3 can request a stationary settled observation instead of
+a rotating scan. Its model history retains visited positions and outcomes in
+degrees, without repeated obsolete route copies; full diagnostics remain intact.
+No motor calibration, obstacle thresholds, or deterministic detour was added.
+
+The full gate passes **2,048 tests**, including continued travel with ambiguous
+non-near IR and retained state across failed stationary measurements. Actual
+Qwen validation reached the open-floor goal on EV3 in two decisions. BLAST also
+reached it in two decisions using a recorded no-echo startup scan, with one
+initial scan and no blocked moves. These validate uncertainty handling, not
+general obstacle avoidance.
+
+The front-box Qwen simulation is **not accepted**: it chose insufficient body
+clearance, made contact and failed to reach the goal within the explicit
+540-second test budget. This budget is not a production mission deadline.
+Later responses exhausted all 4,096 output tokens in reasoning without an
+action. A single diagnostic with 8,192 tokens did the same; ordinary model
+settings remain unchanged. Input was only 4,492 tokens after history cleanup.
+This does not establish RAM offloading or justify merely raising output limits.
+
+Artifacts: `/private/tmp/navigation-refactor-final-quality-20260927.log`,
+`/private/tmp/ev3-refactor-qwen-open-20260927.jsonl`,
+`/private/tmp/blast-no-echo-qwen-validation.json`,
+`/private/tmp/ev3-refactor-qwen-front-20260927.jsonl`, and
+`/private/tmp/ev3-output-budget-comparison.jsonl`. Changes remain local and
+undeployed; no physical motors were run. Simulated contact feedback is stronger
+than EV3's actual sensing and must not be mistaken for physical validation.
+
+## Focused obstacle inspection (2026-09-27)
+
+EV3 reuses `SCAN_FRONT_ARC` for a denser, narrower inspection: nine bearings
+from -60 to +60 degrees in 15-degree increments, followed by a return toward
+the starting heading. Previously it sampled seven bearings over +/-90 degrees
+at 30-degree intervals. The startup full survey, motor calibration and worker
+protocol are unchanged. Qwen sees the scan bearings and that the body, not an
+independent sensor head, rotates. No automatic scan trigger or detour is added.
+
+The final gate passes **2,050 tests**. Focused checks preserve the full-turn
+sequence, current-heading reference, actual encoder poses, missing rays,
+retained observations and routes. In the simulated front-box geometry the new
+rays at +/-15 degrees see reflections that the coarse +/-30-degree rays miss.
+A separate real-Qwen perception check correctly described that angular pattern
+and kept metric edges null. Its scan was supplied for this diagnostic; it is
+not autonomous route acceptance.
+
+The full real-Qwen front-box run is still **not accepted**. Qwen requested the
+focused scan after approaching too close for its body to rotate, then backed
+away after blocked turns. It later attempted another body-overlapping passage.
+Improved scan capability has not yet established reliable edge investigation
+or whole-body route clearance. No physical navigation was started or deployed.
+
+Artifacts: `/private/tmp/ev3-dense-scan-final-quality-20260927.log`,
+`/private/tmp/ev3-dense-scan-qwen-front-20260927.jsonl`, and
+`/private/tmp/ev3-dense-perception-check.jsonl`.
+
+## Retained rectangles with evidence review (2026-09-28)
+
+Historical experiment: the additional evidence-review layer described in this
+section was removed by the simplification below. These results are not an
+acceptance claim for the current code.
+
+Keep model rectangles as compact planning hypotheses and visible dimensions.
+A shared host-computed review now labels every numeric edge `estimated` and
+every absent edge `unknown`, independently of model confidence or prose.
+It retains up to eight distinct reported body-blockage observations beyond
+the compact planner history. Each includes the reported odometric stopped pose. The
+comparison uses the existing footprint envelope internally (including its
+existing clearance margin); its coordinates are not supplied as another box.
+It checks whether any hypothesis could spatially explain the report. This is
+a compatibility check, not a measured object rectangle, identity assignment,
+edge detector, clearance guarantee, route generator or new movement veto.
+
+The same review reaches Qwen and the dashboard. Rectangles and approximate
+dimensions stay visible; unexplained blockages add a “needs review” indication.
+Updated model estimates are checked again against retained outcomes. No-return,
+ambiguous IR, IR proximity alone, generic stalls and transport faults never
+become body-contact geometry. Simulated body blockage remains explicitly
+identified as simulated; physical EV3 only supplies its actual touch evidence.
+
+Validation: all **2,054 tests** pass on the final version. Tests cover the recorded too-narrow region,
+partial progress followed by blockage, repeated/high-confidence guesses,
+compatible but still unmeasured revised regions, missing sensing, compacted
+history, and identical planner/map review with rectangles retained.
+Real Qwen (low reasoning, 4,096 output tokens) changed the replayed failed
+decision to a wider detour instead of repeating the same forward attempt.
+It hypothesized a second object; that identity is NOT established by the review.
+Open-floor Qwen navigation still completed in two decisions, with no contacts.
+The first 12-decision box test recovered after two simulated body blocks and
+ended 16 mm from the goal with 1.5-degree heading error; the test's decision
+limit stopped it before a COMPLETE decision. It is **not a clean-route pass**.
+A repeat with a 20-decision test allowance completed in 13 decisions, again
+16 mm from the goal by odometry, with two simulated body contacts. Both full
+box tests used the intermediate review that exposed the stopped-body envelope.
+Qwen used an envelope coordinate as a guessed obstacle boundary, so the final
+version deliberately keeps that geometry internal. These runs establish
+recovery in simulation, not contact-free navigation or final-version acceptance.
+
+The final-version failed-decision replay was run twice against Qwen with the
+same low-reasoning/4,096-token settings. The first exhausted the response budget
+without a valid decision. The retry returned SCAN_FRONT_ARC in 25 seconds,
+recognizing a possible side/body-clearance problem despite forward IR=100,
+rather than repeating the blocked forward move. It retained uncertain obstacle
+hypotheses; their edges remain unverified. No full final-version box run or
+physical acceptance is claimed. Simulator body-contact feedback is stronger
+than EV3's actual head IR and touch coverage.
+
+Artifacts: `/private/tmp/obstacle-review-quality-20260928.log`,
+`/private/tmp/obstacle-review-qwen-replay-20260928.jsonl`,
+`/private/tmp/obstacle-review-qwen-open-20260928.jsonl`, and
+`/private/tmp/obstacle-review-qwen-front-20260928.jsonl`,
+`/private/tmp/obstacle-review-qwen-front-repeat-20260928.jsonl`,
+`/private/tmp/obstacle-review-final-quality-20260928.log`,
+`/private/tmp/obstacle-review-final-qwen-replay-20260928.jsonl`, and
+`/private/tmp/obstacle-review-final-qwen-replay-retry-20260928.jsonl`.
+No physical robot or running dashboard was redeployed for these checks.
+
+## Simplification: use existing motion feedback (2026-09-28)
+
+Removed the host-computed obstacle/body-envelope compatibility review, its
+extra context/map fields, and associated UI warnings. It duplicated actual
+outcomes already available in `observation.last_motion` and history, did not
+address identifying obstacle edges before the first passage, and relied on
+stronger contact feedback in simulation than EV3 necessarily has physically.
+No replacement inference layer, route planner, motion gate or calibration
+change was added. Numeric model rectangle edges remain estimates; absent edges
+remain unknown. Dimensions and the underlying model hypotheses remain visible.
+
+The regression test now verifies that existing last-motion feedback survives
+stationary observations and compacted history, without changing high-confidence
+model guesses into measured geometry. Tests specific to the removed review
+were removed; the full suite passes **2,051 tests**, including retained map
+rendering, motion-feedback and recovery tests. Focused checks passed 88 tests.
+Artifacts: `/private/tmp/navigation-simplified-feedback-quality-20260928.log`
+and `/private/tmp/navigation-simplified-feedback-focused-20260928.log`.
+Two motor-free Qwen replays of the same recorded blocked state, using the
+current prompt without `obstacle_review`, both exhausted the 4,096-token output
+budget with low reasoning and returned no valid action (`finish_reason=length`).
+No behavior improvement is claimed from those attempts. Artifacts:
+`/private/tmp/navigation-simplified-feedback-qwen-20260928.jsonl` and
+`/private/tmp/navigation-simplified-feedback-qwen-retry-20260928.jsonl`.
+This is a reduction in code and inference paths, not proof of better physical
+box navigation. No robot or running dashboard was redeployed.
+
+## Edge-inspection validation: not accepted (2026-09-28)
+
+The existing body front-sector scan is exposed to Qwen at the lateral waypoint
+after aligning with the passage. It keeps the route, samples every 15 degrees
+from -60 to +60 and returns to the same heading without translation. No automatic
+scan gate, deterministic detour, physical deployment or motor calibration
+change was added. The local prompt revision clarifies that waypoints and motor
+permission do not prove body clearance; it has **not** fixed autonomous passage.
+
+`validate_ev3_navigation.py` now uses `ev3_validation_scenarios()`: open floor,
+front/front-right/front-left boxes, corridor, bend, staggered obstacles, dead
+end, eight boxes, and a five-obstacle maze. It uses the production episode,
+body, session and Qwen planner with the measured EV3 footprint. Scenario
+geometry goes to sensor/physics simulation and diagnostic logs, not the model.
+The mission only gives a straight-ahead goal, and clean success additionally
+requires the simulator's true goal to be reached with no body contacts. The IR
+response curve, ideal rays and encoder/contact assumptions remain limitations,
+not a claim of physical fidelity. The full suite passes 2,053 tests; that does
+not establish successful model navigation.
+
+Real Qwen3.8-27B runs used low reasoning, 4,096 output tokens and at most two
+concurrent requests. None of these runs passed cleanly:
+
+| Scene / prompt revision | Decisions | Remaining distance | Body contacts | End |
+| --- | ---: | ---: | ---: | --- |
+| Front box / initial | 12 | 730 mm | 4 | Test time limit |
+| Eight boxes / initial | 15 | 1,649 mm | 3 | Test time limit |
+| Front box / compact | 14 | 740 mm | 4 | Test time limit |
+| Maze / compact | 13 | 1,779 mm | 4 | Worker expiry during cleanup |
+
+The complex runs struggled at their first obstacle; they did not traverse the
+whole layouts. Maze cleanup raised `simulation worker process is closed or
+expired`, masking normal test termination. This separate lifetime/cleanup issue
+is unresolved and is not counted as a successful navigation result.
+
+A motor-free replay isolated the same pre-passage decision: pose (0,208),
+heading 0, original forward reflection at the origin, unknown object bounds,
+and no forward progress yet. The following controlled variants kept the model,
+output schema and sensor state fixed unless noted:
+
+| Variant | Chosen action |
+| --- | --- |
+| Current production prompt | FOLLOW_WAYPOINT, 3/3 |
+| Much shorter instruction | FOLLOW_WAYPOINT, 3/3 |
+| Short instruction plus explicit ray-origin semantics | FOLLOW_WAYPOINT, 3/3 |
+| Current prompt, remove forward-admission and predicted-motion hints | FOLLOW_WAYPOINT, 3/3 |
+| Short instruction, explicitly request SCAN_FRONT_ARC now | SCAN_FRONT_ARC, 2/2 |
+| Current prompt, supply actual simulated front-arc observations | FOLLOW_WAYPOINT, 3/3 |
+
+The model repeatedly described a lateral move and a no-return center ray as
+having cleared the obstacle. It sometimes confused the measurement origin with
+the obstacle location; clarifying that alone did not fix the decision. With the
+actual sweep it recognized right-front reflections (-30/-45 degrees), but still
+inferred body clearance. In the hidden world the box extends to y=100 and the
+body at y=208 extends 130 mm to its right: its edge is y=78, overlapping the box
+by 22 mm even though the center ray misses. This truth is diagnostic only and
+was not supplied to Qwen. Requiring a scan alone therefore has not been shown
+to solve the whole-body passage problem. No automatic-scan policy is authorized
+by the user's question about why Qwen ignores the instruction.
+
+Artifacts: `/private/tmp/ev3-edge-final-quality-20260928.log`,
+`/private/tmp/ev3-edge-front-20260928.jsonl`,
+`/private/tmp/ev3-edge-many-boxes-20260928.jsonl`,
+`/private/tmp/ev3-edge-front-final-20260928.jsonl`,
+`/private/tmp/ev3-edge-maze-20260928.jsonl`, and
+`/private/tmp/ev3-passage-ab-{current,short,origin,no-hints,direct,after-scan}-20260928.jsonl`.
+The replay variants live in `/private/tmp/ev3-passage-prompt-ab.py`; they do not
+change the production planner or command any physical robot.
 
 ## Remaining acceptance points — stop and report after each
 

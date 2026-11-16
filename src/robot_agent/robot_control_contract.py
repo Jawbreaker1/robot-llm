@@ -163,7 +163,8 @@ class RobotControlSettings:
 
     revision: int = 1
     model: str = DEFAULT_MODEL
-    max_episode_ms: int = 15 * 60 * 1_000
+    # Opt-in for the next mission; the service consumes it only on start.
+    max_episode_ms: Optional[int] = None
     speech_enabled: bool = True
 
     def __post_init__(self) -> None:
@@ -180,12 +181,13 @@ class RobotControlSettings:
                 "invalid_robot_model",
                 "Robot model is invalid",
             )
-        _integer(
-            "max_episode_ms",
-            self.max_episode_ms,
-            1_000,
-            60 * 60 * 1_000,
-        )
+        if self.max_episode_ms is not None:
+            _integer(
+                "max_episode_ms",
+                self.max_episode_ms,
+                1_000,
+                60 * 60 * 1_000,
+            )
         if not isinstance(self.speech_enabled, bool):
             raise DashboardContractError(
                 "invalid_robot_speech_setting",

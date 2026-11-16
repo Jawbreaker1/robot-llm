@@ -75,6 +75,47 @@ class Model:
 
 
 class RobotInputServiceTests(unittest.TestCase):
+    def test_follow_up_receives_completed_dialogue_once_and_only_for_its_robot(self):
+        from robot_agent.lm_studio_robot_input import LMStudioRobotInputModel
+        import json
+        packets = []
+        def transport(_url, body, *_args):
+            request = json.loads(body)
+            packet = json.loads(request["messages"][1]["content"])
+            packets.append(packet)
+            return json.dumps({"object": "chat.completion", "model": request["model"],
+                              "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant",
+                "content": json.dumps({"intent": CONVERSE, "confidence_milli": 950,
+                                        "reply_text": "Neptune."})}}]}).encode()
+        def service():
+            return RobotInputService(control_service=FakeControl(),
+                model_factory=lambda _: LMStudioRobotInputModel(transport=transport))
+        blast, ev3 = service(), service()
+        blast.dispatch("My favourite planet is Neptune", "en", "first", 3)
+        blast.dispatch("My favourite planet is Neptune", "en", "first", 3)
+        blast.dispatch("Which planet did I mention?", "en", "second", 3)
+        history = packets[-1]["facts"]["conversation_history"]
+        self.assertEqual(history, [{"user": "My favourite planet is Neptune",
+                                   "assistant": "Neptune.", "intent": CONVERSE}])
+        self.assertEqual(len(packets), 2)
+        ev3.dispatch("What did Blast hear?", "en", "third", 3)
+        self.assertEqual(packets[-1]["facts"]["conversation_history"], [])
+
+    def test_dialogue_memory_is_bounded_in_bytes_and_keeps_whole_recent_turns(self):
+        import json
+        from robot_agent.robot_input_service import MAX_DIALOGUE_BYTES, MAX_DIALOGUE_TURNS
+        service = RobotInputService(control_service=FakeControl(),
+            model_factory=lambda _: Model(RobotInputDecision(CONVERSE, 950, "Okay."), []))
+        for index in range(30):
+            service.dispatch(str(index) + " å" * 140, "sv", str(index), 3)
+        history = service._facts()["conversation_history"]
+        self.assertLessEqual(len(history), MAX_DIALOGUE_TURNS)
+        self.assertLessEqual(sum(len(json.dumps(turn, ensure_ascii=False).encode()) for turn in history),
+                             MAX_DIALOGUE_BYTES)
+        self.assertEqual(history[-1]["user"], "29" + " å" * 140)
+        history[-1]["user"] = "modified"
+        self.assertNotEqual(service._facts()["conversation_history"][-1]["user"], "modified")
+
     def test_disconnected_navigation_preserves_named_conversation_and_speech(self):
         from unittest.mock import Mock
         from robot_agent.robot_control_contract import RobotControlTarget

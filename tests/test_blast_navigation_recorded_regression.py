@@ -60,7 +60,8 @@ class RecordedNavigationTests(unittest.TestCase):
             )
             trace.record(
                 pose=pose, observation=result["observation"], pose_observed=True,
-                scan_view={"scan_pose": pose.to_dict(), "planar_projection": projection},
+                scan_view={"scan_pose": pose.to_dict(), "planar_projection": projection,
+                           "scan": result["scan"]},
             )
             with self.subTest(scan=index + 1):
                 points, _ = trace._coarse_navigation_observations()
@@ -89,7 +90,7 @@ class RecordedNavigationTests(unittest.TestCase):
             PhysicalPose(**pose), {"x_mm": 600, "y_mm": -300}, available,
         ), ADVANCE)
 
-    def test_only_a_measured_ray_through_old_evidence_removes_it(self):
+    def test_farther_echo_does_not_erase_retained_obstacle_support(self):
         trace = _BlastEpisodeMapTrace(
             bridge=None, episode_id="memory", pose=PhysicalPose(),
             observation={}, observed_at_unix_ms=1, episode_start_heading=0,
@@ -105,7 +106,8 @@ class RecordedNavigationTests(unittest.TestCase):
         self.assertIn(point, trace._obstacle_points)
         farther = {**point, "nominal_echo_x_mm": 1000}
         trace._remember_obstacles([farther])
-        self.assertNotIn(point, trace._obstacle_points)
+        # A farther echo is not proof that a previously observed body vanished.
+        self.assertIn(point, trace._obstacle_points)
         self.assertIn(side, trace._obstacle_points)
 
     def test_turn_feedback_uses_the_same_command_local_heading(self):

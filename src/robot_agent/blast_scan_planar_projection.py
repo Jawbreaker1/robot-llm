@@ -29,6 +29,26 @@ def _delta(heading, reference):
     return (heading - reference + 180.0) % 360.0 - 180.0
 
 
+def project_blast_range_ray(pose, distance, *, settled):
+    """One sensor-origin ray, including no-return/uncertain observations."""
+    sensor = BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.range_sensor_extrinsics
+    angle = math.radians(pose.heading_mdeg / 1_000)
+    origin_x = pose.x_mm + sensor.forward_offset_mm * math.cos(angle) - sensor.left_offset_mm * math.sin(angle)
+    origin_y = pose.y_mm + sensor.forward_offset_mm * math.sin(angle) + sensor.left_offset_mm * math.cos(angle)
+    heading = normalize_heading_mdeg(pose.heading_mdeg + sensor.yaw_mdeg)
+    state = scan_contract.blast_range_state(distance)
+    measured = state == scan_contract.RANGE_STATE_MEASURED
+    beam_angle = math.radians(heading / 1_000)
+    return {
+        "sensor_origin_x_mm": round(origin_x), "sensor_origin_y_mm": round(origin_y),
+        "beam_heading_mdeg": heading, "range_state": state,
+        "measured_range_mm": _finite(distance) if measured else None,
+        "observation_settled": settled is True,
+        "nominal_echo_x_mm": round(origin_x + distance * math.cos(beam_angle)) if measured else None,
+        "nominal_echo_y_mm": round(origin_y + distance * math.sin(beam_angle)) if measured else None,
+    }
+
+
 def _headings(scan):
     start = _finite(scan.get("start_heading_deg"))
     rays = scan.get("angular_rays", scan["rays"])
@@ -106,13 +126,6 @@ def project_blast_scan_planar_surfaces(
         )
     ):
         raise ValueError("BLAST scan sensor pose is not verified")
-    forward, left, yaw = (
-        sensor.forward_offset_mm,
-        sensor.left_offset_mm,
-        sensor.yaw_mdeg,
-    )
-    assert forward is not None and left is not None and yaw is not None
-
     points = []
     uncertain_points = []
     for ray, raw_heading in zip(projection_rays, raw_headings):
@@ -126,22 +139,16 @@ def project_blast_scan_planar_surfaces(
         else:
             relative = -magnitude
         body_heading = normalize_heading_mdeg(scan_pose.heading_mdeg + relative)
-        body_angle = math.radians(body_heading / 1_000)
-        origin_x = scan_pose.x_mm + forward * math.cos(body_angle) - left * math.sin(body_angle)
-        origin_y = scan_pose.y_mm + forward * math.sin(body_angle) + left * math.cos(body_angle)
-        beam_heading = normalize_heading_mdeg(body_heading + yaw)
-        beam_angle = math.radians(beam_heading / 1_000)
-        distance = _finite(ray["distance_mm"])
+        projected = project_blast_range_ray(
+            PhysicalPose(x_mm=scan_pose.x_mm, y_mm=scan_pose.y_mm, heading_mdeg=body_heading),
+            ray["distance_mm"], settled=ray.get("observation_settled"),
+        )
         destination = points if ray.get("observation_settled") is True else uncertain_points
         destination.append({
             "side": ray["side"],
-            "measured_range_mm": distance,
             "relative_bearing_mdeg": relative,
-            "sensor_origin_x_mm": round(origin_x),
-            "sensor_origin_y_mm": round(origin_y),
-            "beam_heading_mdeg": beam_heading,
-            "nominal_echo_x_mm": round(origin_x + distance * math.cos(beam_angle)),
-            "nominal_echo_y_mm": round(origin_y + distance * math.sin(beam_angle)),
+            **{key: value for key, value in projected.items()
+               if key not in ("range_state", "observation_settled")},
         })
     projection = {
         "schema": "blast-planar-scan-projection/v1",
