@@ -16,6 +16,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from robot_agent.codex_subscription import ASTRA_MODEL_ID
 from experiments.navigation_attention_policy import (
     AttentionPolicy, observations, save_weights, WIDTH, HEADS, BLOCKS,
     GLOBAL_SIZE, RAY_FIELDS, MEMORY_FIELDS, MAP_FIELDS, shapes,
@@ -209,7 +210,7 @@ def load_episodes(root, robot, scenes):
                     models.add(diagnostic.get('resolved_model'))
                 elif diagnostic.get('event') == 'planner_request':
                     efforts.add(diagnostic['request'].get('reasoning_effort'))
-        if models != {'gpt-6-astra'} or efforts != {'high'}:
+        if models not in ({'gpt-6-astra'}, {ASTRA_MODEL_ID}) or efforts != {'high'}:
             raise ValueError('Teacher provenance is not Astra high')
         record['teacher_models'],record['reasoning_efforts'] = sorted(models),sorted(efforts)
         labels, recovery_labels, context_labels = Counter(), Counter(), Counter()

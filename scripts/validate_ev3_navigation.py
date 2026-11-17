@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import threading
 
+from robot_agent.codex_subscription import CODEX_MODEL
 from robot_agent.ev3_navigation_body import EV3NavigationBody
 from robot_agent.ev3_episode_adapter import EV3EpisodeAdapter
 from robot_agent.physical_spatial_map import PhysicalSpatialMapBridge
@@ -38,7 +39,7 @@ def main():
     scenarios = {scene.scenario_id: scene for scene in ev3_validation_scenarios()}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("scene", choices=tuple(scenarios))
-    parser.add_argument("--model", default="qwen/qwen3.8-27b", help="LM Studio model or codex/gpt-6-astra")
+    parser.add_argument("--model", default="qwen/qwen3.8-27b", help=f"LM Studio model or {CODEX_MODEL}")
     parser.add_argument("--ir-surface", choices=("white", "dark"), default="white")
     parser.add_argument("--decisions", type=int, default=12)
     parser.add_argument("--output-tokens", type=int, default=4096)

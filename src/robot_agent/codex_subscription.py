@@ -20,7 +20,8 @@ from .http_transport import direct_http_request, DirectHTTPTimeoutError, DirectH
 from .navigation_diagnostics import record_navigation_diagnostic
 
 CODEX_PREFIX = "codex/"
-CODEX_MODEL = CODEX_PREFIX + "gpt-6-astra"
+ASTRA_MODEL_ID = "gpt-6.2-astra"
+CODEX_MODEL = CODEX_PREFIX + ASTRA_MODEL_ID
 RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 MAX_STREAM_BYTES = 8 * 1024 * 1024
 

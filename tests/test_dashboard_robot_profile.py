@@ -310,9 +310,9 @@ class DashboardRobotProfileTests(unittest.TestCase):
                         builder = ev3.return_value.build_adapter if profile_id == EV3RSTORM_PROFILE_ID else blast
                         factory = builder.call_args.kwargs["planner_factory"]
                         # Model changes in the GUI must not reuse startup-model settings.
-                        for model, default in (("codex/gpt-6-astra", "high"),
+                        for model, default in (("codex/gpt-6.2-astra", "high"),
                                                ("qwen/qwen3.8-27b", "low"),
-                                               ("codex/gpt-6-astra", "high")):
+                                               ("codex/gpt-6.2-astra", "high")):
                             self.assertEqual(factory(model)._reasoning_effort, override or default)
 
     def test_blast_profile_requires_and_reuses_one_monitor(self):

@@ -342,9 +342,9 @@ class ControllerActionPlannerTests(unittest.TestCase):
     def test_navigation_reasoning_defaults_and_explicit_overrides_in_requests(self):
         for robot_id in ("ev3rstorm-01", "blast-01"):
             for model, override, expected in (
-                ("codex/gpt-6-astra", None, "high"),
+                ("codex/gpt-6.2-astra", None, "high"),
                 ("qwen/qwen3.8-27b", None, "low"),
-                ("codex/gpt-6-astra", "low", "low"),
+                ("codex/gpt-6.2-astra", "low", "low"),
                 ("qwen/qwen3.8-27b", "none", "none"),
             ):
                 with self.subTest(robot=robot_id, model=model, override=override):

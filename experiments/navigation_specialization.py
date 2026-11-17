@@ -19,7 +19,7 @@ import time
 from experiments import local_navigation as encoder
 from experiments.navigation_set_author import expand, request_for
 from experiments.navigation_set_policy import SetPolicy
-from robot_agent.codex_subscription import CodexSubscription
+from robot_agent.codex_subscription import ASTRA_MODEL_ID, CODEX_MODEL, CodexSubscription
 from robot_agent.navigation_diagnostics import enable_navigation_diagnostics
 
 REPO = Path(__file__).resolve().parents[1]
@@ -124,7 +124,7 @@ def author(args):
     started = time.monotonic()
     response = json.loads(CodexSubscription().complete(request, timeout=600, maximum=2*1024*1024))
     (args.output/"response.json").write_text(json.dumps(response))
-    if response.get("resolved_model") != "gpt-6-astra":
+    if response.get("resolved_model") != ASTRA_MODEL_ID:
         raise ValueError("Weight author was not the requested Astra model")
     authored = json.loads(response["choices"][0]["message"]["content"])
     artifact = expand(authored)
@@ -209,7 +209,7 @@ def compare(args):
     args.output.mkdir(parents=True,exist_ok=False)
     manifest = {"weights":{k:str(v) for k,v in weights.items()},"weight_hashes":hashes,
         "source_hashes":sources,"max_decisions":48,"workers":2,"jobs":jobs,
-        "no_post_evaluation_weight_revision":True,"model":"codex/gpt-6-astra","reasoning":"high"}
+        "no_post_evaluation_weight_revision":True,"model":CODEX_MODEL,"reasoning":"high"}
     (args.output/"manifest.json").write_text(json.dumps(manifest,indent=2))
 
     def run_job(job):

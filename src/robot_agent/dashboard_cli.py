@@ -47,6 +47,7 @@ from .ev3rstorm_profile import (
     EV3RSTORMProfile,
     EV3SSHBinding,
 )
+from .codex_subscription import CODEX_MODEL
 from .lm_studio import DEFAULT_BASE_URL, DEFAULT_MODEL
 from .lm_studio_controller_action import (
     LMStudioControllerActionPlanner,
@@ -461,7 +462,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        help="Robotmodell: LM Studio-ID eller codex/gpt-6-astra för Codex/ChatGPT",
+        help=f"Robotmodell: LM Studio-ID eller {CODEX_MODEL} för Codex/ChatGPT",
     )
     parser.add_argument(
         "--simulation-map-demo",

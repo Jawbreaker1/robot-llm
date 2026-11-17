@@ -9,6 +9,7 @@ import statistics
 import subprocess
 import sys
 
+from robot_agent.codex_subscription import CODEX_MODEL
 from experiments.navigation_specialization import source_hashes, digest
 from scripts.local_navigation_experiment import TEST, ATTENTION_HELD_OUT
 
@@ -66,7 +67,7 @@ def compare(args):
     args.output.mkdir(parents=True, exist_ok=False)
     manifest = {"jobs": jobs, "weight_hashes": hashes, "source_hashes": sources,
         "weights": {k: str(v) for k,v in paths.items()}, "decisions": args.decisions,
-        "model": "codex/gpt-6-astra", "reasoning": "high", "workers": 2,
+        "model": CODEX_MODEL, "reasoning": "high", "workers": 2,
         "frozen_before_evaluation": True}
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2))
 

@@ -475,7 +475,7 @@
       const speech = byId("robot-setting-speech-enabled");
       if (!settingsDirty || force) {
         const customModel = byId("robot-setting-custom-model-option");
-        customModel.hidden = ["qwen/qwen3.8-27b", "codex/gpt-6-astra"].includes(control.settings.model);
+        customModel.hidden = ["qwen/qwen3.8-27b", "codex/gpt-6.2-astra"].includes(control.settings.model);
         customModel.value = customModel.hidden ? "" : control.settings.model;
         customModel.textContent = customModel.hidden ? "" : control.settings.model;
         model.value = control.settings.model;

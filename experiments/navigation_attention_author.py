@@ -20,7 +20,7 @@ from experiments.navigation_weight_space import author_request, feature_layout
 from experiments.navigation_set_policy import observations, LAST_ACTION_FIELDS, GLOBAL_SIZE
 from experiments.local_navigation import features, _category, _boolean, _number, _motion
 from robot_agent.route_execution_memory import latest_action_feedback, route_execution_memory
-from robot_agent.codex_subscription import CodexSubscription
+from robot_agent.codex_subscription import ASTRA_MODEL_ID, CODEX_MODEL, CodexSubscription
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -102,7 +102,7 @@ def request(args):
             "observed_failure": "EV3 many-boxes chose OBSERVE 84 times. Successful observations were only a text reason observation_refreshed; motion.completed and made_progress stayed null. Both previous networks ignored all reason bits, and their successful-sensing detector required motion.completed=true. The shared adapters now explicitly report the action receipt without inventing movement. Rewrite the contradictory utility construction, do not add after-N-scan rules or a host-side action override.",
             "scope": "Rewrite both robot weights using actual sensing completion, geometry and local route failure memory. No training or world-specific coordinates. All six evaluation worlds have been tested before, so they are regressions, not pristine held-out tests.",
         }
-    payload = {"model": "codex/gpt-6-astra", "reasoning_effort": "high", "max_tokens": 32768,
+    payload = {"model": CODEX_MODEL, "reasoning_effort": "high", "max_tokens": 32768,
         "messages": [{"role": "system", "content": "Write an offline Python constructor for neural-network numeric weights. No training. Follow the fixed model contract."},
                      {"role": "user", "content": json.dumps(contract)}],
         "response_format": {"type": "json_schema", "json_schema": {"name": "attention_constructor", "strict": True,
@@ -112,7 +112,7 @@ def request(args):
     (args.output / "request.json").write_text(json.dumps(payload))
     started = time.monotonic()
     response = json.loads(CodexSubscription().complete(payload, timeout=900, maximum=3*1024*1024))
-    if response.get("resolved_model") != "gpt-6-astra":
+    if response.get("resolved_model") != ASTRA_MODEL_ID:
         raise ValueError("Unexpected author model")
     (args.output / "response.json").write_text(json.dumps(response))
     authored = json.loads(response["choices"][0]["message"]["content"])

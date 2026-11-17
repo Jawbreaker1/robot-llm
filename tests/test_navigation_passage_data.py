@@ -81,11 +81,11 @@ class PassageDataTests(unittest.TestCase):
             def save(): (root/'events.jsonl').write_text('\n'.join(map(json.dumps,events)))
             save()
             with patch('experiments.local_navigation.LocalPolicy.load',return_value=SimpleNamespace(predict=lambda p:('OBSERVE',1))):
-                result=audit_trial(root,{'weights':'unused'}, {'runtime_hashes':{'src/runtime.py':'frozen'}})
+                result=audit_trial(root,{'weights':'unused'}, {'teacher':'codex/gpt-6-astra','runtime_hashes':{'src/runtime.py':'frozen'}})
                 self.assertEqual(result['learned_decisions_replayed'],1)
                 events[-1]['decision']['action']='ADVANCE';save()
                 with self.assertRaisesRegex(ValueError,'replaced'):
-                    audit_trial(root,{'weights':'unused'},{'runtime_hashes':{'src/runtime.py':'frozen'}})
+                    audit_trial(root,{'weights':'unused'},{'teacher':'codex/gpt-6-astra','runtime_hashes':{'src/runtime.py':'frozen'}})
 
     def test_real_adapter_prefix_and_single_action_reproduce_for_both_robots(self):
         # Capture one ordinary initial observation; replay it into one bounded OBSERVE.

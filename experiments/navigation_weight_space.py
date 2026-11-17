@@ -16,13 +16,12 @@ import time
 from copy import deepcopy
 
 from experiments import local_navigation as network
-from robot_agent.codex_subscription import CodexSubscription
+from robot_agent.codex_subscription import CODEX_MODEL as MODEL, CodexSubscription
 from robot_agent.navigation_diagnostics import enable_navigation_diagnostics
 
 METHOD = "astra-direct-weights-zero-shot-v1"
 REPAIR_METHOD = "astra-direct-weights-recorded-repair-v1"
 HIDDEN = 32
-MODEL = "codex/gpt-6-astra"
 
 
 def feature_layout():

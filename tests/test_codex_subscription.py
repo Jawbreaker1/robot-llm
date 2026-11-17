@@ -24,7 +24,7 @@ def item(text):
 def completed(text='{"ok":true}', *, output=True):
     return event({"type": "response.output_item.done", "item": item(text)}) + event({
         "type": "response.completed", "response": {"id": "response-test", "status": "completed",
-            "model": "gpt-6-astra", "output": [item(text)] if output else [],
+            "model": "gpt-6.2-astra", "output": [item(text)] if output else [],
             "usage": {"input_tokens": 50, "output_tokens": 20, "total_tokens": 70}}})
 
 def request():
@@ -52,7 +52,7 @@ class CodexSubscriptionTests(unittest.TestCase):
         args = transport.call_args.args
         upstream = json.loads(args[3])
         self.assertEqual(args[1], codex.RESPONSES_URL)
-        self.assertEqual(upstream["model"], "gpt-6-astra")
+        self.assertEqual(upstream["model"], "gpt-6.2-astra")
         self.assertEqual(upstream["instructions"], "Instructions")
         self.assertEqual(upstream["input"], [original["messages"][1]])
         self.assertEqual(upstream["tools"], [])
@@ -65,7 +65,7 @@ class CodexSubscriptionTests(unittest.TestCase):
         self.assertNotIn("test-secret", json.dumps(upstream))
         self.assertNotIn("test-secret", repr(bridge.auth.read()))
         self.assertEqual(result["model"], codex.CODEX_MODEL)
-        self.assertEqual(result["resolved_model"], "gpt-6-astra")
+        self.assertEqual(result["resolved_model"], "gpt-6.2-astra")
         self.assertEqual(result["usage"]["total_tokens"], 70)
 
     def test_qwen_wire_is_untouched_and_never_reads_codex_auth(self):
@@ -91,7 +91,7 @@ class CodexSubscriptionTests(unittest.TestCase):
         self.assertEqual(result["choices"][0]["message"]["content"], '{"ok":true}')
 
     def test_a_different_resolved_model_is_not_accepted_as_astra(self):
-        raw = completed().replace(b'"model": "gpt-6-astra"', b'"model": "different-model"')
+        raw = completed().replace(b'"model": "gpt-6.2-astra"', b'"model": "gpt-6-astra"')
         with self.assertRaises(lm.LMStudioProtocolError):
             codex._completion(raw, codex.CODEX_MODEL, 10000)
 

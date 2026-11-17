@@ -2962,7 +2962,7 @@ const ui = window.RobotControlUI.create({
   }
   const clearedLimitValue = limitField.value;
   const customBeforeSwitch = nodes["robot-setting-custom-model-option"].value;
-  for (const model of ["codex/gpt-6-astra", "qwen/qwen3.8-27b"]) {
+  for (const model of ["codex/gpt-6.2-astra", "qwen/qwen3.8-27b"]) {
     nodes["robot-setting-model"].value = model;
     nodes["robot-setting-model"].listeners.input();
     await nodes["robot-settings-form"].listeners.submit({ preventDefault() {} });
@@ -3051,7 +3051,7 @@ const ui = window.RobotControlUI.create({
         self.assertEqual(result["defaultLimitValue"], "")
         self.assertEqual(result["clearedLimitValue"], "")
         self.assertEqual(result["savedLimits"], [60000, None, None, None])
-        self.assertEqual(result["savedModels"], ["gemma", "gemma", "codex/gpt-6-astra", "qwen/qwen3.8-27b"])
+        self.assertEqual(result["savedModels"], ["gemma", "gemma", "codex/gpt-6.2-astra", "qwen/qwen3.8-27b"])
         self.assertEqual(result["customBeforeSwitch"], "gemma")
         self.assertTrue(result["customHidden"])
         self.assertEqual(result["customValueAfterSwitch"], "")

@@ -145,7 +145,7 @@ flowchart TD
     U["You<br/>text or voice"] --> H
     subgraph APP["Shared local application · the brain"]
         H["Conversation and mission memory<br/>goals · plans · observations"]
-        H --> Q["Qwen (local) or GPT-6 Astra (Codex)<br/>reason · plan · replan · reply · express"]
+        H --> Q["Qwen (local) or GPT-6.2 Astra (Codex)<br/>reason · plan · replan · reply · express"]
         H --> N["Local navigation ML<br/>robot-specific EV3 / BLAST weights"]
         Q -->|"route and waypoints"| N
         N -->|"inspection / recovery review"| Q
@@ -184,7 +184,7 @@ EV3RSTORM uses `en_US-john-medium` for English.
 The dashboard supports English and Swedish.
 
 For model comparisons, each robot's settings offer **local Qwen3.8** or
-**GPT-6 Astra through an existing Codex/ChatGPT login**, for both conversation
+**GPT-6.2 Astra through an existing Codex/ChatGPT login**, for both conversation
 and navigation. The robot's observations, action contract and motion executor
 stay the same. Qwen remains the default; selecting Astra sends the supplied
 conversation and robot context to OpenAI. The subscription connection is an

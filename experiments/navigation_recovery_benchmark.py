@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+from robot_agent.codex_subscription import CODEX_MODEL, CODEX_PREFIX
 from experiments.navigation_specialization import source_hashes, digest
 from scripts.local_navigation_experiment import TRAIN, RECOVERY_TEST, STUDENT_TEST, DENSE_TEST, MAP_TRAIN, MAP_DEV, MAP_TEST, LEARNER_TRAIN, LEARNER_TEST, scenario
 
@@ -76,7 +77,7 @@ def collect(root):
             'test_scenes':list(RECOVERY_TEST),'jobs':jobs,'runtime_hashes':runtime_hashes(),
             'test_world_hashes':{r+'-'+s:world_hash(r,s) for r in ('ev3','blast') for s in RECOVERY_TEST},
             'training':{'seed':23,'epochs':60,'patience':12,'learning_rate':1e-5,'batch_size':8},
-            'teacher':'codex/gpt-6-astra','reasoning':'high','physical_robots':False,
+            'teacher':CODEX_MODEL,'reasoning':'high','physical_robots':False,
             'selection':'Complete collision-free teacher runs only. Fault must actually be observed before counting recovery coverage.',
             'split':'Whole independent layouts; no test results or test packets may be used for fitting or model selection.'}
     (root/'protocol.json').write_text(json.dumps(plan,indent=2))
@@ -101,7 +102,7 @@ def collect_map(root):
           'test_world_hashes':{r+'-'+s:world_hash(r,s) for r in ('ev3','blast') for s in MAP_TEST},
           'training':{'initialization':'dense-centered-xavier-he-v1','seed':23,'epochs':120,'patience':20,
                       'learning_rate':1e-4,'weight_decay':1e-4,'batch_size':8},
-          'teacher':'codex/gpt-6-astra','reasoning':'high','physical_robots':False,
+          'teacher':CODEX_MODEL,'reasoning':'high','physical_robots':False,
           'selection':'Complete collision-free teacher runs, or the successful suffix after the last reported failed operation of a goal-reaching teacher run. Unsafe prefixes never train. Development loss selects weights.',
           'budget':'96 decisions per trial; no mission wall-clock timeout. A separate 3600-second process watchdog is an infrastructure failure, not a navigation result.',
           'split':'Eight training geometries, two development geometries, three independent test geometries. No old-physics data.'}
@@ -154,7 +155,7 @@ def collect_student(root,weights,base_data):
         'test_world_hashes':{r+'-'+s:world_hash(r,s) for r in ('ev3','blast') for s in LEARNER_TEST},
         'test_decisions':128,'base_data':str(base_data.resolve()),
         'training':base['training'],
-        'teacher':'codex/gpt-6-astra','reasoning':'high','physical_robots':False,
+        'teacher':CODEX_MODEL,'reasoning':'high','physical_robots':False,
         'selection':'Only real Astra labels after one same-episode student-state handoff; goal reached and zero new collision stops in teacher suffix. Prefix actions are never labels.',
         'required_training_contexts':{'ev3':['near_obstacle','infrared_blocked'],
                                       'blast':['KNOWN_ECHO_CLEARANCE_INTERSECTION']},
@@ -208,7 +209,7 @@ def audit_trial(folder,job,plan):
         row=json.loads(line)
         if row.get('event')=='provider_response':models.add(row.get('resolved_model'))
         if row.get('event')=='planner_request':efforts.add(row['request'].get('reasoning_effort'))
-    if models!={'gpt-6-astra'} or efforts!={'high'}:
+    if models!={plan['teacher'].removeprefix(CODEX_PREFIX)} or efforts!={'high'}:
         raise ValueError('Trial provider was not verified as Astra high')
     policy=LocalPolicy.load(Path(job['weights'])) if job.get('weights') else None
     dispatch=None
@@ -242,7 +243,7 @@ def prepare_dense(root):
         'test_world_hashes':{r+'-'+s:world_hash(r,s) for r in ('ev3','blast') for s in DENSE_TEST},
         'training':{'initialization':'dense-centered-xavier-he-v1','seed':23,'epochs':200,'patience':30,
                     'learning_rate':1e-4,'weight_decay':1e-4,'batch_size':8},
-        'teacher':'codex/gpt-6-astra','reasoning':'high','physical_robots':False,
+        'teacher':CODEX_MODEL,'reasoning':'high','physical_robots':False,
         'selection':'Reuse accepted teacher training/development data only. Dense checkpoints selected by development loss; previous sparse weights are a reported reference, not a fallback candidate.',
         'split':'Four new geometric layouts frozen before fitting; no old or new test packets admitted to training.'}
     (root/'protocol.json').write_text(json.dumps(plan,indent=2))

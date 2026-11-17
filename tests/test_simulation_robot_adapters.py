@@ -108,7 +108,7 @@ class SimulationRobotAdapterTests(unittest.TestCase):
 
     def test_default_planner_uses_shared_model_transport_for_both_providers(self):
         # Scripted reply checks provider wiring, not model navigation ability.
-        for model in ("codex/gpt-6-astra", "qwen/qwen3.8-27b"):
+        for model in ("codex/gpt-6.2-astra", "qwen/qwen3.8-27b"):
             with self.subTest(model=model):
                 def reply(url, body, headers, timeout, maximum):
                     request = json.loads(body)

@@ -14,6 +14,7 @@ import signal
 import numpy as np
 
 from experiments.local_navigation import LocalPlanner, LocalPolicy
+from robot_agent.codex_subscription import CODEX_MODEL as MODEL
 from robot_agent import dashboard_cli
 from robot_agent.ev3rstorm_profile import EV3RSTORMProfile, EV3SSHBinding
 from robot_agent.lm_studio_controller_action import LMStudioControllerActionPlanner
@@ -21,7 +22,6 @@ from robot_agent.navigation_diagnostics import enable_navigation_diagnostics, re
 from robot_agent.social_expression import EV3_GESTURES
 from robot_agent.blast_personality import EV3_PERSONA_BY_LOCALE
 
-MODEL = 'codex/gpt-6-astra'
 
 
 def build_adapter(weights, target, output, emit=record_navigation_diagnostic):

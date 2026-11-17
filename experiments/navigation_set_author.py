@@ -9,7 +9,7 @@ from copy import deepcopy
 
 from experiments import navigation_set_policy as net
 from experiments.navigation_weight_space import author_request, compact_packet, feature_layout
-from robot_agent.codex_subscription import CodexSubscription
+from robot_agent.codex_subscription import CODEX_MODEL, CodexSubscription
 from robot_agent.navigation_diagnostics import enable_navigation_diagnostics
 
 METHOD = "astra-direct-weights-point-geometry-repair-v2"
@@ -134,7 +134,7 @@ def request_for(repair):
         ],
         "protocol":"Return exactly one COMPLETE numeric candidate: ray, memory, head, output unit arrays. Each index addresses the OUTPUT unit in that layer and its inputs list INPUT feature indices. Omitted numbers are zero. All nonzero weights/biases are authored by you, the host only assigns arrays and checks shapes/finiteness. No gradients, fitting, generated executable policy, environment interaction, candidate forward passes, or new navigation rules. Upcoming rerun data is unavailable. This is a recorded-feedback repair plus representation replacement, not a zero-shot/independent held-out claim. Describe limitations honestly; choose weights yourself.",
     }
-    return {"model":"codex/gpt-6-astra", "reasoning_effort":"high", "max_tokens":32768,
+    return {"model":CODEX_MODEL, "reasoning_effort":"high", "max_tokens":32768,
         "messages":[{"role":"system","content":"Author neural network numeric weights directly. No training or executable code."},
                     {"role":"user","content":json.dumps(contract)}],
         "response_format":{"type":"json_schema","json_schema":{"name":"navigation_set_weights","strict":True,"schema":schema()}}}

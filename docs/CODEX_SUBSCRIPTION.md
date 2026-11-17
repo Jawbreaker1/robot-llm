@@ -1,6 +1,6 @@
 # Robot model selection
 
-Qwen and GPT-6 Astra use the same robot conversation classifier and navigation
+Qwen and GPT-6.2 Astra use the same robot conversation classifier and navigation
 planner contract. Only the model transport changes. Neither provider gets
 shell access, hardware tools, repository contents or direct motor control.
 
@@ -11,7 +11,7 @@ In the web console's **Operate** view, select EV3 or BLAST, expand
 choose **AI model — conversation and navigation**, and save:
 
 - `qwen/qwen3.8-27b`: the existing LM Studio connection, unchanged.
-- `codex/gpt-6-astra`: GPT-6 Astra through the host's Codex/ChatGPT login.
+- `codex/gpt-6.2-astra`: GPT-6.2 Astra through the host's Codex/ChatGPT login.
 
 Settings are per robot and can be changed only while that robot is idle. The
 new selection applies to subsequent inputs and missions, not a running mission.
@@ -22,7 +22,7 @@ The general, read-only workbench chat is separate and still uses LM Studio.
 For a Codex default on startup:
 
 ```sh
-scripts/start_robot_console.sh --model codex/gpt-6-astra
+scripts/start_robot_console.sh --model codex/gpt-6.2-astra
 ```
 
 Selecting Codex sends the supplied conversation, mission and robot observations
@@ -90,7 +90,7 @@ does not add new navigation rules, impose a mission lifetime, or retry motors.
 ```sh
 PYTHONPATH=src:tests .venv/bin/python -m unittest test_codex_subscription
 PYTHONPATH=src:. .venv/bin/python scripts/validate_ev3_navigation.py front \
-  --model codex/gpt-6-astra --decisions 24 --time-budget 420 --planner-timeout 60
+  --model codex/gpt-6.2-astra --decisions 24 --time-budget 420 --planner-timeout 60
 ```
 
 The simulator runs the production EV3 adapter/session/body with simulated

@@ -43,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor
 from experiments.local_navigation import LocalPlanner, LocalPolicy, features, target, train
 from experiments.navigation_recovery_data import FAULTS, RecoveryFault
 from experiments.navigation_student_recovery import StudentRecovery, PROTOCOL as STUDENT_PROTOCOL
+from robot_agent.codex_subscription import CODEX_MODEL as MODEL
 from robot_agent.blast_navigation_simulation import run_blast_gemma_scenario
 from robot_agent.lm_studio_controller_action import (LMStudioControllerActionPlanner, ControllerActionContext,
     ControllerActionDecision, ControllerActionPlannerResult)
@@ -50,7 +51,6 @@ from robot_agent.navigation_diagnostics import enable_navigation_diagnostics
 from robot_agent.navigation_simulation_scenarios import blast_box_front, ev3_validation_scenarios
 from robot_agent.multi_robot_navigation_simulator import RectangleObstacle
 
-MODEL = "codex/gpt-6-astra"
 REPO = Path(__file__).resolve().parents[1]
 TRAIN = ("train-open", "train-left", "train-right")
 RECOVERY = ("train-right-corner", "train-left-corner", "train-staggered")
