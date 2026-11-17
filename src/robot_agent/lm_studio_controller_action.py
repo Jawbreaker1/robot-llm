@@ -13,7 +13,8 @@ from typing import Callable, Mapping, Sequence
 from . import lm_studio as _lm
 from .codex_subscription import CODEX_MODEL, robot_model_transport
 from .blast_personality import normalize_persona_by_locale
-from .social_expression import social_expression_schema, valid_social_expression
+from .social_expression import (ALL_GESTURES, REPLY_FACES, REPLY_GESTURES,
+                                social_expression_schema, valid_social_expression)
 from .navigation_diagnostics import record_navigation_diagnostic
 from .navigation_obstacle_estimates import (
     OBSTACLE_ESTIMATES_PROMPT, obstacle_estimates_schema, decode_obstacle_estimates,
@@ -108,6 +109,8 @@ _SYSTEM_PROMPT = (
     "after a detour or overshoot; crossing the goal line is not arrival. "
     "Choose COMPLETE only when the goal is actually satisfied, "
     "ABORT only when further progress is unreasonable, and only if available. "
+    "Speak briefly at route changes, leg transitions, obstacles and arrival. "
+    "Describe intent before motion; no stage directions. Routine steps may use null. "
     "Assessment and optional utterance use the requested locale. Keep them "
     "short and complete; return only the required JSON object."
 )
@@ -570,9 +573,13 @@ class LMStudioControllerActionPlanner:
         utterance_persona_by_locale: Mapping[str, str] | None = None,
         max_utterance_chars: int = MAX_UTTERANCE_CHARS,
         social_expressions: bool = False,
+        social_gestures: tuple[str, ...] = REPLY_GESTURES,
+        social_faces: tuple[str, ...] = REPLY_FACES,
     ) -> None:
         if (
             not isinstance(social_expressions, bool)
+            or not social_gestures or any(item not in ALL_GESTURES for item in social_gestures)
+            or not social_faces or any(item not in REPLY_FACES for item in social_faces)
             or not callable(transport)
             or not callable(clock)
             or isinstance(timeout_seconds, bool)
@@ -606,10 +613,62 @@ class LMStudioControllerActionPlanner:
         self._max_output_tokens = max_output_tokens
         self._max_utterance_chars = max_utterance_chars
         self._social_expressions = social_expressions
+        self._social_gestures, self._social_faces = tuple(social_gestures), tuple(social_faces)
 
     @property
     def model(self) -> str:
         return self._model
+
+    def comment(self, packet: Mapping[str, object]) -> str | None:
+        """Read the same navigation snapshot; return words, never instructions.
+
+        Called only by the speech worker. It has no separate conversation or
+        world memory and cannot update the route or obstacle estimates.
+        """
+        locale = packet["locale"]
+        persona = (self._utterance_persona_by_locale or {}).get(locale, "")
+        payload = {
+            "model": self._model, "stream": False, "temperature": 0.3,
+            "reasoning_effort": "low", "max_tokens": 1024,
+            "messages": [
+                {"role": "system", "content": (
+                    "You are the robot's background voice, not its navigation controller. "
+                    "Read the supplied navigation snapshot, including its existing history and route memory. "
+                    "Offer one short, natural comment about recorded progress, observations or difficulties, "
+                    "or null if there is nothing worth saying. Describe completed events, not what the "
+                    "robot is doing right now: it may have moved while you were thinking. "
+                    "Unknown obstacle edges and unverified clearance must stay unknown. Do not claim "
+                    "arrival, successful gestures or contact-free travel without evidence. Do not give "
+                    "movement commands or stage directions. Return only {utterance: string or null}. "
+                    f"Use locale {locale}, at most {self._max_utterance_chars} characters. {persona}")},
+                {"role": "user", "content": json.dumps(packet, ensure_ascii=False)},
+            ],
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "navigation_comment", "strict": True, "schema": {
+                    "type": "object", "properties": {"utterance": {
+                        "type": ["string", "null"], "maxLength": self._max_utterance_chars}},
+                    "required": ["utterance"], "additionalProperties": False}}},
+        }
+        body = _json(payload)
+        if len(body) > MAX_REQUEST_BYTES:
+            raise _lm.LMStudioInputError("Controller-action request is too large")
+        request_id = uuid4().hex
+        record_navigation_diagnostic("commentary_request", request_id=request_id,
+                                     robot_id=packet["robot_id"], request=payload)
+        raw = self._transport(self._base_url + CHAT_COMPLETIONS_PATH,
+            body,
+            {"Accept": "application/json", "Content-Type": "application/json; charset=utf-8"},
+            min(self._timeout, 20.0), MAX_RESPONSE_BYTES)
+        record_navigation_diagnostic("commentary_response", request_id=request_id,
+            robot_id=packet["robot_id"], raw_response=raw.decode("utf-8", errors="replace"))
+        value = self._response_value(raw)
+        if not isinstance(value, dict) or set(value) != {"utterance"}:
+            raise _lm.LMStudioProtocolError("Invalid commentary fields")
+        text = value["utterance"]
+        if text is not None and (not isinstance(text, str) or not text.strip()
+                or len(text) > self._max_utterance_chars):
+            raise _lm.LMStudioProtocolError("Invalid commentary utterance")
+        return text
 
     def decide(self, context: ControllerActionContext):
         if not isinstance(context, ControllerActionContext):
@@ -691,12 +750,18 @@ class LMStudioControllerActionPlanner:
             properties["obstacle_estimates"] = obstacle_estimates_schema()
             system_prompt += OBSTACLE_ESTIMATES_PROMPT
         if self._social_expressions and context.completion_allowed:
-            properties["expression"] = social_expression_schema()
+            properties["expression"] = social_expression_schema(
+                gestures=self._social_gestures, faces=self._social_faces)
+            gestures = (
+                "saw_flourish spins the LEGO saw for one second; saw_celebrate spins it for two seconds. "
+                if "saw_celebrate" in self._social_gestures else
+                "arm_wave raises and lowers the arms; claw_snap opens/closes the claw twice; "
+                "claw_flourish does that with the arms raised, then restores them. "
+            )
             system_prompt += (
                 "\nWhen you choose COMPLETE because the mission's final goal is reached, "
                 "celebrate with a short spoken utterance and an expression of your choice. "
-                "arm_wave raises and lowers the arms; claw_snap opens/closes the claw twice; "
-                "claw_flourish does that with the arms raised, then restores them. "
+                + gestures +
                 "The robot remains stationary during the celebration. You choose the face "
                 "and gesture; null or gesture none is also allowed. For any action other "
                 "than COMPLETE, or without an utterance, expression must be null. "
@@ -820,7 +885,7 @@ class LMStudioControllerActionPlanner:
             reasoning_content=reasoning_content,
         )
 
-    def _decode(self, raw: bytes, context: ControllerActionContext):
+    def _response_value(self, raw: bytes):
         envelope = _loads(raw, MAX_RESPONSE_BYTES)
         choices = envelope.get("choices") if isinstance(envelope, dict) else None
         if (
@@ -859,6 +924,10 @@ class LMStudioControllerActionPlanner:
             raise _lm.LMStudioProtocolError(
                 "LM Studio controller-action content is invalid"
             ) from None
+        return value
+
+    def _decode(self, raw: bytes, context: ControllerActionContext):
+        value = self._response_value(raw)
         expected = {
             "action",
             "confidence_milli",
@@ -992,7 +1061,8 @@ class LMStudioControllerActionPlanner:
             issues.append("utterance_invalid")
         if expression is not None and (
             action != COMPLETE or utterance is None
-            or not valid_social_expression(expression)
+            or not valid_social_expression(expression, gestures=self._social_gestures,
+                                           faces=self._social_faces)
         ):
             issues.append("expression_invalid")
         if issues:

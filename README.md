@@ -12,6 +12,8 @@ devices. The robots are its tools for sensing, moving, speaking, and interacting
 with the world — not separate computers that each need their own AI brain.
 Planning, conversation, mission memory, and interpretation of observations live
 in the shared application; the devices supply the physical capabilities.
+Small local neural navigation models complement the LLM, handling routine
+movement decisions without a language-model round trip for every step.
 
 This separates intelligence from the cost and computing power of each body.
 Even a simple, inexpensive robot can draw on a capable model without running
@@ -87,6 +89,33 @@ integration is simulation-tested; physical acceptance of this replacement
 flow is still pending. IR observations remain directional evidence rather
 than invented distance measurements.
 
+### LLM planning, local ML for navigation
+
+The navigation stack combines **LLM reasoning with trained local neural
+policies**. The LLM chooses the route and waypoints; the smaller models handle
+many of the short-step decisions along that route. Both run in the shared host
+application, not on the robots.
+
+- **One interface, robot-specific weights.** EV3 and BLAST have separate learned
+  weights for their different bodies and sensors, using the same policy interface
+  and each robot's existing execution adapter.
+- **Shared evidence and memory.** Local policies use structured views of the
+  goal, route, body geometry, sensor observations, available map evidence and
+  execution history. They choose actions such as following a waypoint, advancing,
+  turning, retreating or observing, and can request LLM replanning.
+- **Fast local decisions, deliberate route changes.** Local inference takes a
+  few milliseconds in current simulator runs. Ordinary movement can proceed
+  without waiting for the LLM; new inspection results, failed actions and route
+  transitions return to the LLM for review. This reduces model round trips while
+  preserving agentic planning rather than substituting a scripted detour.
+
+This hybrid flow is implemented, simulation-tested with both robots, and under
+physical evaluation with EV3. It is an experimental navigation option, not yet
+the default for every dashboard mission. Successful box routes do not imply
+reliable clearance in every corridor: body and turning-space assessment remain
+active validation work. See the [hybrid navigation validation](docs/EV3_INTEGRATION_PLAN.md#shared-feedback-and-parallel-speech)
+and [experiment runner](scripts/local_navigation_experiment.py).
+
 ## More than navigation
 
 **Talk to the robot.** Use text or push-to-talk in the web interface. The model
@@ -105,8 +134,9 @@ waypoints, estimated position, sensor observations, speech, and execution
 events. You can see what the robot is trying to do as well as what it measured.
 
 **Experiment before driving.** A shared-world simulator puts robot bodies,
-sensors, obstacles, and goals in the same room. With the selected LLM in the loop, the model
-must create its own route; the scenario does not supply the answer.
+sensors, obstacles, and goals in the same room. Compare LLM-only planning with
+the hybrid LLM/local-ML flow using the same robot adapters and environments.
+The models must create their own route; the scenario does not supply the answer.
 
 ## How it fits together
 
@@ -116,7 +146,11 @@ flowchart TD
     subgraph APP["Shared local application · the brain"]
         H["Conversation and mission memory<br/>goals · plans · observations"]
         H --> Q["Qwen (local) or GPT-6 Astra (Codex)<br/>reason · plan · replan · reply · express"]
-        Q --> X["Robot-specific adapters<br/>navigation · speech · supported gestures"]
+        H --> N["Local navigation ML<br/>robot-specific EV3 / BLAST weights"]
+        Q -->|"route and waypoints"| N
+        N -->|"inspection / recovery review"| Q
+        N -->|"fast movement and observation decisions"| X["Robot-specific adapters<br/>navigation · speech · supported gestures"]
+        Q -->|"speech and supported gestures"| X
         O["Sensor and motor feedback<br/>maps · estimated poses · execution results"] --> H
         O --> D["Live dashboard and map"]
         H --> D
@@ -132,9 +166,11 @@ flowchart TD
 ```
 
 The application owns the high-level agent loop and keeps mission state outside
-the bodies. Adapters translate its decisions into supported operations, while
-each robot's onboard controller handles its motors and reports results. The model
-chooses the route and expression; it does not need to manage motor ports,
+the bodies. The diagram shows the hybrid navigation path; LLM-only navigation
+uses the same adapters without the local policy. Adapters translate decisions
+into supported operations, while each robot's onboard controller handles its
+motors and reports results. The LLM chooses the route and expression; local ML
+can handle routine navigation actions. Neither needs to manage motor ports,
 Bluetooth packets, or audio encoding.
 
 This is a shared application, not yet a single shared navigation implementation.
@@ -207,13 +243,17 @@ There are two different kinds of test:
 
 - **Hardware-free checks** exercise the simulated world, robot adapters,
   movement, collision checks, and execution contracts.
-- **Model-in-the-loop runs** exercise navigation decisions. Qwen receives the
-  robot's observed context and must choose waypoints, scans, and replans itself.
+- **Model-in-the-loop runs** exercise navigation decisions, using either the LLM
+  alone or the hybrid LLM/local-ML flow. Models receive observed context and
+  execution feedback, not the simulator's hidden obstacle layout or a ready-made
+  route.
 
 The Qwen runner uses BLAST's production episode adapter, planner context, and
-action schema. Model-driven EV3 parity is a next step. The simulator can also
-replay recorded startup scans and inject missing range readings, helping
-reproduce problems encountered on the physical robot.
+action schema. The local-navigation experiment runner exercises both EV3 and
+BLAST production adapters and compares local policies with Astra high. Training
+and held-out scenarios support evaluation beyond the examples used to build the
+models. Recorded startup scans and injected sensor failures also help reproduce
+problems encountered on physical robots.
 
 With Qwen loaded in LM Studio, run a scenario:
 
@@ -328,6 +368,7 @@ during development, but do not replace the full check before merging.
 | [BLAST speech](docs/BLAST_HUB_AUDIO.md) | Piper voice, onboard playback, and firmware setup |
 | [BLAST expressions](docs/BLAST_SOCIAL_EXPRESSIONS.md) | Qwen-directed faces, arm and claw gestures, and physical checks |
 | [Navigation simulation](docs/MULTI_ROBOT_NAVIGATION_SIMULATION.md) | Shared world, scenarios, model runs, and recorded-data regressions |
+| [Hybrid navigation validation](docs/EV3_INTEGRATION_PLAN.md#shared-feedback-and-parallel-speech) | Local ML / LLM responsibilities, shared feedback, simulator results and limitations |
 | [EV3 deployment](docs/EV3_RUNTIME_DEPLOYMENT.md) | Worker setup, transport, speech, and hardware checks |
 | [Architecture notes](docs/ARCHITECTURE.md) | Design background, runtime boundaries, and multi-controller concepts |
 | [Navigation integration plan](docs/NAVIGATION_SIMPLIFICATION_PLAN.md) | Bounded steps toward shared BLAST and EV3 navigation |
@@ -337,6 +378,7 @@ during development, but do not replace the full check before merging.
 config/                 robot topology and action profiles
 docs/                   guides, design notes, validation reports, and images
 ev3/                    EV3 hardware layer, workers, and diagnostics
+experiments/            local navigation ML models, training, and evaluation
 hub_programs/           programs running on LEGO hubs
 src/robot_agent/        agent, navigation, simulation, mapping, speech, and UI
 tests/                  hardware-free scenarios and regression tests

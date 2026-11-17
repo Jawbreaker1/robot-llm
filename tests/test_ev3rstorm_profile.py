@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from robot_agent.blast_personality import EV3_PERSONA_BY_LOCALE
 
 from robot_agent.controller_runtime_profile import (
     ControllerRuntimeProfileError,
@@ -157,7 +158,10 @@ class EV3RSTORMProfileTests(unittest.TestCase):
                           memory_path="/tmp/unused-ev3-memory.json"))
         with mock.patch("robot_agent.ev3rstorm_profile.LMStudioControllerActionPlanner") as planner:
             self.assertIs(adapter.navigation_adapter.planner_factory("qwen-test"), planner.return_value)
-            planner.assert_called_once_with(model="qwen-test", max_output_tokens=4096, timeout_seconds=60)
+        planner.assert_called_once_with(model="qwen-test", max_output_tokens=4096, timeout_seconds=60,
+            social_expressions=True, social_gestures=("none", "saw_flourish", "saw_celebrate"),
+            social_faces=("neutral",),
+            utterance_persona_by_locale=EV3_PERSONA_BY_LOCALE)
 
     def test_reachability_uses_the_bound_motion_free_preflight(self):
         report = {

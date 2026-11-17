@@ -295,6 +295,8 @@ def _planner_step(
             plan_actions=BLAST_PLAN_ACTIONS,
             previous_decision=previous_decision,
         )
+        speech.observe(planner_context.to_dict(), commentator=getattr(planner, "comment", None),
+                       progress_revision=len(history) + 1)
         # Provider trouble is not a navigation event or a consumed decision.
         # Keep this context until a usable reply, cancellation or the deadline.
         while True:
@@ -372,6 +374,7 @@ def _planner_step(
     if outcome is not None:
         return None, outcome
     if action == COMPLETE:
+        speech.end_commentary()
         # Every iteration reaches the planner at rest. The existing gesture
         # executor checks idle again; no wheel action follows this finale.
         speech.offer(
@@ -392,7 +395,7 @@ def _planner_step(
         "action": action,
         "decision_memory": decision.memory(),
         "assessment": assessment,
-        "utterance": decision.utterance,
+        "utterance": None if speech.commentary_enabled else decision.utterance,
         "plan": list(decision.plan),
         "action_source": _PLANNER_ACTION_SOURCE,
         "observation": observation,

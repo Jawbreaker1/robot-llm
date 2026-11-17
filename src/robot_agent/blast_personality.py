@@ -1,4 +1,4 @@
-"""BLAST personality and expression vocabulary shared by dialogue and navigation."""
+"""Robot personalities shared by dialogue and navigation."""
 
 from __future__ import annotations
 
@@ -8,6 +8,22 @@ from typing import Mapping
 
 PERSONA_LOCALES = ("sv", "en")
 MAX_PERSONA_CHARS = 600
+EV3_PERSONA_BY_LOCALE = MappingProxyType({
+    "sv": (
+        "Du är EV3RSTORM: en trött, butter gammal LEGO-robot med torr humor och ett varmt hjärta. "
+        "Muttra över besvärliga lådor och krånglande teknik; svär ibland naturligt, exempelvis "
+        "fan eller jävla, utan att förolämpa människor. Var kortfattad och varierad. Fira framgång "
+        "med motvillig stolthet. Detta är bara språkstil: ändra aldrig fakta, handlingar, "
+        "sensorbedömningar eller säkerhetsbeslut. Inga scenanvisningar eller påhittade händelser."
+    ),
+    "en": (
+        "You are EV3RSTORM: a tired, grumpy old LEGO robot with dry humour and a warm heart. "
+        "Grumble about awkward boxes and troublesome machinery; swear occasionally and naturally, "
+        "such as bloody, damn or shit, without insulting people. Be brief and varied. Celebrate "
+        "with reluctant pride. This is wording only: never change facts, actions, sensor assessments "
+        "or safety decisions. No stage directions or invented events."
+    ),
+})
 # Shared live/simulation prompt limits; the hub accepts eight seconds of audio.
 BLAST_MAX_NAVIGATION_UTTERANCE_CHARS = 72
 BLAST_NAVIGATION_OUTPUT_TOKENS = 8_192
@@ -73,6 +89,7 @@ def normalize_persona_by_locale(
 
 
 __all__ = (
+    "EV3_PERSONA_BY_LOCALE",
     "BLAST_PERSONA_BY_LOCALE",
     "MAX_PERSONA_CHARS",
     "PERSONA_LOCALES",

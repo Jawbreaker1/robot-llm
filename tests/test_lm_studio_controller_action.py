@@ -92,6 +92,27 @@ class Transport:
 
 
 class ControllerActionPlannerTests(unittest.TestCase):
+    def test_background_comment_uses_shared_packet_persona_but_cannot_return_actions(self):
+        packet = context(history=({"action":"ADVANCE","result":"near_obstacle"},),
+            local_map_evidence={"route_execution_memory":{"records":[{"reason":"route_rejected"}]}}).to_dict()
+        for output in ({"utterance":"Damn, that passage was tight."}, {"utterance":None},
+                       {"utterance":"Go", "action":"ADVANCE"}, {"utterance":7}):
+            envelope = json.loads(completion({}))
+            envelope["choices"][0]["message"]["content"] = json.dumps(output)
+            planner, transport = self.planner(json.dumps(envelope).encode(), reasoning_effort="high",
+                utterance_persona_by_locale=BLAST_PERSONA_BY_LOCALE)
+            if set(output) == {"utterance"} and (output["utterance"] is None or isinstance(output["utterance"],str)):
+                self.assertEqual(planner.comment(packet),output["utterance"])
+            else:
+                with self.assertRaises(LMStudioProtocolError):
+                    planner.comment(packet)
+            sent = json.loads(transport.calls[0][1])
+            self.assertEqual(json.loads(sent["messages"][1]["content"]),packet)
+            self.assertIn(BLAST_PERSONA_BY_LOCALE["sv"],sent["messages"][0]["content"])
+            self.assertEqual(sent["reasoning_effort"],"low")
+            self.assertEqual(planner._reasoning_effort,"high")
+            self.assertEqual(sent["max_tokens"],1024)
+
     def test_complete_map_and_route_memory_can_exceed_old_64k_envelope(self):
         planner, transport = self.planner(completion({
             "action":"DRIVE_FORWARD", "confidence_milli":900,
@@ -160,6 +181,23 @@ class ControllerActionPlannerTests(unittest.TestCase):
             self.assertIsNone(planner.decide(context(completion_allowed=False)).decision.expression)
             requests.append(transport.calls[0][1])
         self.assertEqual(*requests)
+
+    def test_ev3_completion_uses_only_its_saw_vocabulary(self):
+        from robot_agent.social_expression import EV3_GESTURES
+        for gesture in ("saw_celebrate", "claw_flourish"):
+            expression = {"face": "neutral", "gesture": gesture}
+            planner, transport = self.planner(completion({
+                "action": COMPLETE, "confidence_milli": 950, "assessment": "Arrived.",
+                "plan": [], "utterance": "Victory!", "expression": expression,
+            }), social_expressions=True, social_gestures=EV3_GESTURES, social_faces=("neutral",))
+            if gesture == "claw_flourish":
+                with self.assertRaises(LMStudioProtocolError):
+                    planner.decide(context(completion_allowed=True))
+            else:
+                self.assertEqual(planner.decide(context(completion_allowed=True)).decision.expression, expression)
+                prompt = json.loads(transport.calls[0][1])["messages"][0]["content"]
+                self.assertIn("saw_celebrate", prompt)
+                self.assertNotIn("claw_flourish", prompt)
 
     def test_completion_expression_rejects_wrong_action_or_invalid_payload(self):
         for action, utterance, expression in (
@@ -802,7 +840,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         supplied = json.loads(request["messages"][1]["content"])
         self.assertEqual(supplied["local_map_evidence"], local_map)
         system_prompt = request["messages"][0]["content"]
-        self.assertLess(len(system_prompt), 6_300)
+        self.assertLess(len(system_prompt), 6_500)  # Includes short milestone-speech instruction.
         self.assertIn("SAME fixed episode frame", system_prompt)
         self.assertIn("x is rows[i].x_mm and y is column_y_mm[j]", system_prompt)
         self.assertIn("+x is starting forward", system_prompt)
@@ -853,7 +891,7 @@ class ControllerActionPlannerTests(unittest.TestCase):
         self.assertNotIn("execution checks each leg against", prompt)
         self.assertNotIn("direct_detour_axis_candidates", prompt)
         self.assertNotIn("column_y_mm", prompt)
-        self.assertLess(len(prompt), 5_300)
+        self.assertLess(len(prompt), 5_500)  # Includes short milestone-speech instruction.
 
     def test_waypoint_round_trips_as_model_owned_advisory_memory(self):
         waypoint = {

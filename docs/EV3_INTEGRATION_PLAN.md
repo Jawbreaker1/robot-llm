@@ -1,6 +1,206 @@
 # EV3 integration: active plan
 
-## Current checkpoint: contract audit before further refactoring (2026-09-26)
+## Shared feedback and parallel speech
+
+Navigation and commentary read the same controller-context packet: observations,
+body geometry, retained route, obstacle estimates and the existing execution
+memory. Commentary takes a snapshot; it owns no separate map or route memory.
+
+The existing speech worker now generates short Astra comments as well as playing
+them. Its latest-progress queue remains bounded; navigation never waits for text
+generation or routine playback. A changed route, obstacle hypothesis, failed
+operation or completed mission invalidates pending old commentary. Speech errors
+remain optional failures, not reasons to stop a navigation mission. Background
+comments may return only text or silence, never actions, route changes or gestures.
+The robot's existing personality and configured Piper voice are reused. This does
+not change the EV3 voice model or make it sound more natural by itself.
+
+The local policy still owns ordinary motion along the retained route. The same
+planner dispatcher returns new observation results, failed actions and completed
+leg alignment to Astra for review, using the existing journal event count to avoid
+reviewing the same result twice. A failed model call does not acknowledge the
+feedback. Astra may keep, inspect or replace the route; no host-authored detour or
+new clearance rule is introduced. Worker transport failures also reach this same
+feedback contract without replaying movement or discarding the route.
+
+Navigation remains Astra high; brief background comments use low reasoning and
+a bounded, optional request. Completion speech and an Astra-selected victory
+gesture remain separate from routine commentary and require confirmed completion
+at rest. No wheel execution, odometry calibration or model weights changed here.
+
+Simulation can exercise this full path with `local_navigation_experiment.py run
+--commentary`: real model requests, production robot adapters and the same speech
+queue, but logged audio/expressions instead of physical playback or motors.
+Artifacts are under `local-artifacts/navigation-parallel-speech-20261116/`.
+
+### Simulator validation (2026-11-16)
+
+Frozen per-robot weights, Astra high for navigation, low for background comments.
+The full regression suite passes: **2,235 tests** in 102.9 seconds
+(`/tmp/parallel-speech-alignment-full-tests.log`). Production-adapter tests hold
+both text generation and playback open while each robot finishes its route;
+they also cover stale comments, cancellation, optional speech failure, preserved
+route memory after transport failure and completion-only gestures.
+
+| Recorded run | Goal reached | Body-collision stops | Local / Astra decisions | Simulator goal distance |
+| --- | --- | --- | --- | --- |
+| `ev3-box` | Yes | 0 | 29 / 10 | 36 mm |
+| `blast-box-r2` | Yes | 0 | 32 / 11 | 46 mm |
+| `ev3-corridor` | Yes | 1 | 49 / 16 | 27 mm |
+| `blast-corridor-r2` | Yes | 4 | 39 / 17 | 27 mm |
+
+The box routes passed collision-free; **neither corridor is a clean navigation
+pass**. EV3's first blocked advance occurred at (488, 0) mm: the center ray missed
+the side baffle while the right body edge overlapped it. Astra received the failed
+action and chose to retreat and reassess. Blast's four collision stops occurred
+during partial sweeps, returned as incomplete coverage. Goal arrival after these
+stops demonstrates recovery, not adequate passage/turn clearance. Sensor/body
+coverage remains an open issue, not solved by enabling speech.
+
+The first Blast corridor attempt was stopped during a scan/alignment loop. Its
+successful waypoint turns lacked EV3's `heading_aligned` feedback, so the local
+policy resumed before Astra could review alignment and selected another scan.
+Blast now publishes that same result only when measured waypoint alignment is
+complete. Explicit inspection turns keep their original semantics. No motion,
+turn tolerance or route-selection rule changed. The repeated corridor and box
+runs above used the corrected feedback.
+
+In the initial box runs all 27 background-comment requests matched an actual
+navigation context packet, and all overlapped navigation model requests. Blast
+used a scan result to move its return leg from x=600 to x=700 mm before proceeding.
+The first simulation-only audio sink rejected completion expressions with a
+TypeError; its signature was corrected, with no production speech change. Both
+corridor runs logged the full arrival reply and Astra-selected victory gesture
+(`saw_celebrate` / `claw_flourish`) without speech errors; `blast-box-r2` also did.
+
+These runs logged audio/gesture requests, not actual Piper synthesis or onboard
+playback. No physical robot was run, deployed or restarted. Physical IR behavior,
+wheel slip, acoustic quality and passage clearance are not certified by these
+tests. The EV3 voice remains the existing configured Piper model.
+
+## Physical box / speech repeat: failed acceptance (2026-11-16)
+
+Run: `local-artifacts/navigation-physical-local-ev3-box-voice-20261116-r2`,
+episode `episode-6dbc73cbd1b2ac62b0304c93`. The same frozen EV3 weights and
+Astra high used the restored short-pulse execution. The operator confirmed
+that the saw caught the box, wheels slipped, and the physical heading no
+longer agreed with the map. This is **not** a successful box passage.
+
+- Initial scan receipts: 357.912 degrees. The operator was asked to compare
+  with reality; subsequent contact invalidates ground-position assumptions.
+- Astra made two route decisions. Both explicitly said the obstacle edges and
+  full-body clearance were unknown. All four obstacle-estimate bounds stayed
+  null. The local policy then selected 34 FOLLOW_WAYPOINT and four front-arc
+  scans; it did not request another Astra assessment after those observations.
+  The displayed hypothesis therefore remained unlocated, with unknown width
+  and depth. The browser does contain that note; no finite box can be drawn
+  from this packet. More scans did not produce a revised geometric hypothesis.
+- Two scan turns returned `motor_fault`; recovery restarted the worker and
+  motion resumed. The test was stopped manually to check possible contact,
+  not terminated automatically by a small sensor error. Final encoder pose
+  (641, -348) mm / 4.278 degrees is not a verified physical pose after slip.
+- Independent integration agrees with the published encoder pose. This only
+  verifies bookkeeping, not motion relative to the floor. There were 96 motor
+  slices and one additional measured encoder-degree gap. Fault-triggering
+  transient motor states are not retained in the final stop receipt, so the
+  trace cannot identify which motor first reported stalled/overloaded.
+- The run used a 100 mm left extent, whose recovered measurement explicitly
+  excluded the removable propeller. Afterwards the operator measured the fitted
+  saw at just under 120 mm from center. Configuration now uses 120 mm left;
+  the right side stays 130 mm and clearance margin 10 mm. This is not yet
+  physically validated and does not by itself solve unknown obstacle edges.
+- Both journey utterances failed because Piper was not running. Starting the
+  local service restored synthesis; a separate stationary five-second voice
+  check received a completed EV3 playback receipt (220716 bytes, 22050 Hz).
+  No later navigation utterance was generated before the stop. The operator
+  confirmed hearing the voice check, but found the john-medium voice synthetic.
+  This dependency should have been checked before starting the physical test.
+  The voice model has not been changed. EV3's shared grumpy, warm, occasionally
+  swearing persona is now supplied to navigation and conversation alike; the
+  physical trial previously omitted it. The neutral voice check was fixed
+  diagnostic text, not an Astra-generated character reply.
+
+The EV3 completion-expression plumbing is now tested: the planner advertises
+only neutral face / EV3 saw gestures; the decision event preserves expression;
+arrival speech and gesture are offered only after confirmed drive-worker
+shutdown and release of the controller lease. Cancellation or failed shutdown
+suppresses the finale. No saw celebration occurred physically because the goal
+was not reached. Before the run, 132 focused navigation/speech/profile tests
+and 13 IR tests passed. After the operator-measured footprint and shared
+persona updates, the full suite passes: 2,227 tests in 105.7 seconds
+(`/tmp/ev3-box-voice-full-tests-20261116-final.log`). This is regression
+validation, not physical passage acceptance. No new navigation rules or
+odometry calibration changes were made.
+
+Deployment preflight found only `ev3/infrared_safety.py` stale on the robot.
+The complete 17-file checkpoint runtime was synchronized after a backup at
+`local-artifacts/ev3-before-box-voice-20261116.tar`; both deployment and
+motion-free worker preflights passed. Motor execution and odometry calibration
+still match checkpoint `3d88db6`; only the operator-corrected body width differs
+after this run. That new width remains local pending the next deployment.
+
+## Decision: continuous forward experiment withdrawn
+
+EV3's motor execution, odometry integration, scan behavior, transport/receipt
+contracts and drive configuration have been restored exactly to checkpoint
+`3d88db6`. FOLLOW_WAYPOINT again returns after alignment or one forward pulse.
+There is no continuous-mode flag, compatibility branch or automatic fallback
+left in the production navigation code. Neither attempt was deployed to a
+physical robot.
+
+The reason for withdrawal is scope and unproven reliability, not a demonstrated
+causal link between continuous travel and the observed corner collision. The
+candidate changed the distance between model decisions, not merely the pauses
+between motor starts. The frozen local model had been trained with the shorter
+decision cadence. No new navigation rules or training were introduced to make
+the candidate pass.
+
+### Controlled comparison
+
+`local-artifacts/navigation-continuous-ab-20261116/` contains the replay harness,
+both candidate archives and four branch runs. Each branch replayed the same
+recorded decisions and verified identical measured poses through its fork.
+The first branch decision was identical. Subsequent decisions used the same
+frozen EV3 model and Astra high; the pulse branch accurately described its
+short execution contract. No ground-truth box geometry reached either planner.
+
+| Fork in recorded run | Continuous | Pulse execution |
+| --- | --- | --- |
+| Before long approach (decision 7) | Contact at (723, -271), after 7 decisions and 2 forward commands | Contact at (725, -270), after 21 decisions and 16 forward commands |
+| Immediately before corner passage (decision 13) | Contact after 1 forward command | Same contact after 2 forward commands |
+
+Both modes reached the same blocked corner, within 2 mm. The longer approach
+comparison used one Astra call in each branch; the corner comparison needed
+none. This demonstrates that reverting does **not** solve that particular
+passage error. It does not establish equivalent reliability across other
+worlds or negate the changed feedback horizon.
+
+The discarded candidate is recoverable from `candidate-tracked.patch` and
+`candidate-continuous-tests.py` in the comparison directory. Earlier simulator
+traces remain under `local-artifacts/navigation-continuous-20261116*`; their
+2,238-test result applies to that withdrawn candidate, not the current code.
+
+### Retained, separate speech change
+
+LocalPlanner still consults Astra at route-leg transitions and final arrival,
+as well as when the local policy requests replanning. Utterances use the
+existing EpisodeSpeech path, without a second narration planner. The navigation
+prompt was restored to the checkpoint wording; only a short speech instruction
+was added. An integration test checks that start, next-leg and arrival comments
+reach the speech API while the robot continues using its original short pulses.
+
+Post-rollback validation: all 2,224 tests pass
+(`/tmp/continuous-revert-tests-20261116.log`). Fresh Astra-high plus frozen-local
+model runs on `map-train-1` reached the goal without simulated contact for both
+robots: EV3 37 mm residual (38 decisions), BLAST 46 mm (43 decisions).
+Artifacts: `local-artifacts/navigation-continuous-reverted-20261116/`.
+These are simple-box checks, not acceptance of the failing two-obstacle route.
+
+Passage estimation and recovery remain separate outstanding navigation issues.
+Do not claim the rollback or a simple-box pass proves reliable multi-obstacle
+navigation. No real audio playback or new physical mission was performed.
+
+## Historical checkpoint: contract audit before further refactoring (2026-09-26)
 
 This checkpoint preserves the current EV3 integration and removal of the old
 physical navigation engine. It is a recovery point, **not** physical acceptance

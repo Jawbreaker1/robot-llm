@@ -8,7 +8,7 @@ observe/plan/act loop or motor cleanup.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import subprocess
 import threading
@@ -45,6 +45,8 @@ class SpeechItem:
     locale: str
     admission: Optional["SpeechAdmission"] = None
     expression: Optional[Mapping[str, str]] = None
+    commentary: Optional[Callable[[], str | None]] = None
+    is_current: Optional[Callable[[], bool]] = None
 
 
 class SpeechAdmission:
@@ -225,16 +227,21 @@ class RobotSpeechRuntime:
         self,
         *,
         episode_id: str,
-        text: str,
+        text: str | None,
         locale: str,
         progress_revision: int = 0,
         cancel_requested: Optional[Callable[[], bool]] = None,
         admission: Optional[SpeechAdmission] = None,
         expression: Optional[Mapping[str, str]] = None,
         replace_pending: bool = True,
+        commentary: Optional[Callable[[], str | None]] = None,
+        is_current: Optional[Callable[[], bool]] = None,
     ) -> int:
         checked_episode = _identifier(episode_id)
-        checked_text = _bounded_text(text)
+        if commentary is not None and (not callable(commentary) or text is not None
+                or expression is not None or not callable(is_current) or not replace_pending):
+            raise RobotSpeechRuntimeError("invalid_commentary", "Commentary is read-only progress speech")
+        checked_text = "" if commentary is not None else _bounded_text(text)
         if locale not in RESPONSE_LOCALES or locale not in VOICE_BY_LOCALE:
             raise RobotSpeechRuntimeError(
                 "unsupported_speech_locale",
@@ -261,7 +268,7 @@ class RobotSpeechRuntime:
             )
         if not isinstance(replace_pending, bool):
             raise ValueError("speech queue policy is invalid")
-        fingerprint = (locale, _normalized_speech_text(checked_text))
+        fingerprint = (locale, "commentary" if commentary is not None else _normalized_speech_text(checked_text))
         dropped = []
         duplicate = None
         with self._condition:
@@ -309,6 +316,7 @@ class RobotSpeechRuntime:
                 locale=locale,
                 admission=admission,
                 expression=dict(expression) if expression is not None else None,
+                commentary=commentary, is_current=is_current,
             )
             if fingerprint in fingerprints:
                 duplicate = item
@@ -425,9 +433,20 @@ class RobotSpeechRuntime:
                 cancel_event = _SpeechCancellationEvent(item.admission)
                 self._active = item
                 self._active_cancel = cancel_event
-            self._emit("playing", item)
             terminal_state = "failed"
             try:
+                if item.commentary is not None:
+                    if cancel_event.is_set() or not item.is_current():
+                        terminal_state = "dropped"
+                        self._emit("dropped", item, reason="stale_commentary")
+                        continue
+                    text = item.commentary()
+                    if text is None or cancel_event.is_set() or not item.is_current():
+                        terminal_state = "dropped"
+                        self._emit("dropped", item, reason="silent_or_stale_commentary")
+                        continue
+                    item = replace(item, text=_bounded_text(text))
+                self._emit("playing", item)
                 self._speaker(
                     item.text,
                     item.locale,
@@ -469,7 +488,7 @@ class RobotSpeechRuntime:
                 if item.admission is not None:
                     item.admission.resolve(terminal_state)
                 with self._condition:
-                    if self._active is item:
+                    if self._active is not None and self._active.sequence == item.sequence:
                         self._active = None
                         self._active_cancel = None
                     self._condition.notify_all()

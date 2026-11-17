@@ -362,12 +362,62 @@ class LocalNavigationExperimentTests(unittest.TestCase):
             self.assertIs(LocalPlanner(astra,biased_policy("REPLAN")).decide(context), expected)
             astra.decide.assert_called_once_with(context)
 
-    def test_completion_uses_existing_goal_contract(self):
+    def test_completion_returns_to_astra_for_verified_arrival_comment(self):
         astra = Mock()
         context = replace(self.context(),completion_allowed=True)
+        astra.decide.return_value = ControllerActionPlannerResult(
+            ControllerActionDecision("COMPLETE",1000,"At the goal",("COMPLETE",),"Made it!"),0)
         result = LocalPlanner(astra,biased_policy("ADVANCE")).decide(context)
         self.assertEqual(result.decision.action,"COMPLETE")
+        self.assertEqual(result.decision.utterance,"Made it!")
+        astra.decide.assert_called_once_with(context)
+
+    def test_route_transition_returns_to_astra_once_not_every_motion(self):
+        astra = Mock()
+        first = self.context()
+        second = replace(first, active_waypoint={"x_mm":800,"y_mm":300,"purpose":"next leg"})
+        astra.decide.return_value = ControllerActionPlannerResult(
+            ControllerActionDecision("FOLLOW_WAYPOINT",900,"Next leg",("FOLLOW_WAYPOINT",),"Turning toward the next leg."),0)
+        local = LocalPlanner(astra,biased_policy("FOLLOW_WAYPOINT"))
+        local.decide(first)
+        local.decide(first)
         astra.decide.assert_not_called()
+        self.assertIsNotNone(local.decide(second).decision.utterance)
+        local.decide(second)
+        astra.decide.assert_called_once_with(second)
+
+    def test_new_observations_and_failures_return_same_context_to_astra_once(self):
+        for feedback in ({"completed":False, "reason":"near_obstacle"},
+                         {"observation_acquired":True}, {"observation_acquired":False},
+                         {"reason":"heading_aligned"}):
+            with self.subTest(feedback=feedback):
+                context = self.context()
+                context = replace(context,
+                    observation={**context.observation, "last_action":feedback},
+                    local_map_evidence={**context.local_map_evidence,
+                        "route_execution_memory":{"event_count":7, "records":[{"reason":"route_rejected"}]}})
+                astra = Mock()
+                astra.decide.return_value = ControllerActionPlannerResult(
+                    ControllerActionDecision("FOLLOW_WAYPOINT",900,"Reviewed",(),None),0)
+                local = LocalPlanner(astra,biased_policy("FOLLOW_WAYPOINT"))
+                local.decide(context)
+                local.decide(context)
+                self.assertEqual(astra.decide.call_count,1)
+                self.assertIs(astra.decide.call_args.args[0],context)
+                newer = replace(context,local_map_evidence={**context.local_map_evidence,
+                    "route_execution_memory":{"event_count":8}})
+                local.decide(newer)
+                self.assertEqual(astra.decide.call_count,2)
+
+    def test_failed_astra_review_is_not_marked_delivered(self):
+        context = replace(self.context(),observation={"last_action":{"completed":False}})
+        astra = Mock()
+        astra.decide.side_effect = RuntimeError("temporary model failure")
+        local = LocalPlanner(astra,biased_policy("ADVANCE"))
+        for _ in range(2):
+            with self.assertRaises(RuntimeError):
+                local.decide(context)
+        self.assertEqual(astra.decide.call_count,2)
 
     @unittest.skipUnless(importlib.util.find_spec("numpy"), "Optional experiment training dependency")
     def test_training_changes_weights_and_learns_held_out_synthetic_labels(self):

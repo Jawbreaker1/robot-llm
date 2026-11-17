@@ -1,6 +1,7 @@
 """Expose executed body geometry, not the ideal polyline through waypoints."""
 import unittest
 import math
+from dataclasses import replace
 
 from robot_agent.ev3rstorm_profile import EV3RSTORMProfile
 from robot_agent.blast_navigation_calibration import BLAST_PROVISIONAL_NAVIGATION_CALIBRATION
@@ -24,15 +25,22 @@ class WaypointExecutionGeometryTests(unittest.TestCase):
     def test_recorded_ev3_corner_exposes_lost_side_clearance(self):
         footprint = EV3RSTORMProfile().hazard_calibration.robot_footprint
         target = {"x_mm": 800, "y_mm": 0}
-        ideal = waypoint_motion_hint(PhysicalPose(x_mm=800, y_mm=-300, heading_mdeg=90_000),
-                                     target, footprint=footprint)["straight_motion_projection"]
-        actual = waypoint_motion_hint(PhysicalPose(x_mm=774, y_mm=-302, heading_mdeg=91_689),
-                                      target, footprint=footprint)["straight_motion_projection"]
-        self.assertEqual(ideal["swept_body_bounds_mm"]["min_x_mm"], 690)
-        self.assertEqual(actual["swept_body_bounds_mm"]["min_x_mm"], 651)
-        self.assertEqual(actual["closest_center_to_waypoint_mm"], {"x_mm": 765, "y_mm": -1})
-        self.assertEqual(actual["waypoint_miss_mm"], 35)
-        self.assertEqual(actual["travel_mm"], 301)
+        # Preserve the recorded smaller envelope as well as the subsequently
+        # measured saw-inclusive body. A wider body must not improve clearance.
+        for body, ideal_min, actual_min in (
+            (replace(footprint, left_extent_mm=100), 690, 651),
+            (footprint, 670, 631),
+        ):
+            with self.subTest(left_extent=body.left_extent_mm):
+                ideal = waypoint_motion_hint(PhysicalPose(x_mm=800, y_mm=-300, heading_mdeg=90_000),
+                                             target, footprint=body)["straight_motion_projection"]
+                actual = waypoint_motion_hint(PhysicalPose(x_mm=774, y_mm=-302, heading_mdeg=91_689),
+                                              target, footprint=body)["straight_motion_projection"]
+                self.assertEqual(ideal["swept_body_bounds_mm"]["min_x_mm"], ideal_min)
+                self.assertEqual(actual["swept_body_bounds_mm"]["min_x_mm"], actual_min)
+                self.assertEqual(actual["closest_center_to_waypoint_mm"], {"x_mm": 765, "y_mm": -1})
+                self.assertEqual(actual["waypoint_miss_mm"], 35)
+                self.assertEqual(actual["travel_mm"], 301)
 
     def test_projection_uses_each_robots_asymmetric_body_and_margin_once(self):
         for footprint in (EV3RSTORMProfile().hazard_calibration.robot_footprint,

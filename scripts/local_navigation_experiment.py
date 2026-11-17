@@ -197,7 +197,7 @@ def scenario(robot, name):
     return scene
 
 
-def run_ev3(scene, planner, maximum, emit):
+def run_ev3(scene, planner, maximum, emit, *, speech_runtime_factory=None):
     from scripts.validate_ev3_navigation import ValidatedTransport
     from robot_agent.ev3_navigation_body import EV3NavigationBody
     from robot_agent.ev3_episode_adapter import EV3EpisodeAdapter
@@ -226,11 +226,11 @@ def run_ev3(scene, planner, maximum, emit):
             calibration=profile.odometry_calibration, **kwargs),
         planner_factory=lambda model: planner, descriptor=profile.descriptor,
         footprint=profile.hazard_calibration.robot_footprint, spatial_map_provider=bridge,
-        speech_runtime_factory=None, controller_lease=threading.Lock(),
+        speech_runtime_factory=speech_runtime_factory, controller_lease=threading.Lock(),
         minimum_forward_progress_mm=distance, event_sink=publish)
     context = RobotEpisodeContext("local-policy-experiment", RobotEpisodeStart(
         f"Reach the goal {distance / 10:g} cm straight ahead of your starting position.", "en", "simulation", 1),
-        RobotControlSettings(model=MODEL, speech_enabled=False),
+        RobotControlSettings(model=MODEL, speech_enabled=speech_runtime_factory is not None),
         stop, threading.Event(), lambda update: None)
     outcome = adapter.run(context)
     pose, goal = world.pose("ev3"), scene.goals[0]
@@ -289,12 +289,14 @@ def run(args):
     mode = "collect" if collecting else "local" if args.weights else "astra"
     scene = scenario(args.robot, args.scene)
     source_hashes = {str(p.relative_to(REPO)):hashlib.sha256(p.read_bytes()).hexdigest()
-                     for directory in (REPO/"src/robot_agent", REPO/"experiments") for p in directory.glob("*.py")}
+                     for directory in (REPO/"src/robot_agent", REPO/"experiments", REPO/"ev3")
+                     for p in directory.glob("*.py")}
+    source_hashes["config/ev3rstorm.json"] = hashlib.sha256((REPO/"config/ev3rstorm.json").read_bytes()).hexdigest()
     source_hashes["scripts/local_navigation_experiment.py"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     (output/"source-hashes.json").write_text(json.dumps(source_hashes, indent=2))
     prefix = recovery_prefix(replay_path, robot=args.robot, scene=args.scene,
                              source_hashes=source_hashes) if replay_path else []
-    records, dispatches = [], []
+    records, dispatches, speech_counts = [], [], Counter()
     started = time.monotonic()
     with (output/"events.jsonl").open("w") as stream:
         def emit(event):
@@ -302,9 +304,13 @@ def run(args):
             stream.flush()
             if event["event"] == "policy_dispatch":
                 dispatches.append(event)
+            if "speech" in event["event"] or "commentary" in event["event"]:
+                speech_counts[event["event"]] += 1
         emit({"event": "configuration", "mode": mode, "robot": args.robot,
               "scene": args.scene, "model": MODEL, "reasoning": "high", "world": asdict(scene),
               "max_decisions": args.decisions, "max_output_tokens":8192, "planner_timeout_seconds":60,
+              "commentary":bool(getattr(args,"commentary",False)), "audio_playback":"simulated_only",
+              "commentary_reasoning":"low",
               "model_sha256": hashlib.sha256(args.weights.read_bytes()).hexdigest() if args.weights else None,
               "collection_protocol":STUDENT_PROTOCOL if student_recovery else "complete-astra-recovery-v1" if collecting else None,
               "fault":getattr(args,"fault","none"),
@@ -314,8 +320,13 @@ def run(args):
               "replay_prefix_sha256":hashlib.sha256(replay_path.read_bytes()).hexdigest() if replay_path else None,
               "replay_prefix_decisions":len(prefix),
               "limitations": "Approximate white-surface IR, ideal range rays/encoders. No real robots. No hidden world geometry in policy input."})
+        from robot_agent.blast_personality import BLAST_PERSONA_BY_LOCALE, EV3_PERSONA_BY_LOCALE
+        from robot_agent.social_expression import EV3_GESTURES
         teacher = LMStudioControllerActionPlanner(model=MODEL, reasoning_effort="high",
-                                                 max_output_tokens=8192, timeout_seconds=60)
+            max_output_tokens=8192, timeout_seconds=60,
+            social_expressions=True,
+            **({"social_gestures":EV3_GESTURES, "social_faces":("neutral",)} if args.robot == "ev3" else {}),
+            utterance_persona_by_locale=EV3_PERSONA_BY_LOCALE if args.robot == "ev3" else BLAST_PERSONA_BY_LOCALE)
         policy = LocalPolicy.load(args.weights) if args.weights else None
         selected = LocalPlanner(teacher, policy, emit) if policy else teacher
         if student_recovery:
@@ -325,6 +336,12 @@ def run(args):
                               stalled_attempts=getattr(args,"fault_stalls",1))
 
         class RecordingPlanner:
+            def comment(self, packet):
+                emit({"event": "commentary_packet", "packet": packet})
+                text = teacher.comment(packet)
+                emit({"event": "commentary_generated", "text": text})
+                return text
+
             def decide(self, context):
                 began = time.perf_counter()
                 if student_recovery:
@@ -363,13 +380,26 @@ def run(args):
                 return result
         try:
             planner = RecordingPlanner()
+            speech_factory = None
+            if getattr(args, "commentary", False):
+                from robot_agent.robot_speech_runtime import RobotSpeechRuntime
+                def speech_factory(*, event_sink):
+                    def speaker(text, locale, cancel, *, expression=None):
+                        emit({"event": "simulated_speech", "text": text, "locale": locale,
+                              "expression": expression})
+                    def speech_event(event):
+                        emit(dict(event))
+                        event_sink(event)
+                    return RobotSpeechRuntime(speaker=speaker, event_sink=speech_event)
             with selected if student_recovery else fault if collecting else nullcontext():
                 if args.robot == "ev3":
-                    result = run_ev3(scene, planner, args.decisions, emit)
+                    result = run_ev3(scene, planner, args.decisions, emit,
+                                     speech_runtime_factory=speech_factory)
                 else:
                     distance = scene.goals[0].x_mm-scene.robots[0].pose.x_mm
                     result = run_blast_gemma_scenario(scene, model=MODEL, max_decisions=args.decisions,
                         planner_factory=lambda model: planner, minimum_forward_progress_mm=distance,
+                        speech_runtime_factory=speech_factory,
                         goal=f"Reach the goal {distance / 10:g} cm straight ahead of your starting position.")
                     result = {k:result[k] for k in ("completed", "goal_reached", "blocked_moves", "distance_to_goal_mm",
                                "terminal_reason", "error_type", "error_message", "commands", "scans", "final_pose")}
@@ -385,6 +415,7 @@ def run(args):
                        "astra_decision_ms": [d["elapsed_ms"] for d in dispatches if d["source"] == "astra"],
                        "decision_seconds": sum(d["elapsed_ms"] for d in dispatches)/1000,
                        "action_counts": dict(Counter(r["decision"]["action"] for r in records))})
+        result["speech_counts"] = dict(speech_counts)
         result["clean"] = bool(result["completed"] and result["goal_reached"] and
                                result["blocked_moves"] == 0 and not result.get("error_type"))
         if student_recovery:
@@ -631,6 +662,8 @@ def main():
         p.add_argument("--output", type=Path, required=True)
         p.add_argument("--weights", type=Path)
         p.add_argument("--decisions", type=int, default=48)
+        p.add_argument("--commentary", action="store_true",
+                       help="Generate real background commentary; log playback without hardware audio")
         if command == "run":
             p.add_argument("--collect", action="store_true")
             p.add_argument("--student-recovery", action="store_true",

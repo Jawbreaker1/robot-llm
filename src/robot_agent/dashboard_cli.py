@@ -35,6 +35,7 @@ from .blast_hub_speech import (
     BlastHubSpeaker,
 )
 from .blast_personality import (
+    EV3_PERSONA_BY_LOCALE,
     BLAST_PERSONA_BY_LOCALE,
     BLAST_MAX_NAVIGATION_UTTERANCE_CHARS,
     BLAST_NAVIGATION_OUTPUT_TOKENS,
@@ -1056,6 +1057,7 @@ def _run(
                 elif profile_id == "ev3rstorm-01":
                     options["social_expressions"] = True
                     options["social_profile"] = "ev3"
+                    options["reply_persona_by_locale"] = EV3_PERSONA_BY_LOCALE
                 return LMStudioRobotInputModel(**options)
 
             return build_input_model

@@ -37,6 +37,7 @@ class EV3EpisodeAdapterTests(unittest.TestCase):
                 raise RuntimeError("Test playback failure")
             spoken.append((args, kwargs))
         planner = Mock()
+        planner.comment = None
         adapter = EV3EpisodeAdapter(body_factory=body_factory, planner_factory=lambda model: planner,
             descriptor=profile.descriptor, footprint=profile.hazard_calibration.robot_footprint,
             spatial_map_provider=bridge, speech_runtime_factory=lambda event_sink: RobotSpeechRuntime(speaker=speaker, event_sink=event_sink),
@@ -71,6 +72,78 @@ class EV3EpisodeAdapterTests(unittest.TestCase):
         result = subprocess.run(["node", "-e", program, str(logic)], input=json.dumps(snapshot), text=True, capture_output=True, check=True)
         normalized = json.loads(result.stdout)
         self.assertEqual(normalized, {"valid": True, "trace": True, "anchors": len(snapshot["qualitative_observations"])})
+
+    def test_arrival_speech_and_saw_follow_confirmed_drive_shutdown(self):
+        from test_ev3_social_speech import EV3SocialSpeechTests
+        for failure in (None, "shutdown", "cancel"):
+            with self.subTest(failure=failure):
+                adapter, context, planner, bodies, _, _, events = self.setup_episode()
+                speaker, audio, commands, _ = EV3SocialSpeechTests().make_speaker()
+                speaker.lease = adapter.controller_lease
+                def audio_receipt(*args):
+                    self.assertTrue(bodies[0].transport.shutdown_complete)
+                    self.assertFalse(adapter.controller_lease.locked())
+                    return {"played": True}
+                audio.side_effect = audio_receipt
+                adapter.speech_runtime_factory = lambda **kwargs: RobotSpeechRuntime(speaker=speaker, **kwargs)
+                original_factory = adapter.body_factory
+                def body_factory(**options):
+                    body = original_factory(**options)
+                    close = body.close
+                    def shutdown():
+                        close()
+                        if failure == "shutdown":
+                            raise RuntimeError("unconfirmed shutdown")
+                        if failure == "cancel":
+                            context.stop_requested.set()
+                    body.close = shutdown
+                    return body
+                adapter.body_factory = body_factory
+                done = choice(COMPLETE)
+                done = replace(done, decision=replace(done.decision, utterance="Victory!",
+                    expression={"face": "neutral", "gesture": "saw_celebrate"}))
+                planner.decide.side_effect = [
+                    choice(FOLLOW_WAYPOINT, {"x_mm": 800, "y_mm": 0, "purpose": "Goal"}),
+                    *[choice(FOLLOW_WAYPOINT) for _ in range(14)], done,
+                ]
+                if failure == "shutdown":
+                    with self.assertRaisesRegex(RuntimeError, "unconfirmed shutdown"):
+                        adapter.run(context)
+                else:
+                    self.assertTrue(adapter.run(context).completed)
+                self.assertEqual(len(commands), 0 if failure else 1)
+                self.assertEqual(audio.call_count, 0 if failure else 1)
+                self.assertFalse(adapter.controller_lease.locked())
+                self.assertEqual([e for e in events if e["event"] == "decision"][-1]["expression"],
+                                 done.decision.expression)
+
+    def test_astra_leg_comments_reach_existing_speech_runtime(self):
+        from experiments.local_navigation import LocalPlanner
+        adapter, context, planner, bodies, _, _, _ = self.setup_episode()
+        offered = []
+        runtime = Mock()
+        runtime.offer_with_admission = None
+        runtime.offer.side_effect = lambda **kwargs: offered.append(kwargs["text"])
+        runtime.close.return_value = True
+        adapter.speech_runtime_factory = lambda **kwargs: runtime
+        first = choice(FOLLOW_WAYPOINT, {"x_mm": 400, "y_mm": 0, "purpose": "First leg"})
+        final = choice(FOLLOW_WAYPOINT, {"x_mm": 800, "y_mm": 0, "purpose": "Goal"})
+        teacher = Mock()
+        teacher.decide.side_effect = [
+            replace(first, decision=replace(first.decision, utterance="On my way.")),
+            replace(final, decision=replace(final.decision, utterance="Continuing to the goal.")),
+            replace(choice(COMPLETE), decision=replace(choice(COMPLETE).decision, utterance="Made it!")),
+        ]
+        policy = Mock()
+        policy.predict.return_value = (FOLLOW_WAYPOINT, 1.0)
+        planner.decide.side_effect = LocalPlanner(teacher, policy).decide
+        outcome = adapter.run(context)
+        self.assertTrue(outcome.completed)
+        self.assertEqual(offered, ["On my way.", "Continuing to the goal.", "Made it!"])
+        self.assertEqual(teacher.decide.call_count, 3)
+        self.assertEqual(sum(op == "pulse" for op, _ in bodies[0].transport.requests), 15)
+        runtime.start.assert_called_once()
+        runtime.close.assert_called_once_with(drain=True, timeout_seconds=30.0)
 
     def test_long_wait_only_expires_an_explicit_mission_time_limit(self):
         for duration in (None, 60_000):

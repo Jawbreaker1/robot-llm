@@ -43,10 +43,12 @@ class EV3EpisodeAdapter:
         while not self.controller_lease.acquire(timeout=0.05):
             if cancelled():
                 return RobotEpisodeOutcome("stopped", False, {"current_action": "STOP"})
-        body = session = mission = None
+        body = session = mission = planner = None
+        finale = None
         speech = EpisodeSpeech(factory=self.speech_runtime_factory, supported_locales=("sv", "en"), context=context)
 
         def publish(event):
+            nonlocal finale
             record_navigation_diagnostic("ev3_episode", episode_id=context.episode_id, payload=event)
             self.event_sink(event)
             if event["event"] == "transport_retry":
@@ -66,7 +68,12 @@ class EV3EpisodeAdapter:
                 update = {"current_action": event["action"], "message": event["assessment"],
                           "model_latency_ms": event["latency_ms"], "plan": event["plan"],
                           "active_route": waypoint_route_trace(mission, body.pose, route)}
-                speech.offer(event.get("utterance"), progress_revision=len(session.history) + 1)
+                if event["action"] == "COMPLETE":
+                    speech.end_commentary()
+                    finale = event
+                elif not speech.observe(event["context"], commentator=getattr(planner, "comment", None),
+                                        progress_revision=len(session.history) + 1):
+                    speech.offer(event.get("utterance"), progress_revision=len(session.history) + 1)
             elif kind == "survey":
                 update = {"scan": {"complete": event["complete"], "sweep_degrees": event["sweep_degrees"]}}
             elif kind == "result":
@@ -89,7 +96,8 @@ class EV3EpisodeAdapter:
                 return RobotEpisodeOutcome("stopped", False, {"current_action": "STOP"})
             mission = DirectionalMission.begin(episode_id=context.episode_id, pose=body.pose,
                 minimum_forward_progress_mm=self.minimum_forward_progress_mm, heading_tolerance_mdeg=20_000)
-            session = EV3NavigationSession(body=body, planner=self.planner_factory(context.settings.model),
+            planner = self.planner_factory(context.settings.model)
+            session = EV3NavigationSession(body=body, planner=planner,
                 descriptor=self.descriptor, footprint=self.footprint, mission=mission,
                 goal=context.request.goal, locale=context.request.locale, publish=publish)
             publish({"event": "started"})
@@ -105,9 +113,18 @@ class EV3EpisodeAdapter:
                 "current_action": "COMPLETE" if session.completed else "STOP", "active_route": None,
                 "message": "Goal reached." if session.completed else "Episode stopped; measured progress retained on the map."})
         finally:
+            stopped = False
             try:
                 if body is not None:
                     body.close()
+                    stopped = True
             finally:
-                speech.close(drain=session is not None and session.completed and not cancelled())
                 self.controller_lease.release()
+                # The existing social speaker owns the arm only after the drive
+                # worker has confirmed shutdown. Never celebrate a proposed or
+                # cancelled completion, or an unconfirmed motor stop.
+                completed = stopped and session is not None and session.completed and not cancelled()
+                if completed and finale is not None:
+                    speech.offer(finale.get("utterance"), progress_revision=len(session.history) + 1,
+                                 expression=finale.get("expression"))
+                speech.close(drain=completed)

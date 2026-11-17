@@ -216,27 +216,45 @@ class LocalPlanner:
     """Mutually exclusive dispatch at the EXISTING planner slot, not a veto layer."""
     def __init__(self, astra, policy, publish=lambda event: None):
         self.astra, self.policy, self.publish = astra, policy, publish
+        self._route_endpoint = None
+        self._reviewed_event_count = -1
+
+    def comment(self, packet):
+        return self.astra.comment(packet)
 
     def decide(self, context):
         from robot_agent.lm_studio_controller_action import ControllerActionDecision, ControllerActionPlannerResult
         started = time.perf_counter()
         packet = context.to_dict()
-        if context.completion_allowed:
-            action, probability = "COMPLETE", 1.0
-        elif context.active_waypoint is None:
+        endpoint = context.active_waypoint
+        feedback = packet.get("observation", {}).get("last_action") or {}
+        event_count = ((packet.get("local_map_evidence") or {}).get("route_execution_memory") or {}).get(
+            "event_count", len(packet.get("history", ())))
+        # Inspection and unsuccessful execution return to the route's owner.
+        # This schedules a review; it neither chooses a route nor vetoes one.
+        review = event_count > self._reviewed_event_count and (
+            feedback.get("completed") is False
+            or feedback.get("observation_acquired") is not None
+            or feedback.get("reason") == "heading_aligned")
+        route_changed = self._route_endpoint is not None and endpoint != self._route_endpoint
+        if context.completion_allowed or endpoint is None or route_changed or review:
             action, probability = "REPLAN", 1.0
         else:
+            self._route_endpoint = endpoint
             action, probability = self.policy.predict(packet)
         if action == "REPLAN":
             result = self.astra.decide(context)
+            self._route_endpoint = result.decision.waypoint or endpoint
+            self._reviewed_event_count = event_count
             source = "astra"
         else:
             result = ControllerActionPlannerResult(ControllerActionDecision(
                 action=action, confidence_milli=round(probability * 1000),
                 assessment="Local neural action; retain the current route.",
                 plan=(action,), utterance=None), round((time.perf_counter() - started) * 1000))
-            source = "goal_contract" if action == "COMPLETE" else "local"
+            source = "local"
         self.publish({"event": "policy_dispatch", "source": source, "selection": action,
+                      "feedback_review": review, "feedback_event_count": event_count,
                       "probability": probability, "elapsed_ms": (time.perf_counter() - started) * 1000})
         return result
 

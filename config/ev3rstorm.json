@@ -48,10 +48,10 @@
       "reference_point": "differential-drive-origin",
       "front_extent_mm": 110,
       "rear_extent_mm": 90,
-      "left_extent_mm": 100,
+      "left_extent_mm": 120,
       "right_extent_mm": 130,
       "clearance_margin_mm": 10,
-      "evidence": "Measured on the current EV3RSTORM build without the removable propeller: 100 mm left and 130 mm right from the differential-drive origin"
+      "evidence": "Operator measurement 2026-11-16: just under 120 mm left from drive center to the fitted saw outer edge, represented as 120 mm; retained measured 130 mm right to the color sensor"
     },
     "local_detour": {
       "lateral_clearance_margin_mm": 30

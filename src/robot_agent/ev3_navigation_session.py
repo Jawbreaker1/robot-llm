@@ -107,6 +107,7 @@ class EV3NavigationSession:
         except EV3NavigationTransportError as error:
             self.body.disconnect()
             event = {"event": "transport_retry", "action": self._action_in_flight,
+                     "action_completed": False, "observation_acquired": False,
                      "result": getattr(error, "code", "worker_transport_error"),
                      "operation": getattr(error, "operation", None),
                      "motion_outcome": "unconfirmed; observe absolute encoders before further motion",
@@ -144,7 +145,8 @@ class EV3NavigationSession:
             self.waypoints = tuple(deepcopy((decision.waypoint, *decision.following_waypoints)))
         before = self.body.pose
         self.publish({"event": "decision", "action": decision.action, "assessment": decision.assessment,
-                      "utterance": decision.utterance, "plan": list(decision.plan),
+                      "utterance": decision.utterance, "expression": decision.expression,
+                      "plan": list(decision.plan),
                       "reasoning": result.reasoning_content, "latency_ms": result.latency_ms,
                       "waypoints": deepcopy(self.waypoints),
                       "obstacle_estimates": deepcopy(self.obstacle_estimates), "context": context.to_dict()})

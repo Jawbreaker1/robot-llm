@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import json
+from copy import deepcopy
 from typing import Mapping
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,42 @@ class EpisodeSpeech:
         self._supported_locales = supported_locales
         self._context = context
         self._runtime = None
+        self.commentary_enabled = False
+        self._commentary_epoch = 0
+        self._commentary_key = None
+
+    def observe(self, packet, *, commentator, progress_revision):
+        """Latest shared navigation snapshot, generated on the audio worker.
+
+        Routine progress may continue during generation. A changed route,
+        belief or failed operation invalidates a pending old commentary.
+        No additional world/route memory is maintained here.
+        """
+        if self._runtime is None or not callable(commentator) or self._cancelled():
+            return False
+        snapshot = deepcopy(packet)
+        feedback = snapshot.get("observation", {}).get("last_action") or {}
+        key = json.dumps([snapshot.get("robot_id"), snapshot.get("goal"),
+            snapshot.get("active_waypoint_plan"), snapshot.get("obstacle_estimates"),
+            snapshot.get("completion_allowed"), feedback.get("completed") is False,
+            feedback.get("observation_acquired") is not None], sort_keys=True)
+        if key != self._commentary_key:
+            self._commentary_epoch += 1
+            self._commentary_key = key
+        epoch = self._commentary_epoch
+        self.commentary_enabled = True
+        try:
+            self._runtime.offer(episode_id=self._context.episode_id, text=None,
+                locale=self._context.request.locale, progress_revision=progress_revision,
+                cancel_requested=self._cancelled,
+                commentary=lambda: commentator(snapshot),
+                is_current=lambda: epoch == self._commentary_epoch and not self._cancelled())
+        except Exception as error:
+            self._publish_failed(error, stage="commentary")
+        return True
+
+    def end_commentary(self):
+        self._commentary_epoch += 1
 
     def _cancelled(self) -> bool:
         return episode_cancelled(self._context)
@@ -152,6 +190,7 @@ class EpisodeSpeech:
             return "failed"
 
     def cancel(self) -> None:
+        self.end_commentary()
         if self._runtime is None:
             return
         try:
@@ -165,6 +204,7 @@ class EpisodeSpeech:
             return
 
     def close(self, *, drain: bool = False) -> bool:
+        self.end_commentary()
         if self._runtime is None:
             return True
         if not drain or self._cancelled():

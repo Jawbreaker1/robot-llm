@@ -18,7 +18,7 @@ from robot_agent.dashboard_cli import (
 )
 from robot_agent.blast_episode_adapter import BLAST_PROFILE_ID
 from robot_agent.blast_hub_speech import BLAST_PIPER_PROFILE
-from robot_agent.blast_personality import BLAST_PERSONA_BY_LOCALE
+from robot_agent.blast_personality import BLAST_PERSONA_BY_LOCALE, EV3_PERSONA_BY_LOCALE
 from robot_agent.ev3rstorm_profile import EV3RSTORM_PROFILE_ID, EV3SSHBinding
 from robot_agent.lm_studio import DEFAULT_MODEL
 from robot_agent.robot_control_contract import RobotControlTarget
@@ -672,6 +672,7 @@ class DashboardRobotProfileTests(unittest.TestCase):
                     timeout_seconds=10.0,
                     social_expressions=True,
                     social_profile="ev3",
+                    reply_persona_by_locale=EV3_PERSONA_BY_LOCALE,
                 ),
                 mock.call(
                     base_url="http://127.0.0.1:1234",

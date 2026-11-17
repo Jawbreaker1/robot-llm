@@ -66,7 +66,7 @@ class NavigationPolicyControlTests(unittest.TestCase):
 
     def test_host_contracts_are_explicit_not_hidden_model_votes(self):
         for complete, waypoint, expected in ((False,None,'REPLAN'),
-                                             (True,{'x_mm':0,'y_mm':0},'COMPLETE')):
+                                             (True,{'x_mm':0,'y_mm':0},'REPLAN')):
             with self.subTest(expected=expected):
                 policy, teacher = Mock(), Mock()
                 context = SimpleNamespace(to_dict=lambda:{}, completion_allowed=complete,
@@ -83,7 +83,7 @@ class NavigationPolicyControlTests(unittest.TestCase):
             for action in targets:
                 with self.subTest(robot=robot, action=action):
                     teacher = Mock()
-                    teacher.decide.return_value = response('SCAN_FRONT_ARC',
+                    teacher.decide.return_value = response('FOLLOW_WAYPOINT',
                         {'x_mm':600,'y_mm':0,'purpose':'Diagnostic route'})
                     dispatches, inputs, outputs = [], [], []
                     local = LocalPlanner(teacher, policy_for(action), dispatches.append)
@@ -102,28 +102,27 @@ class NavigationPolicyControlTests(unittest.TestCase):
                             goal='Reach the goal straight ahead of your starting position.')
                     self.assertIsNone(result.get('error_type'), result.get('error_message'))
                     teacher.decide.assert_called_once()
-                    self.assertEqual(outputs, ['SCAN_FRONT_ARC',action])
+                    self.assertEqual(outputs, ['FOLLOW_WAYPOINT',action])
                     self.assertEqual(dispatches[-1]['selection'], action)
                     if previous_input is not None:
                         self.assertEqual(inputs[-1], previous_input)
                     previous_input = inputs[-1]
                     pose = result['final_pose']
+                    pulse = 52 if robot == 'ev3' else 45
                     if action.startswith('TURN_'):
                         sign = 1 if action == 'TURN_LEFT_90' else -1
                         self.assertAlmostEqual(pose['heading_mdeg'], sign*90_000, delta=3_000)
-                        self.assertEqual(pose['x_mm'], 0)
+                        self.assertAlmostEqual(pose['x_mm'], pulse, delta=2)
                     elif action == 'FOLLOW_WAYPOINT':
-                        self.assertAlmostEqual(pose['x_mm'],52 if robot=='ev3' else 45,delta=2)
+                        self.assertAlmostEqual(pose['x_mm'],2*pulse,delta=2)
                     elif action == 'OBSERVE':
-                        self.assertEqual((pose['x_mm'],pose['y_mm']), (0,0))
+                        self.assertEqual((pose['x_mm'],pose['y_mm']), (pulse,0))
                         self.assertAlmostEqual(pose['heading_mdeg'],0,delta=1_000)
                         if robot == 'blast':
-                            self.assertEqual(result['commands_tail'],
-                                ['scan_surroundings','scan_front_arc','observe_settled'])
-                            self.assertEqual(result['scans'],2)
+                            self.assertEqual(result['commands_tail'][-1], 'observe_settled')
+                            self.assertEqual(result['scans'],1)
                     else:
-                        pulse = 52 if robot == 'ev3' else 45
-                        self.assertEqual(pose['x_mm'], pulse if action == 'ADVANCE' else -pulse)
+                        self.assertEqual(pose['x_mm'], 2*pulse if action == 'ADVANCE' else 0)
 
 
 if __name__ == '__main__':

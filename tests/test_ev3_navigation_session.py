@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock
 
 from robot_agent.ev3_navigation_session import EV3NavigationSession
+from robot_agent.ev3_navigation_transport import EV3NavigationTransportError
 from robot_agent.lm_studio import LMStudioTimeoutError
 from robot_agent.lm_studio_controller_action import ControllerActionDecision, ControllerActionPlannerResult, COMPLETE, FOLLOW_WAYPOINT
 from robot_agent.physical_navigation_contract import ADVANCE, OBSERVE, SCAN_FRONT_ARC
@@ -26,6 +27,26 @@ def finish_leg(session):
 
 
 class EV3NavigationSessionTests(unittest.TestCase):
+    def test_transport_failure_reaches_next_planner_with_route_memory_intact(self):
+        session, planner = self.session(front=False)
+        planner.decide.return_value = choice(FOLLOW_WAYPOINT, {"x_mm":800,"y_mm":0,"purpose":"Goal"})
+        session.step()
+        pose, route = session.body.pose, session.waypoints
+        observe = session.body.observe
+        session.body.observe = Mock(side_effect=EV3NavigationTransportError("lost receipt"))
+        event = session.step()
+        self.assertEqual(event["event"],"transport_retry")
+        self.assertFalse(event["action_completed"])
+        self.assertEqual(session.body.pose,pose)
+        self.assertEqual(session.waypoints,route)
+        session.body.observe = observe
+        planner.decide.return_value = choice(FOLLOW_WAYPOINT)
+        session.step()
+        packet = planner.decide.call_args.args[0].to_dict()
+        self.assertFalse(packet["observation"]["last_action"]["completed"])
+        self.assertEqual(packet["observation"]["last_action"]["reason"],"worker_transport_error")
+        self.assertTrue(packet["local_map_evidence"]["route_execution_memory"]["records"])
+
     def test_decision_memory_keeps_intent_separate_from_measured_result(self):
         session, planner = self.session(front=False)
         first = choice(ADVANCE)

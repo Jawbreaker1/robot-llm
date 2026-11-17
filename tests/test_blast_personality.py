@@ -2,11 +2,20 @@ import unittest
 
 from robot_agent.blast_personality import (
     BLAST_PERSONA_BY_LOCALE,
+    EV3_PERSONA_BY_LOCALE,
     MAX_PERSONA_CHARS,
+    normalize_persona_by_locale,
 )
 
 
 class BlastPersonalityTests(unittest.TestCase):
+    def test_ev3_persona_is_shared_grumpy_and_wording_only(self):
+        self.assertEqual(normalize_persona_by_locale(EV3_PERSONA_BY_LOCALE), EV3_PERSONA_BY_LOCALE)
+        self.assertIn("grumpy", EV3_PERSONA_BY_LOCALE["en"])
+        self.assertIn("swear occasionally", EV3_PERSONA_BY_LOCALE["en"])
+        self.assertIn("never change facts, actions", EV3_PERSONA_BY_LOCALE["en"])
+        self.assertIn("svär ibland", EV3_PERSONA_BY_LOCALE["sv"])
+
     def test_persona_is_energetic_theatrical_harmless_and_text_only(self):
         required_phrases = {
             "sv": (

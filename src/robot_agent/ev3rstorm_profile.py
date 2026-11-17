@@ -15,6 +15,8 @@ from .controller_runtime_profile import (
 )
 from .ev3_audio_transport import EV3WAVSSHSession
 from .ev3_social_speech import EV3SocialSpeaker
+from .blast_personality import EV3_PERSONA_BY_LOCALE
+from .social_expression import EV3_GESTURES
 from .ev3_navigation_transport import EV3NavigationSSHTransport
 from .ev3_navigation_body import EV3NavigationBody
 from .ev3_navigation_preflight_cli import run_ev3_navigation_preflight
@@ -413,7 +415,9 @@ class EV3RSTORMProfile(ControllerRuntimeProfile):
             raise ControllerRuntimeProfileError("EV3 binding selected another controller profile")
         if planner_factory is None:
             planner_factory = lambda model: LMStudioControllerActionPlanner(
-                model=model, max_output_tokens=4096, timeout_seconds=60)
+                model=model, max_output_tokens=4096, timeout_seconds=60,
+                social_expressions=True, social_gestures=EV3_GESTURES, social_faces=("neutral",),
+                utterance_persona_by_locale=EV3_PERSONA_BY_LOCALE)
 
         def transport_factory():
             return EV3NavigationSSHTransport(

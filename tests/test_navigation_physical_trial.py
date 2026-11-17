@@ -29,14 +29,21 @@ class PhysicalLocalTrialTests(unittest.TestCase):
                 teacher.return_value.decide.assert_not_called()
                 self.assertEqual(teacher.call_args.kwargs['reasoning_effort'],'high')
                 self.assertEqual(teacher.call_args.kwargs['max_output_tokens'],8192)
+                self.assertTrue(teacher.call_args.kwargs['social_expressions'])
+                self.assertEqual(teacher.call_args.kwargs['social_gestures'],('none','saw_flourish','saw_celebrate'))
+                self.assertEqual(teacher.call_args.kwargs['social_faces'],('neutral',))
+                self.assertIn('grumpy',teacher.call_args.kwargs['utterance_persona_by_locale']['en'])
                 expected=ControllerActionPlannerResult(ControllerActionDecision('OBSERVE',1000,'teacher',(),None),1)
                 teacher.return_value.decide.return_value=expected
                 context.active_waypoint=None;packet.pop('active_waypoint')
                 self.assertIs(planner.decide(context),expected)
                 teacher.return_value.decide.assert_called_once()
                 context.completion_allowed=True
+                teacher.return_value.decide.return_value=ControllerActionPlannerResult(
+                    ControllerActionDecision('COMPLETE',1000,'Arrived',(),'Made it!'),1)
                 self.assertEqual(planner.decide(context).decision.action,'COMPLETE')
-            self.assertEqual([e[1]['source'] for e in events if e[0]=='policy_dispatch'],['local','astra','goal_contract'])
+                self.assertEqual(teacher.return_value.decide.call_count,2)
+            self.assertEqual([e[1]['source'] for e in events if e[0]=='policy_dispatch'],['local','astra','astra'])
             self.assertEqual(len([e for e in events if e[0]=='decision_pair']),3)
             self.assertFalse(events[0][1]['automatic_mission_start'])
             adapter.spatial_map_provider.close()

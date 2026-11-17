@@ -648,6 +648,9 @@ class BlastEpisodeRuntimeAdapter:
             history_item["action_completed"] = (
                 not command_result.get("action_error") and execution is not None
                 and history_item.get("last_motion", {}).get("completed", execution.motion.complete))
+            if (published_action == FOLLOW_WAYPOINT and action in (TURN_LEFT_90, TURN_RIGHT_90)
+                    and history_item["action_completed"]):
+                history_item["result"] = "heading_aligned"
         map_trace.record_action(
             action, motion_executor.pose, result_observation,
             latest_scan_view,

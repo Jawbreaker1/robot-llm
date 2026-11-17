@@ -18,6 +18,8 @@ from robot_agent import dashboard_cli
 from robot_agent.ev3rstorm_profile import EV3RSTORMProfile, EV3SSHBinding
 from robot_agent.lm_studio_controller_action import LMStudioControllerActionPlanner
 from robot_agent.navigation_diagnostics import enable_navigation_diagnostics, record_navigation_diagnostic
+from robot_agent.social_expression import EV3_GESTURES
+from robot_agent.blast_personality import EV3_PERSONA_BY_LOCALE
 
 MODEL = 'codex/gpt-6-astra'
 
@@ -33,11 +35,16 @@ def build_adapter(weights, target, output, emit=record_navigation_diagnostic):
         if model != MODEL:
             raise ValueError('This validation trial requires Astra high')
         teacher = LMStudioControllerActionPlanner(model=model, reasoning_effort='high',
-                                                  max_output_tokens=8192, timeout_seconds=60)
+            max_output_tokens=8192, timeout_seconds=60, social_expressions=True,
+            social_gestures=EV3_GESTURES, social_faces=('neutral',),
+            utterance_persona_by_locale=EV3_PERSONA_BY_LOCALE)
         selected = LocalPlanner(teacher, policy,
             lambda event: emit(event['event'], **{k:v for k,v in event.items() if k!='event'}))
 
         class RecordingPlanner:
+            def comment(self, packet):
+                return selected.comment(packet)
+
             def decide(self, context):
                 result = selected.decide(context)
                 emit('decision_pair', packet=context.to_dict(), decision=asdict(result.decision))

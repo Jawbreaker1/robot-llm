@@ -1993,6 +1993,7 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         feedback = planner.contexts[2].observation
         self.assertTrue(feedback["last_motion"]["completed"])
         self.assertTrue(feedback["last_action"]["completed"])
+        self.assertEqual(feedback["last_action"]["reason"],"heading_aligned")
         self.assertLess(pose["x_mm"], 100)
         self.assertEqual(planner.contexts[2].active_waypoint, target)
         self.assertLessEqual(abs(pose["y_mm"]), 25)
@@ -2487,6 +2488,18 @@ class BlastEpisodeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(result.terminal_reason, "decision_budget_exhausted")
         self.assertEqual(controller.commands.count("turn_right"), 4)
         self.assertEqual(controller.commands.count("turn_left"), 0)
+
+    def test_route_alignment_has_shared_feedback_but_inspection_turn_does_not(self):
+        for turn, y in ((TURN_LEFT_90,450),(TURN_RIGHT_90,-450)):
+            for action in (FOLLOW_WAYPOINT,turn):
+                with self.subTest(action=action, y=y):
+                    controller = FakeScanController(1000)
+                    planner = Planner([decision(action,waypoint={"x_mm":0,"y_mm":y,"purpose":"side"}),
+                                       decision(SCAN_FRONT_ARC)])
+                    self.adapter(controller,planner,max_decisions=2).run(episode_context()[0])
+                    feedback = planner.contexts[1].observation["last_action"]
+                    self.assertTrue(feedback["completed"])
+                    self.assertEqual(feedback["reason"],"heading_aligned" if action == FOLLOW_WAYPOINT else None)
 
     def test_explicit_inspection_turn_is_not_shortened_toward_retained_route(self):
         for first, inspect, y, command in (

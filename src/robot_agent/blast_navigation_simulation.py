@@ -60,6 +60,10 @@ class _RecordingPlanner:
         self._planner = planner
         self._records = records
 
+    @property
+    def comment(self):
+        return getattr(self._planner, "comment", None)
+
     def decide(self, context):
         context_chars = len(json.dumps(
             context.to_dict(), ensure_ascii=False, separators=(",", ":"),
@@ -123,6 +127,7 @@ def run_blast_gemma_scenario(
     range_dropout_reads: int = 0,
     goal: str = DEFAULT_GOAL,
     minimum_forward_progress_mm: int = 800,
+    speech_runtime_factory=None,
 ) -> dict[str, object]:
     """Run the real BLAST episode loop; only hardware is simulated."""
 
@@ -173,7 +178,7 @@ def run_blast_gemma_scenario(
         ),
         settings=RobotControlSettings(
             model=model,
-            speech_enabled=False,
+            speech_enabled=speech_runtime_factory is not None,
         ),
         stop_requested=threading.Event(),
         emergency_stop_requested=threading.Event(),
@@ -188,6 +193,8 @@ def run_blast_gemma_scenario(
         max_decisions=max_decisions,
         minimum_forward_progress_mm=minimum_forward_progress_mm,
         monotonic_ms=controller.monotonic_ms,
+        speech_runtime_factory=speech_runtime_factory,
+        speech_locales=("en",) if speech_runtime_factory is not None else (),
     )
     outcome = None
     error = None

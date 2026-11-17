@@ -57,7 +57,7 @@ def hazard_map(*, footprint=None, x_mm=100, y_mm=-120, radius_mm=10):
 class ProvisionalHazardFootprintTests(unittest.TestCase):
     def test_shared_planner_view_uses_each_robots_existing_dimensions(self):
         for body, length, width, radius in (
-            (EV3RSTORMProfile().hazard_calibration.robot_footprint, 200, 230, 185),
+            (EV3RSTORMProfile().hazard_calibration.robot_footprint, 200, 250, 185),
             (BLAST_PROVISIONAL_NAVIGATION_CALIBRATION.robot_footprint, 170, 205, 167),
         ):
             with self.subTest(width=width):
@@ -360,7 +360,7 @@ class ProvisionalHazardFootprintTests(unittest.TestCase):
             "operator-measured-current-build",
         )
         self.assertIn(
-            "100 mm left and 130 mm right",
+            "120 mm left",
             geometry[
                 "calibration_evidence"
             ],
